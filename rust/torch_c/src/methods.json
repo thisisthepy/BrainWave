@@ -539,6 +539,12 @@
   "detach_": [
     "aten::detach_(Tensor(a!) self) -> Tensor(a!)"
   ],
+  "maximum": [
+    "aten::maximum(Tensor self, Tensor other) -> Tensor"
+  ],
+  "new_empty": [
+    "aten::new_empty(Tensor self, SymInt[] size, *, ScalarType? dtype=None, Layout? layout=None, Device? device=None, bool? pin_memory=None) -> Tensor"
+  ],
   "new_ones": [
     "aten::new_ones(Tensor self, SymInt[] size, *, ScalarType? dtype=None, Layout? layout=None, Device? device=None, bool? pin_memory=None) -> Tensor"
   ],

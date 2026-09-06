@@ -7365,6 +7365,22 @@ def max_other_cases(torch_module, c_module, torch_call) -> list[Case]:
     return _extremum_other_cases(torch_module, c_module, torch_call, "aten.max.other", "max")
 
 
+def maximum_cases(torch_module, c_module, torch_call) -> list[Case]:
+    """`aten.maximum` -- `rwkv`'s wall after `new_empty`, and `max.other`'s
+    own function under its own schema.
+
+    It gets the whole `_extremum_other_cases` sweep rather than one smoke case
+    because sharing a Rust kernel is not what golden checks: `torch_call` here
+    resolves `torch.ops.aten.maximum.default` on the *upstream* side, so these
+    cases would catch the new key being wired to the `min` arm, or losing the
+    NaN correction that `max.other` needed and that no `maximum` case would
+    inherit if it were assumed rather than run.
+    """
+    return _extremum_other_cases(
+        torch_module, c_module, torch_call, "aten.maximum.default", "maximum"
+    )
+
+
 # --- aten.min.other -----------------------------------------------------------
 #
 # The `min` half of the same story as `min.dim` above: listed in the spelling
@@ -22949,6 +22965,84 @@ def new_zeros_cases(torch_module, c_module, torch_call) -> list[Case]:
     return cases
 
 
+def new_empty_cases(torch_module, c_module, torch_call) -> list[Case]:
+    """`aten.new_empty` -- `new_zeros`'s schema with uninitialised contents.
+
+    `rwkv`'s wall (docs/DEMAND8.md §2.6). Every case here is
+    `_dtype_shape_only_check`, the same comparator `empty_cases` uses and for
+    the same reason: upstream's buffer holds whatever was in that memory, so a
+    value comparison would pass or fail by luck and a green coin flip is not a
+    check.
+
+    That leaves dtype and shape, and those carry the whole rule this op can get
+    wrong -- the dtype comes from the *receiver*, not from the default float,
+    and `new_empty(())` is a 0-d tensor of one element while `new_empty(0)` is
+    an empty one.
+    """
+    op = "aten.new_empty.default"
+    cases: list[Case] = []
+    for self_dtype in dt.DEFAULT_DTYPES:
+        a_t, a_c = pair_from_flat(torch_module, c_module, [1, 2, 3, 4], (2, 2), self_dtype)
+        cases.append(
+            Case(
+                name=f"new_empty(self_dtype={self_dtype}, shape=[2,3]) [dtype inherited from self]",
+                op=op,
+                run_torch=lambda a_t=a_t: torch_call(a_t, [2, 3]),
+                run_c=lambda a_c=a_c: c_module._aten_dispatch(op, a_c, [2, 3]),
+                value_check=_dtype_shape_only_check,
+                note="uninitialized memory -- dtype comes from the receiver, "
+                     "which is the half of the rule a default-float kernel gets wrong",
+            )
+        )
+    for dtype_name in dt.DEFAULT_DTYPES:
+        t_dt = dt.torch_dtype(torch_module, dtype_name)
+        c_dt = dt.c_dtype(c_module, dtype_name)
+        a_t, a_c = pair_from_flat(torch_module, c_module, [1, 2, 3, 4], (2, 2), "float32")
+        cases.append(
+            Case(
+                name=f"new_empty(self_dtype=float32, shape=[2,2], dtype_override={dtype_name})",
+                op=op,
+                run_torch=lambda a_t=a_t, t_dt=t_dt: torch_call(a_t, [2, 2], dtype=t_dt),
+                run_c=lambda a_c=a_c, c_dt=c_dt: c_module._aten_dispatch(op, a_c, [2, 2], dtype=c_dt),
+                value_check=_dtype_shape_only_check,
+                note="explicit dtype override beats the receiver's dtype",
+            )
+        )
+    for size, note in [
+        ([], "0-d result: one element, not zero elements"),
+        ([0], "empty result"),
+        ([0, 3], "empty in the leading axis only"),
+        ([1, 1, 1], "rank 3, all singleton"),
+    ]:
+        a_t, a_c = pair_from_flat(torch_module, c_module, [1, 2, 3, 4], (2, 2), "float32")
+        cases.append(
+            Case(
+                name=f"new_empty(size={size}) [{note}]",
+                op=op,
+                run_torch=lambda a_t=a_t, size=size: torch_call(a_t, size),
+                run_c=lambda a_c=a_c, size=size: c_module._aten_dispatch(op, a_c, size),
+                value_check=_dtype_shape_only_check,
+                note=note,
+            )
+        )
+    kw_t, kw_c = pair_from_flat(torch_module, c_module, [1, 2, 3, 4], (2, 2), "float32")
+    cases.append(
+        Case(
+            name="new_empty(self=/size=/dtype= all by keyword)",
+            op=op,
+            run_torch=lambda: torch_call(
+                self=kw_t, size=[2, 2], dtype=dt.torch_dtype(torch_module, "int64")
+            ),
+            run_c=lambda: c_module._aten_dispatch(
+                op, self=kw_c, size=[2, 2], dtype=dt.c_dtype(c_module, "int64")
+            ),
+            value_check=_dtype_shape_only_check,
+            note="keyword-argument coverage",
+        )
+    )
+    return cases
+
+
 # --- aten.native_batch_norm.default -----------------------------------------
 #
 # docs/DEMAND.md rank 1. The hardest op in this file to test honestly, for two
@@ -23430,6 +23524,430 @@ def roll_default_cases(torch_module, c_module, torch_call):
              run_c=lambda: c_module._aten_dispatch("aten.roll.default", a_c, [1, -1], [0, 1]))
     ]
 
+
+# --- prims.* (docs/PRIMS.md) -------------------------------------------------
+#
+# The thirteen reference operators upstream writes its decompositions over.
+# docs/DECOMP.md §12.4 measured that a working upstream decomposition rule
+# stops in this shim on a `prims.*` name, not on a missing rule.
+#
+# Nine of the thirteen are an aten kernel under another name -- upstream's own
+# `impl_aten` for `prims.cos` *is* `torch.cos`. They get their own cases
+# anyway: `_aten_implemented()` means "this key has a kernel *and* golden
+# compares it against upstream", and a key nothing compares is not covered by
+# the key beside it. It is also the only way the alias claim is a claim -- if
+# `prims.cos` were wired to the wrong kernel, or dropped the integral
+# promotion `aten.cos` does, nothing else in this tree would notice.
+#
+# The `int64` and `bool` rows are there for exactly that: the prims schema is
+# `Tensor self -> Tensor` with no promotion written into it, so "prims.cos is
+# aten.cos" is a statement about integral inputs before it is one about float
+# inputs. Upstream promotes both to the default float; measured, not assumed.
+
+_PRIMS_UNARY_DTYPES = ["float64", "float32", "float16", "bfloat16", "int64"]
+
+_PRIMS_UNARY_SCENARIOS = {
+    "cos": [
+        ([0.0, 1.5707963267948966, 3.141592653589793, -1.5707963267948966], (2, 2), "RoPE angle boundary values"),
+        ([0.0], (), "0-d"),
+    ],
+    "sin": [
+        ([0.0, 1.5707963267948966, 3.141592653589793, -1.5707963267948966], (2, 2), "RoPE angle boundary values"),
+        ([0.0], (), "0-d"),
+    ],
+    "erf": [
+        ([0.0, 0.5, -0.5, 2.0], (2, 2), "gelu's own argument range"),
+        ([0.0], (), "0-d"),
+    ],
+    "tanh": [
+        ([0.0, 1.0, -1.0, 4.0], (2, 2), "saturating and not"),
+        ([0.0], (), "0-d"),
+    ],
+    "sqrt": [
+        ([1.0, 4.0, 0.25, 2.0], (2, 2), "exact and inexact roots"),
+        ([0.0], (), "0-d zero"),
+    ],
+    "rsqrt": [
+        ([1.0, 4.0, 0.25, 2.0], (2, 2), "RMSNorm's own kernel"),
+        ([1.0], (), "0-d"),
+    ],
+    "reciprocal": [
+        ([1.0, 2.0, 4.0, 0.5], (2, 2), "assorted magnitudes"),
+        ([0.0], (1,), "zero -> +inf"),
+    ],
+}
+
+
+def _prims_unary_builder(name):
+    op = f"prims.{name}.default"
+
+    def build(torch_module, c_module, torch_call) -> list[Case]:
+        cases: list[Case] = []
+        for dtype_name in _PRIMS_UNARY_DTYPES:
+            for flat, shape, note in _PRIMS_UNARY_SCENARIOS[name]:
+                cases.append(
+                    _unary_case(
+                        torch_module, c_module, op, torch_call, dtype_name,
+                        flat, shape, note,
+                    )
+                )
+        # `bool` in, default float out -- the far end of the promotion rule,
+        # and the row that would move if this were wired to a kernel that
+        # computed in the storage dtype.
+        cases.append(
+            _unary_case(
+                torch_module, c_module, op, torch_call, "bool",
+                [True, False], (2,), "bool -> default float",
+            )
+        )
+        return cases
+
+    build.__name__ = f"prims_{name}_cases"
+    return build
+
+
+def prims_neg_cases(torch_module, c_module, torch_call) -> list[Case]:
+    """`prims.neg` keeps the input dtype rather than promoting, and refuses
+    `bool` -- upstream's message is about the `-` operator, and both sides
+    have to decline together or the shim has invented a negative True."""
+    op = "prims.neg.default"
+    cases: list[Case] = []
+    for dtype_name in ["float64", "float32", "float16", "bfloat16", "int64", "int32"]:
+        for flat, shape, note in [
+            ([1.0, -2.0, 3.0, -4.0], (2, 2), "both signs"),
+            ([0.0], (), "0-d zero"),
+        ]:
+            cases.append(
+                _unary_case(
+                    torch_module, c_module, op, torch_call, dtype_name,
+                    flat, shape, note,
+                )
+            )
+    b_t, b_c = pair_from_flat(torch_module, c_module, [True, False], (2,), "bool")
+    cases.append(
+        Case(
+            name="neg(dtype=bool) [refused on both sides]",
+            op=op,
+            run_torch=lambda: torch_call(b_t),
+            run_c=lambda: c_module._aten_dispatch(op, b_c),
+            expect="both_error",
+            note="upstream has no bool negation and neither does this",
+        )
+    )
+    return cases
+
+
+def prims_clone_cases(torch_module, c_module, torch_call) -> list[Case]:
+    """`prims.clone`'s `impl_aten` is `torch.clone`, memory_format and all."""
+    op = "prims.clone.default"
+    cases: list[Case] = []
+    for dtype_name in ["float64", "float32", "float16", "bfloat16", "int64", "bool"]:
+        a_t, a_c = pair_from_flat(
+            torch_module, c_module, [1, 0, 3, 4, 5, 6], (2, 3), dtype_name
+        )
+        cases.append(
+            Case(
+                name=f"clone(dtype={dtype_name})",
+                op=op,
+                run_torch=lambda a_t=a_t: torch_call(a_t),
+                run_c=lambda a_c=a_c: c_module._aten_dispatch(op, a_c),
+                note="a real copy, dtype preserved",
+            )
+        )
+    a_t, a_c = pair_from_flat(torch_module, c_module, [1, 2, 3, 4], (2, 2), "float32")
+    cases.append(
+        Case(
+            name="clone(memory_format=contiguous_format)",
+            op=op,
+            run_torch=lambda: torch_call(a_t, memory_format=torch_module.contiguous_format),
+            run_c=lambda: c_module._aten_dispatch(
+                op, a_c, memory_format=c_module.contiguous_format
+            ),
+            note="the one keyword the schema carries",
+        )
+    )
+    return cases
+
+
+def prims_view_of_cases(torch_module, c_module, torch_call) -> list[Case]:
+    """`prims.view_of(a)` -- `aten.alias` under another name, and the argument
+    is `a`, so the keyword row is not decoration."""
+    op = "prims.view_of.default"
+    cases: list[Case] = []
+    for dtype_name in ["float64", "float32", "float16", "int64", "bool"]:
+        a_t, a_c = pair_from_flat(
+            torch_module, c_module, [1, 0, 3, 4, 5, 6], (2, 3), dtype_name
+        )
+        cases.append(
+            Case(
+                name=f"view_of(dtype={dtype_name})",
+                op=op,
+                run_torch=lambda a_t=a_t: torch_call(a_t),
+                run_c=lambda a_c=a_c: c_module._aten_dispatch(op, a_c),
+                note="same shape, same dtype, same values",
+            )
+        )
+    s_t, s_c = pair_from_flat(torch_module, c_module, [7.5], (), "float32")
+    cases.append(
+        Case(
+            name="view_of(0-d)",
+            op=op,
+            run_torch=lambda: torch_call(s_t),
+            run_c=lambda: c_module._aten_dispatch(op, s_c),
+            note="rank zero survives",
+        )
+    )
+    k_t, k_c = pair_from_flat(torch_module, c_module, [1, 2, 3, 4], (2, 2), "float32")
+    cases.append(
+        Case(
+            name="view_of(a=...) [bound by keyword]",
+            op=op,
+            run_torch=lambda: torch_call(a=k_t),
+            run_c=lambda: c_module._aten_dispatch(op, a=k_c),
+            note="the prims schema names the tensor `a`, not `self`",
+        )
+    )
+    return cases
+
+
+def prims_transpose_cases(torch_module, c_module, torch_call) -> list[Case]:
+    """`prims.transpose(a, permutation)` -- a full permutation, unlike
+    `aten.transpose.int`, and **stricter than `aten.permute`**.
+
+    The last three rows are the reason this is not routed to the aten kernel:
+    `aten.permute` computes `[-1, 0]` and `prims.transpose` refuses it, so a
+    shim that delegated would accept a permutation upstream rejects. They are
+    `both_error` rows, which is the only spelling that fails if either side
+    changes its mind.
+    """
+    op = "prims.transpose.default"
+    cases: list[Case] = []
+    for dtype_name in ["float64", "float32", "float16", "int64", "bool"]:
+        a_t, a_c = pair_from_flat(
+            torch_module, c_module, [1, 0, 3, 4, 5, 6], (2, 3), dtype_name
+        )
+        cases.append(
+            Case(
+                name=f"transpose(dtype={dtype_name}, [1,0])",
+                op=op,
+                run_torch=lambda a_t=a_t: torch_call(a_t, [1, 0]),
+                run_c=lambda a_c=a_c: c_module._aten_dispatch(op, a_c, [1, 0]),
+                note="the 2-d swap",
+            )
+        )
+    b_t, b_c = pair_from_flat(
+        torch_module, c_module, list(range(24)), (2, 3, 4), "float32"
+    )
+    for perm, note in (
+        ([0, 2, 1], "attention's own permutation"),
+        ([2, 0, 1], "a 3-cycle, which no transpose.int spelling reaches"),
+        ([0, 1, 2], "the identity permutation"),
+    ):
+        cases.append(
+            Case(
+                name=f"transpose(3-d, {perm})",
+                op=op,
+                run_torch=lambda perm=perm: torch_call(b_t, perm),
+                run_c=lambda perm=perm: c_module._aten_dispatch(op, b_c, perm),
+                note=note,
+            )
+        )
+    s_t, s_c = pair_from_flat(torch_module, c_module, [7.5], (), "float32")
+    cases.append(
+        Case(
+            name="transpose(0-d, [])",
+            op=op,
+            run_torch=lambda: torch_call(s_t, []),
+            run_c=lambda: c_module._aten_dispatch(op, s_c, []),
+            note="rank zero takes the empty permutation",
+        )
+    )
+    cases.append(
+        Case(
+            name="transpose(a=..., permutation=...) [bound by keyword]",
+            op=op,
+            run_torch=lambda: torch_call(a=b_t, permutation=[0, 2, 1]),
+            run_c=lambda: c_module._aten_dispatch(op, a=b_c, permutation=[0, 2, 1]),
+            note="the prims schema names them `a` and `permutation`",
+        )
+    )
+    for bad, note in (
+        ([-1, 0], "negative dims are refused here and accepted by aten.permute"),
+        ([0, 0], "a repeat is not a permutation"),
+        ([0], "wrong length for the rank"),
+    ):
+        a_t, a_c = pair_from_flat(
+            torch_module, c_module, [1, 2, 3, 4, 5, 6], (2, 3), "float32"
+        )
+        cases.append(
+            Case(
+                name=f"transpose(2-d, {bad}) [refused on both sides]",
+                op=op,
+                run_torch=lambda a_t=a_t, bad=bad: torch_call(a_t, bad),
+                run_c=lambda a_c=a_c, bad=bad: c_module._aten_dispatch(op, a_c, bad),
+                expect="both_error",
+                note=note,
+            )
+        )
+    return cases
+
+
+def prims_broadcast_in_dim_cases(torch_module, c_module, torch_call) -> list[Case]:
+    """`prims.broadcast_in_dim(a, shape, broadcast_dimensions)` -- XLA's
+    broadcast, and genuinely new here.
+
+    `broadcast_dimensions[i]` says which dimension of the *result* the input's
+    `i`-th dimension becomes, so a dimension can be inserted anywhere. The
+    `(3,) -> (3, 2)` row is the one with no `aten.expand` spelling at all:
+    expand aligns from the right and would broadcast the 3 against the 2.
+    """
+    op = "prims.broadcast_in_dim.default"
+    cases: list[Case] = []
+    for dtype_name in ["float64", "float32", "float16", "int64", "bool"]:
+        a_t, a_c = pair_from_flat(torch_module, c_module, [1, 0], (2, 1), dtype_name)
+        cases.append(
+            Case(
+                name=f"broadcast_in_dim(dtype={dtype_name}, (2,1)->(2,3) bd=[0,1])",
+                op=op,
+                run_torch=lambda a_t=a_t: torch_call(a_t, [2, 3], [0, 1]),
+                run_c=lambda a_c=a_c: c_module._aten_dispatch(op, a_c, [2, 3], [0, 1]),
+                note="stretch a singleton, the expand-shaped case",
+            )
+        )
+    r_t, r_c = pair_from_flat(torch_module, c_module, [1, 2, 3], (3,), "float32")
+    for shape, bd, note in (
+        ([2, 3], [1], "prepend a dimension -- expand's own alignment"),
+        ([3, 2], [0], "append a dimension -- no aten.expand spelling exists"),
+        ([2, 3, 2], [1], "insert in the middle, both sides new"),
+    ):
+        cases.append(
+            Case(
+                name=f"broadcast_in_dim((3,)->{shape} bd={bd})",
+                op=op,
+                run_torch=lambda shape=shape, bd=bd: torch_call(r_t, shape, bd),
+                run_c=lambda shape=shape, bd=bd: c_module._aten_dispatch(op, r_c, shape, bd),
+                note=note,
+            )
+        )
+    s_t, s_c = pair_from_flat(torch_module, c_module, [5.0], (), "float32")
+    cases.append(
+        Case(
+            name="broadcast_in_dim(0-d -> (2,2), bd=[])",
+            op=op,
+            run_torch=lambda: torch_call(s_t, [2, 2], []),
+            run_c=lambda: c_module._aten_dispatch(op, s_c, [2, 2], []),
+            note="a scalar fills a shape; every broadcast dimension is new",
+        )
+    )
+    i_t, i_c = pair_from_flat(torch_module, c_module, [1, 2, 3, 4, 5, 6], (2, 3), "float32")
+    cases.append(
+        Case(
+            name="broadcast_in_dim(identity (2,3)->(2,3) bd=[0,1])",
+            op=op,
+            run_torch=lambda: torch_call(i_t, [2, 3], [0, 1]),
+            run_c=lambda: c_module._aten_dispatch(op, i_c, [2, 3], [0, 1]),
+            note="nothing is broadcast; the values must survive unpermuted",
+        )
+    )
+    cases.append(
+        Case(
+            name="broadcast_in_dim(bound by keyword)",
+            op=op,
+            run_torch=lambda: torch_call(a=i_t, shape=[2, 3], broadcast_dimensions=[0, 1]),
+            run_c=lambda: c_module._aten_dispatch(
+                op, a=i_c, shape=[2, 3], broadcast_dimensions=[0, 1]
+            ),
+            note="the schema names them `a`, `shape`, `broadcast_dimensions`",
+        )
+    )
+    for shape, bd, note in (
+        ([2, 3], [1, 0], "broadcast_dimensions must be strictly ascending"),
+        ([2, 5], [0, 1], "3 is not broadcastable to 5"),
+        ([3], [0], "one broadcast dimension for a rank-2 input"),
+        ([2, 3], [0, 2], "broadcast dimension out of bounds for the shape"),
+    ):
+        cases.append(
+            Case(
+                name=f"broadcast_in_dim((2,3)->{shape} bd={bd}) [refused on both sides]",
+                op=op,
+                run_torch=lambda shape=shape, bd=bd: torch_call(i_t, shape, bd),
+                run_c=lambda shape=shape, bd=bd: c_module._aten_dispatch(op, i_c, shape, bd),
+                expect="both_error",
+                note=note,
+            )
+        )
+    return cases
+
+
+def prims_split_dim_cases(torch_module, c_module, torch_call) -> list[Case]:
+    """`prims.split_dim(a, dim, outer_length)` -- one dimension becomes two.
+
+    The `dim=-1` row is the one that says this is not `aten.view` wearing a
+    different signature: every aten op in this shim takes a negative dim and
+    this one refuses it, because `utils.validate_idx` does.
+    """
+    op = "prims.split_dim.default"
+    cases: list[Case] = []
+    for dtype_name in ["float64", "float32", "float16", "int64", "bool"]:
+        a_t, a_c = pair_from_flat(
+            torch_module, c_module, [1, 0, 3, 4, 5, 6], (2, 3), dtype_name
+        )
+        cases.append(
+            Case(
+                name=f"split_dim(dtype={dtype_name}, (2,3) dim=1 outer=3)",
+                op=op,
+                run_torch=lambda a_t=a_t: torch_call(a_t, 1, 3),
+                run_c=lambda a_c=a_c: c_module._aten_dispatch(op, a_c, 1, 3),
+                note="the inner length falls out as 1",
+            )
+        )
+    b_t, b_c = pair_from_flat(
+        torch_module, c_module, list(range(24)), (2, 12), "float32"
+    )
+    for dim, outer, note in (
+        (1, 3, "12 -> (3, 4), the attention head split"),
+        (1, 4, "12 -> (4, 3)"),
+        (1, 1, "an outer length of 1 inserts a dimension"),
+        (1, 12, "an outer length of the whole dim leaves an inner 1"),
+        (0, 2, "splitting the first dimension"),
+    ):
+        cases.append(
+            Case(
+                name=f"split_dim((2,12) dim={dim} outer={outer})",
+                op=op,
+                run_torch=lambda dim=dim, outer=outer: torch_call(b_t, dim, outer),
+                run_c=lambda dim=dim, outer=outer: c_module._aten_dispatch(op, b_c, dim, outer),
+                note=note,
+            )
+        )
+    cases.append(
+        Case(
+            name="split_dim(bound by keyword)",
+            op=op,
+            run_torch=lambda: torch_call(a=b_t, dim=1, outer_length=3),
+            run_c=lambda: c_module._aten_dispatch(op, a=b_c, dim=1, outer_length=3),
+            note="the schema names them `a`, `dim`, `outer_length`",
+        )
+    )
+    for dim, outer, note in (
+        (-1, 3, "negative dim is refused, unlike every aten op here"),
+        (5, 1, "dim out of bounds"),
+        (1, 5, "12 does not divide by 5"),
+        (1, 0, "an outer length of zero divides by zero"),
+        (1, -2, "a negative outer length is not a dimension length"),
+    ):
+        cases.append(
+            Case(
+                name=f"split_dim((2,12) dim={dim} outer={outer}) [refused on both sides]",
+                op=op,
+                run_torch=lambda dim=dim, outer=outer: torch_call(b_t, dim, outer),
+                run_c=lambda dim=dim, outer=outer: c_module._aten_dispatch(op, b_c, dim, outer),
+                expect="both_error",
+                note=note,
+            )
+        )
+    return cases
+
 CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
     "aten.adaptive_avg_pool2d.default": adaptive_avg_pool2d_cases,
     "aten.where.ScalarSelf": where_scalar_self_cases,
@@ -23438,6 +23956,7 @@ CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
     "aten.roll.default": roll_default_cases,
 
     "aten.full_like.default": full_like_cases,
+    "aten.new_empty.default": new_empty_cases,
     "aten.new_zeros.default": new_zeros_cases,
     "aten.native_batch_norm.default": native_batch_norm_cases,
     "aten._grouped_mm.default": grouped_mm_cases,
@@ -23505,6 +24024,20 @@ CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
     "aten.all.dim": all_dim_cases,
     "aten.all.dims": all_dims_cases,
     "aten.clone.default": clone_cases,
+    # prims.* -- docs/PRIMS.md
+    "prims.cos.default": _prims_unary_builder("cos"),
+    "prims.sin.default": _prims_unary_builder("sin"),
+    "prims.erf.default": _prims_unary_builder("erf"),
+    "prims.tanh.default": _prims_unary_builder("tanh"),
+    "prims.sqrt.default": _prims_unary_builder("sqrt"),
+    "prims.rsqrt.default": _prims_unary_builder("rsqrt"),
+    "prims.reciprocal.default": _prims_unary_builder("reciprocal"),
+    "prims.neg.default": prims_neg_cases,
+    "prims.clone.default": prims_clone_cases,
+    "prims.view_of.default": prims_view_of_cases,
+    "prims.transpose.default": prims_transpose_cases,
+    "prims.broadcast_in_dim.default": prims_broadcast_in_dim_cases,
+    "prims.split_dim.default": prims_split_dim_cases,
     "aten.detach.default": detach_cases,
     "aten.cos.default": cos_cases,
     "aten.sin.default": sin_cases,
@@ -23652,6 +24185,7 @@ CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
     # found a live NaN defect and held it as a failing case until docs/TRIL.md
     # §3 fixed the kernel; the op is promoted into `_aten_implemented()` there.
     "aten.max.other": max_other_cases,
+    "aten.maximum.default": maximum_cases,
     "aten.reshape.default": reshape_cases,
     # docs/TRIL.md: GPT-BigCode's last wall and its mirror, plus the `min` half
     # of the max/min family, which had spelling-table entries and no kernels.

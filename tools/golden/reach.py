@@ -241,6 +241,36 @@ def spelling_exercised(corpus: str, name: str) -> bool:
     )
 
 
+def ops_namespace_spelled(corpus: str, keys) -> set:
+    """Keys outside `aten` that a test reaches through `torch.ops.<ns>.<op>`.
+
+    Shape 2 asks "can Python reach this kernel", and for `aten` the answer runs
+    through the resolution tables -- `torch.<name>` and `Tensor.<name>` -- which
+    is what `declared()` reads. **The thirteen `prims.*` kernels have no such
+    door and are not supposed to have one.** Nothing spells
+    `torch.broadcast_in_dim`; upstream's own callers are `torch._refs`, and
+    they call `torch.ops.prims.broadcast_in_dim.default` by its full key. So
+    for a non-`aten` namespace the qualified spelling *is* the spelling.
+
+    It is still a real question and not a waiver, which is why this reads the
+    same corpus shape 3 reads instead of returning the keys unconditionally: a
+    prims kernel no test calls by its full name is exactly as invisible as an
+    aten kernel with no `torch.<name>`, and it fails here the same way.
+    """
+    found = set()
+    for key in keys:
+        namespace, _, rest = key.partition(".")
+        if namespace == "aten":
+            continue
+        name, _, overload = rest.rpartition(".")
+        pattern = r"\btorch\.ops\.%s\.%s\.%s\b" % (
+            re.escape(namespace), re.escape(name), re.escape(overload)
+        )
+        if re.search(pattern, corpus):
+            found.add(key)
+    return found
+
+
 # --- the audit --------------------------------------------------------------
 
 
@@ -268,9 +298,10 @@ def audit(module, repo_root=REPO_ROOT) -> dict:
     implemented |= set(module._aten_implemented_awaiting_golden())
     spelled = {k for keys in decl.values() for k in keys}
     spelled |= composite_keys(repo_root)
+    corpus = test_corpus(repo_root)
+    spelled |= ops_namespace_spelled(corpus, implemented)
     unspelled = sorted(implemented - spelled)   # shape 2
 
-    corpus = test_corpus(repo_root)
     names = sorted({name for _, name in decl})
     unexercised = sorted(n for n in names if not spelling_exercised(corpus, n))  # shape 3
 

@@ -842,6 +842,13 @@ prims.sqrt              prims.tanh      prims.transpose  prims.view_of
 > 그러므로 "NNAPI 를 막는 것이 무엇인가" 의 답은 **분해 60 개** 도 **24 개** 도 아니고,
 > **`prims.*` 13 개 + 작은 인자 구멍 5 개** 입니다. 그것이 이 라운드가 사려던 정보입니다.
 
+**그 13 개는 이후 구현되었고, 이 절의 첫 줄은 그 시점에서 낡았습니다 — docs/PRIMS.md 를 보십시오.**
+분해는 이제 끝까지 돕니다(union 표 LOWERED 11 → 24, 막는 prims 커널 13 → 0). 그런데 그렇게 끝까지
+돈 그래프는 `prims.*` 노드에서 끝나고, `ADDER_MAP` 은 TorchScript `aten::` 노드 종류로 키가 잡혀
+있어 그 노드를 받을 수 없으며, prims 는 원시 연산이라 어느 상류 표도 더 분해하지 않습니다.
+**NNAPI 밖 op 의 개수는 내려가지 않았고**(`vit` 은 10 → 11 로 한 개 늘었습니다), 남은 일은
+커널이 아니라 `torchnative/export/` 쪽의 prims → aten 되접기입니다.
+
 ### 12.5 세 표를 나란히 돌린 결과 — 그리고 낮춤이 **후퇴**하는 경우
 
 | 표 | LOWERED | `smollm2` 밖 | `vit` 밖 | `mobilenet` 밖 |

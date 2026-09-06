@@ -153,6 +153,7 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.max.default",
     "aten.max.dim",
     "aten.max.other",
+    "aten.maximum.default",
     "aten.mean.default",
     "aten.mean.dim",
     "aten.min.default",
@@ -172,6 +173,7 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.ne.Tensor",
     "aten.neg.default",
     "aten.neg_.default",
+    "aten.new_empty.default",
     "aten.new_ones.default",
     "aten.new_zeros.default",
     "aten.nll_loss_forward.default",
@@ -244,6 +246,23 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.where.self",
     "aten.zero_.default",
     "aten.zeros_like.default",
+    // `prims.*` -- docs/PRIMS.md. Sorted after the aten names rather than
+    // merged into them: the list is one namespace's work queue followed by
+    // another's, and interleaving `prims.cos` between `aten.copy_` and
+    // `aten.cos` would hide that these thirteen arrived together.
+    "prims.broadcast_in_dim.default",
+    "prims.clone.default",
+    "prims.cos.default",
+    "prims.erf.default",
+    "prims.neg.default",
+    "prims.reciprocal.default",
+    "prims.rsqrt.default",
+    "prims.sin.default",
+    "prims.split_dim.default",
+    "prims.sqrt.default",
+    "prims.tanh.default",
+    "prims.transpose.default",
+    "prims.view_of.default",
 ];
 
 /// Ops with a real kernel that `_aten_implemented()` does **not** advertise.
@@ -489,6 +508,7 @@ static FLOAT8_E4M3FN_REFUSALS: &[(&str, &str)] = &[
     ("aten.max.default", "max_all"),
     ("aten.max.dim", "max_cpu"),
     ("aten.max.other", "maximum_cpu"),
+    ("aten.maximum.default", "maximum_cpu"),
     ("aten.max_pool2d.default", "max_pool2d"),
     ("aten.mean.default", "sum_cpu"),
     ("aten.mean.dim", "sum_cpu"),
@@ -1117,7 +1137,11 @@ fn meta_dispatch(
         // already copy rather than alias (docs/OPS4.md §8), so meta is not
         // losing an aliasing property it otherwise had.
         "aten.detach.default" | "aten.alias.default" | "aten.clone.default"
-        | "aten.contiguous.default" | "aten.lift_fresh.default" => {
+        | "aten.contiguous.default" | "aten.lift_fresh.default"
+        // `prims.clone` is the same pass-through. `prims.view_of` is too, but
+        // its argument is named `a`, so it is a line of its own below rather
+        // than a name added to this list.
+        | "prims.clone.default" => {
             let input = tensor_arg(op, args, kwargs, 0, "self")?;
             meta_result(py, input.dims().to_vec(), input.tag())
         }
@@ -1458,7 +1482,14 @@ fn meta_dispatch(
         // dense kernels do not promote (upstream has no integral `silu`
         // kernel at all, measured in `unary_float`'s own comment), so they
         // would need a different rule and nothing has reached them on meta.
-        "aten.cos.default"
+        "prims.cos.default"
+        | "prims.sin.default"
+        | "prims.erf.default"
+        | "prims.tanh.default"
+        | "prims.sqrt.default"
+        | "prims.reciprocal.default"
+        | "prims.rsqrt.default"
+        | "aten.cos.default"
         | "aten.sin.default"
         | "aten.erf.default"
         | "aten.log2.default"
@@ -1476,7 +1507,11 @@ fn meta_dispatch(
         // `neg_result_tag` carries so that both paths decline the same
         // inputs. A meta `neg` that accepted a bool would promise a tensor
         // the dense kernel refuses to compute.
-        "aten.neg.default" => {
+        "prims.view_of.default" => {
+            let input = tensor_arg(op, args, kwargs, 0, "a")?;
+            meta_result(py, input.dims().to_vec(), input.tag())
+        }
+        "aten.neg.default" | "prims.neg.default" => {
             let input = tensor_arg(op, args, kwargs, 0, "self")?;
             let tag = neg_result_tag(input.tag())?;
             meta_result(py, input.dims().to_vec(), tag)
@@ -1847,7 +1882,7 @@ fn aten_dispatch_inner(
             remainder_op(py, args, kwargs, "aten.remainder.Tensor", false)
         }
         "aten.repeat.default" => repeat_default(py, args, kwargs),
-        "aten.rsqrt.default" => rsqrt_default(py, args, kwargs),
+        "aten.rsqrt.default" => rsqrt_default(py, args, kwargs, "aten.rsqrt.default"),
         // `sqrt` sits with the `unary_float` family rather than beside
         // `rsqrt`'s own kernel: it is one candle call, and sharing the family
         // is what makes `float16` in / `float16` out true for both without
@@ -1920,7 +1955,7 @@ fn aten_dispatch_inner(
             unary_float(py, args, kwargs, "aten.reciprocal.default", Unary::Reciprocal)
         }
         "aten.tanh.default" => unary_float(py, args, kwargs, "aten.tanh.default", Unary::Tanh),
-        "aten.neg.default" => neg_default(py, args, kwargs),
+        "aten.neg.default" => neg_default(py, args, kwargs, "aten.neg.default"),
         "aten.sigmoid.default" => sigmoid_default(py, args, kwargs),
         "aten.sign.default" => sign_default(py, args, kwargs),
         "aten.silu.default" => silu_default(py, args, kwargs),
@@ -1938,8 +1973,20 @@ fn aten_dispatch_inner(
         "aten.min.default" => extremum_default(py, args, kwargs, Extremum::Min),
         "aten.max.dim" => extremum_dim(py, args, kwargs, Extremum::Max),
         "aten.min.dim" => extremum_dim(py, args, kwargs, Extremum::Min),
-        "aten.max.other" => extremum_other(py, args, kwargs, Extremum::Max),
-        "aten.min.other" => extremum_other(py, args, kwargs, Extremum::Min),
+        "aten.max.other" => {
+            extremum_other(py, args, kwargs, Extremum::Max, "aten.max.other")
+        }
+        "aten.min.other" => {
+            extremum_other(py, args, kwargs, Extremum::Min, "aten.min.other")
+        }
+        // `rwkv`'s next wall after `new_empty`. The *same function* as
+        // `max.other` -- the doc comment on `extremum_other` measured that
+        // `torch.max(a, b)` dispatches to `aten::maximum` upstream -- but a
+        // separate schema and so a separate key, and the key is what a
+        // refusal has to name.
+        "aten.maximum.default" => {
+            extremum_other(py, args, kwargs, Extremum::Max, "aten.maximum.default")
+        }
         "aten.tril.default" => tril_triu(py, args, kwargs, Triangle::Lower),
         "aten.triu.default" => tril_triu(py, args, kwargs, Triangle::Upper),
         "aten.any.default" => {
@@ -1993,9 +2040,35 @@ fn aten_dispatch_inner(
         "aten.squeeze.dims" => squeeze_dims(py, args, kwargs),
         "aten.split.Tensor" => split_tensor(py, args, kwargs),
         "aten.contiguous.default" => contiguous_default(py, args, kwargs),
-        "aten.clone.default" => clone_default(py, args, kwargs),
+        "aten.clone.default" => clone_default(py, args, kwargs, "aten.clone.default"),
+
+        // -- `prims.*` (docs/PRIMS.md) -------------------------------------
+        //
+        // Nine of these thirteen are an aten kernel under another name --
+        // upstream's own `impl_aten` for `prims.cos` *is* `torch.cos` -- so
+        // they are routed to it with the prims key carried through, which is
+        // what makes a refusal name the op the caller actually called. The
+        // four below them are separate kernels because the semantics differ
+        // from the aten op of the same name; see the section header on
+        // `prims_transpose`.
+        "prims.cos.default" => unary_float(py, args, kwargs, "prims.cos.default", Unary::Cos),
+        "prims.sin.default" => unary_float(py, args, kwargs, "prims.sin.default", Unary::Sin),
+        "prims.erf.default" => unary_float(py, args, kwargs, "prims.erf.default", Unary::Erf),
+        "prims.tanh.default" => unary_float(py, args, kwargs, "prims.tanh.default", Unary::Tanh),
+        "prims.sqrt.default" => unary_float(py, args, kwargs, "prims.sqrt.default", Unary::Sqrt),
+        "prims.reciprocal.default" => {
+            unary_float(py, args, kwargs, "prims.reciprocal.default", Unary::Reciprocal)
+        }
+        "prims.rsqrt.default" => rsqrt_default(py, args, kwargs, "prims.rsqrt.default"),
+        "prims.neg.default" => neg_default(py, args, kwargs, "prims.neg.default"),
+        "prims.clone.default" => clone_default(py, args, kwargs, "prims.clone.default"),
+        "prims.view_of.default" => prims_view_of(py, args, kwargs),
+        "prims.transpose.default" => prims_transpose(py, args, kwargs),
+        "prims.broadcast_in_dim.default" => prims_broadcast_in_dim(py, args, kwargs),
+        "prims.split_dim.default" => prims_split_dim(py, args, kwargs),
         "aten.detach.default" => detach_default(py, args, kwargs),
         "aten._to_copy.default" => to_copy_default(py, args, kwargs),
+        "aten.new_empty.default" => new_empty_default(py, args, kwargs),
         "aten.new_ones.default" => new_ones_default(py, args, kwargs),
         "aten.new_zeros.default" => new_zeros_default(py, args, kwargs),
         "aten.zeros.default" => zeros_or_ones(py, args, kwargs, "aten.zeros.default", false),
@@ -4460,8 +4533,14 @@ fn rsqrt_default(
     py: Python<'_>,
     args: &Bound<'_, PyTuple>,
     kwargs: Option<&Bound<'_, PyDict>>,
+    op: &str,
 ) -> PyResult<Py<PyAny>> {
-    const OP: &str = "aten.rsqrt.default";
+    // The key is a parameter because `prims.rsqrt` is this exact kernel
+    // under another name (docs/PRIMS.md), and a refusal that named the aten
+    // spelling for a call that never mentioned aten would send the reader to
+    // the wrong op.
+    #[allow(non_snake_case)]
+    let OP: &str = op;
     let input = tensor_arg(OP, args, kwargs, 0, "self")?;
     let tag = unary_float_tag(input.tag());
     let storage = PyDtype::new(tag).storage(OP)?;
@@ -6932,8 +7011,14 @@ fn neg_default(
     py: Python<'_>,
     args: &Bound<'_, PyTuple>,
     kwargs: Option<&Bound<'_, PyDict>>,
+    op: &str,
 ) -> PyResult<Py<PyAny>> {
-    const OP: &str = "aten.neg.default";
+    // The key is a parameter because `prims.neg` is this exact kernel
+    // under another name (docs/PRIMS.md), and a refusal that named the aten
+    // spelling for a call that never mentioned aten would send the reader to
+    // the wrong op.
+    #[allow(non_snake_case)]
+    let OP: &str = op;
     let input = tensor_arg(OP, args, kwargs, 0, "self")?;
     let tag = neg_result_tag(input.tag())?;
 
@@ -8179,11 +8264,8 @@ fn extremum_other(
     args: &Bound<'_, PyTuple>,
     kwargs: Option<&Bound<'_, PyDict>>,
     which: Extremum,
+    op: &str,
 ) -> PyResult<Py<PyAny>> {
-    let op = match which {
-        Extremum::Max => "aten.max.other",
-        Extremum::Min => "aten.min.other",
-    };
     let lhs = tensor_arg(op, args, kwargs, 0, "self")?;
     let rhs = tensor_arg(op, args, kwargs, 1, "other")?;
     // Promotes over the lattice (docs/PROMOTE.md §3). Both operands are
@@ -10637,8 +10719,14 @@ fn clone_default(
     py: Python<'_>,
     args: &Bound<'_, PyTuple>,
     kwargs: Option<&Bound<'_, PyDict>>,
+    op: &str,
 ) -> PyResult<Py<PyAny>> {
-    const OP: &str = "aten.clone.default";
+    // The key is a parameter because `prims.clone` is this exact kernel
+    // under another name (docs/PRIMS.md), and a refusal that named the aten
+    // spelling for a call that never mentioned aten would send the reader to
+    // the wrong op.
+    #[allow(non_snake_case)]
+    let OP: &str = op;
     let input = tensor_arg(OP, args, kwargs, 0, "self")?;
     reject_memory_format(OP, args, kwargs, 1)?;
     let out = input.tensor()?.copy().map_err(|e| candle_err(OP, e))?;
@@ -10681,6 +10769,273 @@ fn alias_default(
     const OP: &str = "aten.alias.default";
     let input = tensor_arg(OP, args, kwargs, 0, "self")?;
     finish(py, input.tensor()?.clone(), input.tag())
+}
+
+// ---------------------------------------------------------------------------
+// `prims.*` -- the reference operators upstream writes its decompositions over
+// ---------------------------------------------------------------------------
+//
+// docs/PRIMS.md. `torch._refs` and `torch._decomp` are written over `prims`,
+// not over aten, so a decomposition rule that upstream already ships stops
+// here on a `prims.*` name rather than on a missing rule. docs/DECOMP.md §12.4
+// measured that: of the 24 ops in real captured graphs that need lowering for
+// NNAPI, thirteen refuse for exactly this reason.
+//
+// **Nine of the thirteen are the aten kernel under another name and are
+// dispatched straight to it** -- the eight elementwise unary ops and `clone`,
+// whose `impl_aten` upstream *is* `torch.cos` / `torch.clone`. They are given
+// their own dispatch keys and their own golden cases anyway, because
+// `_aten_implemented()` means "this key has a kernel and golden compares it",
+// and a key nothing compares is not covered by the key beside it.
+//
+// The four below are **not** aliases, and three of them share a name with an
+// aten op that has different semantics:
+//
+//   * `prims.transpose(a, permutation)` takes a full permutation, like
+//     `aten.permute` and unlike `aten.transpose.int`, which swaps two dims --
+//     but it is *stricter* than `aten.permute`: negative entries and repeats
+//     are refused (`utils.is_valid_permutation` is `sorted(perm) ==
+//     range(rank)`), where `aten.permute` accepts `[-1, 0]`. Routing it to the
+//     aten kernel would accept a permutation upstream rejects.
+//   * `prims.split_dim(a, dim, outer_length)` splits one dimension in two. It
+//     refuses a negative `dim`, which `aten.view` has no opinion about.
+//   * `prims.broadcast_in_dim(a, shape, broadcast_dimensions)` is XLA's, not
+//     `aten.expand`'s: the caller says *where* each existing dimension lands
+//     in the result, so it can insert dimensions in the middle rather than
+//     only on the left.
+//   * `prims.view_of(a)` is `aten.alias` under another name.
+//
+// Every refusal below was read off upstream 2.13.0 by calling the op, not
+// derived from the reference source, and the exception *types* differ between
+// them (`ValueError`, `AssertionError`, `RuntimeError`) because upstream's do.
+
+/// A `Vec<isize>` printed the way Python prints a list, for the refusals that
+/// quote the argument back (`Received an invalid permutation, [-1, 0]!`).
+fn python_list(values: &[isize]) -> String {
+    let parts: Vec<String> = values.iter().map(|v| v.to_string()).collect();
+    format!("[{}]", parts.join(", "))
+}
+
+/// `prims::view_of(Tensor(a) a) -> Tensor(a)` -- upstream's `a.view(a.shape)`.
+///
+/// The same kernel as `aten.alias.default`: a new handle over the same
+/// storage. Written out rather than delegated so the refusal names `a` and not
+/// `self`, which is the argument name in this op's schema.
+fn prims_view_of(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "prims.view_of.default";
+    let input = tensor_arg(OP, args, kwargs, 0, "a")?;
+    finish(py, input.tensor()?.clone(), input.tag())
+}
+
+/// `prims::transpose(Tensor(a) a, int[] permutation) -> Tensor(a)`
+///
+/// **Not `aten.transpose.int`.** That one swaps `dim0` and `dim1`; this one
+/// takes the whole permutation, so the aten op of the same name computes a
+/// different function from the same arguments. It is `aten.permute` minus the
+/// negative-dim tolerance -- measured on 2.13.0:
+///
+/// ```text
+///   prims.transpose(t, [-1, 0])  ValueError: Received an invalid permutation, [-1, 0]!
+///   aten.permute(t, [-1, 0])     computes it
+/// ```
+fn prims_transpose(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "prims.transpose.default";
+    let input = tensor_arg(OP, args, kwargs, 0, "a")?;
+    let permutation = shape_arg(OP, args, kwargs, 1, "permutation")?;
+    let rank = input.tensor()?.rank();
+    if permutation.len() != rank {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "Attempting to permute a tensor of rank {rank}, but received a \
+             permutation of length {}!",
+            permutation.len()
+        )));
+    }
+    // `utils.is_valid_permutation(rank, perm)` is `sorted(perm) == range(rank)`,
+    // which rejects negatives and repeats in one test.
+    let mut sorted = permutation.clone();
+    sorted.sort_unstable();
+    if sorted
+        .iter()
+        .enumerate()
+        .any(|(index, &value)| value != index as isize)
+    {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "Received an invalid permutation, {}!",
+            python_list(&permutation)
+        )));
+    }
+    if rank == 0 {
+        return finish(py, input.tensor()?.clone(), input.tag());
+    }
+    let order: Vec<usize> = permutation.iter().map(|&value| value as usize).collect();
+    let out = input
+        .tensor()?
+        .permute(order)
+        .map_err(|e| candle_err(OP, e))?;
+    finish(py, out, input.tag())
+}
+
+/// `prims::broadcast_in_dim(Tensor(a) a, SymInt[] shape, int[] broadcast_dimensions) -> Tensor(a)`
+///
+/// XLA's broadcast, which is what makes it worth having beside `aten.expand`:
+/// `broadcast_dimensions[i]` says which dimension of the *result* the input's
+/// `i`-th dimension becomes, so a new dimension can be inserted anywhere.
+/// `expand` can only align from the right, so
+/// `broadcast_in_dim(ones(3), [3, 2], [0])` has no `expand` spelling.
+///
+/// The body is upstream's `_broadcast_in_dim_aten` transcribed -- unsqueeze at
+/// every result position that is *not* claimed by a broadcast dimension, in
+/// increasing order, then broadcast to `shape`. The checks are
+/// `_broadcast_in_dim_meta`'s, in its wording and with its exception types:
+/// the two rank checks and the ascending check are `AssertionError`, and the
+/// broadcastability check goes through `torch._check` and is a `RuntimeError`.
+fn prims_broadcast_in_dim(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "prims.broadcast_in_dim.default";
+    let input = tensor_arg(OP, args, kwargs, 0, "a")?;
+    let shape = shape_arg(OP, args, kwargs, 1, "shape")?;
+    let broadcast_dimensions = shape_arg(OP, args, kwargs, 2, "broadcast_dimensions")?;
+    let dims = input.dims().to_vec();
+
+    if dims.len() != broadcast_dimensions.len() {
+        return Err(pyo3::exceptions::PyAssertionError::new_err(format!(
+            "a.ndim ({}) != len(broadcast_dimensions) ({})",
+            dims.len(),
+            broadcast_dimensions.len()
+        )));
+    }
+    if shape.len() < dims.len() {
+        return Err(pyo3::exceptions::PyAssertionError::new_err(format!(
+            "len(shape) ({}) must be >= a.ndim ({})",
+            shape.len(),
+            dims.len()
+        )));
+    }
+    // `reduce(_greater_than_reduce, broadcast_dimensions, -1)`. Starting the
+    // accumulator at -1 is what makes a negative entry fail here rather than
+    // index from the end, which is the whole difference from `aten.permute`'s
+    // rule and is why this is not a bounds check written the short way.
+    let mut previous: isize = -1;
+    for &value in &broadcast_dimensions {
+        if value <= previous {
+            return Err(pyo3::exceptions::PyAssertionError::new_err(format!(
+                "broadcast_dimensions must be strictly ascending: {value} <= {previous}"
+            )));
+        }
+        if value >= shape.len() as isize {
+            return Err(pyo3::exceptions::PyAssertionError::new_err(format!(
+                "broadcast_dimension {value} out of bounds for shape of length {}",
+                shape.len()
+            )));
+        }
+        previous = value;
+    }
+    for (index, &target) in broadcast_dimensions.iter().enumerate() {
+        let have = dims[index] as isize;
+        let want = shape[target as usize];
+        if have != 1 && have != want {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "{have} must be broadcastable to {want}"
+            )));
+        }
+    }
+
+    let mut tensor = input.tensor()?.clone();
+    for index in 0..shape.len() {
+        if !broadcast_dimensions.contains(&(index as isize)) {
+            tensor = tensor.unsqueeze(index).map_err(|e| candle_err(OP, e))?;
+        }
+    }
+    let target: Vec<usize> = shape.iter().map(|&value| value as usize).collect();
+    let out = tensor.broadcast_as(target).map_err(|e| candle_err(OP, e))?;
+    finish(py, out, input.tag())
+}
+
+/// `prims::split_dim(Tensor(a) a, int dim, SymInt outer_length) -> Tensor(a)`
+///
+/// One dimension of length `l` becomes two, `(outer_length, l /
+/// outer_length)`. `native_layer_norm`'s and the attention refs' reshapes are
+/// written with it.
+///
+/// The three refusals are upstream's and they come from three different
+/// places, which is why they are three different exception types: `dim` goes
+/// through `utils.validate_idx` (`AssertionError`, and **no negative
+/// indexing** -- `split_dim(t, -1, 3)` refuses where every aten op would
+/// accept), `outer_length` through `utils.validate_dim_length`, and the
+/// divisibility check is the prim's own `ValueError`. A zero `outer_length`
+/// passes both validators and dies in the division, so it is a
+/// `ZeroDivisionError` -- transcribed rather than tidied, because a caller
+/// matching on upstream's type would not match a tidied one.
+fn prims_split_dim(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "prims.split_dim.default";
+    let input = tensor_arg(OP, args, kwargs, 0, "a")?;
+    let dim = dim_arg(args, kwargs, 1, "dim")?.ok_or_else(|| missing(OP, "dim"))?;
+    let outer_length =
+        dim_arg(args, kwargs, 2, "outer_length")?.ok_or_else(|| missing(OP, "outer_length"))?;
+    let dims = input.dims().to_vec();
+    let rank = dims.len();
+
+    // `validate_idx`: `idx >= 0 and idx < rank or idx == 0`. The trailing
+    // `or idx == 0` is what lets a 0-d tensor be split at dim 0.
+    if !((dim >= 0 && dim < rank as isize) || dim == 0) {
+        return Err(pyo3::exceptions::PyAssertionError::new_err(format!(
+            "idx {dim} is out of bounds for rank {rank}"
+        )));
+    }
+    // `validate_dim_length` -> `torch._check(length >= 0)`.
+    if outer_length < 0 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "Expected cond to be True, but got False.  (Could this error message be improved?  If so, please report an enhancement request to PyTorch.)",
+        ));
+    }
+    if outer_length == 0 {
+        return Err(pyo3::exceptions::PyZeroDivisionError::new_err(
+            "integer division or modulo by zero",
+        ));
+    }
+    let length = *dims.get(dim as usize).unwrap_or(&1) as isize;
+    if length % outer_length != 0 {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "Attempting to split dimension of length {length}, but outer length of \
+             {outer_length} divides it with a remainder!"
+        )));
+    }
+    let inner_length = length / outer_length;
+
+    let mut new_shape: Vec<usize> = Vec::with_capacity(rank + 1);
+    for (index, &extent) in dims.iter().enumerate() {
+        if index == dim as usize {
+            new_shape.push(outer_length as usize);
+            new_shape.push(inner_length as usize);
+        } else {
+            new_shape.push(extent);
+        }
+    }
+    // Upstream is `a.view(new_shape)`, a genuine restride. This shim has no
+    // strided views, so it materialises -- the values are the same because
+    // both read the tensor in row-major order (checked against upstream on a
+    // transposed input, where the two would part company if they did not).
+    let out = input
+        .tensor()?
+        .contiguous()
+        .and_then(|t| t.reshape(new_shape))
+        .map_err(|e| candle_err(OP, e))?;
+    finish(py, out, input.tag())
 }
 
 /// `aten::_to_copy(Tensor self, *, ScalarType? dtype=None, ...)`
@@ -10788,6 +11143,31 @@ fn new_zeros_default(
     new_ones_or_zeros(py, args, kwargs, "aten.new_zeros.default")
 }
 
+/// `aten::new_empty(Tensor self, SymInt[] size, *, ScalarType? dtype=None,
+///     Layout? layout=None, Device? device=None, bool? pin_memory=None) -> Tensor`
+///
+/// `rwkv`'s wall, and the last of docs/DEMAND8.md §2.6's five models. Measured
+/// on 2.13.0: the schema is `new_zeros`'s **character for character**, and so
+/// is every defaulting rule -- `x.new_empty(())` is 0-d, `x.new_empty(0)` is
+/// empty, an explicit `dtype=` beats the receiver's, `device="meta"` gives a
+/// meta tensor. The only thing that differs is the contents, and they are
+/// uninitialised.
+///
+/// So it is `new_ones_or_zeros` with the zero fill, which is the same choice
+/// `aten.empty.memory_format` already makes in this tree: candle has no
+/// uninitialised allocation to expose, and a deterministic zero is the answer
+/// a caller can least be misled by. Golden compares it with
+/// `_dtype_shape_only_check` for exactly that reason -- comparing values
+/// against upstream's uninitialised memory would be a coin flip, and a green
+/// coin flip is not a check.
+fn new_empty_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    new_ones_or_zeros(py, args, kwargs, "aten.new_empty.default")
+}
+
 /// The body both `new_ones` and `new_zeros` are. `op` selects the fill and is
 /// also the name every refusal below carries, so a caller that spelled one of
 /// them is never told about the other.
@@ -10807,6 +11187,10 @@ fn new_ones_or_zeros(
     }
     let device = label.resolve()?;
     let storage = PyDtype::new(tag).storage(op)?;
+    // `new_zeros` and `new_empty` share the zero fill; only `new_ones` differs.
+    // Selected on the one key that fills with ones rather than listing the two
+    // that fill with zeros, so a third zero-filling factory added here cannot
+    // fall through to `ones` by omission.
     let out = if op == "aten.new_ones.default" {
         Tensor::ones(size, storage, &device)
     } else {
@@ -18588,6 +18972,12 @@ fn interned_name<'py>(py: Python<'py>, name: &str) -> Option<&'py Bound<'py, PyS
     // nothing may decref it.
     Some(match name {
         "self" => intern!(py, "self"),
+        // `prims.*` schemas name the tensor `a`, not `self`.
+        "a" => intern!(py, "a"),
+        "shape" => intern!(py, "shape"),
+        "broadcast_dimensions" => intern!(py, "broadcast_dimensions"),
+        "permutation" => intern!(py, "permutation"),
+        "outer_length" => intern!(py, "outer_length"),
         "other" => intern!(py, "other"),
         "dim" => intern!(py, "dim"),
         "dtype" => intern!(py, "dtype"),

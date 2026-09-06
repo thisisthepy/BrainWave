@@ -365,9 +365,16 @@ def check_shim_schemas(torch) -> tuple[int, int]:
         return 1, 1
     failures = 0
     for key, entry in sorted(report["ops"].items()):
-        _, _, rest = key.partition(".")
+        # The namespace off the key, not a literal `aten`. The implemented set
+        # is two namespaces since docs/PRIMS.md, and `torch.ops.aten.clone`
+        # exists -- so hardcoding `aten` would silently check
+        # `prims.clone.default` against a *different operator's* schema and
+        # call it a match, which is worse than the AttributeError
+        # `broadcast_in_dim` happened to raise.
+        namespace, _, rest = key.partition(".")
         op, _, overload = rest.rpartition(".")
-        upstream = getattr(getattr(torch.ops.aten, op), overload)._schema
+        upstream = getattr(getattr(torch.ops, namespace), op)
+        upstream = getattr(upstream, overload)._schema
         if entry["placeholder"]:
             failures += 1
             print(f"FAIL shim schemas {key}: still a placeholder")

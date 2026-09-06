@@ -9181,7 +9181,29 @@ def test_core_ops_and_op_tags_agree():
     # carries only `pt2_compliant_tag` (its bilinear sibling already in this
     # shim is not core either). Getting 110 here would mean the tags were
     # guessed from the neighbours.
-    assert r["tag_core_count"] == 107, r["tag_core_count"]
+    #
+    # 108 with docs/PRIMS.md's round, and **+1 across fifteen new keys** --
+    # which is the largest gap this counter has had between "kernels added"
+    # and "core kernels added", so it is worth writing out:
+    #
+    #     maximum.default   ['core', 'pointwise', 'pt2_compliant_tag']  <- counted
+    #     new_empty.default ['pt2_compliant_tag']
+    #     the thirteen prims.*                                          (see below)
+    #
+    # `new_empty` is not core while `new_zeros`, its schema twin, also is not
+    # -- read rather than paired off `empty.memory_format`, which is.
+    #
+    # The thirteen `prims.*` keys contribute **zero, structurally**, and that
+    # is not an omission: `_tagged_core` reads `native_functions.yaml`, which
+    # declares `aten::` entries only. `prims` schemas come from
+    # `Library.define()` in `torch/_prims/__init__.py` and carry
+    # `pt2_compliant_tag` upstream, which this tree does not yet see --
+    # docs/PRIMS.md §5 has that gap and `verify_schemas.py` counts it (13
+    # `FAIL tags` rows). None of them is `core` upstream either, so the number
+    # here would be 108 even with the gap closed; the reason it is 108 today
+    # is weaker than the reason it should be, and that distinction is what
+    # §5 records.
+    assert r["tag_core_count"] == 108, r["tag_core_count"]
 
 
 def test_decompose_lowers_the_op_capture_md_named():
@@ -10130,7 +10152,12 @@ for key in torch._C._aten_implemented():
     # The route the op actually takes, not a second lookup: `torch.ops` is what
     # every reader in the tree goes through, and if `_get_schema` were right
     # while `torch.ops.aten.<op>.<ov>._schema` were not, nothing would be fixed.
-    packet = getattr(torch.ops.aten, name)
+    # `getattr(torch.ops, namespace)`, not `torch.ops.aten`: the implemented
+    # set is no longer one namespace. Hardcoding `aten` here would have looked
+    # up `torch.ops.aten.clone` for the key `prims.clone.default` and compared
+    # a different operator's schema against it -- a check that passes for the
+    # wrong reason exactly where two namespaces share a name.
+    packet = getattr(getattr(torch.ops, namespace), name)
     entry["via_ops"] = str(getattr(packet, overload)._schema)
     ops[key] = entry
 out["ops"] = ops
@@ -10349,7 +10376,13 @@ def test_every_implemented_op_has_schema_text():
     )
     for key, entry in sorted(report["ops"].items()):
         assert entry["text"] != f"{key}(...) -> ...", key
-        assert entry["text"].startswith("aten::"), (key, entry["text"])
+        # The namespace the key carries, not a literal `aten::`. The thirteen
+        # `prims.*` kernels (docs/PRIMS.md) are in `_aten_implemented()` and
+        # their schema text is `prims::...`; asserting `aten::` here would
+        # force the next namespace to be dropped from the coverage check
+        # rather than checked.
+        namespace = key.split(".")[0]
+        assert entry["text"].startswith(f"{namespace}::"), (key, entry["text"])
         # The route the tree takes has to carry the same text.
         assert entry["via_ops"] == entry["text"], (key, entry)
 
@@ -10684,7 +10717,29 @@ def test_schema_text_survives_the_round_trip_through_the_transcribed_tables():
     # either transcribed table, exactly as `upsample_bilinear2d` already is.
     # Getting +5 here would mean a `_nn` name had been given a table entry
     # upstream does not have.
-    assert len(keys) == 291, len(keys)
+    #
+    # 293 with the two names `rwkv` needed (docs/PRIMS.md §6). **+2, one per
+    # op, and the two arrive from different tables**: `new_empty` is
+    # `methods.json`-only, because upstream has no `torch.new_empty` at all --
+    # it is a receiver method like `new_zeros` beside it -- and `maximum` goes into
+    # **both** tables, because upstream has both doors (`torch.maximum` and
+    # `Tensor.maximum` are distinct members on 2.13.0) -- and it still brings
+    # only one identity, because both name `aten::maximum|default`. That is
+    # `detach`'s shape at 230, and it is why this is +2 and not +3.
+    #
+    # Neither brings an `.out` sibling, and that is a choice rather than an
+    # omission: `aten::maximum.out` exists upstream, but `max`/`min` beside it
+    # in `overloads.json` carry no `.out` either, and a dead overload key here
+    # counts against `reach_allow.json`'s `shape1_dead_overload_keys_ceiling`,
+    # which is a ratchet. Following the neighbour rather than `ceil`'s pattern
+    # is what makes this +2 and not +3.
+    #
+    # The thirteen `prims.*` keys bring **none**. Both tables are `aten::`
+    # resolution tables -- they answer "what does `torch.<name>` mean" -- and
+    # `torch.broadcast_in_dim` does not exist upstream. A prims entry here
+    # would be inventing a surface, which is why `reach.py` reaches them
+    # through `torch.ops.prims.<op>.<overload>` instead.
+    assert len(keys) == 293, len(keys)
     from_tables = sorted(
         k for k in keys
         if report["table"][f"{k[0]}|{k[1]}"]["from"] == "tables"
@@ -22528,6 +22583,28 @@ def test_coreml_operator_set_refuses_instead_of_inventing_one():
     assert "coremltools" in r["coreml"], r["coreml"]
 
 
+def _lowered_spelling(name: str, aten_fallback: str) -> str:
+    """Which spelling a lowered graph ends on for one primitive.
+
+    Upstream's decomposition rules are `torch._refs`, and the refs are written
+    over `prims` -- `_refs.erf` calls `prims.erf`, `_refs.t` calls
+    `prims.transpose`. Whether the lowering *stops* on that prims node or is
+    refused and leaves the aten node standing is decided by exactly one thing:
+    whether this build has a kernel for the prims op. docs/PRIMS.md landed
+    thirteen of them and every expectation below moved one level down as a
+    result.
+
+    Derived from `_aten_implemented()` rather than written as a literal, for
+    the reason `test_every_implemented_op_has_schema_text` gives about its own
+    count: a literal here would go red on the fourteenth prims kernel and
+    teach the reader to edit the constant, which is how a claim decays into a
+    change detector. `aten_fallback` is the pre-docs/PRIMS.md answer and is
+    still the right one for a build without the kernel.
+    """
+    prim = f"prims.{name}.default"
+    return prim if prim in _C._aten_implemented() else aten_fallback
+
+
 def test_gelu_lowers_to_erf_primitives_and_computes_the_same_values():
     """docs/DECOMP.md §12. The task's named example, proven numerically.
 
@@ -22542,9 +22619,12 @@ def test_gelu_lowers_to_erf_primitives_and_computes_the_same_values():
         return
     r = _target_lowering_fixture()
 
+    erf = _lowered_spelling("erf", "aten.erf.default")
+    tanh = _lowered_spelling("tanh", "aten.tanh.default")
+
     exact = r["gelu"]
     assert exact["verdict"] == "LOWERED", exact
-    assert "aten.erf.default" in exact["ops_after"], exact["ops_after"]
+    assert erf in exact["ops_after"], (erf, exact["ops_after"])
     assert exact["nodes_after"] > exact["nodes_before"], exact
     # Bit for bit, not merely close.
     assert exact["max_abs_diff"] == 0.0, exact["max_abs_diff"]
@@ -22554,11 +22634,14 @@ def test_gelu_lowers_to_erf_primitives_and_computes_the_same_values():
 
     approx = r["gelu_tanh"]
     assert approx["verdict"] == "LOWERED", approx
-    assert "aten.tanh.default" in approx["ops_after"], approx["ops_after"]
+    assert tanh in approx["ops_after"], (tanh, approx["ops_after"])
     assert approx["max_abs_diff"] == 0.0, approx["max_abs_diff"]
     # The two approximations really are different graphs; a rule that ignored
     # `approximate=` would produce the erf one twice and still be "close".
+    # Both spellings are excluded, not only the one this build reaches: an
+    # `aten.erf` here would be just as wrong as a `prims.erf`.
     assert "aten.erf.default" not in approx["ops_after"], approx["ops_after"]
+    assert "prims.erf.default" not in approx["ops_after"], approx["ops_after"]
 
 
 def test_the_core_table_cannot_lower_gelu_and_the_full_table_can():
@@ -22603,8 +22686,12 @@ def test_more_ops_lower_toward_nnapi_and_each_keeps_its_values():
         print("   (skipped: vendored tree has no _C.abi3.so)")
         return
     r = _target_lowering_fixture()
+    # `_refs.t` calls `prims.transpose`, so with that kernel present the rule
+    # runs to the prims node instead of stopping at `aten.permute`. Either
+    # way it is one node and neither name is in NNAPI's set, which is the
+    # point the docstring above is making.
     for name, expect in (("silu", "aten.sigmoid.default"),
-                         ("t", "aten.permute.default"),
+                         ("t", _lowered_spelling("transpose", "aten.permute.default")),
                          ("matmul", "aten.mm.default")):
         entry = r[name]
         assert entry["verdict"] == "LOWERED", (name, entry)
@@ -22626,9 +22713,11 @@ def test_lowering_a_whole_module_graph_preserves_what_it_computes():
         return
     r = _target_lowering_fixture()
     whole = r["whole_module"]
+    erf = _lowered_spelling("erf", "aten.erf.default")
+    perm = _lowered_spelling("transpose", "aten.permute.default")
     assert whole["nodes_after"] > whole["nodes_before"], whole
     # The GELU really was taken apart in the module graph, not just in isolation.
-    assert "aten.erf.default" in whole["ops_after"], whole["ops_after"]
+    assert erf in whole["ops_after"], (erf, whole["ops_after"])
     assert "aten.gelu.default" not in whole["ops_after"], whole["ops_after"]
     assert whole["max_abs_diff"] <= 1e-6, whole["max_abs_diff"]
 
@@ -22640,12 +22729,20 @@ def test_lowering_a_whole_module_graph_preserves_what_it_computes():
     #
     # This is pinned rather than described because it is the shape of result a
     # sizing round is most likely to overstate -- "9 ops now lower" reads like
-    # 9 ops of progress toward NNAPI, and for this module it is zero. What
-    # actually blocks NNAPI is one level down: `erf` and `permute` both have
-    # upstream rules, and both refuse here on missing `prims.*` ops in the
-    # shim. docs/DECOMP.md §12 carries that list.
+    # 9 ops of progress toward NNAPI, and for this module it is zero.
+    #
+    # **docs/PRIMS.md moved the two ops on the right and did not move the
+    # count.** Before those kernels existed, `erf` and `permute` were where
+    # lowering stopped, because `_refs.erf`/`_refs.t` refused on a missing
+    # `prims.*` op. With the kernels present the rules run to completion and
+    # the graph ends on `prims.erf`/`prims.transpose` instead -- still two ops
+    # outside NNAPI, and now outside it for a *different and harder* reason:
+    # `ADDER_MAP` is keyed by TorchScript `aten::` node kind, so no `prims.*`
+    # node can ever be accepted by that serializer, whatever it computes.
+    # That is the finding this round bought, and it is worth more than the
+    # count it failed to move.
     assert whole["outside_before"] == ["aten.t.default", "aten.gelu.default"], whole
-    assert whole["outside_after"] == ["aten.permute.default", "aten.erf.default"], whole
+    assert whole["outside_after"] == [perm, erf], whole
     assert len(whole["outside_after"]) == len(whole["outside_before"]), whole
 
 
@@ -22660,19 +22757,40 @@ def test_lower_to_refuses_a_graph_it_could_not_finish_and_names_the_ops():
     if not os.path.isfile(_CKPT_VENDOR_SHIM):
         print("   (skipped: vendored tree has no _C.abi3.so)")
         return
+    import re
+
     r = _target_lowering_fixture()
-    assert r["lower_to_refusal"] != "ACCEPTED", r["lower_to_refusal"]
-    # The refusal names an op, not just a count. It arrives as the *first*
+    why = r["lower_to_refusal"]
+    assert why != "ACCEPTED", why
+    # The refusal names an op key, not just a count. It arrives as the *first*
     # thing that could not be lowered rather than as a summary at the end --
     # `_lower_node` raises through `lower_to` -- and either wording is a
     # refusal that a caller can act on, which is the contract.
-    assert "aten." in r["lower_to_refusal"], r["lower_to_refusal"]
-    assert "cannot lower" in r["lower_to_refusal"] or (
-        "outside the target set" in r["lower_to_refusal"]
-    ), r["lower_to_refusal"]
-    # Specifically: it stopped on a missing `prims.*` op rather than on a
-    # missing decomposition rule, which is the round's whole finding.
-    assert "prims." in r["lower_to_refusal"], r["lower_to_refusal"]
+    assert re.search(r"\b\w+\.\w+\.\w+\b", why), why
+    assert (
+        "cannot lower" in why
+        or "outside the target set" in why
+        or "has no rule for it" in why
+    ), why
+    # It stops on a `prims.*` op either way, but **why** it stops there is the
+    # thing docs/PRIMS.md changed, so the two reasons are told apart rather
+    # than both accepted by a bare `"prims." in why`:
+    #
+    #   before  the rule ran and hit a `prims.*` op with no kernel
+    #           -> "not implemented in torch._C shim: prims.erf.default"
+    #   now     the rule runs to completion and leaves a `prims.*` node, and
+    #           a primitive is a leaf -- no table decomposes it further
+    #           -> "prims.erf.default is not in Core ATen and ... no rule"
+    #
+    # The second is not a gap that adding a kernel closes; it is what a
+    # reference primitive *is*. Asserting the wording that matches this
+    # build's kernel set is what makes the day it flips back visible.
+    assert "prims." in why, why
+    if "prims.erf.default" in _C._aten_implemented():
+        assert "has no rule for it" in why, why
+        assert "not implemented in torch._C shim" not in why, why
+    else:
+        assert "not implemented in torch._C shim" in why, why
 
 
 _DEMAND8_ROAD_SCRIPT = r"""
@@ -22919,6 +23037,243 @@ def test_capture_refuses_demand8_inplace_names_and_lets_the_others_through():
     ops = [n["op"] if isinstance(n, dict) else n.op for n in trace.nodes]
     assert ops == ["aten.upsample_bicubic2d.default"], ops
 
+
+
+# --- prims.* -- docs/PRIMS.md -----------------------------------------------
+
+
+_PRIMS_ROAD_SCRIPT = r"""
+import json, sys
+import torch
+
+out = {"is_shim": hasattr(torch._C, "_aten_implemented")}
+
+
+def rec(key, fn):
+    try:
+        out[key] = fn()
+    except Exception as e:
+        out[key] = "ERROR:%s:%s" % (type(e).__name__, e)
+
+
+# `torch.equal` has no entry in the shim's overload table, so equality is read
+# off the values themselves. That is the stronger comparison anyway: it fails
+# on a shape difference the same way, and it does not route the check through
+# a second op whose own gap would look like a prims failure.
+def eq(a, b):
+    return a.tolist() == b.tolist() and a.shape == b.shape
+
+
+x = torch.tensor([[0.25, 1.0], [2.0, 4.0]])
+n = torch.tensor([[1.0, -2.0], [3.0, -4.0]])
+
+# The eight elementwise unaries and `clone`: upstream's own `impl_aten` for
+# each of these *is* the torch function of the same name, so the claim being
+# checked is that the prims key reaches the same kernel and not merely a
+# kernel. Compared against the torch spelling in the same process.
+#
+# Written out one key at a time rather than through `getattr(torch.ops.prims,
+# name)`: `tools/golden/reach.py` reads this file as *text* looking for the
+# qualified spelling of each key, and a name built at runtime is invisible to
+# it -- which would make the reach check pass while nothing spelled the op.
+def unary(key, op, ref, t):
+    rec(key, lambda: [eq(op(t), ref(t)), str(op(t).dtype)])
+
+
+unary("unary_cos", torch.ops.prims.cos.default, torch.cos, x)
+unary("unary_sin", torch.ops.prims.sin.default, torch.sin, x)
+unary("unary_erf", torch.ops.prims.erf.default, torch.erf, x)
+unary("unary_tanh", torch.ops.prims.tanh.default, torch.tanh, x)
+unary("unary_sqrt", torch.ops.prims.sqrt.default, torch.sqrt, x)
+unary("unary_reciprocal", torch.ops.prims.reciprocal.default, torch.reciprocal, x)
+unary("unary_rsqrt", torch.ops.prims.rsqrt.default, torch.rsqrt, x)
+unary("unary_neg", torch.ops.prims.neg.default, torch.neg, n)
+rec("clone", lambda: eq(torch.ops.prims.clone.default(x), torch.clone(x)))
+rec("view_of", lambda: eq(torch.ops.prims.view_of.default(x), x))
+
+# `prims.transpose` is a full permutation, and stricter than `aten.permute`:
+# the two rows below are the reason it is not routed to that kernel.
+b = torch.arange(24.0).reshape(2, 3, 4)
+rec("transpose_perm", lambda: eq(
+    torch.ops.prims.transpose.default(b, [2, 0, 1]), torch.permute(b, [2, 0, 1])))
+rec("transpose_negative", lambda: torch.ops.prims.transpose.default(x, [-1, 0]).shape)
+rec("permute_negative", lambda: list(torch.permute(x, [-1, 0]).shape))
+
+# `prims.split_dim` refuses a negative dim where every aten op accepts one.
+m = torch.arange(24.0).reshape(2, 12)
+rec("split_dim", lambda: [
+    list(torch.ops.prims.split_dim.default(m, 1, 3).shape),
+    eq(torch.ops.prims.split_dim.default(m, 1, 3), m.reshape(2, 3, 4))])
+rec("split_dim_negative", lambda: list(
+    torch.ops.prims.split_dim.default(m, -1, 3).shape))
+
+# `prims.broadcast_in_dim` can append a dimension, which `aten.expand` cannot
+# express at all -- expand aligns from the right and would broadcast 3 against
+# 2 and fail.
+r = torch.tensor([1.0, 2.0, 3.0])
+rec("broadcast_append", lambda: [
+    list(torch.ops.prims.broadcast_in_dim.default(r, [3, 2], [0]).shape),
+    eq(torch.ops.prims.broadcast_in_dim.default(r, [3, 2], [0]),
+       r.unsqueeze(1).expand(3, 2))])
+rec("broadcast_prepend", lambda: eq(
+    torch.ops.prims.broadcast_in_dim.default(r, [2, 3], [1]), r.expand(2, 3)))
+rec("expand_append", lambda: list(r.expand(3, 2).shape))
+
+json.dump(out, sys.stdout)
+"""
+
+
+def _prims_road_fixture():
+    env = dict(os.environ)
+    env["PYTHONPATH"] = _CKPT_VENDOR_DIR
+    env["TORCH_USE_RTLD_GLOBAL"] = "1"
+    proc = subprocess.run(
+        [sys.executable, "-c", _PRIMS_ROAD_SCRIPT],
+        capture_output=True, text=True, env=env, timeout=300,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            "prims-road subprocess exited %d\n--- stdout ---\n%s\n--- stderr ---\n%s"
+            % (proc.returncode, proc.stdout, proc.stderr)
+        )
+    return json.loads(proc.stdout)
+
+
+def test_the_thirteen_prims_ops_are_callable_by_their_own_key():
+    """docs/PRIMS.md. Nine are an aten kernel under another name; four are not.
+
+    This is the only place the *spelling* is exercised. Golden compares the
+    thirteen keys against upstream by dispatching them directly, which proves
+    the kernels and not the door; `torch.ops.prims.<op>.default` is the door,
+    and it is the one upstream's own `torch._refs` go through, so a prims key
+    that no `torch.ops.prims` call reaches is a kernel nothing in this tree can
+    use. `reach.ops_namespace_spelled` reads this file for exactly that.
+    """
+    if not os.path.isfile(_CKPT_VENDOR_SHIM):
+        print("   (skipped: vendored tree has no _C.abi3.so)")
+        return
+    r = _prims_road_fixture()
+    assert r["is_shim"] is True, r["is_shim"]
+
+    # Nine aliases: same values, same dtype, as the torch spelling.
+    for name in ("cos", "sin", "erf", "tanh", "sqrt", "reciprocal", "rsqrt",
+                 "neg"):
+        entry = r["unary_%s" % name]
+        assert isinstance(entry, list), (name, entry)
+        same, dtype = entry
+        assert same is True, (name, entry)
+        assert dtype == "torch.float32", (name, dtype)
+    assert r["clone"] is True, r["clone"]
+    assert r["view_of"] is True, r["view_of"]
+
+    # `prims.transpose` computes `aten.permute`'s answer for a valid
+    # permutation and **refuses one that `aten.permute` accepts**. Both halves
+    # are asserted: without the second, routing the prims key straight to the
+    # aten kernel would pass.
+    assert r["transpose_perm"] is True, r["transpose_perm"]
+    assert str(r["transpose_negative"]).startswith("ERROR:"), r["transpose_negative"]
+    assert "invalid permutation" in str(r["transpose_negative"]), r["transpose_negative"]
+    assert r["permute_negative"] == [2, 2], r["permute_negative"]
+
+    # Same shape of claim for `split_dim`'s negative `dim`.
+    assert r["split_dim"] == [[2, 3, 4], True], r["split_dim"]
+    assert str(r["split_dim_negative"]).startswith("ERROR:"), r["split_dim_negative"]
+
+    # And `broadcast_in_dim` appending a dimension, which `expand` cannot do:
+    # the control is that the `expand` spelling of the same intent raises.
+    assert r["broadcast_append"] == [[3, 2], True], r["broadcast_append"]
+    assert r["broadcast_prepend"] is True, r["broadcast_prepend"]
+    assert str(r["expand_append"]).startswith("ERROR:"), r["expand_append"]
+
+
+
+_RWKV_ROAD_SCRIPT = r"""
+import json, sys
+import torch
+
+out = {"is_shim": hasattr(torch._C, "_aten_implemented")}
+
+
+def rec(key, fn):
+    try:
+        out[key] = fn()
+    except Exception as e:
+        out[key] = "ERROR:%s:%s" % (type(e).__name__, e)
+
+
+# `TensorBase.new_empty` -- the receiver method, which is the only door
+# upstream has (there is no `torch.new_empty`). Values are uninitialised
+# upstream so only dtype and shape are asked for.
+h = torch.ones(2, 2, dtype=torch.float16)
+rec("new_empty_shape", lambda: list(h.new_empty((2, 3)).shape))
+rec("new_empty_dtype", lambda: str(h.new_empty((2, 3)).dtype))
+rec("new_empty_0d", lambda: list(h.new_empty(()).shape))
+rec("new_empty_override", lambda: str(h.new_empty((2, 2), dtype=torch.int64).dtype))
+
+# `torch.maximum` -- the free function, which is the spelling
+# `modeling_rwkv.rwkv_linear_attention_cpu` uses.
+a = torch.tensor([1.0, 5.0, -3.0])
+b = torch.tensor([4.0, 2.0, -1.0])
+rec("maximum_fn", lambda: torch.maximum(a, b).tolist())
+rec("maximum_member", lambda: a.maximum(b).tolist())
+# The NaN rule is the one `max.other` needed and that a fresh key could lose.
+n = torch.tensor([1.0, float("nan")])
+m = torch.tensor([float("nan"), 1.0])
+rec("maximum_nan", lambda: [str(v) for v in torch.maximum(n, m).tolist()])
+
+json.dump(out, sys.stdout)
+"""
+
+
+def _rwkv_road_fixture():
+    env = dict(os.environ)
+    env["PYTHONPATH"] = _CKPT_VENDOR_DIR
+    env["TORCH_USE_RTLD_GLOBAL"] = "1"
+    proc = subprocess.run(
+        [sys.executable, "-c", _RWKV_ROAD_SCRIPT],
+        capture_output=True, text=True, env=env, timeout=300,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            "rwkv-road subprocess exited %d\n--- stdout ---\n%s\n--- stderr ---\n%s"
+            % (proc.returncode, proc.stdout, proc.stderr)
+        )
+    return json.loads(proc.stdout)
+
+
+def test_the_two_names_rwkv_needed_reach_their_kernels_through_the_vendored_tree():
+    """docs/PRIMS.md §6 -- `TensorBase.new_empty` and `torch.maximum`.
+
+    docs/DEMAND8.md §2.6 left `rwkv` as the one model of five that still
+    refused, at `TensorBase.new_empty`. Behind it stood a second name,
+    `torch.maximum`, which nothing found until the first was closed -- so the
+    two are checked together, through a real `import torch` against this shim
+    rather than through `_aten_dispatch`, because the failure both had was a
+    *spelling* failure and golden dispatches by key and cannot see one.
+
+    Every expected value below was run on upstream 2.13.0 separately.
+    """
+    if not os.path.isfile(_CKPT_VENDOR_SHIM):
+        print("   (skipped: vendored tree has no _C.abi3.so)")
+        return
+    r = _rwkv_road_fixture()
+    assert r["is_shim"] is True, r["is_shim"]
+
+    # `new_empty`: the dtype comes from the receiver, and `()` is 0-d. Values
+    # are not asserted -- upstream's are whatever was in that memory.
+    assert r["new_empty_shape"] == [2, 3], r["new_empty_shape"]
+    assert r["new_empty_dtype"] == "torch.float16", r["new_empty_dtype"]
+    assert r["new_empty_0d"] == [], r["new_empty_0d"]
+    assert r["new_empty_override"] == "torch.int64", r["new_empty_override"]
+
+    # `maximum`: both doors, since upstream has both and `rwkv` uses the free
+    # one.
+    assert r["maximum_fn"] == [4.0, 5.0, -1.0], r["maximum_fn"]
+    assert r["maximum_member"] == [4.0, 5.0, -1.0], r["maximum_member"]
+    # IEEE `maximum`, not `fmax`: a NaN on *either* side wins. This is the
+    # correction `max.other` carries, and the reason `aten.maximum.default`
+    # was routed to that kernel rather than to candle's raw comparison.
+    assert r["maximum_nan"] == ["nan", "nan"], r["maximum_nan"]
 
 
 
