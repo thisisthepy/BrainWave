@@ -660,3 +660,122 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(set_storage_class, m)?)?;
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// The `as_strided` write barrier. docs/STRIDED.md.
+// ---------------------------------------------------------------------------
+//
+// `aten.as_strided` promises a **two-way view**: writes through the result are
+// visible in the base, and writes to the base are visible through the result.
+// candle 0.11.0 cannot produce that -- `Layout::new(shape, stride, offset)` is
+// public and `Tensor::from_storage` is public, but the struct that joins them
+// (`Tensor_ { storage: Arc<RwLock<Storage>>, layout }`) has no public field, so
+// the nine internal sites that build a shallow view cannot be reached from
+// here. docs/TAIL3.md §6 and `tools/golden/reach_allow.json` recorded that; it
+// is re-verified in `test_strided.py`.
+//
+// So the result is a **gather**, and a gather is silently wrong for a writer in
+// both directions at once. This registry is what makes that wrongness loud
+// instead of silent: while an `as_strided` result is alive, the storage of the
+// result *and* the storage of the base are barred from every in-place write.
+// The single door those writes go through is `tensor::write_into`
+// (`aten.rs::write_back` is its only caller), and that is where the barrier is
+// read.
+//
+// **Why an address is a sound key here and is not one in general.** An address
+// is reused after the allocation it named is freed, so a permanent poison set
+// keyed on one starts refusing writes to unrelated later tensors -- which is
+// exactly why docs/TAIL4.md §1.2 rejected this structure. What removes that
+// objection is the keep-alive below: a `StridedBarrier` holds a clone of both
+// candle tensors, so neither storage can be freed while its key is registered,
+// so neither key can be reused while it means something. The barrier is
+// unregistered in `Drop`, at which moment the keep-alive is released too --
+// the entry and the reservation end in the same statement, which is the
+// property that makes reuse unobservable rather than merely unlikely.
+//
+// Holding the base alive for as long as the view is **not** a leak relative to
+// upstream: upstream's `as_strided` result holds the base's storage alive by
+// aliasing it. This is the same lifetime, reached a different way.
+//
+// What this does not close is written down rather than hidden, in
+// docs/STRIDED.md §4: an alias of the *result* that outlives the result.
+
+/// `storage address -> how many live barriers name it`.
+///
+/// A count rather than a set because two `as_strided` calls on one base are
+/// ordinary, and the first result to be dropped must not unbar the second.
+static STRIDED_BARRIER: std::sync::Mutex<Option<std::collections::HashMap<usize, usize>>> =
+    std::sync::Mutex::new(None);
+
+/// The address of the candle `Storage` behind a tensor -- `capture.rs`'s
+/// `storage_key` idiom, and the same reason for leaving `storage_offset` out of
+/// it: every alias of a buffer must answer the same value.
+pub(crate) fn storage_identity(tensor: &candle_core::Tensor) -> usize {
+    let (guard, _layout) = tensor.storage_and_layout();
+    let storage: &candle_core::Storage = &guard;
+    storage as *const candle_core::Storage as usize
+}
+
+/// A live `as_strided` result, and the two storages it bars from being written.
+///
+/// The `keep_alive` field is load-bearing and is the whole of the soundness
+/// argument above; it is never read, which is why it is named for what it does.
+pub struct StridedBarrier {
+    keys: Vec<usize>,
+    #[allow(dead_code)]
+    keep_alive: Vec<candle_core::Tensor>,
+}
+
+impl StridedBarrier {
+    /// Bar `base`'s storage and `view`'s storage until the returned handle
+    /// (and every clone of the tensor holding it) is dropped.
+    pub fn new(base: &candle_core::Tensor, view: &candle_core::Tensor) -> Arc<Self> {
+        let mut keys = vec![storage_identity(base), storage_identity(view)];
+        keys.sort_unstable();
+        keys.dedup();
+        if let Ok(mut guard) = STRIDED_BARRIER.lock() {
+            let map = guard.get_or_insert_with(std::collections::HashMap::new);
+            for key in &keys {
+                *map.entry(*key).or_insert(0) += 1;
+            }
+        }
+        Arc::new(Self {
+            keys,
+            keep_alive: vec![base.clone(), view.clone()],
+        })
+    }
+}
+
+impl Drop for StridedBarrier {
+    fn drop(&mut self) {
+        if let Ok(mut guard) = STRIDED_BARRIER.lock() {
+            if let Some(map) = guard.as_mut() {
+                for key in &self.keys {
+                    if let Some(count) = map.get_mut(key) {
+                        *count -= 1;
+                        if *count == 0 {
+                            map.remove(key);
+                        }
+                    }
+                }
+            }
+        }
+        // `keep_alive` drops here, after the keys are gone. The order matters:
+        // the reservation must not be released while the key still means
+        // something, or a reallocation at the same address would inherit it.
+    }
+}
+
+/// Is this tensor's storage barred from in-place writes?
+///
+/// Read by exactly one caller, `tensor::write_into`, which is the single write
+/// door. A poisoned lock answers `false` -- refusing on a lock failure would
+/// turn an unrelated panic into a wall of refusals -- and that is safe here
+/// only because the lock is never held across anything that can panic.
+pub(crate) fn write_is_barred(tensor: &candle_core::Tensor) -> bool {
+    let key = storage_identity(tensor);
+    match STRIDED_BARRIER.lock() {
+        Ok(guard) => guard.as_ref().is_some_and(|map| map.contains_key(&key)),
+        Err(_) => false,
+    }
+}

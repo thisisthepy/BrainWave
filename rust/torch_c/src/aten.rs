@@ -70,6 +70,7 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.amax.default",
     "aten.any.default",
     "aten.any.dim",
+    "aten.as_strided.default",
     "aten.arange.default",
     "aten.arange.start",
     "aten.arange.start_step",
@@ -2369,6 +2370,7 @@ fn aten_dispatch_inner(
         "aten.add.Tensor" => add_tensor(py, args, kwargs),
         "aten.addmm.default" => addmm_default(py, args, kwargs),
         "aten.alias.default" => alias_default(py, args, kwargs),
+        "aten.as_strided.default" => as_strided_default(py, args, kwargs),
         "aten.arange.default" => arange(py, args, kwargs, ArangeForm::End),
         "aten.arange.start" => arange(py, args, kwargs, ArangeForm::Start),
         "aten.arange.start_step" => arange(py, args, kwargs, ArangeForm::StartStep),
@@ -12578,6 +12580,179 @@ fn repeat_default(
     // storage, and returning it would make `x.repeat(1,1).fill_(0)` zero `x`.
     let out = out.copy().map_err(|e| candle_err(OP, e))?;
     finish(py, out, input.tag())
+}
+
+/// `aten::as_strided(Tensor(a) self, SymInt[] size, SymInt[] stride,
+/// SymInt? storage_offset=None) -> Tensor(a)` -- **a read-only view, where
+/// upstream's is a two-way one.** docs/STRIDED.md.
+///
+/// Upstream returns a tensor that shares the receiver's storage with a layout
+/// the caller supplies outright, so writes propagate in **both** directions:
+///
+/// ```text
+///   y = x.as_strided(...);  y[0] = 99.   ->  x sees 99.
+///   x[1] = -7.                           ->  y sees -7.
+/// ```
+///
+/// candle 0.11.0 cannot express that, and this is the precise reason rather
+/// than "no constructor": `Layout::new(shape, stride, offset)` is public and
+/// `Tensor::from_storage` is public, but `from_storage` takes an **owned**
+/// `Storage`, allocates a fresh `Arc` and documents "this uses contiguous
+/// strides". The nine sites inside candle that do build a shallow view --
+/// `transpose`, `permute`, `narrow`, `squeeze`, `unsqueeze`, `reshape`,
+/// `broadcast_as`, `detach`, `slice_scatter`'s helper -- all write
+/// `Tensor_ { storage: self.storage.clone(), layout: <custom> }` directly, and
+/// `Tensor_` has no public field. Both halves of the constructor are public and
+/// the struct that joins them is not.
+///
+/// So this materialises: it builds the index each output element would have
+/// read from and gathers. **The values are upstream's.** What is not upstream's
+/// is the aliasing, and that is not left to a caller's good manners --
+/// `storage.rs::StridedBarrier` bars in-place writes to the result's storage
+/// and to the base's for as long as the result is alive, so the two
+/// propagations upstream has and this does not are refusals rather than wrong
+/// numbers. docs/STRIDED.md §2 and §4.
+///
+/// **The receiver must be contiguous, and that check is not tidiness.**
+/// Upstream's `as_strided` addresses the *storage*, ignoring the receiver's own
+/// layout entirely: `x.reshape(3, 4).t().as_strided((2, 2), (1, 1))` is
+/// `[[0, 1], [1, 2]]` -- storage order, not the transposed logical order.
+/// `flatten_all()` on a non-contiguous receiver would hand back logical order
+/// and this kernel would gather the wrong elements with the right shape.
+/// Measured on upstream before the check was written, which is the only way
+/// round it: no shape or dtype comparison can see it.
+fn as_strided_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.as_strided.default";
+    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let size = shape_arg(OP, args, kwargs, 1, "size")?;
+    let stride = shape_arg(OP, args, kwargs, 2, "stride")?;
+    let requested_offset = int_arg(args, kwargs, 3, "storage_offset")?;
+
+    // Upstream's order, read off real refusals on 2.13.0. The length check is
+    // first, and it is the one with no operand in its message.
+    if size.len() != stride.len() {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "mismatch in length of strides and shape",
+        ));
+    }
+    if stride.iter().any(|&s| s < 0) {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "as_strided: Negative strides are not supported at the moment, \
+             got strides: {stride:?}"
+        )));
+    }
+    if size.iter().any(|&s| s < 0) {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "Storage size calculation overflowed with sizes={size:?} and \
+             strides={stride:?}"
+        )));
+    }
+
+    let base = input.tensor()?;
+    let layout = base.layout().clone();
+    let start = layout.start_offset();
+    let offset = match requested_offset {
+        // Upstream's default is the receiver's own storage offset, not zero.
+        // `x[4:].as_strided((2,), (1,))` is `[4., 5.]`, measured.
+        None => start as i64,
+        Some(value) => value,
+    };
+    if offset < 0 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "Tensor: invalid storage offset {offset}"
+        )));
+    }
+
+    if !layout.is_contiguous() {
+        return Err(not_implemented(format!(
+            "{OP}: torch._C shim implements as_strided by gathering out of the \
+             receiver's elements in storage order, so it needs the receiver to \
+             be contiguous; this one has stride {:?} at offset {start}. \
+             Upstream addresses the raw storage and ignores the receiver's \
+             layout, so answering here would return upstream's shape with \
+             elements read from the wrong places. Call .contiguous() first only \
+             if you meant the logical order -- it is not the same view. \
+             docs/STRIDED.md §3",
+            layout.stride()
+        )));
+    }
+
+    let numel = base.elem_count();
+    let itemsize = input.tag().itemsize();
+    // The last element this view would address, in storage elements. `size`
+    // and `stride` are both non-negative by the checks above, so the maximum
+    // is at the far corner and an empty extent contributes nothing.
+    let mut span: i64 = offset;
+    let mut count: i64 = 1;
+    for (&extent, &step) in size.iter().zip(stride.iter()) {
+        if extent == 0 {
+            count = 0;
+        }
+        span += (extent as i64 - 1).max(0) * step as i64;
+        count = count.saturating_mul(extent as i64);
+    }
+    let need = if count == 0 { offset } else { span + 1 };
+    if offset < start as i64 || need > (start + numel) as i64 {
+        // Upstream's wording, and its arithmetic is in **bytes**:
+        //   setStorage: sizes [100], strides [1], storage offset 0, and
+        //   itemsize 4 requiring a storage size of 400 are out of bounds for
+        //   storage of size 48
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "setStorage: sizes {size:?}, strides {stride:?}, storage offset \
+             {offset}, and itemsize {itemsize} requiring a storage size of {} \
+             are out of bounds for storage of size {}",
+            need.max(0) * itemsize as i64,
+            (start + numel) * itemsize
+        )));
+    }
+
+    // Contiguous, so logical order is storage order and `flatten_all` is a
+    // reshape over the same buffer rather than a copy.
+    let flat = base.flatten_all().map_err(|e| candle_err(OP, e))?;
+    let dims: Vec<usize> = size.iter().map(|&s| s as usize).collect();
+    let strides: Vec<i64> = stride.iter().map(|&s| s as i64).collect();
+
+    // The odometer. Built on the host out of the *shape*, not out of any
+    // tensor's values -- no element is read back, so this op does not join
+    // `device.rs::MPS_HOST_READBACK_OPS`.
+    let total = dims.iter().product::<usize>();
+    let mut indices: Vec<i64> = Vec::with_capacity(total);
+    let mut counter = vec![0usize; dims.len()];
+    for _ in 0..total {
+        let mut at = offset - start as i64;
+        for (k, &c) in counter.iter().enumerate() {
+            at += c as i64 * strides[k];
+        }
+        indices.push(at);
+        for k in (0..dims.len()).rev() {
+            counter[k] += 1;
+            if counter[k] < dims[k] {
+                break;
+            }
+            counter[k] = 0;
+        }
+    }
+
+    let picker = Tensor::from_vec(indices, total, base.device()).map_err(|e| candle_err(OP, e))?;
+    let out = flat
+        .index_select(&picker, 0)
+        .and_then(|t| t.reshape(dims.as_slice()))
+        .map_err(|e| candle_err(OP, e))?;
+
+    // The barrier is taken over the *base* and the *result*, before either is
+    // handed to Python, and the handle lives on the result. docs/STRIDED.md §2.
+    let barrier = crate::storage::StridedBarrier::new(&base, &out);
+    let mut wrapped = if input.tag() == TorchDType::Bool {
+        PyTensorBase::boolean(out)?
+    } else {
+        PyTensorBase::new(out)?
+    };
+    wrapped.bar_writes_as_strided_view(barrier);
+    Ok(wrapped.into_pyobject(py)?.into_any().unbind())
 }
 
 fn expand_default(

@@ -14,15 +14,7 @@
     "docs/SPELLINGS.md's deliberate gaps would otherwise become indistinguishable",
     "from forgotten ones."
   ],
-  "shape1_no_dispatch_arm": {
-    "methods:as_strided": {
-      "reason": "Listed in methods.json with NO kernel, on purpose, so that `x.as_strided(size, stride)` refuses by the name of the aten overload it resolved to (`aten.as_strided.default`) rather than by 'no matching signature' -- `clamp.Tensor`'s pattern, one level up. The absent thing is not effort but a constructor: `as_strided` is by definition a VIEW over raw strides, and candle 0.11.0 exposes no way to build a Tensor over an existing storage with arbitrary strides. `Layout::new(shape, stride, offset)` is public, but the only public path that reaches it is `Tensor::from_storage`, which takes an OWNED `Storage` and documents 'this uses contiguous strides'; `Tensor { storage: Arc<RwLock<Storage>>, layout }` is private and `same_storage` is `pub(crate)`. So the aliasing the op promises cannot be produced. A materialising gather would return the right values for `longformer`'s read-only `_chunk` (modeling_longformer.py:719) and silently wrong ones for any writer -- the divergence shape docs/VULKAN2.md says must be unrepresentable rather than merely unused, and the one docs/VIEWS.md 6.4 already carries for `slice.Tensor` step>1 and `view.dtype`. Sizing it properly means the same work those two need: a stride-carrying tensor wrapper in this crate, or a candle patch exposing a storage-sharing constructor. docs/TAIL3.md 6. Delete this entry the day either lands.",
-      "upstream_present": [
-        "torch.Tensor.as_strided",
-        "torch.as_strided"
-      ]
-    }
-  },
+  "shape1_no_dispatch_arm": {},
   "shape1_dead_overload_keys_ceiling": 110,
   "shape2_kernel_without_spelling": {
     "aten._fft_c2c.default": {
@@ -51,7 +43,7 @@
       ]
     },
     "aten.upsample_linear1d.default": {
-      "reason": "Reached upstream as `torch._C._nn.upsample_linear1d`, and as `F.interpolate(x, size, mode='linear', align_corners=...)` on a 3-D input. Neither `torch.upsample_linear1d` nor `Tensor.upsample_linear1d` exists on 2.13.0 (checked), so this is NOT an overloads.json or methods.json row -- a row there would invent a door upstream does not have, exactly as `aten.upsample_nearest1d.default` records immediately above. The missing connection is one `_install_nn` entry shaped like `upsample_nearest2d`'s. It is NOT an alias of `aten.upsample_bilinear2d.default`, which docs/GLU.md §2 flagged as likely and this round measured rather than assumed: a different rank check (`input_size equals to 3`), a different dtype-refusal kernel name (`compute_indices_weights_linear` against `upsample_bilinear2d_channels_last`), a different dtype set (`uint8` computes for the 2-D op through a separate fixed-point kernel and RAISES here), an upper clamp on the source index that bilinear does not need, and a FUSED multiply-add in the source index that the unfused bilinear transcription gets ~3 ULP wrong (docs/RNN.md §3). `sam_vision_model` and `sam_hq_vision_model`'s wall, docs/ARCH200.md §2. bootstrap.py was another agent's file this round, so this is a work item, not a design decision, and it fails the suite the moment the entry lands -- which is when this entry should be deleted.",
+      "reason": "Reached upstream as `torch._C._nn.upsample_linear1d`, and as `F.interpolate(x, size, mode='linear', align_corners=...)` on a 3-D input. Neither `torch.upsample_linear1d` nor `Tensor.upsample_linear1d` exists on 2.13.0 (checked), so this is NOT an overloads.json or methods.json row -- a row there would invent a door upstream does not have, exactly as `aten.upsample_nearest1d.default` records immediately above. The missing connection is one `_install_nn` entry shaped like `upsample_nearest2d`'s. It is NOT an alias of `aten.upsample_bilinear2d.default`, which docs/GLU.md \u00a72 flagged as likely and this round measured rather than assumed: a different rank check (`input_size equals to 3`), a different dtype-refusal kernel name (`compute_indices_weights_linear` against `upsample_bilinear2d_channels_last`), a different dtype set (`uint8` computes for the 2-D op through a separate fixed-point kernel and RAISES here), an upper clamp on the source index that bilinear does not need, and a FUSED multiply-add in the source index that the unfused bilinear transcription gets ~3 ULP wrong (docs/RNN.md \u00a73). `sam_vision_model` and `sam_hq_vision_model`'s wall, docs/ARCH200.md \u00a72. bootstrap.py was another agent's file this round, so this is a work item, not a design decision, and it fails the suite the moment the entry lands -- which is when this entry should be deleted.",
       "upstream_absent": [
         "torch.upsample_linear1d",
         "torch.Tensor.upsample_linear1d"
@@ -123,10 +115,10 @@
       "reason": "operator spelling. Tests exercise it as syntax (`a + b`, `a @ b`, `~a`), which this check reads as text and cannot attribute back to the dunder. A grep for `.__add__(` would be a lie in the other direction."
     },
     "_grouped_mm": {
-      "reason": "backlog: the kernel is golden-compared by dispatch key, but no test spells the name. docs/REACH.md §3."
+      "reason": "backlog: the kernel is golden-compared by dispatch key, but no test spells the name. docs/REACH.md \u00a73."
     },
     "multinomial": {
-      "reason": "backlog: the kernel is golden-compared by dispatch key, but no test spells the name. Deliberately not attempted in this round: `multinomial` is a random sample, and a test asserting a value against upstream on a random op is exactly the shallow-coverage failure mode this file warns against (a fixed seed narrows the risk but does not remove it, since the shim and upstream draw from different RNG implementations even with the same seed). docs/REACH.md §3."
+      "reason": "backlog: the kernel is golden-compared by dispatch key, but no test spells the name. Deliberately not attempted in this round: `multinomial` is a random sample, and a test asserting a value against upstream on a random op is exactly the shallow-coverage failure mode this file warns against (a fixed seed narrows the risk but does not remove it, since the shim and upstream draw from different RNG implementations even with the same seed). docs/REACH.md \u00a73."
     }
   }
 }

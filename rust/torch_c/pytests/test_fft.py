@@ -551,21 +551,53 @@ def test_the_three_fft_ops_are_parked_and_stft_is_advertised():
         assert op not in parked, op
 
 
-def test_as_strided_is_still_unimplemented_and_that_is_deliberate():
-    """`torch.stft` upstream reaches `aten.as_strided.default`; this does not.
+def test_as_strided_landed_and_stft_still_does_not_use_it():
+    """**Inverted, not deleted** -- this test's previous body asked for exactly
+    this, and `docs/STRIDED.md` is the round it was addressed to.
 
-    docs/VOICE.md section 3 named `as_strided` alongside `_fft_r2c` as
-    `stft`'s walls. Only one of the two fell, because this kernel extracts
-    frames with a **gather** rather than a strided view -- the frames are
-    copied, and nothing in this shim can write through them between the
-    extraction and the window multiply.
+    What it said: `as_strided` is unimplemented, `torch.stft` upstream reaches
+    it and this `stft` does not, because the frames are extracted with a
+    **gather** rather than a strided view. `docs/VOICE.md` §3 had named the two
+    as `stft`'s walls and only `_fft_r2c` fell.
 
-    Asserted here so that the claim "`as_strided` was not needed" stays true
-    by measurement. If someone implements `as_strided`, this test is the note
-    telling them `stft` does not have to change.
+    `as_strided` has now landed (`docs/STRIDED.md`), and the note that body was
+    written to leave still holds: **`stft` does not have to change.** That is
+    the claim worth keeping, so it is what is asserted now, and it is asserted
+    about the kernel rather than about the op list -- `stft`'s frames must
+    still be an `index_select` gather and not a call into the new op.
+
+    The reason it should stay that way is `docs/STRIDED.md` §2: an
+    `as_strided` result bars in-place writes to its base's storage for as long
+    as it lives. `stft` would be barring its own input for the duration of the
+    window multiply, in exchange for aliasing nothing can observe -- the
+    frames are consumed immediately. A gather is the right primitive here even
+    now that the other one exists.
     """
-    assert "aten.as_strided.default" not in set(_C._aten_implemented())
-    assert "aten.as_strided.default" not in set(_C._aten_implemented_awaiting_golden())
+    assert "aten.as_strided.default" in set(_C._aten_implemented()), (
+        "as_strided left _aten_implemented(); if it was reverted, invert this "
+        "test back rather than deleting it -- docs/STRIDED.md §1"
+    )
+    path = os.path.join(_REPO_ROOT, "rust", "torch_c", "src", "aten.rs")
+    if not os.path.isfile(path):
+        print("   (skipped: aten.rs is not beside this file)")
+        return
+    text = open(path, encoding="utf-8").read()
+    start = text.index("fn stft_kernel(") if "fn stft_kernel(" in text else None
+    assert start is not None, "stft's kernel was renamed; re-point this check"
+    body = text[start:]
+    body = body[:body.index("\nfn ", 10)]
+    # Comments stripped first. `stft_kernel` says "Upstream is `as_strided`;
+    # this is the same index arithmetic" in a comment, and reading that as a
+    # call is the mistake this repository has made in the other direction
+    # (commented-out code read as live).
+    body = "\n".join(line for line in body.splitlines()
+                     if not line.lstrip().startswith("//"))
+    assert "as_strided" not in body, (
+        "stft now routes through as_strided. That is a real change and may be "
+        "right, but it makes stft bar its input's storage for the duration -- "
+        "docs/STRIDED.md §2, docs/FFT.md §5.2."
+    )
+    assert "index_select" in body, body[:400]
 
 
 def _main():
