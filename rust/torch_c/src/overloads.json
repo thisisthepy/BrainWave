@@ -267,7 +267,25 @@
     "in `bootstrap.py` next to `softmax`; the *private* spelling",
     "`torch._log_softmax` has parser key `aten::_log_softmax`, which is the",
     "dispatched leaf and belongs here. Two names one underscore apart, and the",
-    "right answer for each is the opposite of the right answer for the other."
+    "right answer for each is the opposite of the right answer for the other.",
+    "",
+    "docs/COMPLEX2.md added `view_as_complex`, `view_as_real`, `polar`, `real`",
+    "and `imag`. Four of the five are single-overload ops and need no order",
+    "decision. `polar` is the third name after `pow` and `log` where the",
+    "`aten::` packet is mostly TorchScript numerics -- five of its seven",
+    "overloads (`polar.int`, `polar.float`, `polar.int_float`,",
+    "`polar.float_int`, `polar.Scalar_Scalar`) return a Python `complex` or a",
+    "`Scalar` from two numbers, and `torch.polar` accepts none of them. Only",
+    "the `Tensor` schema is listed, for the reason `log`'s note gives: listing",
+    "the numerics would turn a call upstream refuses into a call this shim",
+    "answers. `polar.out` is omitted for the reason `sum.out` is -- there is no",
+    "out-variant kernel here and no measured caller passes `out=` to it.",
+    "",
+    "These five resolve to keys in `IMPLEMENTED_AWAITING_GOLDEN`, not in",
+    "`IMPLEMENTED`: the golden harness compares by reading both sides as real",
+    "tensors and there is no dense storage to read on a complex one. They are",
+    "compared against upstream element-wise in `pytests/test_complex.py`",
+    "instead. See `aten.rs`'s note on that list."
   ],
   "arange": [
     "aten::arange.start_out(Scalar start, Scalar end, Scalar step=1, *, Tensor(a!) out) -> Tensor(a!)",
@@ -854,5 +872,20 @@
   ],
   "cumprod": [
     "aten::cumprod(Tensor self, int dim, *, ScalarType? dtype=None) -> Tensor"
+  ],
+  "view_as_complex": [
+    "aten::view_as_complex(Tensor(a) self) -> Tensor(a)"
+  ],
+  "view_as_real": [
+    "aten::view_as_real(Tensor(a) self) -> Tensor(a)"
+  ],
+  "polar": [
+    "aten::polar(Tensor abs, Tensor angle) -> Tensor"
+  ],
+  "real": [
+    "aten::real(Tensor(a) self) -> Tensor(a)"
+  ],
+  "imag": [
+    "aten::imag(Tensor(a) self) -> Tensor(a)"
   ]
 }

@@ -347,6 +347,25 @@ pub const IMPLEMENTED: &[&str] = &[
 /// replaced that comparator compares seeded values.
 pub const IMPLEMENTED_AWAITING_GOLDEN: &[&str] = &[
     "aten.any.dims",
+    // The five complex ops (docs/COMPLEX2.md). Parked here rather than
+    // advertised, and for a *stronger* reason than the rest of this list: the
+    // golden harness compares a shim result against an upstream one by reading
+    // both as real tensors, and four of these five return or accept a
+    // `complex64` tensor -- there is no dense storage to read on either side of
+    // that comparison, so a case builder would have to compare something other
+    // than the thing the op produced. They are proven against upstream
+    // element-wise in `pytests/test_complex.py` instead, which runs upstream in
+    // a separate process and checks both halves, exactly as
+    // `aten.reshape_as.default` below is proven in `test_indexsel.py`.
+    //
+    // `aten.mul.Tensor` is deliberately NOT here: its dense path is unchanged
+    // and stays golden-compared. Only the complex branch is new, and that
+    // branch is unreachable without one of the four constructors above it.
+    "aten.imag.default",
+    "aten.polar.default",
+    "aten.real.default",
+    "aten.view_as_complex.default",
+    "aten.view_as_real.default",
     "aten.contiguous.default",
     "aten.div.Scalar",
     "aten.masked_fill.Tensor",
@@ -977,6 +996,13 @@ impl Where {
             // mis-name that.
             crate::tensor::Repr::Quantized(q) => Where::Dense(q.device()),
             crate::tensor::Repr::Vulkan(_) => Where::Vulkan,
+            // A complex tensor's two halves are on a real device (checked at
+            // construction), so it compares as one. It refuses a page later at
+            // `tensor()` for every kernel that was not taught the pair, and
+            // that refusal names the representation -- which is the right
+            // reason, and not one this door should mis-name as a device
+            // mismatch.
+            crate::tensor::Repr::Complex { re, .. } => Where::Dense(re.device().clone()),
         }
     }
 
@@ -1133,6 +1159,10 @@ fn visit_for_device(
         // so it agrees with a dense argument on the same device and the op
         // goes on to refuse for the right reason.
         (Some(Where::Dense(seen)), crate::tensor::Repr::Quantized(q)) => seen.same_device(&q.device()),
+        // Same reasoning again for the complex arm.
+        (Some(Where::Dense(seen)), crate::tensor::Repr::Complex { re, .. }) => {
+            seen.same_device(re.device())
+        }
         _ => false,
     };
     if agrees {
@@ -1904,6 +1934,62 @@ fn aten_dispatch_inner(
     kwargs: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<Py<PyAny>> {
     match op {
+        // **The complex pass-throughs, guarded rather than given their own
+        // keys.** These five ops are already implemented for dense tensors
+        // below and golden-compared there; what is new is that a complex
+        // receiver has to copy *both* halves instead of refusing at
+        // `tensor()`. The guard is false for every real tensor, so the dense
+        // path is bit-for-bit unchanged -- which is why these keys stay in
+        // `IMPLEMENTED` rather than moving to the parked list.
+        //
+        // `detach` is here because it is the op `llama4` construction reaches
+        // first: `nn.Buffer` -> `nn/parameter.py` -> `data.detach()`.
+        // docs/COMPLEX2.md §5.
+        "aten.detach.default"
+        | "aten.alias.default"
+        | "aten.clone.default"
+        | "aten.contiguous.default"
+        | "aten.lift_fresh.default"
+            if first_arg_is_complex(args, kwargs) =>
+        {
+            let input = tensor_arg(op, args, kwargs, 0, "self")?;
+            crate::tensor::complex_ops::passthrough(py, &input)
+        }
+        // The other two guarded arms, both found by running the sweep rather
+        // than predicted: `copy_` is what `_init_weights` uses to refill the
+        // buffer, and `mul.Scalar` is `freqs_cis * self.attention_scaling` in
+        // `llama4_text`'s rope forward.
+        "aten.copy_.default" if first_arg_is_complex(args, kwargs) => {
+            let receiver = tensor_receiver("aten.copy_.default", args, kwargs)?;
+            let source = tensor_arg("aten.copy_.default", args, kwargs, 1, "src")?;
+            let replacement = {
+                let borrowed = receiver.borrow();
+                crate::tensor::complex_ops::copy_replacement(&borrowed, &source)?
+            };
+            // `replace_with`, not `write_back`. `write_into` is the write
+            // primitive for a tensor that may be a *view*, and it starts with
+            // `self.tensor()?` -- which refuses here, correctly: there is no
+            // single buffer a complex tensor's layout addresses.
+            //
+            // That makes this a narrowing and it is the same one
+            // `view_as_complex` already carries: a complex tensor in this shim
+            // is never an alias of anything (`view_as_complex` calls candle's
+            // `copy()`, which allocates unconditionally), so no view exists
+            // that could observe the difference between swapping the
+            // representation and writing through it. docs/COMPLEX2.md §6.
+            receiver.borrow_mut().replace_with(replacement);
+            Ok(receiver.into_any().unbind())
+        }
+        "aten.unsqueeze.default" if first_arg_is_complex(args, kwargs) => {
+            let input = tensor_arg("aten.unsqueeze.default", args, kwargs, 0, "self")?;
+            let dim = required("aten.unsqueeze.default", args, kwargs, 1, "dim")?;
+            crate::tensor::complex_ops::unsqueeze(py, &input, dim.extract::<i64>()?)
+        }
+        "aten.mul.Scalar" if first_arg_is_complex(args, kwargs) => {
+            let input = tensor_arg("aten.mul.Scalar", args, kwargs, 0, "self")?;
+            let other = required("aten.mul.Scalar", args, kwargs, 1, "other")?;
+            crate::tensor::complex_ops::mul_scalar(py, &input, other.extract::<f64>()?)
+        }
         "aten.add.Tensor" => add_tensor(py, args, kwargs),
         "aten.addmm.default" => addmm_default(py, args, kwargs),
         "aten.alias.default" => alias_default(py, args, kwargs),
@@ -1980,7 +2066,49 @@ fn aten_dispatch_inner(
         "aten.add.Scalar" => arith_scalar(py, args, kwargs, "aten.add.Scalar", Arith::Add),
         "aten.sub.Tensor" => arith_tensor(py, args, kwargs, "aten.sub.Tensor", Arith::Sub),
         "aten.sub.Scalar" => arith_scalar(py, args, kwargs, "aten.sub.Scalar", Arith::Sub),
-        "aten.mul.Tensor" => arith_tensor(py, args, kwargs, "aten.mul.Tensor", Arith::Mul),
+        // **The one existing arm the complex representation changes.** The
+        // guard is a discriminant test on already-parsed wrappers and it is
+        // `false` for every real tensor, so the dense path is unchanged --
+        // golden's 9691 cases go through `arith_tensor` exactly as before.
+        // Routing on the *representation* rather than on the tag is
+        // deliberate: the tag can only be complex if the arm is
+        // (`PyTensorBase::complex` is the single entrance), and reading the
+        // representation is what makes that true rather than assumed.
+        // docs/COMPLEX2.md §4.
+        "aten.mul.Tensor" => {
+            let lhs = tensor_arg("aten.mul.Tensor", args, kwargs, 0, "self")?;
+            let rhs = tensor_arg("aten.mul.Tensor", args, kwargs, 1, "other")?;
+            if lhs.is_complex_repr() || rhs.is_complex_repr() {
+                crate::tensor::complex_ops::mul(py, &lhs, &rhs)
+            } else {
+                arith_tensor(py, args, kwargs, "aten.mul.Tensor", Arith::Mul)
+            }
+        }
+        // The four ops that carry `llama4`'s closed complex pipeline. Each is
+        // a parse and a delegate; the arithmetic is in `tensor::complex_ops`,
+        // beside the representation it is defined over, the way `quant.rs`
+        // holds the quantised ops.
+        "aten.view_as_complex.default" => {
+            let input = tensor_arg("aten.view_as_complex.default", args, kwargs, 0, "self")?;
+            crate::tensor::complex_ops::view_as_complex(py, &input)
+        }
+        "aten.view_as_real.default" => {
+            let input = tensor_arg("aten.view_as_real.default", args, kwargs, 0, "self")?;
+            crate::tensor::complex_ops::view_as_real(py, &input)
+        }
+        "aten.polar.default" => {
+            let abs = tensor_arg("aten.polar.default", args, kwargs, 0, "abs")?;
+            let angle = tensor_arg("aten.polar.default", args, kwargs, 1, "angle")?;
+            crate::tensor::complex_ops::polar(py, &abs, &angle)
+        }
+        "aten.real.default" => {
+            let input = tensor_arg("aten.real.default", args, kwargs, 0, "self")?;
+            crate::tensor::complex_ops::part(py, &input, false)
+        }
+        "aten.imag.default" => {
+            let input = tensor_arg("aten.imag.default", args, kwargs, 0, "self")?;
+            crate::tensor::complex_ops::part(py, &input, true)
+        }
         "aten.mul.Scalar" => arith_scalar(py, args, kwargs, "aten.mul.Scalar", Arith::Mul),
         "aten.div.Tensor" => arith_tensor(py, args, kwargs, "aten.div.Tensor", Arith::Div),
         "aten.div.Scalar" => arith_scalar(py, args, kwargs, "aten.div.Scalar", Arith::Div),
@@ -20127,6 +20255,26 @@ fn required<'py>(
     })
 }
 
+/// Is argument 0 a tensor held as a `Repr::Complex` pair?
+///
+/// The guard on the pass-through arm above. Deliberately answers `false` for
+/// anything that is not a `TensorBase` at all rather than raising: the guard
+/// only chooses *which* kernel runs, and the kernel it falls through to is the
+/// one that produces the right error message for a bad argument.
+fn first_arg_is_complex(args: &Bound<'_, PyTuple>, kwargs: Option<&Bound<'_, PyDict>>) -> bool {
+    let value = match args.get_item(0) {
+        Ok(v) => v,
+        Err(_) => match kwargs.and_then(|k| k.get_item("self").ok().flatten()) {
+            Some(v) => v,
+            None => return false,
+        },
+    };
+    value
+        .cast::<PyTensorBase>()
+        .map(|t| t.borrow().is_complex_repr())
+        .unwrap_or(false)
+}
+
 pub(crate) fn tensor_arg(
     op: &str,
     args: &Bound<'_, PyTuple>,
@@ -20270,7 +20418,7 @@ fn c10_name(dtype: TorchDType) -> &'static str {
 /// from both `TorchDType::name()` (`uint32`) and `c10_name` (`uint32_t`), and
 /// like those it is not derivable: only the entries this shim can actually
 /// reach are listed, each read off a real torch error.
-fn scalar_type_name(dtype: TorchDType) -> &'static str {
+pub(crate) fn scalar_type_name(dtype: TorchDType) -> &'static str {
     use TorchDType::*;
     match dtype {
         Float32 => "Float",
