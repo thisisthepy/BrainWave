@@ -26,10 +26,26 @@ Read §5 first if you are deciding whether to upgrade: what this release does
 | **The eager recorder** | Always-on tape recording, reusing the 60 existing derivative rules verbatim rather than growing a second implementation, with a bounded tape (`EAGER_MAX_NODES = 100,000`) that refuses by name and releases what it held (`docs/BACKWARD7.md`, `docs/BACKWARD8.md`) |
 | **`rwkv` forwards** | Its wall was `torch.maximum` |
 | **All thirteen missing `prims.*` ops** | Missing prims 13 → 0 |
-| **New operators and spellings** | `nonzero` — the first op here whose output *shape* depends on the values — plus `ndimension`, `upsample_bicubic2d`, `torch.fmod`, `torch.maximum`, `Tensor.shape` returning a real `torch.Size`, and the `rsub.Scalar`/`pow.Scalar` autograd-key spellings. **ATen operators 203 → 224**, golden cases 8,509 → 9,137 |
+| **New operators and spellings** | `nonzero` — the first op here whose output *shape* depends on the values — plus `ndimension`, `upsample_bicubic2d`, `torch.fmod`, `torch.maximum`, `Tensor.shape` returning a real `torch.Size`, and the `rsub.Scalar`/`pow.Scalar` autograd-key spellings. **ATen operators 203 → 255**, golden cases 8,509 → 9,691 |
 | **float8 (E4M3) computes what upstream computes** | Across the 23 op rows that previously hung or refused, without forking candle |
 | **A verifiable WASM/Pyodide wheel** | `PyEmscriptenTarget` and a checker for it; the ABI trap is closed structurally rather than by convention |
 | **`from_pretrained(dtype=torch.int8)`** | Beside a `TorchnativeConfig`, widens to float32 and *discloses* rather than raising |
+
+Counted at the tip of this branch rather than on the day the note was
+drafted, which is why they are higher than the figures the README still
+carries: **255 ATen operators**, **9,691 / 9,691** golden comparison cases
+with **none pending**, **587** tests passing across the suite (480 of them
+in `test_shim.py`, which is what `smoke_ok` counts) and **562 / 562**
+DOCWATCH markers holding. Operator work was still landing on five branches
+while this was written, so every marker below is `ge`: a later round that
+raises one of these is progress, and `eq` would turn it into a red suite
+(`test_release.py::test_count_markers_use_ge_wherever_another_round_could_raise_them`).
+
+<!-- DOCWATCH: count golden_ops_covered ge 255 -->
+<!-- DOCWATCH: count golden_cases_total ge 9691 -->
+<!-- DOCWATCH: count golden_cases_passed ge 9691 -->
+<!-- DOCWATCH: count golden_pending eq 0 -->
+<!-- DOCWATCH: count smoke_ok ge 480 -->
 
 ## 2. Defects fixed
 
@@ -122,16 +138,20 @@ would otherwise count these as features.
 
 ## 6. Platform status for this release
 
-Do not read a platform as verified unless it is listed here.
+Do not read a platform as verified unless it is listed here. And a wheel
+that *built* is not a platform that works: all seven wheels for this
+release build and pass `tools/wheel/verify_cross.py`, which is a claim about
+tags, binaries and symbol resolution. `computes` is a separate claim and is
+made below only where something ran.
 
 | | |
 |---|---|
-| macOS arm64 | the machine everything above was measured on |
-| Linux x86_64 · Windows amd64 | verified by CI installing the **published** wheel and computing — but the green runs installed the version the workflow defaults to. `tools/ci/verify_published.py` gained a `loss.backward()` training step and three operator checks for this release, each skipping by name on an older wheel; **those have not run green on Linux or Windows yet**, because the wheel they check is this one |
-| iOS simulator arm64 | **red.** The leg builds an iOS-simulator CPython and reaches the wheel, then fails staging the pure-Python requirements: setuptools 84 dropped `pkg_resources`, which the wheel's METADATA requires. Pinned to `setuptools<81` in this release's workflow, **not yet verified** |
-| iOS device | never executed, on any release |
-| Android arm64 | emulator and device runs exist for earlier releases; not re-run for this one |
-| WASM | a hand-built wheel imports and computes under Pyodide 3.14; `build.py` does not produce one |
+| macOS arm64 | the machine everything above was measured on. The `macosx_11_0_arm64` wheel installs into a clean venv and its torch computes (`tools/wheel/verify.py` PASS) |
+| Linux x86_64 · Windows amd64 | verified by CI installing the **published** wheel and computing — but the green runs installed the version the workflow defaults to. `tools/ci/verify_published.py` gained a `loss.backward()` training step and three operator checks for this release, each skipping by name on an older wheel; **those have not run green on Linux or Windows yet**, because the wheel they check is this one. The `manylinux_2_17_x86_64` and `win_amd64` wheels for this release build and pass `verify_cross.py` — glibc floor 2.17 read off the artefact's own `.gnu.version_r`, `DT_NEEDED` inside the PEP 599 policy list, 123 `python3.dll` imports on the Windows side — which is a symbol-level claim and not a run |
+| iOS simulator arm64 | **computes on this machine; CI is still red as published.** This release's `0.0.13a0` simulator wheel was unpacked into an iOS CPython inside a booted simulator here and its torch computed (`verify_ios_sim.py` PASS, 1,282 `_C` names, 896 aten ops). The CI leg is a separate question: it builds its own simulator CPython, reaches the wheel, and last failed staging the pure-Python requirements — setuptools 84 dropped `pkg_resources`, which the wheel's METADATA requires (run 34021836088). The `setuptools<81` pin was reproduced locally against the **published** `0.0.12a0` wheel: staging resolves setuptools 80.10.2, `stage_dependencies` returns all twelve entries, and the whole harness then reaches PASS. **The runner has not yet executed that fix** — the workflow change is unpushed |
+| iOS device | never executed, on any release. The `ios_12_0_arm64_iphoneos` wheel builds and passes `verify_cross.py`; nothing has imported it |
+| Android arm64 | emulator and device runs exist for earlier releases; **not re-run for this one**. The `android_21_arm64_v8a` wheel builds and passes `verify_cross.py` |
+| WASM | `build.py --target wasm32-emscripten` now produces one — `PyEmscriptenTarget` landed this batch, and the sentence that `build.py` cannot is no longer true. The `pyemscripten_2026_0_wasm32` wheel builds and passes `verify_cross.py`'s wasm reader: `PyInit__C` exported as a **function**, 133 exports, both binaries wasm32 side modules, and **96 `Py*` imports all resolved against `pyodide.asm.wasm`**. Two things that check does not cover and says so: the non-`Py*` `env` imports, and the abi3 binding, which has no wasm spelling. Nothing has imported *this* wheel under Pyodide — the computing claim still rests on the earlier hand-built one |
 
 ---
 
@@ -140,8 +160,15 @@ Do not read a platform as verified unless it is listed here.
 This document and the version bump are prepared; **nothing has been published.**
 In order:
 
-1. Build the wheels (`tools/wheel/build.py`). Disk was at 88% when this was
-   written — check before starting.
+1. ~~Build the wheels~~ **done.** All seven are in `dist/` at `0.0.13a0`:
+   `macosx_11_0_arm64`, `android_21_arm64_v8a`, `ios_12_0_arm64_iphoneos`,
+   `ios_14_0_arm64_iphonesimulator`, `manylinux_2_17_x86_64`, `win_amd64`,
+   `pyemscripten_2026_0_wasm32`. Each cross wheel passes `verify_cross.py`; the
+   host wheel passes `verify.py` (which installs it) and the simulator wheel
+   passes `verify_ios_sim.py` (which runs it). Disk was at 92% / 30 GB free
+   afterwards — check before rebuilding, and note `build.py` refuses while a
+   `build/` cache from a previous target is present, so it must be cleared
+   between targets.
 2. Upload. The token is not in this worktree and was not read here.
 3. **Then** bump two things that must not lead the upload, and which two tests
    in `rust/torch_c/pytests/test_release.py` hold to that rule:
@@ -151,4 +178,8 @@ In order:
    `loss.backward()` training step and the three new operator checks for the
    first time — until step 3 they skip themselves by name against `0.0.12a0`,
    which is correct and is not a green result for those checks.
-5. The iOS leg is red for a staging reason, fixed but unverified (§6).
+5. The iOS leg's staging fix (`setuptools<81`, plus the CI default moving off
+   `0.0.9a0`) is verified locally against the published `0.0.12a0` wheel and has
+   **never run on a runner** — the workflow change is unpushed. Pushing it is
+   what triggers the run; it is a `push` trigger on this workflow's own path.
+   Until that run exists, §6's iOS row is a claim about this machine.
