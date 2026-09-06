@@ -410,7 +410,10 @@ impl FlashFloat for f64 {
         f64::is_nan(self)
     }
     fn read(tensor: &Tensor) -> candle_core::Result<Vec<f64>> {
-        tensor.to_dtype(DType::F64)?.flatten_all()?.to_vec1::<f64>()
+        // `widen_f64` rather than `to_dtype`: docs/FLOAT8C.md §1 -- candle's
+        // `F8E4M3 -> F64` arm does not terminate. This op refuses float8 at the
+        // door, so the route matters only if that gate is ever narrowed.
+        crate::aten::widen_f64(tensor)?.flatten_all()?.to_vec1::<f64>()
     }
     fn build(values: Vec<f64>, shape: Vec<usize>, device: &Device) -> candle_core::Result<Tensor> {
         Tensor::from_vec(values, shape, device)

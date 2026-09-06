@@ -327,6 +327,20 @@ pub fn to_dtype(t: &Tensor, target: DType) -> candle_core::Result<Tensor> {
     match (src, target) {
         (DType::F16 | DType::BF16, DType::F32) => t.apply_op1_no_bwd(&Widen),
         (DType::F32, DType::F16 | DType::BF16) => t.apply_op1_no_bwd(&Narrow(target)),
+        // **The one route in this crate that is a correctness fix and not a
+        // speed one** (docs/FLOAT8C.md §1). candle 0.11.0's converter reaches
+        // `F8E4M3 -> F64` through `WithDType::to_f64`, whose macro-generated
+        // body calls itself; release-mode LLVM makes that `.L1: jmp .L1`, so
+        // `x.to(torch.float64)` on a float8 tensor spins forever instead of
+        // answering. Its `F8E4M3 -> F32` arm is written `v.to_f32()`, which
+        // has no trait method to collide with and terminates, so the hang is
+        // routed around by going through `F32` first.
+        //
+        // Exact, not approximate: `float8_e4m3fn` is 4 exponent bits and 3
+        // mantissa bits with a max magnitude of 448, so all 256 of its bit
+        // patterns are representable in `f32`, and `f32 -> f64` is exact for
+        // every one of them. NaN stays NaN; the dtype has no infinities.
+        (DType::F8E4M3, DType::F64) => t.to_dtype(DType::F32)?.to_dtype(DType::F64),
         _ => t.to_dtype(target),
     }
 }

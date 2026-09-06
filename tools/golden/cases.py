@@ -8029,14 +8029,13 @@ def fill__cases(torch_module, c_module, torch_call) -> list[Case]:
             if expect != "match":
                 continue
             a_t, a_c = pair_from_flat(torch_module, c_module, [0, 0, 0, 0], (2, 2), dtype_name)
-            # `float8_e4m3fn` is a known gap rather than a match: every
-            # in-place writer refuses this dtype because `tensor.rs`'s
-            # `flat_storage` cannot read F8E4M3 back out to write through it
-            # (docs/FLOAT8B.md §4.2). Upstream fills it. Recorded as
-            # `expect="c_error"` so the harness keeps saying so every run and
-            # **fails if the gap silently closes** -- which is what the
-            # vocabulary is for; it is not a way to stop looking.
-            f8_gap = dtype_name == "float8_e4m3fn"
+            # `float8_e4m3fn` was `expect="c_error"` here -- a known gap,
+            # recorded so the harness would **fail if the gap silently
+            # closed**. It closed, and this is that failure being answered:
+            # docs/FLOAT8C.md §3 gave `tensor.rs::flat_storage` an `F8E4M3`
+            # arm, so every in-place writer reaches the buffer and the case is
+            # an ordinary value comparison against upstream now.
+            f8_gap = False
             cases.append(
                 Case(
                     name=f"fill_(dtype={dtype_name}, value={fill!r})",
@@ -10827,18 +10826,13 @@ def fill__tensor_cases(torch_module, c_module, torch_call) -> list[Case]:
                     _pair(torch_module, c_module, [0, 0, 0, 0], (2, 2), dtype_name)[1],
                     _pair(torch_module, c_module, [3], (), dtype_name)[1],
                 ),
-                # `float8_e4m3fn`: one of the ten ops upstream computes and this
-                # build cannot, because candle 0.11.0's `F8E4M3 -> f64`
-                # conversion does not terminate (docs/FLOAT8B.md §4.1). Refusing
-                # is the only safe answer here today; `expect="c_error"` records
-                # that and **fails if it silently starts computing**.
-                expect="c_error" if dtype_name == "float8_e4m3fn" else "match",
-                note=(
-                    "candle's F8E4M3 -> f64 conversion does not terminate, so "
-                    "the shim refuses; upstream fills it. docs/FLOAT8B.md §4.1"
-                    if dtype_name == "float8_e4m3fn"
-                    else "in-place: compares the mutated operand fill_ returns"
-                ),
+                # `float8_e4m3fn` was `expect="c_error"` (docs/FLOAT8B.md
+                # §4.1's ten). It computes now -- docs/FLOAT8C.md §1 routes the
+                # widening around candle's non-terminating arm and §3 lets the
+                # writer reach the buffer -- so it is compared by value like
+                # every other dtype.
+                expect="match",
+                note="in-place: compares the mutated operand fill_ returns",
             )
         )
     cases.append(
@@ -12715,17 +12709,11 @@ def zero__cases(torch_module, c_module, torch_call) -> list[Case]:
                 op=op,
                 run_torch=lambda a_t=a_t: torch_call(a_t),
                 run_c=lambda a_c=a_c: c_module._aten_dispatch(op, a_c),
-                # Same known gap as `fill_.Scalar`: no in-place writer can reach
-                # an F8E4M3 buffer, because `tensor.rs`'s `flat_storage` cannot
-                # read that dtype back out. docs/FLOAT8B.md §4.2.
-                expect="c_error" if dtype_name == "float8_e4m3fn" else "match",
-                note=(
-                    "torch._C shim cannot write through a view of candle dtype "
-                    "F8E4M3 (tensor.rs::flat_storage); upstream zeroes it. "
-                    "docs/FLOAT8B.md §4.2"
-                    if dtype_name == "float8_e4m3fn"
-                    else "in-place: compares the mutated operand zero_ returns"
-                ),
+                # Same closure as `fill_.Scalar`: `flat_storage` grew an
+                # `F8E4M3` arm in docs/FLOAT8C.md §3, so the writer reaches the
+                # buffer and this is a value comparison for every dtype.
+                expect="match",
+                note="in-place: compares the mutated operand zero_ returns",
             )
         )
     cases.append(
@@ -23091,3 +23079,203 @@ CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
     "aten.where.default": where_default_cases,
 
 }
+
+
+# --- float8_e4m3fn: the surface docs/FLOAT8C.md opened -----------------------
+#
+# docs/FLOAT8B.md put `float8_e4m3fn` into the suite, but the ops it left open
+# -- the ten that hung and the thirteen that refused -- had **no float8 case at
+# all**, because a case for an op that hangs is a case that hangs the harness.
+# Closing them without adding cases would have left the closure resting on a
+# smoke test, and docs/FLOAT8B.md §5 is explicit that this dtype belongs in the
+# golden suite rather than only there.
+#
+# So these are appended to the *existing* builders rather than replacing them:
+# `CASE_BUILDERS` is one entry per op, and every op below already has one.
+# Wrapping at the registry is one readable block instead of twenty scattered
+# insertions into unrelated builders.
+#
+# Everything here compares against upstream. Where upstream refuses -- `pow`
+# for any exponent but 0 and 1, `adaptive_avg_pool1d` for any non-empty output
+# size -- the case is `expect="both_error"`, which fails if **either** side
+# changes its mind, so a refusal that quietly becomes a computation is caught
+# in the same run as a computation that quietly becomes a refusal.
+
+_F8 = "float8_e4m3fn"
+
+
+def _f8_pair(torch_module, c_module, flat, shape):
+    return pair_from_flat(torch_module, c_module, flat, shape, _F8)
+
+
+def _f8_case(name, op, torch_call, c_module, torch_module, build, expect="match", note=""):
+    """One float8 case. `build` returns the argument tuple for a side, given
+    the index of that side (0 = torch, 1 = `_C`), so in-place ops get a **fresh
+    tensor per call** rather than sharing a mutated one."""
+    return Case(
+        name=name,
+        op=op,
+        run_torch=lambda: torch_call(*build(0)),
+        run_c=lambda: c_module._aten_dispatch(op, *build(1)),
+        expect=expect,
+        note=note or "float8_e4m3fn, docs/FLOAT8C.md",
+    )
+
+
+def _float8_extra(op, torch_module, c_module, torch_call) -> list[Case]:
+    tm, cm = torch_module, c_module
+
+    def side(flat, shape):
+        return lambda i: _f8_pair(tm, cm, flat, shape)[i]
+
+    def case(name, build, expect="match"):
+        return _f8_case(name, op, torch_call, cm, tm, build, expect)
+
+    mixed = side([0.0, 2.0], [2])
+    ones = side([1.0, 2.0], [2])
+    square = side([0.0, 1.0, 2.0, 3.0], [2, 2])
+    zeros2 = side([0.0, 0.0, 0.0, 0.0], [2, 2])
+    out: list[Case] = []
+
+    if op in ("aten.all.default", "aten.any.default"):
+        # Both operands matter: `all` and `any` differ only on the mixed one.
+        out.append(case(f"{op}(float8_e4m3fn [0,2])", lambda i: (mixed(i),)))
+        out.append(case(f"{op}(float8_e4m3fn [1,2])", lambda i: (ones(i),)))
+    elif op in ("aten.all.dim", "aten.any.dim"):
+        out.append(case(f"{op}(float8_e4m3fn, dim=0)", lambda i: (mixed(i), 0)))
+    elif op == "aten.all.dims":
+        out.append(case("aten.all.dims(float8_e4m3fn, dims=[0])", lambda i: (mixed(i), [0])))
+    elif op in ("aten.eq.Scalar", "aten.ne.Scalar"):
+        out.append(case(f"{op}(float8_e4m3fn, 1.0)", lambda i: (ones(i), 1.0)))
+    elif op in ("aten.eq.Tensor", "aten.ne.Tensor"):
+        other = side([1.0, 5.0], [2])
+        out.append(case(f"{op}(float8_e4m3fn, float8_e4m3fn)", lambda i: (ones(i), other(i))))
+    elif op in ("aten.mm.default", "aten.matmul.default"):
+        # candle has no F8E4M3 matmul; this is the f32-widened route
+        # (docs/FLOAT8C.md §4) held against upstream's own values.
+        out.append(case(f"{op}(float8_e4m3fn 2x2)", lambda i: (square(i), square(i))))
+    elif op == "aten.addmm.default":
+        out.append(
+            case("aten.addmm.default(float8_e4m3fn 2x2)", lambda i: (zeros2(i), square(i), square(i)))
+        )
+    elif op == "aten.pow.Tensor_Scalar":
+        # Value-dependent: upstream short-circuits 0 and 1 and refuses the rest.
+        for exponent in (0, 1):
+            out.append(
+                case(
+                    f"aten.pow.Tensor_Scalar(float8_e4m3fn, {exponent}) [upstream short-circuits]",
+                    lambda i, e=exponent: (ones(i), e),
+                )
+            )
+        for exponent in (2, -1, 0.5):
+            out.append(
+                case(
+                    f"aten.pow.Tensor_Scalar(float8_e4m3fn, {exponent}) [upstream: \"pow\"]",
+                    lambda i, e=exponent: (ones(i), e),
+                    expect="both_error",
+                )
+            )
+    elif op == "aten.pow.Scalar":
+        out.append(
+            case("aten.pow.Scalar(1, float8_e4m3fn) [upstream short-circuits]",
+                 lambda i: (1, ones(i)))
+        )
+        for base in (0, 2):
+            out.append(
+                case(f"aten.pow.Scalar({base}, float8_e4m3fn) [upstream: \"pow\"]",
+                     lambda i, b=base: (b, ones(i)), expect="both_error")
+            )
+    elif op == "aten.adaptive_avg_pool1d.default":
+        # `[0]` is the one output size upstream answers for this dtype, and the
+        # reason docs/FLOAT8B.md table D recorded the op as computing at all.
+        out.append(
+            case("aten.adaptive_avg_pool1d.default(float8_e4m3fn, [0]) [empty output, no kernel]",
+                 lambda i: (square(i), [0]))
+        )
+        for size in (1, 2):
+            out.append(
+                case(f"aten.adaptive_avg_pool1d.default(float8_e4m3fn, [{size}])",
+                     lambda i, s=size: (square(i), [s]), expect="both_error")
+            )
+    elif op == "aten.abs_.default":
+        neg = side([-1.0, 2.0], [2])
+        out.append(case("aten.abs_.default(float8_e4m3fn)", lambda i: (neg(i),)))
+    elif op == "aten.copy_.default":
+        src = side([5.0, 6.0], [2])
+        out.append(case("aten.copy_.default(float8_e4m3fn <- float8_e4m3fn)",
+                        lambda i: (ones(i), src(i))))
+    elif op == "aten.mul_.Scalar":
+        out.append(case("aten.mul_.Scalar(float8_e4m3fn, 2.0)", lambda i: (ones(i), 2.0)))
+    elif op == "aten.mul_.Tensor":
+        other = side([2.0, 3.0], [2])
+        out.append(case("aten.mul_.Tensor(float8_e4m3fn, float8_e4m3fn)",
+                        lambda i: (ones(i), other(i))))
+    elif op == "aten.index_put_.default":
+        def build(i):
+            target = ones(i)
+            index = (
+                tm.tensor([0]) if i == 0 else cm._tensor_from_flat([0], [1], dtype=cm.int64)
+            )
+            return (target, [index], side([3.0], [1])(i))
+        out.append(case("aten.index_put_.default(float8_e4m3fn)", build))
+    elif op == "aten._local_scalar_dense.default":
+        # Returns a plain Python float, not a Tensor, so it needs the same
+        # scalar comparator the rest of this op's cases use.
+        zero_d = side([1.5], [])
+        out.append(
+            Case(
+                name="_local_scalar_dense(dtype=float8_e4m3fn, value=1.5)",
+                op=op,
+                run_torch=lambda: torch_call(zero_d(0)),
+                run_c=lambda: cm._aten_dispatch(op, zero_d(1)),
+                value_check=_scalar_match_check,
+                note="float8_e4m3fn; refused before docs/FLOAT8C.md §1",
+            )
+        )
+    elif op == "aten._to_copy.default":
+        # The narrowest statement of §1: this exact call spun the CPU forever.
+        for target in ("float32", "float64"):
+            out.append(
+                Case(
+                    name=f"aten._to_copy.default(float8_e4m3fn -> {target})",
+                    op=op,
+                    run_torch=lambda t=target: torch_call(
+                        _f8_pair(tm, cm, [1.0, 2.0], [2])[0], dtype=dt.torch_dtype(tm, t)
+                    ),
+                    run_c=lambda t=target: cm._aten_dispatch(
+                        op, _f8_pair(tm, cm, [1.0, 2.0], [2])[1], dtype=dt.c_dtype(cm, t)
+                    ),
+                    expect="match",
+                    note="float8_e4m3fn widening, docs/FLOAT8C.md §1",
+                )
+            )
+    return out
+
+
+def _with_float8(op, builder):
+    def wrapped(torch_module, c_module, torch_call):
+        return list(builder(torch_module, c_module, torch_call)) + _float8_extra(
+            op, torch_module, c_module, torch_call
+        )
+
+    return wrapped
+
+
+for _op in (
+    "aten.all.default", "aten.all.dim", "aten.all.dims",
+    "aten.any.default", "aten.any.dim",
+    "aten.eq.Scalar", "aten.eq.Tensor", "aten.ne.Scalar", "aten.ne.Tensor",
+    "aten.mm.default", "aten.addmm.default", "aten.matmul.default",
+    "aten.pow.Scalar", "aten.pow.Tensor_Scalar",
+    "aten.adaptive_avg_pool1d.default",
+    "aten.abs_.default", "aten.copy_.default",
+    "aten.mul_.Scalar", "aten.mul_.Tensor",
+    "aten.index_put_.default", "aten._local_scalar_dense.default",
+    "aten._to_copy.default",
+):
+    # A missing key here is a typo, not a dtype this op happens to skip: every
+    # op named above is in `_aten_implemented()` and therefore already has a
+    # builder. Failing loudly beats registering float8 coverage for nothing.
+    assert _op in CASE_BUILDERS, _op
+    CASE_BUILDERS[_op] = _with_float8(_op, CASE_BUILDERS[_op])
+del _op

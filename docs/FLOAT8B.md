@@ -1,5 +1,15 @@
 # `float8_e4m3fn`, round 2: refusing exactly what upstream refuses
 
+> **Superseded in part by `docs/FLOAT8C.md` (round 3).** Tables **D** and **E**
+> below — the ten this build hung on and the thirteen it refused — are all
+> closed, so their "after" columns no longer describe this build. §4.1's
+> conclusion that fixing the ten needs a `candle-core` fork is **wrong**: the
+> recursion reaches exactly one arm of candle's converter, and routing
+> `F8E4M3 -> F32 -> F64` around it is exact and needs no patch. Two of table
+> D's rows were also artefacts of the generic recipe rather than ops upstream
+> computes; `docs/FLOAT8C.md` §2 has the re-measurement. Everything else here —
+> §2's 114 transcribed refusals above all — still holds.
+
 `docs/FLOAT8.md` turned three hangs into named refusals and then recorded a wider
 finding from an eleven-op probe: seven ops answered where upstream declined. This
 document is that finding enumerated properly, and closed.

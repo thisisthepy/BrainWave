@@ -744,6 +744,11 @@ fn flat_storage(op: &str, source: &Tensor) -> PyResult<CpuStorage> {
         DType::F16 => pour!(F16, half::f16),
         DType::F32 => pour!(F32, f32),
         DType::F64 => pour!(F64, f64),
+        // `float8_e4m3fn` joined the list in docs/FLOAT8C.md §3. `to_vec1`
+        // reads the storage slice directly -- it never widens, so it does not
+        // touch candle's non-terminating `F8E4M3 -> f64` arm (§1), which is why
+        // this arm is a two-line addition rather than a conversion.
+        DType::F8E4M3 => pour!(F8E4M3, float8::F8E4M3),
         other => {
             return Err(not_implemented(format!(
                 "{op}: torch._C shim cannot write through a view of candle dtype \
@@ -788,6 +793,7 @@ impl InplaceOp1 for WriteThrough {
             (CpuStorage::F16(d), CpuStorage::F16(s)) => scatter!(d, s),
             (CpuStorage::F32(d), CpuStorage::F32(s)) => scatter!(d, s),
             (CpuStorage::F64(d), CpuStorage::F64(s)) => scatter!(d, s),
+            (CpuStorage::F8E4M3(d), CpuStorage::F8E4M3(s)) => scatter!(d, s),
             // `write_into` compared the two candle dtypes before building this,
             // so a mismatch here is a defect in that check rather than a
             // reachable input.
@@ -2033,11 +2039,12 @@ fn flat_objects(py: Python<'_>, tensor: &Tensor, tag: TorchDType) -> PyResult<Ve
             .collect::<PyResult<Vec<_>>>();
     }
     if dtype.is_float() {
-        if tag == TorchDType::Float8E4M3FN {
-            return Err(not_implemented("tolist on float8_e4m3fn"));
-        }
-        let values = flat
-            .to_dtype(DType::F64)
+        // `float8_e4m3fn` refused here until docs/FLOAT8C.md §1: candle's
+        // `F8E4M3 -> F64` conversion recurses into itself, so this read hung.
+        // `widen_f64` routes it `F8E4M3 -> F32 -> F64`, which is exact for
+        // every one of the dtype's 256 bit patterns, so the refusal is gone
+        // and `tolist` answers upstream's numbers.
+        let values = crate::aten::widen_f64(&flat)
             .and_then(|t| t.to_vec1::<f64>())
             .map_err(|e| candle_err("tolist", e))?;
         values

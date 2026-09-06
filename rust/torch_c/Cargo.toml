@@ -59,6 +59,20 @@ gemm = "0.19.0"
 # statement rather than two.
 half = "2.7"
 
+# The `float8_e4m3fn` scalar type, named for the same reason `half` and `gemm`
+# are: this crate calls it, and the version is the one candle-core already
+# resolves, so it adds no code to the artefact.
+#
+# One call site: `tensor.rs::flat_storage` and the `WriteThrough` arm beside it,
+# which is what lets an in-place op write through a `float8_e4m3fn` view
+# (docs/FLOAT8C.md §3). `CpuStorage::F8E4M3(Vec<F8E4M3>)` cannot be matched
+# without naming the type, and candle-core does not re-export it.
+#
+# Note what this dependency is *not* for: it is not a way to reach the crate's
+# inherent `to_f64`. §1's hang is routed around inside candle's own converter
+# by going through `F32`, and no code here calls `F8E4M3::to_f64` at all.
+float8 = "0.7"
+
 # Apple only. `target_vendor = "apple"` covers macOS and iOS, device and
 # simulator alike, and excludes Android and Linux -- where turning this on would
 # not merely be useless but would fail to link, there being no Accelerate

@@ -553,21 +553,55 @@ fn float8_e4m3fn_kernel(op: &str) -> Option<&'static str> {
 /// They are refused in **this shim's** words, never upstream's. Reporting
 /// `"pow" not implemented for 'Float8_e4m3fn'` for `aten.pow.Scalar` would be a
 /// lie: upstream implements it.
-static FLOAT8_E4M3FN_SHIM_ONLY: &[&str] = &[
-    "aten.adaptive_avg_pool1d.default",
-    "aten.all.default",
-    "aten.all.dim",
-    "aten.all.dims",
-    "aten.any.default",
-    "aten.any.dim",
-    "aten.fill_.Tensor",
-    "aten.index_put_.default",
-    "aten.pow.Scalar",
-    "aten.pow.Tensor_Scalar",
-];
+/// **Empty as of docs/FLOAT8C.md.** All ten ops it held are settled: eight
+/// compute here now that `widen_f64` routes around candle's poisoned arm, and
+/// the remaining two (`aten.pow.Scalar`, `aten.pow.Tensor_Scalar`) turned out
+/// to be ops upstream refuses for all but a degenerate exponent, so they moved
+/// to `float8_pow_refusal` and carry upstream's own `"pow"` wording.
+///
+/// The list is kept rather than deleted because it is the right home for a
+/// future op that this shim genuinely cannot answer for this dtype, and its
+/// emptiness is the statement that there is no such op today.
+static FLOAT8_E4M3FN_SHIM_ONLY: &[&str] = &[];
 
 fn float8_shim_only_refusal(op: &str) -> bool {
     FLOAT8_E4M3FN_SHIM_ONLY.binary_search(&op).is_ok()
+}
+
+/// `aten.pow.Scalar` and `aten.pow.Tensor_Scalar` for `float8_e4m3fn`, where
+/// upstream's refusal is **value-dependent** rather than op-level -- the same
+/// shape as `aten.matmul.default`'s shape-dependence (docs/FLOAT8B.md §2.1),
+/// and the reason neither belongs in `FLOAT8_E4M3FN_REFUSALS`.
+///
+/// Measured on 2.13.0 over `{0, 1, 2, 3, -1, 0.5, 1.5, True, False}`:
+///
+/// * `pow.Tensor_Scalar(t, e)` computes for `e == 0` (all-ones) and `e == 1`
+///   (a copy) and raises `"pow" not implemented for 'Float8_e4m3fn'` for every
+///   other exponent. Those two are TensorIterator short-circuits that never
+///   reach a kernel.
+/// * `pow.Scalar(b, t)` computes only for `b == 1` -- all-ones, independent of
+///   the exponent tensor. `b == 0` raises, unlike the `Tensor_Scalar` side.
+///
+/// Returns `true` when upstream would refuse, i.e. when the shim must too.
+fn float8_pow_refuses(op: &str, args: &Bound<'_, PyTuple>, kwargs: Option<&Bound<'_, PyDict>>) -> bool {
+    let (index, name) = match op {
+        "aten.pow.Tensor_Scalar" => (1usize, "exponent"),
+        "aten.pow.Scalar" => (0usize, "self"),
+        _ => return false,
+    };
+    let Ok(Some(value)) = scalar_arg(op, args, kwargs, index, name) else {
+        // Unreadable operand: leave it to the op, which reports the real
+        // argument error rather than a dtype refusal that hides it.
+        return false;
+    };
+    // `Scalar` carries `Int`/`Float`; a Python `bool` arrives as `Int`, which
+    // is why `pow(t, True)` and `pow(t, 1)` land on the same answer here and
+    // do upstream too (measured).
+    let as_f64 = value.as_f64();
+    if op == "aten.pow.Scalar" {
+        return as_f64 != 1.0;
+    }
+    as_f64 != 0.0 && as_f64 != 1.0
 }
 
 /// Whether the float8 gate applies to this call: at least one tensor operand is
@@ -686,6 +720,35 @@ fn float8_e4m3fn_gate(
     if op == "aten.matmul.default" && float8_only_floats(args, kwargs) && all_operands_are_1d(args, kwargs) {
         return Err(not_implemented("\"dot\" not implemented for 'Float8_e4m3fn'"));
     }
+    // `aten.adaptive_avg_pool1d.default` is value-dependent in the same way,
+    // and docs/FLOAT8B.md table D has it as an op upstream *computes* only
+    // because the generic recipe synthesised `output_size=[0]` -- an empty
+    // output, where no kernel is ever dispatched. Re-measured over
+    // `[0] [1] [2] [4]` and 2-D and 3-D inputs, upstream refuses every
+    // non-empty output size, and with **two different kernel names**:
+    // `output_size == [1]` is the global-average path and says `"sum_cpu"`,
+    // everything else says `"adaptive_avg_pool2d"`.
+    if op == "aten.adaptive_avg_pool1d.default" && float8_only_floats(args, kwargs) {
+        if let Ok(output_size) = shape_arg(op, args, kwargs, 1, "output_size") {
+            match output_size.first().copied() {
+                Some(0) => {}
+                Some(1) => {
+                    return Err(not_implemented(
+                        "\"sum_cpu\" not implemented for 'Float8_e4m3fn'",
+                    ))
+                }
+                Some(_) => {
+                    return Err(not_implemented(
+                        "\"adaptive_avg_pool2d\" not implemented for 'Float8_e4m3fn'",
+                    ))
+                }
+                None => {}
+            }
+        }
+    }
+    if float8_pow_refuses(op, args, kwargs) && float8_only_floats(args, kwargs) {
+        return Err(not_implemented("\"pow\" not implemented for 'Float8_e4m3fn'"));
+    }
     if float8_shim_only_refusal(op) && float8_only_floats(args, kwargs) {
         return Err(not_implemented(format!(
             "{op}: float8_e4m3fn is not supported by this op in the torch._C shim \
@@ -694,6 +757,38 @@ fn float8_e4m3fn_gate(
         )));
     }
     Ok(())
+}
+
+/// `t.to_dtype(DType::F64)`, with `F8E4M3` widened through `F32` on the way.
+///
+/// **This is the whole of docs/FLOAT8C.md §1.** candle 0.11.0's
+/// `WithDType for f8e4m3` generates `fn to_f64(self) -> f64 { (|v: f8e4m3|
+/// v.to_f64())(self) }`, and the by-value trait method is the exact receiver
+/// match, so the inner call resolves to itself; release-mode LLVM turns that
+/// tail call into `.L1: jmp .L1`. Only **one** arm of candle's converter is
+/// poisoned by it -- `(CpuStorage::F8E4M3, DType::F64)`. Every other conversion
+/// out of `F8E4M3` (`U8`/`U32`/`I16`/`I32`/`I64`/`BF16`/`F16`/`F32`) is written
+/// `v.to_f32()`, and `WithDType` declares no `to_f32`, so those resolve to the
+/// `float8` crate's inherent method and terminate.
+///
+/// So the poisoned arm can be *routed around* rather than patched: go
+/// `F8E4M3 -> F32 -> F64`. That is not a tolerance. `float8_e4m3fn` has 4
+/// exponent bits and 3 mantissa bits and no value outside `f32`'s range, so
+/// every one of its 256 bit patterns is exactly representable in `f32`, and
+/// `f32 -> f64` is exact for all of them; the two-step result is bit-identical
+/// to what a non-recursive `to_f64` would return. `tools/golden/compare.py`
+/// already reads float8 results by this same widening (docs/FLOAT8B.md §5.1).
+///
+/// It is a free function rather than a method so that **every** `F64` widening
+/// in this crate can be routed through one place: a `to_dtype(DType::F64)` left
+/// behind anywhere is a hang, not a wrong answer, and hangs are what this dtype
+/// costs the most to find.
+pub(crate) fn widen_f64(t: &Tensor) -> candle_core::Result<Tensor> {
+    // `reduced::to_dtype` owns the routing -- `fast_to` is the funnel
+    // `aten._to_copy.default` already goes through, so putting it there means
+    // `x.to(torch.float64)` is fixed by the same line as every internal
+    // widening rather than by a second one that can drift from it.
+    crate::reduced::to_dtype(t, candle_core::DType::F64)
 }
 
 /// The single entrance. `torch.ops.aten.<op>.<overload>(...)` is expected to
@@ -2487,6 +2582,27 @@ fn add_tensor(
 /// integral matmul is a real gap, and `float32` cannot hold an `int64` product
 /// exactly; standing one in would answer a different question.
 fn gemm_accumulate_in(storage: candle_core::DType) -> candle_core::DType {
+    // `float8_e4m3fn` is a gemm-only widening and deliberately not part of
+    // `opmath_in` (docs/FLOAT8C.md §4). candle has no `F8E4M3` matmul at all --
+    // `unsupported dtype F8E4M3 for op matmul` -- while upstream computes
+    // `mm`/`addmm`/`bmm`/`matmul` for it and returns a `float8_e4m3fn` result.
+    //
+    // Widening the operands to `f32`, multiplying, and narrowing back is not a
+    // guess about what upstream does: over 700 random cases -- `k` from 1 to
+    // 512, three magnitude scales, both `f32` and `f64` accumulation -- the
+    // narrowed product was **bit-identical** to upstream's `mm` in every one,
+    // and the `f32` and `f64` routes never differed from each other either.
+    // Three mantissa bits is coarse enough that the accumulation width cannot
+    // show through the final rounding.
+    //
+    // Scoped to gemm rather than to `opmath_in` because `opmath_in` is the
+    // elementwise opmath type, and upstream **refuses** float8 for the
+    // elementwise kernels (docs/FLOAT8B.md §2). Widening there would compute
+    // where upstream declines, which is the divergence direction this dtype's
+    // gate exists to prevent.
+    if storage == candle_core::DType::F8E4M3 {
+        return candle_core::DType::F32;
+    }
     opmath_in(storage)
 }
 
@@ -2717,7 +2833,7 @@ fn scale_by_alpha(
     }
     let narrowed = Tensor::full(alpha, (), operand.device())
         .and_then(|t| t.fast_to(storage))
-        .and_then(|t| t.to_dtype(candle_core::DType::F64))
+        .and_then(|t| widen_f64(&t))
         .and_then(|t| t.to_scalar::<f64>())
         .map_err(|e| candle_err(op, e))?;
     let scaled = operand
@@ -4651,7 +4767,7 @@ fn side_from_tensor(op: &str, tensor: &Tensor, tag: TorchDType) -> PyResult<PowS
     let flat = tensor.flatten_all().map_err(|err| candle_err(op, err))?;
     if tag.is_floating_point() {
         Ok(PowSide::Floats(
-            flat.to_dtype(candle_core::DType::F64)
+            widen_f64(&flat)
                 .and_then(|t| t.to_vec1::<f64>())
                 .map_err(|err| candle_err(op, err))?,
         ))
@@ -6136,15 +6252,17 @@ enum Cmp {
 /// -- different schema, different overload -- but the same kernel, exactly as
 /// `lt.Tensor`/`lt.Scalar` already are.
 fn compare_common(op: &str, tensor: &Tensor, floating: bool, tag: TorchDType) -> PyResult<Tensor> {
-    if tag == TorchDType::Float8E4M3FN {
-        return Err(not_implemented(format!("{}: float8_e4m3fn", op)));
+    let _ = tag;
+    // `float8_e4m3fn` refused here until docs/FLOAT8C.md §2. `widen_f64` routes
+    // it through `F32`, so `eq`/`ne` answer upstream's booleans. `lt`/`le`/
+    // `ge`/`gt` are *still* refused for this dtype -- upstream refuses them by
+    // kernel name (`lt_cpu` and friends) and the table at the door raises that
+    // before any operand reaches here.
+    if floating {
+        return widen_f64(tensor).map_err(|e| candle_err(op, e));
     }
     tensor
-        .to_dtype(if floating {
-            candle_core::DType::F64
-        } else {
-            candle_core::DType::I64
-        })
+        .to_dtype(candle_core::DType::I64)
         .map_err(|e| candle_err(op, e))
 }
 
@@ -7601,7 +7719,7 @@ fn cumsum_default(
         let mut flat: Vec<f64> = input
             .tensor()?
             .flatten_all()
-            .and_then(|t| t.to_dtype(candle_core::DType::F64))
+            .and_then(|t| widen_f64(&t))
             .and_then(|t| t.to_vec1::<f64>())
             .map_err(|e| candle_err(OP, e))?;
         for o in 0..outer {
@@ -8256,8 +8374,7 @@ fn extremum_dim(
 /// also give. Recorded because it reads like an accident and is upstream's
 /// documented behaviour.
 fn any_from(op: &str, source: &Tensor) -> PyResult<Tensor> {
-    source
-        .to_dtype(candle_core::DType::F64)
+    widen_f64(source)
         .and_then(|t| t.ne(0f64))
         .map_err(|e| candle_err(op, e))
 }
@@ -10545,7 +10662,7 @@ fn to_copy_default(
         let out = input
             .tensor()?
             .to_device(&device)
-            .and_then(|t| t.to_dtype(candle_core::DType::F64))
+            .and_then(|t| widen_f64(&t))
             .and_then(|t| t.ne(0f64))
             .map_err(|e| candle_err(OP, e))?;
         return finish(py, out, tag);
@@ -10675,12 +10792,8 @@ fn local_scalar_dense(
             .map_err(|e| candle_err(OP, e))?[0];
         return Ok((value != 0).into_bound_py_any(py)?.unbind());
     }
-    if input.tag() == TorchDType::Float8E4M3FN {
-        return Err(not_implemented(format!("{}: float8_e4m3fn", OP)));
-    }
     if input.tag().is_floating_point() {
-        let value = flat
-            .to_dtype(candle_core::DType::F64)
+        let value = widen_f64(&flat)
             .and_then(|t| t.to_vec1::<f64>())
             .map_err(|e| candle_err(OP, e))?[0];
         return Ok(value.into_bound_py_any(py)?.unbind());
@@ -11281,8 +11394,7 @@ fn copy_inplace(
         .map_err(|e| candle_err(OP, e))?;
     let replacement = if tag == TorchDType::Bool {
         PyTensorBase::boolean(
-            widened
-                .to_dtype(candle_core::DType::F64)
+            widen_f64(&widened)
                 .and_then(|t| t.ne(0f64))
                 .map_err(|e| candle_err(OP, e))?,
         )?
@@ -12597,7 +12709,7 @@ fn read_flat(op: &str, tensor: &Tensor, tag: TorchDType) -> PyResult<Flat> {
         .map_err(|e| candle_err(op, e))?;
     if tag.is_floating_point() {
         Ok(Flat::Float(
-            flat.to_dtype(candle_core::DType::F64)
+            widen_f64(&flat)
                 .and_then(|t| t.to_vec1::<f64>())
                 .map_err(|e| candle_err(op, e))?,
         ))
@@ -17319,7 +17431,7 @@ fn narrow_through(
     }
     Tensor::from_vec(values, n, device)
         .and_then(|t| t.fast_to(storage))
-        .and_then(|t| t.to_dtype(candle_core::DType::F64))
+        .and_then(|t| widen_f64(&t))
         .and_then(|t| t.to_vec1::<f64>())
         .map_err(|e| candle_err(op, e))
 }
@@ -17633,9 +17745,7 @@ fn scalar_arg(
                 tensor.tensor()?.rank()
             )));
         }
-        let as_f64 = tensor
-            .tensor()?
-            .to_dtype(candle_core::DType::F64)
+        let as_f64 = widen_f64(tensor.tensor()?)
             .and_then(|t| t.to_scalar::<f64>())
             .map_err(|err| candle_err(op, err))?;
         return Ok(Some(if tensor.tag().is_floating_point() {
@@ -18845,6 +18955,23 @@ fn adaptive_avg_pool1d_default(
     let mut out_dims = dims.to_vec();
     out_dims[split] = osize as usize;
     
+    // **An empty output runs no kernel, for any dtype.** Measured on 2.13.0
+    // over float32/float64/float16/bfloat16/float8_e4m3fn/int64/bool:
+    // `output_size=[0]` returns a `(..., 0)` tensor of the input's own dtype in
+    // every case, including the dtypes whose non-empty call raises
+    // `"adaptive_avg_pool2d" not implemented for '<Type>'`.
+    //
+    // It is also the row that made docs/FLOAT8B.md table D claim upstream
+    // *computes* `adaptive_avg_pool1d` for `float8_e4m3fn`: the generic recipe
+    // had synthesised exactly this output size (docs/FLOAT8C.md §2). Returning
+    // here, before the dtype gate below, is what makes that claim true for the
+    // one input it was ever true for.
+    if osize == 0 {
+        let storage = PyDtype::new(tag).storage(OP)?;
+        let empty = Tensor::zeros(out_dims, storage, t.device()).map_err(|e| candle_err(OP, e))?;
+        return finish(py, empty, tag);
+    }
+
     let source = read_flat(OP, t, tag)?;
     
     let acc32 = match tag {

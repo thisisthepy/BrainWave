@@ -20758,20 +20758,156 @@ def test_float8_gate_does_not_fire_on_a_mixed_dtype_call():
     assert "\"add_stub\" not implemented" not in message, message
 
 
-def test_float8_shim_only_refusals_do_not_borrow_upstreams_wording():
-    """The ten ops upstream computes and this build cannot (docs/FLOAT8B.md
-    §4.1). They refuse -- a hang is not an acceptable answer -- but claiming
-    `"pow" not implemented for 'Float8_e4m3fn'` for `aten.pow.Scalar` would be a
-    lie, because upstream implements it."""
+def _f8_values(tensor):
+    """Read a float8 result through the lossless widening to float32.
+
+    `float8_e4m3fn` is 4 exponent and 3 mantissa bits, so every one of its
+    finite values is exact in `float32` -- this is a read, not a tolerance,
+    and it is the same route `tools/golden/compare.py::_as_list` uses.
+    """
+    return _C._aten_dispatch("aten._to_copy.default", tensor, dtype=_C.float32).tolist()
+
+
+def test_float8_no_op_refuses_in_the_shims_own_words_any_more():
+    """docs/FLOAT8B.md §4.1 listed ten ops upstream computes and this build
+    could not, refused in this shim's own wording. docs/FLOAT8C.md closed all
+    ten, so `FLOAT8_E4M3FN_SHIM_ONLY` is empty and **no** float8 call may
+    produce that sentence.
+
+    This is the load-bearing half of the round: put any of the ten back on the
+    list and this fails, rather than the closure quietly reverting to a
+    refusal that reads reasonable.
+    """
     for op, args in (
         ("aten.all.default", (_f8(),)),
+        ("aten.all.dim", (_f8(), 0)),
         ("aten.any.default", (_f8(),)),
+        ("aten.any.dim", (_f8(), 0)),
         ("aten.pow.Tensor_Scalar", (_f8(), 2.0)),
+        ("aten.pow.Scalar", (2.0, _f8())),
+        ("aten.adaptive_avg_pool1d.default", (_f8([1.0, 2.0, 3.0, 4.0], [2, 2]), [2])),
+        ("aten.mm.default", (_f8([1.0, 2.0, 3.0, 4.0], [2, 2]),) * 2),
+        ("aten.eq.Tensor", (_f8(), _f8())),
     ):
-        exc, message = _f8_refusal(op, *args)
+        _, message = _f8_refusal(op, *args)
+        assert "is not supported by this op in the torch._C shim" not in message, (op, message)
+        assert "does not terminate" not in message, (op, message)
+
+
+def test_float8_all_and_any_compute_and_agree_with_upstreams_values():
+    """Five of the ten: `all`/`any` hung because `any_from` widened to `f64`
+    through candle's non-terminating arm. `widen_f64` routes them through
+    `f32` (docs/FLOAT8C.md §1), and the answers are upstream's."""
+    mixed = _f8([0.0, 2.0])
+    assert _C._aten_dispatch("aten.all.default", mixed).tolist() is False
+    assert _C._aten_dispatch("aten.any.default", mixed).tolist() is True
+    nonzero = _f8([1.0, 2.0])
+    assert _C._aten_dispatch("aten.all.default", nonzero).tolist() is True
+    assert _C._aten_dispatch("aten.all.dim", nonzero, 0).tolist() is True
+    assert _C._aten_dispatch("aten.all.dims", nonzero, [0]).tolist() is True
+    assert _C._aten_dispatch("aten.any.dim", mixed, 0).tolist() is True
+
+
+def test_float8_pow_refuses_the_exponents_upstream_refuses_and_only_those():
+    """`pow` is **value-dependent** for this dtype, the way `matmul` is
+    shape-dependent (docs/FLOAT8C.md §2). Measured on 2.13.0:
+    `pow.Tensor_Scalar` short-circuits for exponent 0 and 1 and raises `"pow"`
+    for every other exponent; `pow.Scalar` computes only for base 1.
+
+    Refusing the whole op would be wrong in one direction and computing the
+    whole op wrong in the other, so both ends are asserted here.
+    """
+    base = _f8([1.0, 2.0])
+    for exponent, expected in ((0, [1.0, 1.0]), (1, [1.0, 2.0]), (1.0, [1.0, 2.0])):
+        got = _C._aten_dispatch("aten.pow.Tensor_Scalar", base, exponent)
+        assert str(got.dtype) == "torch.float8_e4m3fn", (exponent, got.dtype)
+        assert _f8_values(got) == expected, (exponent, _f8_values(got))
+    for exponent in (2, 3, -1, 0.5):
+        exc, message = _f8_refusal("aten.pow.Tensor_Scalar", base, exponent)
+        assert exc is NotImplementedError, (exponent, exc, message)
+        assert message == "\"pow\" not implemented for 'Float8_e4m3fn'", (exponent, message)
+    assert _f8_values(_C._aten_dispatch("aten.pow.Scalar", 1, base)) == [1.0, 1.0]
+    for scalar_base in (0, 2, -1, 0.5):
+        exc, message = _f8_refusal("aten.pow.Scalar", scalar_base, base)
+        assert exc is NotImplementedError, (scalar_base, exc, message)
+        assert message == "\"pow\" not implemented for 'Float8_e4m3fn'", (scalar_base, message)
+
+
+def test_float8_adaptive_avg_pool1d_names_the_kernel_the_output_size_selects():
+    """docs/FLOAT8B.md table D had this as an op upstream computes. It does
+    not: the generic recipe had synthesised `output_size=[0]`, an empty output
+    where no kernel is ever dispatched. Re-measured, upstream refuses every
+    non-empty output size -- and with **two** kernel names, `"sum_cpu"` for
+    `[1]` (the global-average path) and `"adaptive_avg_pool2d"` otherwise."""
+    source = _f8([1.0, 2.0, 3.0, 4.0], [2, 2])
+    empty = _C._aten_dispatch("aten.adaptive_avg_pool1d.default", source, [0])
+    assert list(empty.shape) == [2, 0], empty.shape
+    exc, message = _f8_refusal("aten.adaptive_avg_pool1d.default", source, [1])
+    assert exc is NotImplementedError, (exc, message)
+    assert message == "\"sum_cpu\" not implemented for 'Float8_e4m3fn'", message
+    exc, message = _f8_refusal("aten.adaptive_avg_pool1d.default", source, [2])
+    assert exc is NotImplementedError, (exc, message)
+    assert message == "\"adaptive_avg_pool2d\" not implemented for 'Float8_e4m3fn'", message
+
+
+def test_float8_in_place_writers_reach_the_buffer():
+    """docs/FLOAT8B.md §4.2's other family: `tensor.rs::flat_storage` had no
+    `F8E4M3` arm, so every in-place writer refused with "cannot write through a
+    view of candle dtype F8E4M3". docs/FLOAT8C.md §3 added the arm."""
+    assert _f8_values(_C._aten_dispatch("aten.zero_.default", _f8())) == [0.0, 0.0]
+    assert _f8_values(_C._aten_dispatch("aten.fill_.Scalar", _f8(), 3.0)) == [3.0, 3.0]
+    assert _f8_values(_C._aten_dispatch("aten.abs_.default", _f8([-1.0, 2.0]))) == [1.0, 2.0]
+    assert _f8_values(_C._aten_dispatch("aten.mul_.Scalar", _f8(), 2.0)) == [2.0, 4.0]
+    assert _f8_values(
+        _C._aten_dispatch("aten.copy_.default", _f8(), _f8([5.0, 6.0]))
+    ) == [5.0, 6.0]
+    filled = _C._aten_dispatch(
+        "aten.fill_.Tensor", _f8(), _C._tensor_from_flat([3.0], [], _C.float8_e4m3fn)
+    )
+    assert _f8_values(filled) == [3.0, 3.0]
+
+
+def test_float8_matmul_widens_to_f32_and_lands_on_upstreams_values():
+    """candle has no `F8E4M3` matmul at all. Widening the operands to `f32`,
+    multiplying and narrowing back reproduces upstream bit for bit -- measured
+    over 700 random cases, `k` up to 512 (docs/FLOAT8C.md §4). Here the two
+    products are exact in `e4m3` so the assertion is on values, not tolerance.
+    """
+    square = _f8([0.0, 1.0, 2.0, 3.0], [2, 2])
+    product = _C._aten_dispatch("aten.mm.default", square, square)
+    assert str(product.dtype) == "torch.float8_e4m3fn", product.dtype
+    assert _f8_values(product) == [[2.0, 3.0], [6.0, 11.0]], _f8_values(product)
+    zeros = _C._tensor_from_flat([0.0] * 4, [2, 2], _C.float8_e4m3fn)
+    biased = _C._aten_dispatch("aten.addmm.default", zeros, square, square)
+    assert _f8_values(biased) == [[2.0, 3.0], [6.0, 11.0]], _f8_values(biased)
+
+
+def test_float8_tolist_and_item_answer_instead_of_refusing():
+    """docs/FLOAT8.md's three refusals. `tolist` and `item` widened to `f64`
+    and hung; the comparisons did too. All three route through `f32` now."""
+    assert _C._tensor_from_flat([1.0, 2.0], [2], _C.float8_e4m3fn).tolist() == [1.0, 2.0]
+    scalar = _C._tensor_from_flat([1.5], [1], _C.float8_e4m3fn)
+    assert _C._aten_dispatch("aten._local_scalar_dense.default", scalar) == 1.5
+    assert _C._aten_dispatch("aten.eq.Scalar", _f8(), 1.0).tolist() == [True, False]
+    assert _C._aten_dispatch("aten.ne.Tensor", _f8(), _f8([1.0, 5.0])).tolist() == [False, True]
+    # `lt`/`le`/`ge`/`gt` are **still** refused, in upstream's own words: the
+    # kernel table at the door runs before `compare_common`. Closing `eq`/`ne`
+    # must not have opened those.
+    for op, kernel in (("aten.lt.Tensor", "lt_cpu"), ("aten.ge.Scalar", "ge_cpu")):
+        exc, message = _f8_refusal(op, _f8(), _f8() if "Tensor" in op else 1.0)
         assert exc is NotImplementedError, (op, exc, message)
-        assert "not implemented for 'Float8_e4m3fn'" not in message, (op, message)
-        assert op in message and "FLOAT8B" in message, (op, message)
+        assert message == "\"%s\" not implemented for 'Float8_e4m3fn'" % kernel, (op, message)
+
+
+def test_float8_to_float64_terminates():
+    """The narrowest statement of docs/FLOAT8C.md §1, and the one that was
+    still hanging after the first two fixes: `x.to(torch.float64)` goes through
+    `reduced::to_dtype`, not through any `aten.rs` helper, so routing it needed
+    the funnel itself rather than the call sites.
+    """
+    widened = _C._aten_dispatch("aten._to_copy.default", _f8(), dtype=_C.float64)
+    assert str(widened.dtype) == "torch.float64", widened.dtype
+    assert widened.tolist() == [1.0, 2.0], widened.tolist()
 
 
 if __name__ == "__main__":
