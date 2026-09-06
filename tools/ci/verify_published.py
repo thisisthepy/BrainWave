@@ -10,10 +10,18 @@ missing machine, and this is what it runs.
 That is the point of hardcoding them rather than computing a tolerance: a
 mismatch localises to the platform, because the arithmetic is identical.
 
+What is deliberately **not** here: the `mps` and `vulkan` devices (Apple-only,
+and these runners are Linux and Windows) and the `world_size >= 3` transport
+(it spawns processes and binds loopback sockets, which is a different kind of
+check from "does this wheel compute"). Neither is verified on Linux or Windows,
+and this file staying quiet about them is the honest state rather than an
+oversight.
+
 Exits non-zero on the first disagreement, so the workflow fails loudly rather
 than leaving a wrong number in a log nobody reads.
 """
 
+import re
 import sys
 
 
@@ -169,6 +177,116 @@ def quantised(torch):
     check("Linear left dense (lm_head)", kinds.get("Linear", 0), 1)
 
 
+def _predates(feature_version):
+    """True when the *installed* release is older than `feature_version`.
+
+    The skip convention `quantised()` established, generalised: this script
+    runs against **published** wheels, so a check written today outruns PyPI
+    until the next upload. A version comparison is used here rather than a
+    capability probe because the capability being tested -- `loss.backward()`
+    -- refuses *by name* in older releases, and a probe could not tell that
+    deliberate refusal apart from a regression. The installed version is
+    printed either way, so the skip cannot quietly become permanent.
+    """
+    import importlib.metadata as md
+
+    try:
+        from packaging.version import Version
+    except ImportError:  # not guaranteed present on a bare runner
+        def Version(s):  # noqa: N802  -- enough to order this project's X.Y.ZaN
+            m = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)a(\d+)", s)
+            if not m:
+                raise SystemExit(f"cannot order version {s!r} without packaging")
+            return tuple(int(g) for g in m.groups())
+
+    try:
+        have = md.version("torchnative")
+    except md.PackageNotFoundError:
+        # Not pip-installed: someone is running this against a source tree
+        # (`PYTHONPATH=torchnative/src/main`), where there is no release to be
+        # older than. Run the check rather than skip it -- a skip here would
+        # mean the section is never exercised until after it has shipped.
+        return False, "source tree (no dist metadata)"
+    return Version(have) < Version(feature_version), have
+
+
+def training(torch):
+    """`loss.backward()` and an optimizer step -- 0.0.13a0's headline.
+
+    New in 0.0.13a0: the eager autograd engine reached upstream's own path
+    (`torch/_tensor.py` -> `_engine_run_backward` -> `_ImperativeEngine`), so
+    nothing below is shim-specific -- it is the code any PyTorch user writes.
+
+    The expected values are exact rather than tolerant, deliberately. With the
+    weights filled and the input all ones, d(sum(xW^T))/dW is exactly 1 for
+    every element, so `0.5 - 3 * 0.1 * 1` is a float32 identity and not a
+    measurement -- a platform that disagrees here has an arithmetic fault, not
+    a rounding difference. Losses fall 6.0 -> 4.8 -> 3.6 for the same reason.
+    """
+    old, have = _predates("0.0.13a0")
+    if old:
+        print(
+            f"SKIP  loss.backward() training step -- torchnative {have} "
+            f"predates the eager autograd engine (it refuses by name there). "
+            f"Not a platform result."
+        )
+        return
+
+    lin = torch.nn.Linear(3, 4, bias=False)
+    with torch.no_grad():
+        lin.weight.fill_(0.5)
+    opt = torch.optim.SGD(lin.parameters(), lr=0.1)
+    x = torch.ones(1, 3)
+
+    losses = []
+    for _ in range(3):
+        opt.zero_grad()
+        loss = lin(x).sum()
+        loss.backward()
+        losses.append(round(loss.item(), 4))
+        grad_ok = lin.weight.grad is not None and lin.weight.grad.tolist()[0] == [1.0, 1.0, 1.0]
+        opt.step()
+
+    check("backward produced a .grad", grad_ok, True)
+    check("loss falls under SGD", losses, [6.0, 4.8, 3.6])
+    check(
+        "three steps moved the weight",
+        [round(v, 4) for v in lin.weight.tolist()[0]],
+        [0.2, 0.2, 0.2],
+    )
+
+    # zero_grad has to actually zero, not merely complete: a loop that
+    # silently does nothing passes every test that only checks it finished.
+    opt.zero_grad()
+    check(
+        "zero_grad clears the gradient",
+        lin.weight.grad is None or lin.weight.grad.abs().sum().item() == 0.0,
+        True,
+    )
+
+
+def newer_ops(torch):
+    """Operators that landed after 0.0.12a0, each skipped by name if absent.
+
+    Per-op rather than per-release: these arrive one at a time from separate
+    rounds, so asking the wheel which ones it has is more precise than asking
+    how old it is. `nonzero` is the interesting one -- its output *shape*
+    depends on the values, which nothing before it did.
+    """
+    have = set(torch._C._aten_implemented())
+
+    cases = [
+        ("aten.nonzero.default", "nonzero", lambda: torch.nonzero(torch.tensor([0.0, 3.0, 0.0, 5.0])).tolist(), [[1], [3]]),
+        ("aten.fmod.Tensor", "fmod keeps the dividend's sign", lambda: torch.fmod(torch.tensor([7.0, -7.0]), 3.0).tolist(), [1.0, -1.0]),
+        ("aten.maximum.default", "maximum", lambda: torch.maximum(torch.tensor([1.0, 5.0]), torch.tensor([3.0, 2.0])).tolist(), [3.0, 5.0]),
+    ]
+    for op, label, fn, want in cases:
+        if op not in have:
+            print(f"SKIP  {label:<34} -- this wheel has no {op}. Not a platform result.")
+            continue
+        check(label, fn(), want)
+
+
 def main():
     want_model = "--model" in sys.argv
     torch = provenance()
@@ -178,6 +296,8 @@ def main():
     else:
         kernels(torch)
         promotion(torch)
+        newer_ops(torch)
+        training(torch)
 
     print()
     if FAILURES:

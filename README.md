@@ -219,29 +219,41 @@ loads on 3.13, 3.14 and later without a rebuild.
 
 <table>
 <tr><th align="left">Working</th><th align="left"></th></tr>
-<tr><td>ATen operators</td><td><b>203</b>, each compared against upstream</td></tr>
-<!-- DOCWATCH: count golden_ops_covered ge 203 -->
-<tr><td>Golden comparison cases</td><td><b>8,509 / 8,509</b> — values, shapes, dtypes, positional <i>and</i> keyword, through the door <i>and</i> through the member</td></tr>
-<!-- DOCWATCH: count golden_cases_total ge 8509 -->
-<!-- DOCWATCH: count golden_cases_passed ge 8509 -->
+<tr><td>ATen operators</td><td><b>224</b>, each compared against upstream</td></tr>
+<!-- DOCWATCH: count golden_ops_covered ge 224 -->
+<tr><td>Golden comparison cases</td><td><b>9,137 / 9,137</b> — values, shapes, dtypes, positional <i>and</i> keyword, through the door <i>and</i> through the member</td></tr>
+<!-- DOCWATCH: count golden_cases_total ge 9137 -->
+<!-- DOCWATCH: count golden_cases_passed ge 9137 -->
 <!-- DOCWATCH: count golden_pending eq 0 -->
-<tr><td>Smoke tests</td><td><b>389</b></td></tr>
-<!-- DOCWATCH: count smoke_ok ge 389 -->
+<tr><td>Smoke tests</td><td><b>490</b> — <b>479</b> in <code>test_shim.py</code>, which is what the marker below counts, and 11 more in the files split off it (<code>test_split_probe.py</code>, <code>test_release.py</code>)</td></tr>
+<!-- DOCWATCH: count smoke_ok ge 479 -->
 <tr><td><code>from_pretrained</code></td><td>works for models whose init computes on the <b>meta</b> device — the Llama-3.2 <code>rope_scaling</code> path needed 30-odd meta kernels that were absent (<a href="docs/META.md">META.md</a>)</td></tr>
 <tr><td>Signature and schema tables</td><td><b>4,641</b> entries checked against upstream</td></tr>
 <!-- DOCWATCH: count schema_entries_matched ge 4641 -->
 <!-- DOCWATCH: count schema_entries_total ge 4641 -->
 <tr><td>Architectures — operator coverage</td><td><b>26 of 26</b> reach zero missing operators in the traced sweep</td></tr>
-<tr><td>Architectures — <b>actually forward</b></td><td><b>26 of 26</b>, matching upstream. Agreement is module-by-module through forward hooks, because two of the toy outputs are degenerate enough that their argmax is a tie — reported as a tie rather than as a match (<a href="docs/KERNELS26.md">KERNELS26.md</a>)</td></tr>
+<tr><td>Architectures — <b>agreeing with upstream</b></td><td><b>26 of 26</b>, matching upstream. Agreement is module-by-module through forward hooks, because two of the toy outputs are degenerate enough that their argmax is a tie — reported as a tie rather than as a match (<a href="docs/KERNELS26.md">KERNELS26.md</a>)</td></tr>
+<tr><td>Architectures — <b>swept, all of them</b></td><td><b>215 of 297 forward</b> (72%). <b>The denominator is not 528.</b> 528 is every model type <code>AutoModel</code> can build; of those, <b>231 fail on upstream torch too</b> under the same shrunk random-weight config, so they are not this project's gap and are excluded — <i>215 of 528</i> would be a different and wrong claim. The remaining <b>82</b> are blocked here and need <b>31 distinct operator names</b>, which is a <i>first-wall</i> count: closing one wall can reveal another. And <b>a forward is not a match</b> — this row measures reachability, the row above measures agreement, and only 26 architectures have been checked for agreement (<a href="docs/ARCH100.md">ARCH100.md</a>)</td></tr>
+<!-- DOCWATCH: symbol-in-file docs/ARCH100.md 215 present -->
+<!-- DOCWATCH: symbol-in-file docs/ARCH100.md 297 present -->
+<!-- DOCWATCH: symbol-in-file docs/ARCH100.md 82 present -->
+<!-- DOCWATCH: symbol-in-file docs/ARCH100.md 31 present -->
 <tr><td>Checkpoints</td><td><code>torch.load</code> and safetensors, round-tripped against upstream</td></tr>
 <tr><td>Build targets</td><td>macOS · Android · iOS · Linux · Windows — <b>five of six build a wheel</b>. WASM builds the extension and computes under Node, and a wheel has been built by hand but not by <code>build.py</code> (<a href="#platform-support">table</a>)</td></tr>
-<tr><td>Training mode</td><td><b>26 of 26</b> forward in <code>.train()</code> as well as <code>.eval()</code>, agreeing with upstream draw for draw — <code>bernoulli_</code> draws in <code>float64</code> for every dtype, so a seeded dropout is comparable. Test-time adaptation runs on real checkpoints — <code>adapt.wrap(model, method=adapt.Tent())</code> drops GPT-2's prediction entropy 39% and transfers to held-out text — in <code>.train()</code> as well as <code>.eval()</code>, with dropout active. A training step moves all 272 SmolLM2 parameters the way upstream moves them — gradients compared element-wise over all 134,515,008 values, sign agreement 99.9987%. It is a <b>tape over a captured region</b>, not <code>Tensor.backward()</code>, which still refuses — though <code>requires_grad=True</code> is now carried rather than refused, and the refusal has moved to the engine itself and names what does work. Ten walls stand between here and an eager <code>.backward()</code> and <b>seven of them do not raise</b>, so a traceback finds one at a time (<a href="docs/BACKWARD2.md">BACKWARD2.md</a>, <a href="docs/BACKWARD3.md">BACKWARD3.md</a>) Unlike <code>torch.compile</code>, autograd <b>is reachable under abi3</b> — <code>torch/csrc/autograd</code> defines <code>Py_BUILD_CORE</code> in 0 of 129 files — and a SmolLM2 backward needs 24 ops of which 16 exist and one is a real missing kernel (<a href="docs/AUTOGRAD.md">AUTOGRAD.md</a>)</td></tr>
+<tr><td>Training mode</td><td><b>26 of 26</b> forward in <code>.train()</code> as well as <code>.eval()</code>, agreeing with upstream draw for draw — <code>bernoulli_</code> draws in <code>float64</code> for every dtype, so a seeded dropout is comparable. Test-time adaptation runs on real checkpoints — <code>adapt.wrap(model, method=adapt.Tent())</code> drops GPT-2's prediction entropy 39% and transfers to held-out text — in <code>.train()</code> as well as <code>.eval()</code>, with dropout active. A training step moves all 272 SmolLM2 parameters the way upstream moves them — gradients compared element-wise over all 134,515,008 values, sign agreement 99.9987%. <b><code>loss.backward()</code> now works</b>, through upstream's own path (<code>torch/_tensor.py</code> → <code>_engine_run_backward</code> → <code>_ImperativeEngine.run_backward</code>) with no shim-specific call: a six-step SGD loop over an <code>nn.Sequential</code>, driven by the real <code>torch.optim.SGD</code>, matches upstream to <b>2.98e-08</b> — one float32 ulp — across the loss trajectory, the gradients and the final parameters. <b>What it is not:</b> no transformer has been trained end to end through it, there is no convolution backward rule (so vision models stop), and <code>create_graph=True</code>/double-backward, multiple root tensors, <code>GradientEdge</code> inputs, <code>torch.autograd.Function</code>, hooks and <code>retain_grad</code> on non-leaves all refuse by name. Mutation through a view is refused rather than differentiated, which is deliberately <i>less</i> than upstream (<a href="docs/BACKWARD9.md">BACKWARD9.md</a>, <a href="docs/BACKWARD7.md">BACKWARD7.md</a>) Unlike <code>torch.compile</code>, autograd <b>is reachable under abi3</b> — <code>torch/csrc/autograd</code> defines <code>Py_BUILD_CORE</code> in 0 of 129 files — and a SmolLM2 backward needs 24 ops of which 16 exist and one is a real missing kernel (<a href="docs/AUTOGRAD.md">AUTOGRAD.md</a>)</td></tr>
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_a_real_training_loop_runs_through_loss_backward_and_agrees_with_upstream present -->
+<!-- DOCWATCH: op-implemented aten.native_batch_norm.default -->
 <tr><td>Test-time adaptation</td><td><b>Tent runs on SmolLM2-135M.</b> Ten steps of entropy minimisation over the 61 normalisation weights: entropy <b>4.1604 → 2.9828</b> on unlabelled text, <b>3.7237 → 2.9439</b> on a held-out sentence never adapted on, adapted weights within a median relative <b>1.5e-06</b> of upstream's own autograd at 100% sign agreement. Reverting restores the base <b>bit-identically</b> across all 272 parameters, for a 137 KiB base copy against 513 MiB of model. The wrong sign sends entropy <i>up</i>, <code>lr=0</code> holds it to the last digit, and a detached objective is refused by name — because a loop that silently does nothing passes every test that only checks it completed. <code>nn.LayerNorm</code> models are refused: <code>aten.native_layer_norm.default</code> has no derivative rule (<a href="docs/ADAPT.md">ADAPT.md</a>)</td></tr>
+<tr><td>Accelerators</td><td><b>Metal and Vulkan compute on this Mac's real GPU.</b> <code>mps</code> is candle's Metal backend; <code>vulkan</code> is a fourth arm of <code>tensor::Repr</code> outside candle, with a real <code>VkBuffer</code> round-trip. Both are gated so a silent CPU fallback cannot happen: Vulkan teaches <b>four ops by name</b> and refuses the rest naming themselves, and on <code>mps</code> every op whose kernel would read the tensor back to the host is refused by name — enumerable at runtime through <code>_C._shim_mps_host_readback_ops()</code>. <b>A transformer does not run on <code>mps</code> yet</b>: <code>aten._softmax.default</code> is in that refused set, and every attention block passes through it (<a href="docs/MPS.md">MPS.md</a>, <a href="docs/VULKAN3.md">VULKAN3.md</a>)</td></tr>
+<!-- DOCWATCH: symbol-in-file rust/torch_c/src/device.rs _shim_mps_host_readback_ops present -->
+<tr><td>NPU</td><td>The capture layer exists and a graph lowers through it. A <b>CoreML <code>.mlpackage</code> is compiled by macOS and executed</b> through <code>MLModel.predict</code>, agreeing with the replayed trace to <b>2–3e-08</b> at float32 — and float32 had to be forced, because <code>coremltools</code> defaults to float16, which is four orders of magnitude looser. The NNAPI blob is <b>structurally validated only</b>: there is no NNAPI runtime on a Mac and <b>nothing here has run on an NPU</b> (<a href="docs/NPU.md">NPU.md</a>)</td></tr>
+<tr><td><code>torch.distributed</code></td><td><code>ProcessGroupLocal</code> at <b><code>world_size &gt;= 3</code></b>, over real loopback TCP sockets in a star with the hub at rank 0, folding contributions in ascending rank order so the answer does not depend on arrival order. Proper-subset cohorts, a survivor set after a dropout, and <code>on_missing='average_arrived'</code> all run. Everything else — other reduce ops, <code>broadcast</code>/<code>allgather</code>/<code>send</code>/<code>recv</code>, secure aggregation, differential privacy — refuses by name (<a href="docs/FEDERATED4.md">FEDERATED4.md</a>)</td></tr>
+<!-- DOCWATCH: symbol-in-file rust/torch_c/src/bootstrap.py ProcessGroupLocal present -->
 <tr><td>Devices run</td><td>Android arm64 — <code>import torch</code>, 119 ops, <code>nn</code> forward. <b>WASM runs under Pyodide</b> — a hand-built wheel installs, imports and computes, on CPython 3.14</td></tr>
 <tr><td>Speed vs upstream</td><td>desktop CPU, SmolLM2-135M prefill: <b>0.97x at 6 tokens, 1.13x at 128, 1.52x at 512, 2.03x at 1024</b> in <code>float32</code> — the gap grows with sequence length and what is left is attention (<a href="docs/SEQLEN.md">SEQLEN.md</a>). In <code>bfloat16</code> it is <b>2.3x faster than upstream</b> (<a href="docs/DTYPE_PERF.md">DTYPE_PERF.md</a>). Decode is the other half and it was never measured until now: <code>generate()</code> with a KV cache — the default, and what the example above runs — is <b>0.95x</b>, <b>46.6 tok/s against upstream's 44.4</b> on SmolLM2-135M <code>float32</code>, with character-identical output. The long-sequence gap is attention, and <b>not because we materialise the score matrix</b>: two independent blocked kernels were built to stop materialising it and both were slower — upstream's own, reproduced exactly, by 20x (<a href="docs/FLASH.md">FLASH.md</a>)</td></tr>
 </table>
 
-**All twenty forward**: Llama · GPT-2 · Qwen2 · Mistral · Gemma · GPT-NeoX · OPT · MPT ·
+**Twenty of the twenty-six checked for agreement**: Llama · GPT-2 · Qwen2 · Mistral · Gemma · GPT-NeoX · OPT · MPT ·
 StarCoder2 · StableLM · OLMo · Phi · Mixtral · BERT · BLOOM · Cohere · Falcon · Mamba ·
 Persimmon · GPT-BigCode
 
@@ -274,7 +286,16 @@ generator stream — a seeded run reproduces exactly. `randn`, `rand`, their `_l
   is what lets one binary per platform serve 3.13 and every later CPython. Eager is the supported
   path, and graph capture through the single door — already bit-exact against eager — is the
   route being pursued instead ([`docs/DYNAMO.md`](docs/DYNAMO.md)).
-- CPU only. No GPU or NPU backend.
+  That is now a **recommendation to refuse it permanently**, not a postponement: `docs/COMPILE.md`
+  says ship abi3 only, refuse `torch.compile` by name, and spend the effort on `torch.export`.
+  Nothing here has ever implemented any part of either — `torch.export` is *reachable* under abi3,
+  18 symbols censused with none in a `Py_BUILD_CORE` file, but a census is not an implementation
+  ([`docs/COMPILE.md`](docs/COMPILE.md)).
+- **The GPU is on, and it is not a backend you can run a model on.** Metal and Vulkan compute,
+  under gates that refuse rather than fall back — see the Status table. `aten._softmax.default`
+  is refused on `mps`, so no transformer forwards there.
+- **82 of 297 architectures do not forward**, needing 31 operator names. See the Status table for
+  what 297 means.
 - The Android run is an emulator, not a phone. No number here describes real silicon.
 - Apple is much faster than Android at `f32` matmul, and that is the hardware. Accelerate
   reaches the AMX coprocessor; ARMv8.2-A NEON has no equivalent. Our Android throughput equals
@@ -470,13 +491,21 @@ torchnative.nn.federated    rounds · client selection · aggregation · dropout
           └ devices         CPU · Metal · Vulkan · NPU
 ```
 
-| | |
+| | what is measured today |
 |---|---|
-| **Device abstraction** | `torch.device`, per-device dispatch. Everything else waits on it. |
-| **Metal** | On, Apple targets only. One arm of `resolve()` -- an `mps` tensor is an ordinary candle tensor, so no kernel here had to be taught it ([`docs/VULKAN3.md`](docs/VULKAN3.md)). That is also why it needs a gate the Vulkan representation does not: the ops whose kernels read the tensor back to the host are refused by name ([`docs/MPS.md`](docs/MPS.md)). |
-| **`torch.distributed`** | From `world_size = 1` upward. Unblocks `transformers` as a side effect. |
-| **Vulkan** | No candle backend, so it is a fourth arm of `tensor::Repr` outside candle entirely — which is what makes a silent CPU fallback unrepresentable rather than merely avoided ([`docs/VULKAN3.md`](docs/VULKAN3.md)). Wiring and correctness are testable on this host; only the performance question needs a phone. |
-| **NPU** | NNAPI, CoreML and QNN compile at runtime, so no export step is added — but they take a whole subgraph, not one operator. That needs a capture layer, and the single door is where it attaches. |
+| **Device abstraction** | **Done.** `torch.device`, per-device dispatch, and a `Repr` arm per device. Everything below attached here. |
+| **Metal** | **On, computing on the real GPU** (Apple M1, candle's Metal backend), Apple targets only. An `mps` tensor is an ordinary candle tensor, so no kernel had to be taught it ([`docs/VULKAN3.md`](docs/VULKAN3.md)) — which is also why it needs a gate the Vulkan representation does not: the ops whose kernels read the tensor back to the host are refused by name, `aten._softmax.default` among them, so a transformer does not forward on `mps` ([`docs/MPS.md`](docs/MPS.md)). |
+| **Vulkan** | **Wired and computing**, through real `VkBuffer`s on this host — a fourth arm of `tensor::Repr` outside candle entirely, which is what makes a silent CPU fallback unrepresentable rather than merely avoided. **Four ops by name**; every other op refuses naming itself. Performance still needs a phone ([`docs/VULKAN3.md`](docs/VULKAN3.md)). |
+| **`torch.distributed`** | **`world_size >= 3` runs**, over loopback TCP in a star with the hub at rank 0. Only `allreduce(op=SUM)` is implemented; every other collective and every other reduce op refuses by name ([`docs/FEDERATED4.md`](docs/FEDERATED4.md), [`docs/TRANSPORT.md`](docs/TRANSPORT.md)). |
+| **NPU** | **The capture layer is built** and a whole model lowers through it — prims folded back to aten, BatchNorm fused into the preceding convolution, nothing left outside NNAPI's op set for `mobilenet_v2`. **CoreML executes**; the NNAPI blob is structurally validated and has never met an NPU ([`docs/NPU.md`](docs/NPU.md)). |
+| **Eager training** | **`loss.backward()` and an optimizer step work** and match upstream to one float32 ulp on a small `nn.Sequential`. Not a milestone that is finished: no transformer has been trained through it, and there is no convolution backward rule ([`docs/BACKWARD9.md`](docs/BACKWARD9.md)). |
+| **`torch.compile`** | **Not on this roadmap.** `docs/COMPILE.md` recommends refusing it by name, permanently: PEP 523 frame evaluation needs CPython internals that cannot coexist with the limited API in one extension, and abi3 is what makes one binary per platform serve 3.13 and later. `torch.export` is the direction instead, and it is not implemented ([`docs/COMPILE.md`](docs/COMPILE.md)). |
+
+> This table records what has been **measured**, not what is planned. Where it disagrees with a
+> `docs/` file, the file is the measurement and this is the summary. It said `torch.distributed`
+> was coming "from `world_size = 1` upward", NPU "needs a capture layer" and Metal was "disabled
+> here" for some days after all three had landed — a roadmap is a progress record, and a stale
+> progress record misleads in the one direction a reader cannot check.
 
 ---
 
@@ -511,8 +540,11 @@ kind of claim nobody re-reads.
 
 Linux and Windows were in that position and are not any more: CI installs the published wheel on
 `ubuntu-latest` and `windows-latest` and both compute, matching macOS arm64 character for character
-on a real SmolLM2 generation. What follows is the artefact-level check that used to be all there
-was, and it still runs — it catches a broken wheel before anything is uploaded. Every
+on a real SmolLM2 generation. **The green runs installed the version the workflow defaults to**,
+which is what `tools/ci/verify_published.py` was written against; checks added for a later release
+skip themselves by name on an older wheel rather than failing the platform.
+
+What follows is the artefact-level check that used to be all there was, and it still runs — it catches a broken wheel before anything is uploaded. Every
 import in the Linux wheel resolves, and every import in the Windows one is attributed to a
 naming DLL, which is the stronger of the two checks because PE records a DLL per import where ELF
 records only versioned ones ([`docs/LINUX.md`](docs/LINUX.md),

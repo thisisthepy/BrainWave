@@ -1,0 +1,196 @@
+"""Is the release consistent with itself, and does it claim only what shipped?
+
+A release is four files that have to agree and are edited by four different
+hands: `pyproject.toml` carries the version, `README.md` says what is on PyPI,
+`.github/workflows/verify-published-wheel.yml` decides which published wheel CI
+installs, and `tools/ci/verify_published.py` decides what is asked of it. Every
+one of those has been wrong at least once in this repository, and none of the
+mistakes was visible from inside any single file:
+
+  * CI's default stayed at `0.0.9a0` through three releases, so the green runs
+    that the README cites as "Linux and Windows compute" were computing an
+    older wheel than the one the README's table says is published.
+  * A count marker was written `eq` where a later round could legitimately
+    raise the number, which turns a correct improvement into a red suite. That
+    has now happened three times, most recently in `docs/MPS.md`.
+
+None of this checks whether the release *works* -- the rest of the suite does
+that. It checks that the four files tell one story, and that the story is not
+ahead of PyPI.
+"""
+
+import pathlib
+import re
+
+REPO = pathlib.Path(__file__).resolve().parents[3]
+PYPROJECT = REPO / "pyproject.toml"
+README = REPO / "README.md"
+WORKFLOW = REPO / ".github/workflows/verify-published-wheel.yml"
+VERIFY = REPO / "tools/ci/verify_published.py"
+
+
+def _version_tuple(s):
+    """(0, 0, 13, 0) from '0.0.13a0'. Enough to order this project's own
+    versions, which are all `X.Y.ZaN`; deliberately not a PEP 440 parser,
+    because a dependency on `packaging` here would make the suite refuse on a
+    host that has none."""
+    m = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)a(\d+)", s)
+    assert m, f"not an X.Y.ZaN version: {s!r}"
+    return tuple(int(g) for g in m.groups())
+
+
+def _project_version():
+    for line in PYPROJECT.read_text().splitlines():
+        if line.startswith("version = "):
+            return line.split('"')[1]
+    raise AssertionError("no `version = ` line in pyproject.toml")
+
+
+def test_the_version_is_a_prerelease_and_parses():
+    v = _project_version()
+    _version_tuple(v)
+    assert "a" in v, (
+        f"{v} is not an alpha version. Every release of this project so far "
+        f"has been a pre-release, and the README tells users to pass --pre."
+    )
+
+
+def test_pyproject_is_the_only_place_a_version_is_declared():
+    """`setup.py` exists and deliberately declares no version; `Cargo.toml`
+    holds `0.0.0` because the crate is not what is published. If either grows
+    a version they will disagree with pyproject the first time one is bumped."""
+    setup = (REPO / "setup.py").read_text()
+    assert not re.search(r"^\s*version\s*=", setup, re.M), (
+        "setup.py declares a version now. pyproject.toml is the authority; two "
+        "declarations means one of them goes stale at the next release."
+    )
+    cargo = (REPO / "rust/torch_c/Cargo.toml").read_text()
+    assert re.search(r'^version = "0\.0\.0"', cargo, re.M), (
+        "rust/torch_c/Cargo.toml no longer carries the placeholder 0.0.0 -- if "
+        "the crate version is now meaningful it has to be kept in step here."
+    )
+
+
+def test_the_readme_does_not_claim_an_unpublished_version_is_on_pypi():
+    """The README's platform table has a row naming the version on PyPI. It may
+    lag the version being prepared -- that is the normal state between the bump
+    and the upload -- but it may never lead it, which would be a claim about a
+    wheel nobody can install."""
+    claimed = re.findall(r"\*\*on PyPI `([^`]+)`\*\*", README.read_text())
+    assert claimed, "the README no longer names the version that is on PyPI"
+    project = _version_tuple(_project_version())
+    for c in claimed:
+        assert _version_tuple(c) <= project, (
+            f"README says {c} is on PyPI, but the version being built is "
+            f"{_project_version()}. The README is ahead of the release."
+        )
+
+
+def test_ci_never_points_at_a_version_that_is_not_published_yet():
+    """`verify-published-wheel.yml` installs *from PyPI*. Defaulting it to the
+    version in pyproject.toml before the upload makes every push a red run that
+    says nothing about any platform -- and a red CI that is expected to be red
+    is a check nobody reads."""
+    text = WORKFLOW.read_text()
+    defaults = set(re.findall(r"inputs\.version \|\| '([^']+)'", text))
+    defaults |= set(re.findall(r'^\s*default: "([^"]+)"', text, re.M))
+    assert defaults, "the workflow no longer has a default version"
+    project = _version_tuple(_project_version())
+    for d in defaults:
+        assert _version_tuple(d) <= project, (
+            f"CI defaults to {d}, which is newer than the {_project_version()} "
+            f"being prepared here."
+        )
+    assert len(defaults) == 1, (
+        f"the workflow names more than one default version {sorted(defaults)} -- "
+        f"the download step and the install step would test different wheels"
+    )
+
+
+def test_every_check_section_is_actually_called():
+    """A section added to `verify_published.py` and never wired into `main()`
+    is invisible: the file still exits 0 and the platform still reports ALL
+    PASS, having asked nothing."""
+    text = VERIFY.read_text()
+    sections = set(re.findall(r"^def (\w+)\(torch\):", text, re.M))
+    body = text[text.index("def main():"):]
+    called = set(re.findall(r"^\s+(\w+)\(torch\)", body, re.M))
+    missing = sections - called
+    assert not missing, f"defined in verify_published.py but never called: {sorted(missing)}"
+
+
+def test_the_newer_checks_can_skip_on_an_older_published_wheel():
+    """This script runs against **published** wheels, so a check written for
+    the release being prepared will outrun PyPI until the upload. Reporting
+    that as a platform failure would be a lie about the platform, so each new
+    section skips by name and says so."""
+    text = VERIFY.read_text()
+    assert text.count("Not a platform result.") >= 3, (
+        "fewer skip-by-name paths than sections that need one"
+    )
+    assert "def training(torch):" in text, (
+        "the loss.backward() check is gone -- it is the headline of 0.0.13a0"
+    )
+    assert "_predates(" in text, "the version-based skip helper is gone"
+
+
+def test_count_markers_use_ge_wherever_another_round_could_raise_them():
+    """`eq` on a number that a later correct round can raise turns growth into
+    a red suite. Three separate rounds in this repository have made that
+    mistake. The one legitimate `eq` is `golden_pending`: it is zero, and a
+    change in either direction is news rather than progress."""
+    offenders = []
+    for path in sorted(REPO.glob("docs/*.md")) + [README]:
+        for i, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+            for m in re.finditer(r"DOCWATCH: count (\w+) (\w+) (\d+)", line):
+                name, op, _ = m.groups()
+                if op == "eq" and name != "golden_pending":
+                    offenders.append(f"{path.relative_to(REPO)}:{i} count {name} eq")
+    assert not offenders, (
+        "count markers pinned with `eq` on a number that can legitimately "
+        f"rise: {offenders}"
+    )
+
+
+def test_the_release_notes_exist_and_split_the_work_four_ways():
+    """CLAUDE.md 5.3: a release note that reports one number has merged
+    implementation, defect fixes, measurement and documentation into a single
+    figure that looks like progress. The four headings are the whole point."""
+    notes = REPO / f"docs/RELEASE_{_project_version().replace('.', '_')}.md"
+    assert notes.exists(), f"no release notes at {notes.relative_to(REPO)}"
+    text = notes.read_text()
+    for heading in ("Features added", "Defects fixed", "Measured but not implemented", "Documentation corrected"):
+        assert heading in text, f"release notes have no `{heading}` section"
+
+
+def test_the_release_notes_state_the_gaps_and_not_only_the_additions():
+    """An alpha note that lists what landed and omits that 82 architectures do
+    not forward, and that `torch.compile` is recommended for permanent refusal,
+    is selling something."""
+    text = (REPO / f"docs/RELEASE_{_project_version().replace('.', '_')}.md").read_text()
+    assert "82" in text and "297" in text, (
+        "the notes do not carry the architecture coverage denominator"
+    )
+    assert "torch.compile" in text, "the notes do not mention the torch.compile gap"
+    assert "ARCH100" in text and "COMPILE" in text, (
+        "the notes do not point at the documents that measured the gaps"
+    )
+
+
+def _main():
+    failures = 0
+    for name, fn in sorted(globals().items()):
+        if not name.startswith("test_"):
+            continue
+        try:
+            fn()
+        except Exception as e:  # noqa: BLE001
+            failures += 1
+            print(f"FAIL {name}: {type(e).__name__}: {e}")
+        else:
+            print(f"ok   {name}")
+    return 1 if failures else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(_main())

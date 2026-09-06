@@ -38,4 +38,10 @@ Everything else remains refused by name:
 - Collectives like `broadcast`, `allgather`, `reduce`, `gather`, and point-to-point ops (`send`, `recv`) refuse if `world_size != 1`.
 - Any `world_size` other than 1 and 2 refuses.
 
+> **Superseded on the last point.** `docs/FEDERATED4.md` extended the transport
+> to `world_size >= 1` — a star of loopback sockets with the hub at rank 0 — so
+> a world larger than two no longer refuses. Everything else in this list still
+> holds: `allreduce(op=SUM)` remains the only collective. Left in place rather
+> than rewritten, because this document is the record of what two ranks cost.
+
 This enforces the policy: a collective must be honest end-to-end, or it refuses by name. A test at `world_size = 2` ensures we are no longer running an identity function disguised as a distributed operation.
