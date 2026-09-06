@@ -15888,6 +15888,25 @@ def _tape_case_bodies():
     cases["aten._safe_softmax.default"] = shape_case(
         [2, 3, 4], lambda x: s(d("aten._safe_softmax.default", x, 1)))
 
+    # -- convolution and pooling (docs/TRAIN2.md) ---------------------------
+    # `stride=2, padding=1, groups=2` in one case, deliberately: a rule is
+    # right for `stride=1, padding=0, groups=1` even with its input gradient's
+    # crop and its weight gradient's stride/dilation the wrong way round. This
+    # oracle sees the **input** gradient only -- one input per case is what it
+    # is built on -- so the weight and bias gradients are compared against
+    # upstream in `pytests/test_train.py` instead, which is a different oracle
+    # and not this one relaxed.
+    conv_w = _tape_f64(_tape_ramp(4 * 1 * 3 * 3, -0.9, 1.1), [4, 1, 3, 3])
+    conv_b = _tape_f64(_tape_ramp(4, -0.5, 0.5), [4])
+    cases["aten.convolution.default"] = shape_case(
+        [1, 2, 5, 5],
+        lambda x: s(d("aten.convolution.default", x, conv_w, conv_b,
+                      [2], [1], [1], False, [0], 2)))
+    cases["aten.avg_pool2d.default"] = shape_case(
+        [1, 2, 4, 6], lambda x: s(d("aten.avg_pool2d.default", x, [2, 3])))
+    cases["aten.adaptive_avg_pool2d.default"] = shape_case(
+        [1, 2, 4, 6], lambda x: s(d("aten.adaptive_avg_pool2d.default", x, [2, 2])))
+
     # -- the one rule that is "no gradient" --------------------------------
     cases["aten.detach.default"] = shape_case([2, 3], lambda x: s(d("aten.detach.default", x)))
     return cases

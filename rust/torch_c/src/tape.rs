@@ -368,15 +368,18 @@ pub const RULE_OPS: &[&str] = &[
     "aten._softmax.default",
     "aten._to_copy.default",
     "aten._unsafe_view.default",
+    "aten.adaptive_avg_pool2d.default",
     "aten.add.Scalar",
     "aten.add.Tensor",
     "aten.addmm.default",
     "aten.alias.default",
+    "aten.avg_pool2d.default",
     "aten.bmm.default",
     "aten.cat.default",
     "aten.clone.default",
     "aten.constant_pad_nd.default",
     "aten.contiguous.default",
+    "aten.convolution.default",
     "aten.cos.default",
     "aten.detach.default",
     "aten.div.Scalar",
@@ -1064,6 +1067,11 @@ fn derivative<'py>(
         "aten.native_layer_norm.default" => {
             layer_norm_backward(py, node, env, gouts, outs)
         }
+        "aten.convolution.default" => convolution_backward(py, node, env, gouts),
+
+        "aten.avg_pool2d.default" => avg_pool_backward(py, node, env, gouts, false),
+        "aten.adaptive_avg_pool2d.default" => avg_pool_backward(py, node, env, gouts, true),
+
         "aten.native_batch_norm.default" => {
             batch_norm_backward(py, node, env, gouts, outs)
         }
@@ -1360,6 +1368,516 @@ fn cast_like<'py>(py: Python<'py>, g: Obj<'py>, like: &Obj<'py>) -> PyResult<Obj
 /// statistics at the input's rank, batch norm reduces the complement of one
 /// axis and keeps its statistics at rank 1. The reshape to `[1, C, 1, ...]` is
 /// therefore explicit here and absent there.
+/// `aten::convolution`'s three gradients, and every one of them is spelled as
+/// another convolution through the same door the forward used.
+///
+/// **Nothing here is a kernel.** `docs/RELEASE_0_0_13a0.md` §5 lists "there is
+/// still no convolution backward rule" as the reason a vision model does not
+/// train, and the shape of the missing thing is not a new `conv2d`: upstream's
+/// `convolution_backward` is itself three convolutions, and this shim already
+/// has the forward one, its transposed sibling, and `groups`.
+///
+///   * **grad_input** is a *transposed* convolution of the output gradient with
+///     the same weight -- that is the definition of a transposed convolution
+///     (`aten.rs`'s own comment establishes the `(c_in, c_out, k)` layout from
+///     upstream three ways, and it is exactly the layout the weight already
+///     has when read from the output side). Its result can be *shorter* than
+///     the input when `stride > 1` did not divide the input evenly; the missing
+///     tail is padded with **zeros**, which is not a fudge -- those input
+///     positions are read by no output element, so their gradient is zero.
+///     Spending it as `constant_pad_nd` rather than as `output_padding` is what
+///     keeps this correct when the two spatial axes need *different* tails,
+///     which `output_padding` cannot express here (the forward refuses an
+///     asymmetric one).
+///   * **grad_weight** is a forward convolution with the batch and channel axes
+///     swapped on both operands, and with **`stride` and `dilation` exchanged**:
+///     `gw[co,ci,u,v] = sum_{n,y,x} gout[n,co,y,x] * x[n,ci, y*s - p + u*d, ...]`
+///     is a convolution over `u` whose step through `x` is `d` and whose step
+///     through `gout` is `s`. A rule that left them in the forward order is
+///     right for every `stride == dilation == 1` case and wrong otherwise,
+///     which is why the tests below carry `stride=2` and `dilation=2` cases
+///     with different values.
+///   * **grad_bias** is the sum over every axis but the channel one.
+///
+/// **`groups` is decomposed rather than passed.** Both gradients are formed one
+/// group at a time and concatenated, so `groups` never reaches a kernel from
+/// here: the transposed 2-D convolution in `aten.rs` has no `groups` argument
+/// at all (candle's `conv_transpose2d` has no field for one), and the
+/// grad-weight trick's grouping is *not* the forward's grouping -- its channel
+/// axis is the batch. A rule that forwarded `groups` to either call would be
+/// refused by one and silently wrong in the other.
+/// `avg_pool2d` and `adaptive_avg_pool2d`, for the windows that **tile**.
+///
+/// A pooling gradient is a scatter, and for a non-overlapping window it is a
+/// scatter with no arithmetic in it at all: every input position belongs to
+/// exactly one window, so it receives that window's gradient divided by the
+/// window's area. Spelled in shape ops -- `reshape`, `expand`, `reshape` --
+/// which is why this rule adds no kernel and cannot disagree with the forward
+/// about anything but geometry.
+///
+/// **What it refuses, by name, is every window that does not tile**: an
+/// overlapping one (`stride < kernel`), a padded one, `ceil_mode`, a
+/// `divisor_override`, and an input the window does not divide evenly. Those
+/// are a different rule -- an overlapping window makes the scatter an
+/// *accumulation*, which the expansion above cannot express -- and returning
+/// the tiling answer for them would be wrong by a factor that a single
+/// `AvgPool2d(2)` test could never show.
+fn avg_pool_backward<'py>(
+    py: Python<'py>,
+    node: &Node,
+    env: &Env,
+    gouts: &[Option<Obj<'py>>],
+    adaptive: bool,
+) -> PyResult<Rule<'py>> {
+    let op = if adaptive {
+        "aten.adaptive_avg_pool2d.default"
+    } else {
+        "aten.avg_pool2d.default"
+    };
+    let ops = if adaptive {
+        bind(py, node, env, &["self", "output_size"])?
+    } else {
+        bind(
+            py,
+            node,
+            env,
+            &[
+                "self",
+                "kernel_size",
+                "stride",
+                "padding",
+                "ceil_mode",
+                "count_include_pad",
+                "divisor_override",
+            ],
+        )?
+    };
+    let g = gouts
+        .first()
+        .and_then(|slot| slot.clone())
+        .ok_or_else(|| missing(op, "grad"))?;
+    let input = required(op, &ops, 0, "self")?;
+    let xshape = input.shape()?;
+    let rank = xshape.len();
+    if rank != 4 {
+        return Err(crate::err::not_implemented(format!(
+            "torch._C tape: {op}'s gradient is implemented for a rank-4 (batch mode) \
+             input, and this node's is rank-{rank}"
+        )));
+    }
+    let widen = |name: &str, v: Vec<i64>| -> PyResult<Vec<i64>> {
+        match v.len() {
+            1 => Ok(vec![v[0], v[0]]),
+            2 => Ok(v),
+            _ => Err(crate::err::not_implemented(format!(
+                "torch._C tape: {op}'s gradient was given {name}={v:?}"
+            ))),
+        }
+    };
+    // The window, in both spellings. `adaptive_avg_pool2d` names the *output*
+    // and leaves the window implied, so the window is only well defined -- and
+    // only equal to a plain average -- when the output divides the input.
+    let window: Vec<i64> = if adaptive {
+        let out = widen("output_size", i64_list(&ops, 1, "output_size", op)?)?;
+        let mut window = Vec::with_capacity(2);
+        for axis in 0..2 {
+            let extent = xshape[2 + axis] as i64;
+            if out[axis] <= 0 || extent % out[axis] != 0 {
+                return Err(crate::err::not_implemented(format!(
+                    "torch._C tape: adaptive_avg_pool2d's gradient is implemented where \
+                     the output size divides the input, and axis {axis} is {extent} into \
+                     {}: upstream's windows there have different sizes and overlap, which \
+                     this rule cannot express",
+                    out[axis]
+                )));
+            }
+            window.push(extent / out[axis]);
+        }
+        window
+    } else {
+        let kernel = widen("kernel_size", i64_list(&ops, 1, "kernel_size", op)?)?;
+        let stride = match ops.get(2).and_then(|slot| slot.as_ref()) {
+            None => kernel.clone(),
+            Some(operand) if operand.value.is_none() => kernel.clone(),
+            Some(_) => {
+                let raw = i64_list(&ops, 2, "stride", op)?;
+                if raw.is_empty() {
+                    kernel.clone()
+                } else {
+                    widen("stride", raw)?
+                }
+            }
+        };
+        if stride != kernel {
+            return Err(crate::err::not_implemented(format!(
+                "torch._C tape: avg_pool2d's gradient is implemented for a window that \
+                 tiles (stride == kernel_size), and this node's kernel is {kernel:?} with \
+                 stride {stride:?} -- an overlapping window makes the scatter an \
+                 accumulation, which is a different rule and not this one with a \
+                 different constant"
+            )));
+        }
+        let padding = match ops.get(3).and_then(|slot| slot.as_ref()) {
+            None => vec![0, 0],
+            Some(operand) if operand.value.is_none() => vec![0, 0],
+            Some(_) => widen("padding", i64_list(&ops, 3, "padding", op)?)?,
+        };
+        if padding.iter().any(|&p| p != 0) {
+            return Err(crate::err::not_implemented(format!(
+                "torch._C tape: avg_pool2d's gradient is implemented for padding=0, and \
+                 this node's is {padding:?} -- a padded window's divisor depends on \
+                 count_include_pad and differs per cell"
+            )));
+        }
+        if opt_bool(&ops, 4, false)? {
+            return Err(crate::err::not_implemented(
+                "torch._C tape: avg_pool2d's gradient is not implemented for \
+                 ceil_mode=True -- the last window is partial and its divisor is not the \
+                 kernel's area"
+                    .to_string(),
+            ));
+        }
+        if let Some(operand) = ops.get(6).and_then(|slot| slot.as_ref()) {
+            if !operand.value.is_none() {
+                return Err(crate::err::not_implemented(
+                    "torch._C tape: avg_pool2d's gradient is not implemented for a \
+                     divisor_override"
+                        .to_string(),
+                ));
+            }
+        }
+        kernel
+    };
+
+    for axis in 0..2 {
+        let extent = xshape[2 + axis] as i64;
+        if window[axis] <= 0 || extent % window[axis] != 0 {
+            return Err(crate::err::not_implemented(format!(
+                "torch._C tape: {op}'s gradient is implemented where the window tiles the \
+                 input, and axis {axis} is {extent} in windows of {} -- upstream drops the \
+                 partial tail, and a rule that scattered into it would be wrong there \
+                 rather than merely short",
+                window[axis]
+            )));
+        }
+    }
+
+    let (kh, kw) = (window[0] as usize, window[1] as usize);
+    let gshape = dims(&g)?;
+    if gshape.len() != 4 || gshape[2] * kh != xshape[2] || gshape[3] * kw != xshape[3] {
+        return Err(crate::err::not_implemented(format!(
+            "torch._C tape: {op}'s gradient was given a {gshape:?} gradient for a \
+             {xshape:?} input in windows of {window:?}"
+        )));
+    }
+    // Every input in a window gets the same share, and the share is the whole
+    // of the arithmetic: `y = mean(window)` so `dy/dx = 1/area` for each.
+    let share = call(
+        py,
+        "aten.div.Scalar",
+        vec![g, scalar(py, (kh * kw) as f64)?],
+    )?;
+    let split = [gshape[0], gshape[1], gshape[2], 1, gshape[3], 1];
+    let full = [gshape[0], gshape[1], gshape[2], kh, gshape[3], kw];
+    let spread = expand_to(py, reshape(py, share, &split)?, &full)?;
+    let gi = reshape(py, call(py, "aten.contiguous.default", vec![spread])?, &xshape)?;
+
+    let mut grads = vec![None; ops.len().max(1)];
+    grads[0] = Some(gi);
+    Ok((ops, grads))
+}
+
+fn convolution_backward<'py>(
+    py: Python<'py>,
+    node: &Node,
+    env: &Env,
+    gouts: &[Option<Obj<'py>>],
+) -> PyResult<Rule<'py>> {
+    const OP: &str = "aten.convolution.default";
+    let ops = bind(
+        py,
+        node,
+        env,
+        &[
+            "input",
+            "weight",
+            "bias",
+            "stride",
+            "padding",
+            "dilation",
+            "transposed",
+            "output_padding",
+            "groups",
+        ],
+    )?;
+    let g = gouts
+        .first()
+        .and_then(|slot| slot.clone())
+        .ok_or_else(|| missing(OP, "grad"))?;
+    let input = required(OP, &ops, 0, "input")?;
+    let weight = required(OP, &ops, 1, "weight")?;
+    let xshape = input.shape()?;
+    let wshape = weight.shape()?;
+    let gshape = dims(&g)?;
+    let rank = xshape.len();
+    if rank != 3 && rank != 4 {
+        return Err(crate::err::not_implemented(format!(
+            "torch._C tape: convolution's gradient is implemented for 1-D and 2-D \
+             convolution (a rank-3 or rank-4 input), and this node's input is rank-{rank}"
+        )));
+    }
+    let spatial = rank - 2;
+    if wshape.len() != rank || gshape.len() != rank {
+        return Err(crate::err::not_implemented(format!(
+            "torch._C tape: convolution's gradient was given input {xshape:?}, weight \
+             {wshape:?} and grad {gshape:?}, which are not all rank-{rank}"
+        )));
+    }
+
+    let widen = |name: &str, v: Vec<i64>| -> PyResult<Vec<i64>> {
+        match v.len() {
+            1 => Ok(vec![v[0]; spatial]),
+            n if n == spatial => Ok(v),
+            _ => Err(crate::err::not_implemented(format!(
+                "torch._C tape: convolution's gradient was given {name}={v:?} against a \
+                 {spatial}-D convolution"
+            ))),
+        }
+    };
+    let stride = widen("stride", i64_list(&ops, 3, "stride", OP)?)?;
+    let padding = widen("padding", i64_list(&ops, 4, "padding", OP)?)?;
+    let dilation = widen("dilation", i64_list(&ops, 5, "dilation", OP)?)?;
+    let transposed = opt_bool(&ops, 6, false)?;
+    let groups = opt_i64(&ops, 8, 1)?;
+
+    if transposed {
+        // Refused by name rather than guessed. The gradient of a transposed
+        // convolution is a *forward* one and the roles of `padding` and
+        // `output_padding` swap with it; nothing measured here trains one, and
+        // a rule that reused the arms below would be wrong in the one place a
+        // shape check cannot see -- `output_padding` moves which input
+        // positions the sum runs over, not how many results there are.
+        return Err(crate::err::not_implemented(
+            "torch._C tape: no derivative rule for a *transposed* convolution \
+             (aten.convolution.default with transposed=True) -- the forward one is \
+             differentiated, the transposed one is not"
+                .to_string(),
+        ));
+    }
+    // Every asymmetry that reaches here would have been refused by the forward
+    // (`aten.rs` takes one value per argument, candle's kernels being
+    // symmetric) except *padding*, which the forward lowers by pre-padding the
+    // input. That lowering has no counterpart on this side: the grad-weight
+    // convolution's `padding` is the forward's, and there is no input left to
+    // pre-pad. So it is named rather than approximated.
+    for (name, v) in [("stride", &stride), ("padding", &padding), ("dilation", &dilation)] {
+        if v.iter().any(|&x| x != v[0]) {
+            return Err(crate::err::not_implemented(format!(
+                "torch._C tape: convolution's gradient is implemented for a symmetric \
+                 {name}, and this node's is {v:?} -- the forward lowers an asymmetric \
+                 padding by pre-padding its input, and there is no input to pre-pad here"
+            )));
+        }
+    }
+    if groups < 1 {
+        return Err(crate::err::not_implemented(format!(
+            "torch._C tape: convolution's gradient was given groups={groups}"
+        )));
+    }
+    let groups_usize = groups as usize;
+    if xshape[1] % groups_usize != 0 || gshape[1] % groups_usize != 0 {
+        return Err(crate::err::not_implemented(format!(
+            "torch._C tape: convolution's gradient was given groups={groups} against \
+             input channels {} and output channels {}",
+            xshape[1], gshape[1]
+        )));
+    }
+    let cin_per = xshape[1] / groups_usize;
+    let cout_per = gshape[1] / groups_usize;
+    let kernel: Vec<usize> = wshape[2..].to_vec();
+
+    let slice_dim = |py: Python<'py>, t: Obj<'py>, dim: i64, from: i64, to: i64| -> PyResult<Obj<'py>> {
+        call(
+            py,
+            "aten.slice.Tensor",
+            vec![
+                t,
+                dim.into_bound_py_any(py)?,
+                from.into_bound_py_any(py)?,
+                to.into_bound_py_any(py)?,
+                1i64.into_bound_py_any(py)?,
+            ],
+        )
+    };
+    let contiguous = |py: Python<'py>, t: Obj<'py>| -> PyResult<Obj<'py>> {
+        call(py, "aten.contiguous.default", vec![t])
+    };
+    let conv = |py: Python<'py>,
+                x: Obj<'py>,
+                w: Obj<'py>,
+                stride: &[i64],
+                padding: &[i64],
+                dilation: &[i64],
+                transposed: bool|
+     -> PyResult<Obj<'py>> {
+        call(
+            py,
+            "aten.convolution.default",
+            vec![
+                x,
+                w,
+                py.None().into_bound(py),
+                ints(py, stride)?,
+                ints(py, padding)?,
+                ints(py, dilation)?,
+                transposed.into_bound_py_any(py)?,
+                ints(py, &vec![0i64; spatial])?,
+                1i64.into_bound_py_any(py)?,
+            ],
+        )
+    };
+
+    // --- grad_input: a transposed convolution, one group at a time ----------
+    let mut gi_parts: Vec<Obj<'py>> = Vec::with_capacity(groups_usize);
+    for group in 0..groups_usize {
+        let go = slice_dim(
+            py,
+            g.clone(),
+            1,
+            (group * cout_per) as i64,
+            ((group + 1) * cout_per) as i64,
+        )?;
+        let w = slice_dim(
+            py,
+            weight.value.clone(),
+            0,
+            (group * cout_per) as i64,
+            ((group + 1) * cout_per) as i64,
+        )?;
+        // **`padding` is spent here, not passed.** A transposed convolution's
+        // `padding` crops the scatter by `p` on *both* sides, and the far side
+        // of that crop is not always outside the input: with `stride > 1` the
+        // last input position can be read by the last window and still fall
+        // past the cropped result, so it comes back missing rather than zero.
+        // Measured, before it was believed: `groups=2, stride=2, padding=1` on
+        // an `[1,4,8,8]` input disagreed with upstream at **relative 1.0** --
+        // an entire row of the gradient was zero where upstream had values --
+        // while every `padding=0` and every `stride=1` case agreed to 3e-07.
+        // A test suite without a case that has both would have shipped this.
+        //
+        // So the scatter is taken whole (`padding=0`) and the window
+        // `[p, p + extent)` is *sliced* out of it below, which is what
+        // `padding` means on this side. Anything past the end of the scatter is
+        // read by no window at all and is zero for a reason rather than by
+        // truncation.
+        let part = conv(
+            py,
+            contiguous(py, go)?,
+            contiguous(py, w)?,
+            &stride,
+            &vec![0i64; spatial],
+            &dilation,
+            true,
+        )?;
+        gi_parts.push(part);
+    }
+    let gi = if gi_parts.len() == 1 {
+        gi_parts.remove(0)
+    } else {
+        let list = PyList::new(py, gi_parts)?.into_any();
+        call(py, "aten.cat.default", vec![list, 1i64.into_bound_py_any(py)?])?
+    };
+    // The crop `padding` stands for, and then the tail no window reaches.
+    let mut gi = gi;
+    for axis in 0..spatial {
+        let have = dims(&gi)?[2 + axis] as i64;
+        let want = xshape[2 + axis] as i64;
+        let from = padding[axis];
+        let to = (from + want).min(have);
+        if to <= from {
+            return Err(crate::err::not_implemented(format!(
+                "torch._C tape: convolution's gradient scattered {have} positions on axis                  {axis}, and the input's own window starts at {from}"
+            )));
+        }
+        if from != 0 || to != have {
+            gi = slice_dim(py, gi, (2 + axis) as i64, from, to)?;
+        }
+        let short = want - (to - from);
+        if short > 0 {
+            // Zero, and not a truncation: these are input positions past the
+            // last window's reach, so no output element reads them.
+            let mut pad = vec![0i64; 2 * spatial];
+            pad[2 * (spatial - 1 - axis) + 1] = short;
+            gi = call(
+                py,
+                "aten.constant_pad_nd.default",
+                vec![gi, ints(py, &pad)?, scalar(py, 0.0)?],
+            )?;
+        }
+    }
+
+    // --- grad_weight: the forward convolution with batch and channel swapped -
+    let mut gw_parts: Vec<Obj<'py>> = Vec::with_capacity(groups_usize);
+    for group in 0..groups_usize {
+        let xg = slice_dim(
+            py,
+            input.value.clone(),
+            1,
+            (group * cin_per) as i64,
+            ((group + 1) * cin_per) as i64,
+        )?;
+        let go = slice_dim(
+            py,
+            g.clone(),
+            1,
+            (group * cout_per) as i64,
+            ((group + 1) * cout_per) as i64,
+        )?;
+        let a = contiguous(py, transpose(py, xg, 0, 1)?)?;
+        let b = contiguous(py, transpose(py, go, 0, 1)?)?;
+        // `stride` and `dilation` exchanged, deliberately -- see the doc
+        // comment. `padding` is the forward's.
+        let mut part = conv(py, a, b, &dilation, &padding, &stride, false)?;
+        // The result is at least the kernel and can be longer, when a stride
+        // left a partial window at the end of the input.
+        for axis in 0..spatial {
+            let extent = dims(&part)?[2 + axis];
+            if extent < kernel[axis] {
+                return Err(crate::err::not_implemented(format!(
+                    "torch._C tape: convolution's weight gradient came out {extent} long \
+                     on axis {axis} against a kernel of {}",
+                    kernel[axis]
+                )));
+            }
+            if extent > kernel[axis] {
+                part = slice_dim(py, part, (2 + axis) as i64, 0, kernel[axis] as i64)?;
+            }
+        }
+        gw_parts.push(contiguous(py, transpose(py, part, 0, 1)?)?);
+    }
+    let gw = if gw_parts.len() == 1 {
+        gw_parts.remove(0)
+    } else {
+        let list = PyList::new(py, gw_parts)?.into_any();
+        call(py, "aten.cat.default", vec![list, 0i64.into_bound_py_any(py)?])?
+    };
+
+    // --- grad_bias ----------------------------------------------------------
+    let bias = ops
+        .get(2)
+        .and_then(|slot| slot.as_ref())
+        .filter(|operand| !operand.value.is_none());
+    let gb = match bias {
+        None => None,
+        Some(_) => {
+            let axes: Vec<i64> = (0..rank as i64).filter(|d| *d != 1).collect();
+            Some(sum_dims(py, g.clone(), &axes, false)?)
+        }
+    };
+
+    Ok((ops, vec![Some(gi), Some(gw), gb, None, None, None, None, None, None]))
+}
+
 fn batch_norm_backward<'py>(
     py: Python<'py>,
     node: &Node,
