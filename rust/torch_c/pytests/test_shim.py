@@ -9316,7 +9316,34 @@ def test_core_ops_and_op_tags_agree():
     # are is upstream's table again and not derivable. Each of the five was
     # read off its own `.tags`; inferring from the round would have written
     # 130.
-    assert r["tag_core_count"] == 130, r["tag_core_count"]
+    #
+    # 130 -> 131 with docs/TAIL4.md's eight new keys, and **the delta is one,
+    # not eight**, for the third time and the same reason. Each was read off
+    # its own `.tags`:
+    #
+    #     round.default        ['core', 'pointwise', 'pt2_compliant_tag'] <- counted
+    #     round.decimals       ['pointwise', 'pt2_compliant_tag']
+    #     round_.default       ['inplace', 'pointwise', 'pt2_compliant_tag']
+    #     round_.decimals      ['inplace', 'pointwise', 'pt2_compliant_tag']
+    #     index_copy.default   ['pt2_compliant_tag']
+    #     index_copy_.default  ['inplace', 'pt2_compliant_tag']
+    #     logsumexp.default    ['pt2_compliant_tag', 'reduction']
+    #     t_.default           ['inplace', 'inplace_view', 'pt2_compliant_tag']
+    #
+    # `round.default` being core while `round.decimals` -- the same op with one
+    # more argument, implemented here by the *same function* -- is not, is
+    # upstream's table again, exactly as `_fft_c2c` beside `_fft_r2c` was.
+    # Inferring from the round would have written 138.
+    #
+    # `logsumexp.default` is the other one worth naming: it is the round's only
+    # reduction and reductions are heavily represented among core ops
+    # (`amax`, `sum.dim_IntList`, `mean.dim` all are), so "it is a reduction,
+    # it must be core" is exactly the inference this comment exists to stop.
+    # 132 with `logical_not.default`, added to the same round after the fact
+    # (three nemotron ASR encoders and `cpmant` all stop one line behind it).
+    # It IS core -- read off its own `.tags`, like the eight above -- and it is
+    # the round's ninth key and second core one.
+    assert r["tag_core_count"] == 132, r["tag_core_count"]
 
 
 def test_decompose_lowers_the_op_capture_md_named():
@@ -10412,6 +10439,16 @@ _EXPECTED_MUTABLE = (
     # restatement of "what changed".
     "aten.floor_.default",
     "aten.index_add_.default",
+    # docs/TAIL4.md: `index_copy_.default`, `round_.default`,
+    # `round_.decimals` and `t_.default` are that round's four mutating
+    # additions. **Four, not eight**, and which four is the check: the round
+    # also landed `index_copy.default`, `round.default`, `round.decimals` and
+    # `logsumexp.default`, every one of which is out-of-place and must NOT
+    # appear here. `t_` is the one worth naming -- it is the only in-place op
+    # in this shim that writes no bytes at all (it swaps the receiver's layout
+    # through `replace_with`), so a list derived from "does the kernel call
+    # write_back" rather than from the parsed schema would have missed it.
+    "aten.index_copy_.default",
     "aten.index_put_.default",
     "aten.log2_.default",
     "aten.log_.default",
@@ -10422,6 +10459,8 @@ _EXPECTED_MUTABLE = (
     "aten.normal_.default",
     "aten.reciprocal_.default",
     "aten.relu_.default",
+    "aten.round_.decimals",
+    "aten.round_.default",
     "aten.rsqrt_.default",
     # docs/SCATTER.md: `scatter_.src` and `scatter_.value` are this round's
     # two mutating additions, both `Tensor(a!) self`. Two, not six: the round
@@ -10438,6 +10477,7 @@ _EXPECTED_MUTABLE = (
     "aten.sqrt_.default",
     "aten.sub_.Scalar",
     "aten.sub_.Tensor",
+    "aten.t_.default",
     "aten.tanh_.default",
     "aten.uniform_.default",
     "aten.zero_.default",
@@ -10943,7 +10983,12 @@ def test_schema_text_survives_the_round_trip_through_the_transcribed_tables():
     # invent a `torch.upsample_linear1d` upstream lacks -- the six pad kernels'
     # reasoning above), and `torch.conv1d` was already spelled, as a
     # bootstrap.py composite over `aten::convolution`, since docs/ARCH20.md.
-    assert len(keys) == 353, len(keys)
+    # 362 on the merged tree. Four rounds added table rows in parallel --
+    # docs/BIND3.md, docs/RNN.md, docs/VMAP.md and docs/TAIL4.md -- and each
+    # branch's figure was right against its own base and wrong once merged.
+    # Measured where the branches meet, which is the only place the total
+    # exists.
+    assert len(keys) == 362, len(keys)
     from_tables = sorted(
         k for k in keys
         if report["table"][f"{k[0]}|{k[1]}"]["from"] == "tables"

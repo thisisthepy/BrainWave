@@ -330,6 +330,16 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.kaiser_window.default",
     "aten.kaiser_window.periodic",
     "aten.kaiser_window.beta",
+    // docs/TAIL4.md
+    "aten.index_copy_.default",
+    "aten.index_copy.default",
+    "aten.round.default",
+    "aten.round.decimals",
+    "aten.round_.default",
+    "aten.round_.decimals",
+    "aten.logsumexp.default",
+    "aten.t_.default",
+    "aten.logical_not.default",
 ];
 
 /// Ops with a real kernel that `_aten_implemented()` does **not** advertise.
@@ -2551,6 +2561,23 @@ fn aten_dispatch_inner(
              rather than a rectangular (seq, batch, feature) tensor. \
              `aten.lstm.input` is implemented.",
         )),
+        // -- docs/TAIL4.md: index_copy_, index_copy, round (four keys),
+        // logsumexp, t_ ------------------------------------------------
+        "aten.index_copy_.default" => {
+            index_copy_common(py, args, kwargs, "aten.index_copy_.default", true)
+        }
+        "aten.index_copy.default" => {
+            index_copy_common(py, args, kwargs, "aten.index_copy.default", false)
+        }
+        "aten.round.default" => round_common(py, args, kwargs, "aten.round.default", false, false),
+        "aten.round.decimals" => round_common(py, args, kwargs, "aten.round.decimals", true, false),
+        "aten.round_.default" => round_common(py, args, kwargs, "aten.round_.default", false, true),
+        "aten.round_.decimals" => {
+            round_common(py, args, kwargs, "aten.round_.decimals", true, true)
+        }
+        "aten.logsumexp.default" => logsumexp_default(py, args, kwargs),
+        "aten.t_.default" => t_inplace(py, args, kwargs),
+        "aten.logical_not.default" => logical_not_default(py, args, kwargs),
 
         other => Err(aten_not_implemented(other)),
     }
@@ -6369,10 +6396,39 @@ fn embedding_default(
     let mut shape = indices.tensor()?.dims().to_vec();
     shape.push(weight.tensor()?.dims()[1]);
 
+    // **`cpmant`'s wall, and it is an index dtype rather than a missing
+    // kernel.** `modeling_cpmant.py:602` casts its `input_ids` to `int32`
+    // before the embedding lookup, and candle's `index_select` accepts only
+    // `u8`/`u32`/`i64` -- so this refused with `candle: unsupported dtype F32
+    // for op index-select`, a message naming the *weight's* dtype and no part
+    // of the actual problem, which is why docs/ARCH200.md classified it as a
+    // backend limitation. Upstream takes `Int` and `Long` alike
+    // (`torch.embedding(w, idx.int())` is measured to answer the same values
+    // as `torch.embedding(w, idx.long())`), and refuses anything else by name.
+    match indices.tag() {
+        TorchDType::Int64 | TorchDType::Int32 => {}
+        other => {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "Expected tensor for argument #1 'indices' to have one of the following \
+                 scalar types: Long, Int; but got {} instead (while checking arguments \
+                 for embedding)",
+                legacy_tensor_type_name(other)
+            )))
+        }
+    }
     let flat = indices
         .tensor()?
         .flatten_all()
         .and_then(|t| t.contiguous())
+        // `i32` is not one of candle's index dtypes; widening is free of any
+        // question, since every `i32` is an `i64`.
+        .and_then(|t| {
+            if t.dtype() == candle_core::DType::I64 {
+                Ok(t)
+            } else {
+                t.to_dtype(candle_core::DType::I64)
+            }
+        })
         .map_err(|e| candle_err(OP, e))?;
     let tensor = weight
         .tensor()?
@@ -27397,4 +27453,911 @@ fn lstm_input(
         crate::tensor::promote(py, finish(py, c_out, tag)?)?,
     ];
     Ok(PyTuple::new(py, triple)?.into_any().unbind())
+}
+
+// docs/TAIL4.md -- `index_copy_`, `round`, `logsumexp`, `t_`
+//
+// Four kernels and one argument-form fix, kept in one block because a second
+// agent was adding ops to this file at the same time and scattered additions
+// are what makes a merge expensive.
+//
+// **None of them reads a tensor back to the host.** That is a constraint this
+// round worked under rather than a coincidence: `device.rs` -- where
+// `MPS_HOST_READBACK_OPS` lives and where `read_flat` obliges an op to be
+// declared -- was not this round's file, and
+// `test_the_mps_readback_list_is_what_the_kernels_actually_do` re-derives that
+// list from these bodies. `index_copy_` is the one where it changed the design:
+// its sibling `index_add_` walks the index on the host, and this one delegates
+// to candle's `scatter` instead. See `index_copy_common` for what that costs.
+// ===========================================================================
+
+/// The `InvalidIndex` under candle's `WithBacktrace`/`WithPath` wrappers.
+///
+/// `Error::bt()` boxes the real variant whenever backtraces are enabled, so a
+/// direct `match` on the returned error sees `WithBacktrace` and never the
+/// thing it is looking for -- and the difference is invisible in a build where
+/// `RUST_BACKTRACE` is unset, which is the shape of bug that ships.
+fn invalid_index_of(error: &candle_core::Error) -> Option<(usize, usize)> {
+    match error {
+        candle_core::Error::InvalidIndex { index, size, .. } => Some((*index, *size)),
+        candle_core::Error::WithBacktrace { inner, .. } => invalid_index_of(inner),
+        candle_core::Error::WithPath { inner, .. } => invalid_index_of(inner),
+        _ => None,
+    }
+}
+
+/// `aten::index_copy_(Tensor(a!) self, int dim, Tensor index, Tensor source)`
+/// and `aten::index_copy(Tensor self, int dim, Tensor index, Tensor source)`
+///
+/// `aria`/`aria_text`'s wall: `modeling_aria.py:356`
+/// `unpermuted_tokens.index_copy_(0, sorted_indices, expert_output)`, the
+/// un-permute at the end of the MoE dispatch.
+///
+/// # It is next to `index_add_` and it agrees with it about almost nothing
+///
+/// The two ops differ by one word in their names and this shim's first draft
+/// of `scatter_reduce` was wrong for exactly this reason (docs/TAIL3.md §3), so
+/// every rule below was measured on `index_copy_` itself rather than inherited
+/// from the kernel three thousand lines above. Four of them differ:
+///
+/// ```text
+///                       index_add_                     index_copy_
+/// index dtype     int32 OR int64                 int64 ONLY -- an int32 index
+///                                                raises "Expected a long
+///                                                tensor for index, but got Int"
+/// index rank      <= 1                           <= 1 (same)
+/// negative index  refused, message carries       refused, message carries BOTH:
+///                 neither index nor extent       "index -1 is out of bounds for
+///                 ("index out of range in self") dimension 0 with size 3"
+/// duplicates      accumulate                     LAST WRITE WINS
+/// alpha           keyword-only, exists           no alpha at all
+/// ```
+///
+/// The `int32` row is the one that would have shipped: `index_add_` accepts an
+/// `int32` index and has a golden case pinning that it does, so copying its
+/// dtype gate would have made `index_copy_` accept an index upstream refuses --
+/// a widening, invisible to every test that passes a `torch.long` index, which
+/// is every test anybody writes.
+///
+/// # The shape checks are upstream's five, in upstream's order
+///
+/// Transcribed from `at::native::index_copy_` rather than reconstructed, since
+/// the order decides which of five messages a caller sees:
+///
+/// ```text
+/// 1  dim range        IndexError, and with NO op prefix on the message
+/// 2  index.dim() < 2  "Index should have dimension 1 or 0 (got 2)"
+/// 3  index is Long    "Expected a long tensor for index, but got Float"
+/// 4  self/source dtype "self and source expected to have the same dtype"
+/// 5  scalar source    "When source is scalar, index should have one element"
+///    else rank match   "...their dimensionality must match..."
+/// 6  numIndices       "Number of indices (2) should be equal to
+///                      source.size(dim) (1)"
+/// 7  slice shapes     "Destination slice shape: 2 3 at dimension 0 and source
+///                      slice shape: 5 7 at dimension 0."
+/// ```
+///
+/// Step 5's second arm fires only when **neither** operand is a scalar, which
+/// is why `zeros(3).index_copy_(0, [1], tensor(5.))` is legal and
+/// `zeros(2,3).index_copy_(0, [1], tensor(5.))` is not -- the latter falls
+/// through to step 7 and reports an *empty* source slice shape, which is what
+/// the trailing "and source slice shape:  at dimension 0." with two spaces in
+/// it is. Both measured.
+///
+/// Upstream has a sixth check between 5 and 6 (`dim == 0 || dim <
+/// source.dim()`, "Indexing dim ... is out of bounds") and it is **not
+/// reproduced here because it is unreachable**: `dim < self.dim()` holds after
+/// step 1, and step 5 has already refused every case where `self.dim()` and
+/// `source.dim()` differ and neither is zero.
+///
+/// # candle's `scatter` is the kernel, and that is what keeps this off mps
+///
+/// `index_add_` reads the index to the host with `read_flat` and walks the
+/// source itself. Doing that here would put `index_copy_.default` and
+/// `index_copy.default` on the derived host-readback set and therefore oblige
+/// an edit to `device.rs`, which was not this round's file. `Tensor::scatter`
+/// does the same job on the device: broadcast the 1-D index across the
+/// source's shape along `dim`, and `scatter` writes source elements to the
+/// index's positions, in index order -- so **last write wins**, which is
+/// upstream's answer for a repeated index (`[1., 2., 3.]` into position 0
+/// leaves `3.`, measured on both sides).
+///
+/// Two consequences of borrowing candle's bounds check rather than writing
+/// one, both recorded rather than hidden:
+///
+///   * The out-of-range index arrives as `Error::InvalidIndex { index: usize }`
+///     with a *negative* index already reinterpreted as a huge `usize`, so it
+///     is cast back through `as i64` to print `-1` the way upstream does.
+///   * candle's scatter silently **skips** an index equal to `i64::MAX`
+///     (its sentinel for "no write"), where upstream raises. A caller would
+///     have to pass `9223372036854775807` as an index to reach it. It is a
+///     divergence and `test_tail4.py` pins that it is the only one.
+fn index_copy_common(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+    op: &str,
+    in_place: bool,
+) -> PyResult<Py<PyAny>> {
+    #[allow(non_snake_case)]
+    let OP: &str = op;
+    let receiver = tensor_receiver(OP, args, kwargs)?;
+    let dim_raw = dim_arg(args, kwargs, 1, "dim")?.ok_or_else(|| missing(OP, "dim"))?;
+    let index = tensor_arg(OP, args, kwargs, 2, "index")?;
+    let source = tensor_arg(OP, args, kwargs, 3, "source")?;
+
+    let (tag, dims, device) = {
+        let borrowed = receiver.borrow();
+        (
+            borrowed.tag(),
+            borrowed.tensor()?.dims().to_vec(),
+            borrowed.tensor()?.device().clone(),
+        )
+    };
+    let _ = &device;
+    let rank = dims.len();
+
+    // 1. The dimension, with upstream's own message -- which carries no op
+    //    prefix, unlike `normalise_dim`'s.
+    let limit = rank.max(1) as isize;
+    if dim_raw < -limit || dim_raw >= limit {
+        return Err(pyo3::exceptions::PyIndexError::new_err(format!(
+            "Dimension out of range (expected to be in range of [{}, {}], but got {dim_raw})",
+            -limit,
+            limit - 1
+        )));
+    }
+    let dim = if dim_raw < 0 { (dim_raw + limit) as usize } else { dim_raw as usize };
+
+    // 2. The index's rank.
+    let index_dims = index.tensor()?.dims().to_vec();
+    if index_dims.len() > 1 {
+        return Err(pyo3::exceptions::PyIndexError::new_err(format!(
+            "index_copy_(): Index should have dimension 1 or 0 (got {})",
+            index_dims.len()
+        )));
+    }
+    // 3. `int64` only. `index_add_` accepts `int32` here and this one does not.
+    if index.tag() != TorchDType::Int64 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "index_copy_(): Expected a long tensor for index, but got {}",
+            scalar_type_name(index.tag())
+        )));
+    }
+    // 4. No promotion between self and source.
+    if source.tag() != tag {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "index_copy_(): self and source expected to have the same dtype, but got \
+             (self) {} and (source) {}",
+            scalar_type_name(tag),
+            scalar_type_name(source.tag())
+        )));
+    }
+
+    let source_dims = source.tensor()?.dims().to_vec();
+    let source_rank = source_dims.len();
+    let count = index.tensor()?.elem_count();
+
+    // 5. Scalars, then rank.
+    if source_rank == 0 {
+        if count != 1 {
+            return Err(pyo3::exceptions::PyIndexError::new_err(format!(
+                "index_copy_(): When source is scalar, index should have one element (got {count})"
+            )));
+        }
+    } else if source_rank != rank && rank != 0 {
+        return Err(pyo3::exceptions::PyIndexError::new_err(format!(
+            "index_copy_(): When source and destination are not scalars, their \
+             dimensionality must match. Source dimensionality ({source_rank}), \
+             destination dimensionality ({rank})"
+        )));
+    }
+
+    // 6. One index per slice of the source along `dim`.
+    let expected = if source_rank == 0 { 1 } else { source_dims[dim.min(source_rank - 1)] };
+    if count != expected {
+        return Err(pyo3::exceptions::PyIndexError::new_err(format!(
+            "index_copy_(): Number of indices ({count}) should be equal to \
+             source.size(dim) ({expected})"
+        )));
+    }
+
+    // 7. The slices either side of `dim` have to agree, and the message prints
+    //    them space-separated with the *destination's* dim and a literal 0 for
+    //    the source (upstream's own asymmetry, transcribed).
+    let strip = |shape: &[usize], at: usize| -> Vec<usize> {
+        if shape.is_empty() {
+            Vec::new()
+        } else {
+            let mut out = shape.to_vec();
+            out.remove(at.min(out.len() - 1));
+            out
+        }
+    };
+    let self_slice = strip(&dims, dim);
+    let source_slice = strip(&source_dims, dim);
+    if self_slice != source_slice {
+        let render = |shape: &[usize]| {
+            shape.iter().map(|d| d.to_string()).collect::<Vec<_>>().join(" ")
+        };
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "index_copy_(): Source/destination tensor must have same slice shapes. \
+             Destination slice shape: {} at dimension {dim} and source slice shape: {} \
+             at dimension 0.",
+            render(&self_slice),
+            render(&source_slice)
+        )));
+    }
+
+    // The write itself. A 0-d receiver or a 0-d source is reshaped to rank 1
+    // so that candle has an axis to scatter along; the answer is reshaped back
+    // to the receiver's own dims at the end, so `write_back`'s shape contract
+    // still sees exactly the receiver's shape.
+    let self_dims: Vec<usize> = if rank == 0 { vec![1] } else { dims.clone() };
+    let source_view_dims: Vec<usize> = if source_rank == 0 { vec![1] } else { source_dims.clone() };
+    let scattered = {
+        let borrowed = receiver.borrow();
+        let base = borrowed
+            .tensor()?
+            .reshape(self_dims.clone())
+            .map_err(|e| candle_err(OP, e))?;
+        let src = source
+            .tensor()?
+            .reshape(source_view_dims.clone())
+            .and_then(|t| t.contiguous())
+            .map_err(|e| candle_err(OP, e))?;
+        // The index, broadcast across the source's shape so that every element
+        // of the source carries the index of the slice it belongs to.
+        let mut broadcast_shape = vec![1usize; source_view_dims.len()];
+        broadcast_shape[dim] = count;
+        let ids = index
+            .tensor()?
+            .reshape(count)
+            .and_then(|t| t.reshape(broadcast_shape))
+            .and_then(|t| t.broadcast_as(source_view_dims.clone()))
+            .and_then(|t| t.contiguous())
+            .map_err(|e| candle_err(OP, e))?;
+        base.scatter(&ids, &src, dim).map_err(|e| {
+            // candle reports the out-of-range index it saw; upstream reports it
+            // signed, with the axis and the extent.
+            match invalid_index_of(&e) {
+                Some((raw, size)) => pyo3::exceptions::PyIndexError::new_err(format!(
+                    "index_copy_(): index {} is out of bounds for dimension {dim} with size {size}",
+                    raw as i64
+                )),
+                None => candle_err(OP, e),
+            }
+        })?
+    };
+    let out = scattered.reshape(dims.clone()).map_err(|e| candle_err(OP, e))?;
+
+    if !in_place {
+        return finish(py, out, tag);
+    }
+    let replacement = if tag == TorchDType::Bool {
+        PyTensorBase::boolean(out)?
+    } else {
+        PyTensorBase::new(out)?
+    };
+    write_back(OP, &receiver, replacement)?;
+    Ok(receiver.into_any().unbind())
+}
+
+/// `nearbyint` in the default rounding mode: **round half to even**.
+///
+/// `fastspeech2_conformer`'s `torch.round(hidden_states.exp() - offset)` is the
+/// caller, and the whole of this function is the one fact a test on `0.3` and
+/// `0.7` cannot see:
+///
+/// ```text
+/// round(0.5)   0.      round(1.5)   2.      round(2.5)   2.      round(3.5)   4.
+/// round(-0.5) -0.      round(-1.5) -2.      round(-2.5) -2.
+/// ```
+///
+/// **candle's `Tensor::round` is `f32::round`, which is half-away-from-zero**,
+/// so it is not the kernel here: it answers `1.` for `0.5` and `3.` for `2.5`.
+/// Rust's `f64::round_ties_even` is the right rule but only exists on the host,
+/// and a host round trip would put `round` on `MPS_HOST_READBACK_OPS` (see this
+/// block's header). So the rule is written out of candle primitives instead:
+///
+/// ```text
+/// f    = floor(x)
+/// frac = x - f                   in [0, 1)   -- NaN when x is +-inf or NaN
+/// inc  = (frac > 0.5) or (frac == 0.5 and f is odd)
+/// out  = f + inc
+/// ```
+///
+/// "`f` is odd" is `f/2` having a fractional part, which is why `affine(0.5)`
+/// appears: it is the only parity test available when the value may be larger
+/// than any integer type.
+///
+/// The `+-inf`/NaN cases fall out rather than being special-cased: `frac` is
+/// NaN there, every comparison against NaN is false, so `inc` is zero and `out`
+/// is `f`, which `floor` already made `+-inf`/NaN. Measured on both sides.
+///
+/// # The last line is about a signed zero and it is not decoration
+///
+/// `nearbyint(-0.5)` is `-0.0` and `f + inc` computes `-1.0 + 1.0`, which is
+/// `+0.0`. Upstream keeps the sign -- `torch.signbit(torch.round(tensor([-0.5])))`
+/// is `True`, the same property `floor`'s comment in this file already records
+/// for `floor(-0.0)`. So a zero result takes its sign from `x * 0`, which is
+/// `-0.0` for every negative `x` and for `-0.0` itself. `affine(0.0, 0.0)` will
+/// **not** do: it computes `x * mul + add` and `-0.0 + 0.0` is `+0.0`, which is
+/// exactly the digit this line exists to preserve.
+fn nearbyint_ties_even(op: &str, x: &Tensor) -> PyResult<Tensor> {
+    let floor = x.floor().map_err(|e| candle_err(op, e))?;
+    let frac = (x - &floor).map_err(|e| candle_err(op, e))?;
+    let above = frac.gt(0.5f64).map_err(|e| candle_err(op, e))?;
+    let tie = frac.eq(0.5f64).map_err(|e| candle_err(op, e))?;
+    let half = floor.affine(0.5, 0.0).map_err(|e| candle_err(op, e))?;
+    let odd = half
+        .floor()
+        .and_then(|f| (&half - f))
+        .and_then(|d| d.ne(0.0f64))
+        .map_err(|e| candle_err(op, e))?;
+    let out = (tie * odd)
+        .and_then(|both| both.maximum(&above))
+        .and_then(|inc| inc.to_dtype(x.dtype()))
+        .and_then(|inc| &floor + inc)
+        .map_err(|e| candle_err(op, e))?;
+    let signed_zero = Tensor::zeros((), x.dtype(), x.device())
+        .and_then(|z| x.broadcast_mul(&z))
+        .map_err(|e| candle_err(op, e))?;
+    out.eq(0.0f64)
+        .and_then(|at_zero| at_zero.where_cond(&signed_zero, &out))
+        .map_err(|e| candle_err(op, e))
+}
+
+/// The body behind all four `round` keys.
+///
+/// `decimals` is `None` for `aten::round`/`aten::round_` and `Some(d)` for the
+/// `.decimals` overloads, and **the two are not the same op on an integral
+/// input**, which is upstream's table and not a rule:
+///
+/// ```text
+/// torch.round(arange(3))                 -> [0, 1, 2]     identity
+/// torch.round(arange(3), decimals=0)     -> NotImplementedError "round_vml_cpu"
+/// torch.round(arange(3), decimals=2)     -> NotImplementedError "round_cpu"
+/// ```
+///
+/// So the `.decimals` overload refuses an integral receiver even when the
+/// argument makes it a no-op, and *which* kernel name it puts in the message
+/// depends on the value: `decimals == 0` reaches `round_stub` (`round_vml_cpu`)
+/// and anything else reaches `round_decimals_stub` (`round_cpu`). Both
+/// transcribed off real `NotImplementedError`s, because a house string would
+/// send a reader to the wrong kernel -- the same reason `floor`'s refusal names
+/// `floor_vml_cpu` and not `ceil_vml_cpu`.
+///
+/// # `10^d` is applied at the tensor's own precision, and that is the whole
+/// difficulty
+///
+/// Upstream's `round_decimals_kernel` is
+/// `nearbyint(a * ten) / ten` at `scalar_t`, with the operands *swapped*
+/// (`nearbyint(a / ten) * ten`) for a negative `decimals`. Doing the same
+/// arithmetic at `f64` and narrowing once gives a different answer, and the
+/// canonical case is two decimal places of `2.675`:
+///
+/// ```text
+/// float32 2.675 is 2.6749999523162842
+///   f64:      2.6749999523 * 100 = 267.4999952  -> 267 -> 2.67
+///   float32:  2.6749999523 * 100 = 267.5f       -> 268 -> 2.68   <- upstream
+/// ```
+///
+/// The rounding that decides it happens in the *multiply*, before `nearbyint`
+/// is reached at all. So `ten` is a tensor of the input's dtype and the
+/// multiply and divide are candle's, at that dtype. `broadcast_div` rather than
+/// `affine(1.0 / ten)` for the same reason one level down: `268 * 0.01f` is
+/// `2.6800001` and `268 / 100f` is `2.68`.
+fn round_common(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+    op: &str,
+    decimals: bool,
+    in_place: bool,
+) -> PyResult<Py<PyAny>> {
+    #[allow(non_snake_case)]
+    let OP: &str = op;
+    let places = if decimals {
+        Some(int_arg(args, kwargs, 1, "decimals")?.ok_or_else(|| missing(OP, "decimals"))?)
+    } else {
+        None
+    };
+
+    let (tag, input) = if in_place {
+        let receiver = tensor_receiver(OP, args, kwargs)?;
+        let tag = receiver.borrow().tag();
+        let inner = receiver.borrow().tensor()?.clone();
+        (tag, Some((receiver, inner)))
+    } else {
+        let arg = tensor_arg(OP, args, kwargs, 0, "self")?;
+        let tag = arg.tag();
+        let inner = arg.tensor()?.clone();
+        let _ = inner;
+        (tag, None)
+    };
+    let source = match &input {
+        Some((_, inner)) => inner.clone(),
+        None => tensor_arg(OP, args, kwargs, 0, "self")?.tensor()?.clone(),
+    };
+
+    if !tag.is_floating_point() {
+        match places {
+            // The `.decimals` overload has no integral kernel at all, and the
+            // name in the message depends on which stub it would have reached.
+            Some(d) => {
+                let kernel = if d == 0 { "round_vml_cpu" } else { "round_cpu" };
+                return Err(pyo3::exceptions::PyNotImplementedError::new_err(format!(
+                    "\"{kernel}\" not implemented for '{}'",
+                    scalar_type_name(tag)
+                )));
+            }
+            // The bare overload refuses `bool` and is the identity on every
+            // other integral dtype.
+            None if tag == TorchDType::Bool => {
+                return Err(pyo3::exceptions::PyNotImplementedError::new_err(
+                    "\"round_vml_cpu\" not implemented for 'Bool'",
+                ))
+            }
+            None => {
+                if let Some((receiver, _)) = input {
+                    let _ = py;
+                    return Ok(receiver.into_any().unbind());
+                }
+                return finish(py, source, tag);
+            }
+        }
+    }
+
+    let rounded = match places {
+        None | Some(0) => nearbyint_ties_even(OP, &source)?,
+        Some(d) => {
+            // **`float16` and `bfloat16` scale in `float32`, and this is the
+            // one line of the op that a `float32`-only test cannot see.**
+            // `c10::BFloat16`'s arithmetic operators return `float`, so
+            // upstream's `nearbyint(a * ten) / ten` runs entirely in `float`
+            // and narrows once at the store. Doing it in `bfloat16` throughout
+            // rounds twice: `bfloat16(2.675)` is `2.671875`, times 100 is
+            // `267.1875` which has no `bfloat16` neighbour closer than `268`,
+            // and the answer comes back `2.6875` where upstream says
+            // `2.671875` -- the input, unchanged, which is the right answer
+            // for two decimal places of a value that only has three bits after
+            // the point. The plain overload needs no such promotion and is not
+            // given one: `nearbyint` of a `bfloat16` is exactly representable
+            // in `bfloat16` (integers below 256, and everything above 256 is
+            // already an integer), measured against upstream on the whole
+            // half-integer grid.
+            let acc = match source.dtype() {
+                candle_core::DType::F16 | candle_core::DType::BF16 => candle_core::DType::F32,
+                other => other,
+            };
+            let wide = source.to_dtype(acc).map_err(|e| candle_err(OP, e))?;
+            let negative = d < 0;
+            let power = 10f64.powi(d.unsigned_abs().min(64) as i32);
+            let ten = Tensor::full(power, (), wide.device())
+                .and_then(|t| t.to_dtype(acc))
+                .map_err(|e| candle_err(OP, e))?;
+            let scaled = if negative {
+                wide.broadcast_div(&ten)
+            } else {
+                wide.broadcast_mul(&ten)
+            }
+            .map_err(|e| candle_err(OP, e))?;
+            let whole = nearbyint_ties_even(OP, &scaled)?;
+            if negative {
+                whole.broadcast_mul(&ten)
+            } else {
+                whole.broadcast_div(&ten)
+            }
+            .and_then(|t| t.to_dtype(source.dtype()))
+            .map_err(|e| candle_err(OP, e))?
+        }
+    };
+
+    match input {
+        None => finish(py, rounded, tag),
+        Some((receiver, _)) => {
+            write_back(OP, &receiver, PyTensorBase::new(rounded)?)?;
+            let _ = py;
+            Ok(receiver.into_any().unbind())
+        }
+    }
+}
+
+/// `aten::logsumexp(Tensor self, int[1] dim, bool keepdim=False) -> Tensor`
+///
+/// `granite_swa`'s wall: `modeling_granite_swa.py:111`
+/// `lse = torch.logsumexp(attn_weights, dim=-1)` inside `eager_attention_forward`.
+///
+/// **No new arithmetic.** It is `amax`, `sub`, `exp`, `sum`, `log`, `add` --
+/// upstream's own sequence, in candle, at the storage dtype. That is not a
+/// stylistic choice: computing it on the host at `f64` and narrowing once
+/// would put the op on the derived host-readback set (this block's header), and
+/// it would also *stop matching*. The candle sequence is bit-for-bit identical
+/// to upstream on 200 random `float32` rows of 7; an `f64` reformulation is
+/// only approximately identical, and "approximately" is what a tolerance hides.
+///
+/// # `+-inf` is the only branch, and zeroing the maximum is the whole of it
+///
+/// The stabilised form `max + log(sum(exp(x - max)))` is `nan` whenever `max`
+/// is infinite, because `-inf - -inf` is `nan`. Upstream is not:
+///
+/// ```text
+/// logsumexp([-inf, -inf, -inf])  ->  -inf        naive form gives nan
+/// logsumexp([inf, 0.])           ->   inf        naive form gives nan
+/// logsumexp([nan, 0.])           ->   nan
+/// ```
+///
+/// Upstream's `masked_fill_(maxes.abs() == inf, 0)` is the fix, and the
+/// measurement that matters is that the zero has to reach **both** uses -- the
+/// subtraction as well as the addition. With `max` replaced by `0`, the all
+/// `-inf` row becomes `log(exp(-inf) + ...) = log(0) = -inf` and the `+inf` row
+/// becomes `log(inf + 1) = inf`, which is what upstream answers, with no branch
+/// on the values and therefore no host read. A `nan` maximum is not `inf`, so
+/// it is left alone and poisons the row, which is also upstream's answer.
+///
+/// The finite path is untouched by this: only infinite maxima are zeroed, so
+/// every ordinary row still subtracts its true maximum and the bit-parity above
+/// still holds.
+///
+/// # The rest, measured rather than inherited from `amax` next door
+///
+///   * **An integral or `bool` input answers `float32`**, not its own dtype and
+///     not `int64`: `logsumexp(arange(3), 0)` is `2.4076058864593506`. `amax`
+///     keeps the input dtype and `sum` promotes to `int64`; this does neither.
+///   * **`dim=[]` reduces everything** -- `logsumexp(zeros(2,3), dim=[],
+///     keepdim=True)` is shaped `[1, 1]`, so it is `amax`'s reading of an empty
+///     list and not `sum`'s. But with `keepdim=False` upstream **raises**,
+///     `output with shape [] doesn't match the broadcast shape [1, 1]`: it
+///     sized the result for the no-reduction reading and then reduced anyway.
+///     That is a bug upstream, and it is reproduced rather than fixed, because
+///     the alternative is answering where upstream raises.
+///   * **A repeated dimension is refused**, `dim 0 appears multiple times in
+///     the list of dims` -- `amax`'s message, and `sum` still accepts one.
+///   * **An empty reduction is `-inf`**, not an error: `logsumexp(zeros(2,0),
+///     dim=1)` is `[-inf, -inf]`. That is upstream's other branch (`sum` of
+///     `exp` over nothing, then `log`) and it is taken here for the same
+///     inputs.
+fn logsumexp_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.logsumexp.default";
+    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let rank = input.tensor()?.rank();
+    // The dims are parsed here rather than through `reduce_dims`, for one
+    // reason: `normalise_dim` prefixes its refusal with the op key
+    // (`aten.logsumexp.default: Dimension out of range ...`) and upstream's
+    // carries no prefix at all. Measured on both sides -- the prefix is the
+    // whole of the difference, so the parse is repeated to drop it.
+    let value = match optional(args, kwargs, 1, "dim")? {
+        Some(value) if !value.is_none() => value,
+        _ => return Err(missing(OP, "dim")),
+    };
+    let raw: Vec<isize> = match value.extract::<Vec<isize>>() {
+        Ok(list) => list,
+        Err(_) => vec![value.extract::<isize>()?],
+    };
+    let limit = rank.max(1) as isize;
+    let mut named: Vec<usize> = Vec::with_capacity(raw.len());
+    for d in raw {
+        if d < -limit || d >= limit {
+            return Err(pyo3::exceptions::PyIndexError::new_err(format!(
+                "Dimension out of range (expected to be in range of [{}, {}], but got {d})",
+                -limit,
+                limit - 1
+            )));
+        }
+        named.push(if d < 0 { (d + limit) as usize } else { d as usize });
+    }
+    let keepdim = bool_arg(args, kwargs, 2, "keepdim")?.unwrap_or(false);
+
+    if let Some(repeated) = first_repeat(&named) {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "dim {repeated} appears multiple times in the list of dims"
+        )));
+    }
+
+    // Integral and `bool` inputs answer `float32`; a floating input keeps its
+    // own dtype.
+    let tag = if input.tag().is_floating_point() {
+        input.tag()
+    } else {
+        TorchDType::Float32
+    };
+    let storage = PyDtype::new(tag).storage(OP)?;
+    let x = input
+        .tensor()?
+        .to_dtype(storage)
+        .map_err(|e| candle_err(OP, e))?;
+
+    if rank == 0 {
+        // Nothing to reduce over: `logsumexp(tensor(3.), dim=0)` is `3.` and
+        // `dim=[]` is too, both exactly. The stabilised form would compute
+        // `3 + log(exp(0))` and land on the same value, but only by luck of the
+        // arithmetic; returning the value is the answer, not an approximation
+        // of it.
+        return finish(py, x, tag);
+    }
+
+    let mut dims: Vec<usize> = named.clone();
+    if dims.is_empty() {
+        if !keepdim {
+            // Upstream's own defect, transcribed: it sizes the output for "no
+            // dimensions" and then reduces all of them.
+            let ones = vec!["1"; rank].join(", ");
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "output with shape [] doesn't match the broadcast shape [{ones}]"
+            )));
+        }
+        dims = (0..rank).collect();
+    }
+    dims.sort_unstable();
+
+    if x.elem_count() == 0 {
+        // `sum` over an empty axis is `0` and `log(0)` is `-inf`, which is
+        // upstream's answer and its own second branch.
+        let mut out = x.exp().map_err(|e| candle_err(OP, e))?;
+        for &dim in dims.iter() {
+            out = out.sum_keepdim(dim).map_err(|e| candle_err(OP, e))?;
+        }
+        out = out.log().map_err(|e| candle_err(OP, e))?;
+        if !keepdim {
+            for &dim in dims.iter().rev() {
+                out = out.squeeze(dim).map_err(|e| candle_err(OP, e))?;
+            }
+        }
+        return finish(py, out, tag);
+    }
+
+    let mut maxes = x.clone();
+    for &dim in dims.iter() {
+        // `amax_keepdim_anywhere` and not candle's `max_keepdim`: the latter
+        // folds with `<` and drops a NaN that is not the element it started on.
+        maxes = amax_keepdim_anywhere(&maxes, dim).map_err(|e| candle_err(OP, e))?;
+    }
+    let finite_max = maxes
+        .abs()
+        .and_then(|m| m.eq(f64::INFINITY))
+        .and_then(|at_inf| {
+            let zeros = maxes.zeros_like()?;
+            at_inf.where_cond(&zeros, &maxes)
+        })
+        .map_err(|e| candle_err(OP, e))?;
+
+    // The `sum` accumulates in `float32` for a `float16`/`bfloat16` input and
+    // narrows once, which is upstream's `opmath_t` and not a refinement of it:
+    // `at::sum` on a half tensor folds into a `float` accumulator. Summing in
+    // `bfloat16` throughout costs up to two ulps on a row of nine, measured --
+    // enough to be visible without being enough for the golden tolerance to
+    // catch, which is the size of error worth removing rather than allowing.
+    // Every other step stays at the storage dtype, because upstream's does:
+    // `exp_()` writes a half tensor and `log_()` reads one.
+    let accumulate = match x.dtype() {
+        candle_core::DType::F16 | candle_core::DType::BF16 => Some(candle_core::DType::F32),
+        _ => None,
+    };
+    let mut summed = x
+        .broadcast_sub(&finite_max)
+        .and_then(|shifted| shifted.exp())
+        .and_then(|e| match accumulate {
+            Some(wide) => e.to_dtype(wide),
+            None => Ok(e),
+        })
+        .map_err(|e| candle_err(OP, e))?;
+    for &dim in dims.iter() {
+        summed = summed.sum_keepdim(dim).map_err(|e| candle_err(OP, e))?;
+    }
+    if accumulate.is_some() {
+        summed = summed.to_dtype(x.dtype()).map_err(|e| candle_err(OP, e))?;
+    }
+    let mut out = summed
+        .log()
+        .and_then(|logged| logged.broadcast_add(&finite_max))
+        .map_err(|e| candle_err(OP, e))?;
+    if !keepdim {
+        for &dim in dims.iter().rev() {
+            out = out.squeeze(dim).map_err(|e| candle_err(OP, e))?;
+        }
+    }
+    finish(py, out, tag)
+}
+
+/// `aten::t_(Tensor(a!) self) -> Tensor(a!)`
+///
+/// `rwkv`'s fifth wall, and the fifth this shim has closed for it:
+/// `ndimension` -> `new_empty` -> `torch.maximum` -> `linalg_qr` -> `diag` ->
+/// this. `torch/nn/init.py:705`'s `orthogonal_` does `flattened.t_()` whenever
+/// the weight it is initialising has `rows < cols`, and `_init_weights` reaches
+/// the first such weight partway down `rwkv`'s module list -- which is why
+/// docs/VOICE3.md saw the line number move *backwards*, from 710 to 705.
+///
+/// # It is the first in-place op in this file that changes the receiver's shape
+///
+/// Every other one hands `write_back` a replacement of the receiver's own shape
+/// and dtype, and `tensor::write_into` checks exactly that before writing
+/// through the layout. `t_` changes the layout and touches no bytes, so
+/// `write_into` is the wrong primitive: it would refuse a `(3, 2)` replacement
+/// for a `(2, 3)` receiver, correctly, because that check is what stops a
+/// kernel from silently retagging a tensor.
+///
+/// So this is the second caller of `replace_with`, and the aliasing question
+/// docs/VIEWS.md §6 asks about every in-place op has to be answered again:
+/// **the alias survives**, because candle's `transpose` shares the storage
+/// `Arc` and rebuilds only the `Layout`. Measured on both sides:
+///
+/// ```text
+/// x = arange(6.).reshape(2, 3);  v = x.view(-1);  x.t_();  v[0] = 99.
+/// x[0, 0]  ->  99.0
+/// ```
+///
+/// That is the property `replace_with`'s own doc comment warns about --
+/// "anything that means the receiver's values change but the receiver stays the
+/// same tensor must not come here" -- and `t_` is on the right side of it: no
+/// value changes, and the new wrapper points at the *same* buffer rather than a
+/// fresh one. The two existing `replace_with` callers (`set_`, `tensor.data =`)
+/// repoint at a different buffer, which is why they read as a rebinding.
+///
+/// # What it is not
+///
+/// Rank decides everything, exactly as for `aten::t`: 0-D and 1-D come back
+/// unchanged, 2-D swaps, and 3-D or more raises `t_() expects a tensor with <= 2
+/// dimensions, but self is 3D` -- **not** a batched `transpose(-2, -1)`.
+///
+/// Upstream additionally refuses a receiver that requires a gradient
+/// (`a leaf Variable that requires grad is being used in an in-place
+/// operation`). That refusal is not reproduced, because `requires_grad` is
+/// inert here (tensor.rs) and the shim's own in-place ops are uniformly silent
+/// about it; adding it for `t_` alone would make one op stricter than
+/// `add_`/`mul_`/`copy_` beside it for no measured reason.
+///
+/// Capture and the eager tape need nothing added: the name ends in `_`, so
+/// `capture.rs::is_mutating` refuses it inside a trace and `note_mutation`
+/// bumps the receiver's storage version, both by name. The bump is
+/// conservative here in a way worth writing down -- `t_` changes no bytes, so a
+/// trace constant that is merely transposed is treated as written to and its
+/// replay refused. Refusing is the safe direction, and narrowing it would mean
+/// editing `capture.rs`.
+fn t_inplace(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.t_.default";
+    let receiver = tensor_receiver(OP, args, kwargs)?;
+    let (tag, rank) = {
+        let borrowed = receiver.borrow();
+        (borrowed.tag(), borrowed.tensor()?.rank())
+    };
+    if rank > 2 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "t_() expects a tensor with <= 2 dimensions, but self is {rank}D"
+        )));
+    }
+    if rank == 2 {
+        let transposed = {
+            let borrowed = receiver.borrow();
+            borrowed
+                .tensor()?
+                .transpose(0, 1)
+                .map_err(|e| candle_err(OP, e))?
+        };
+        let replacement = if tag == TorchDType::Bool {
+            PyTensorBase::boolean(transposed)?
+        } else {
+            PyTensorBase::new(transposed)?
+        };
+        receiver.borrow_mut().replace_with(replacement);
+    }
+    let _ = py;
+    Ok(receiver.into_any().unbind())
+}
+
+/// The dtype spelling upstream's **argument checker** uses, which is not the
+/// one `scalar_type_name` produces.
+///
+/// `TORCH_CHECK`'s type errors print `t.type()` -- the legacy `Type` object --
+/// rather than the scalar type, so `embedding`'s refusal says
+/// `torch.FloatTensor` where every message in this file up to now has said
+/// `Float`. Both spellings are upstream's and they are not interchangeable; the
+/// mapping is transcribed off real refusals rather than derived, because two of
+/// the ten do not follow the pattern at all:
+///
+/// ```text
+/// float32   torch.FloatTensor      int8    torch.CharTensor
+/// float64   torch.DoubleTensor     int16   torch.ShortTensor
+/// float16   torch.HalfTensor       int32   torch.IntTensor
+/// uint8     torch.ByteTensor       int64   torch.LongTensor
+/// bfloat16  CPUBFloat16Type   <-- no `torch.` prefix, no `Tensor` suffix
+/// bool      CPUBoolType       <-- the same, and the device is in the name
+/// ```
+///
+/// The last two are the ones a generated spelling would have got wrong, and
+/// they are the two a caller is most likely to hit: a `bool` mask handed to
+/// `embedding` by mistake is a real slip, and `torch.BoolTensor` is what the
+/// pattern predicts.
+fn legacy_tensor_type_name(tag: TorchDType) -> &'static str {
+    match tag {
+        TorchDType::Float32 => "torch.FloatTensor",
+        TorchDType::Float64 => "torch.DoubleTensor",
+        TorchDType::Float16 => "torch.HalfTensor",
+        TorchDType::BFloat16 => "CPUBFloat16Type",
+        TorchDType::UInt8 => "torch.ByteTensor",
+        TorchDType::Int8 => "torch.CharTensor",
+        TorchDType::Int16 => "torch.ShortTensor",
+        TorchDType::Int32 => "torch.IntTensor",
+        TorchDType::Int64 => "torch.LongTensor",
+        TorchDType::Bool => "CPUBoolType",
+        // Every other tag is one `PyDtype::storage()` refuses, so no tensor
+        // with it can have reached a kernel. Naming the scalar type keeps the
+        // function total without inventing a legacy spelling upstream has.
+        other => scalar_type_name(other),
+    }
+}
+
+/// `aten::logical_not(Tensor self) -> Tensor`
+///
+/// Three ASR encoders' wall (`modeling_nemotron_asr_streaming.py:628`,
+/// `attention_mask.logical_not()`) and `cpmant`'s next one, one line past the
+/// `int32` embedding index §7 unblocked.
+///
+/// # It is not `bitwise_not`, and integers are where that shows
+///
+/// `~x` and `bitwise_not` already worked, which is exactly the trap:
+/// `docs/TAIL1.md` measured the same distinction for the `and` pair and found
+/// the two genuinely diverge. Measured here for the `not` pair, on
+/// `[0, 1, 2, -1, 3]`:
+///
+/// ```text
+///                 logical_not                    bitwise_not
+/// bool      [True, False, False, False, False]   the same
+/// int64     [True, False, False, False, False]   [-1, -2, -3, 0, -4]  int64
+/// uint8     [True, False, False, False, False]   [255, 254, 253, 0, 252]
+/// float32   [True, False, False, False, False]   "bitwise_not_cpu" not
+///                                                 implemented for 'Float'
+/// ```
+///
+/// They agree on **`bool` and nothing else**: every integral dtype gives
+/// different values *and* a different result dtype, and every floating dtype
+/// makes `bitwise_not` raise. So a kernel that routed `logical_not` at
+/// `bitwise_not` would be right for exactly the one dtype a test is most
+/// likely to use.
+///
+/// # The result is always `bool`
+///
+/// Whatever the input dtype -- `logical_not(arange(3, dtype=float64))` is
+/// `torch.bool`. A version that kept the input dtype answers *plausible
+/// values* (`1.0`/`0.0` instead of `True`/`False`) with the wrong type, which
+/// is the shape golden's dtype comparison exists to catch and which a
+/// `tolist()` comparison alone would pass.
+///
+/// # `x == 0`, and NOT `x != 0` negated
+///
+/// The rule is "true where the element is zero", and the difference from the
+/// spelling that reads more naturally is one value: **`nan`**.
+/// `logical_not(nan)` is `False` upstream -- a NaN is truthy -- and `nan != 0`
+/// is `true` in IEEE, so `!(x != 0)` gives `False` and `x == 0` gives `False`
+/// only because the comparison against NaN is false in *both* directions.
+/// Written as `eq` so the NaN answer comes from the comparison rather than
+/// from a negation that would have to be reasoned about. `-0.0` is zero and
+/// therefore `True`; `inf` is `False`.
+///
+/// The in-place `aten::logical_not_` and the `.out` overload are **not**
+/// implemented. `Tensor.logical_not_` exists upstream and keeps the
+/// receiver's dtype (`tensor([0., 1.]).logical_not_()` is `[1., 0.]`,
+/// `float32`), which is a different rule from this one and would be a second
+/// kernel rather than a flag; nothing measured calls it. It refuses by name.
+fn logical_not_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.logical_not.default";
+    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let out = input
+        .tensor()?
+        .eq(0f64)
+        .map_err(|e| candle_err(OP, e))?;
+    finish(py, out, TorchDType::Bool)
 }
