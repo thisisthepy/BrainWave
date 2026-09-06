@@ -445,6 +445,32 @@ def test_fft_and_stft_are_not_implemented():
         )
 
 
+
+def _linalg_norm_value():
+    """`float(linalg_norm(ones(2, 2)))` from the vendored tree, as a number.
+
+    Separate from `_probe` because `_probe` deliberately does not stringify
+    results any more, and a norm's whole content is its value.
+    """
+    import json
+    import subprocess
+    import sys
+
+    script = (
+        "import json, torch\n"
+        "assert hasattr(torch._C, '_aten_implemented'), 'not the shim'\n"
+        "print(json.dumps(float(torch._C._linalg.linalg_norm(torch.ones(2, 2)))))\n"
+    )
+    env = dict(os.environ)
+    env["PYTHONPATH"] = _VENDOR_DIR
+    env["TORCH_USE_RTLD_GLOBAL"] = "1"
+    proc = subprocess.run([sys.executable, "-c", script],
+                          capture_output=True, text=True, env=env, timeout=120)
+    if proc.returncode != 0:
+        raise RuntimeError(proc.stdout + proc.stderr)
+    return json.loads(proc.stdout.strip().splitlines()[-1])
+
+
 def test_linalg_norm_binding_landed_on_the_kernel_that_was_already_there():
     """OWL-ViT's wall (`owlv2`, `owlvit`). This test used to pin the *gap* --
     the kernel present, the name unreachable, COMPLEX.md §6 naming the install
@@ -470,7 +496,15 @@ def test_linalg_norm_binding_landed_on_the_kernel_that_was_already_there():
         "the flattened 2-norm and should answer 2.0"
     )
     # `ones(2, 2)` flattens to four ones, so the 2-norm is exactly 2.
-    assert "2." in _probe()["linalg_norm"]["ok"], _probe()["linalg_norm"]
+    # The probe records a type-and-shape string, not `repr(r)` -- once
+    # `view_as_complex` began returning a tensor, `repr` reached
+    # `torch/_tensor_str.py` and refused (docs/COMPLEX2.md). So the *value*
+    # is asserted here directly rather than looked for in that string, which
+    # is the stronger check anyway: `linalg_norm(ones(2, 2))` is the Frobenius
+    # norm of four ones, and 2.0 is the one number a correct binding gives.
+    # `Tensor()` -- a 0-dim scalar, which is the shape a norm has.
+    assert _probe()["linalg_norm"]["ok"] == "Tensor()", _probe()["linalg_norm"]
+    assert _linalg_norm_value() == 2.0, _linalg_norm_value()
 
     # And the half that is deliberately still shut: `ord` selects between
     # different computations, and the matrix ones are `linalg_matrix_norm`
