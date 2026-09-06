@@ -43,6 +43,7 @@ mod rng;
 mod storage;
 mod tape;
 mod tensor;
+mod vulkan;
 
 use crate::device::PyDevice;
 use crate::dtype::PyDtype;
@@ -643,6 +644,7 @@ fn _C(m: &Bound<'_, PyModule>) -> PyResult<()> {
     rng::register(m)?;
     storage::register(m)?;
     quant::register(m)?;
+    vulkan::register(m)?;
     m.add_function(wrap_pyfunction!(_tensor_from_flat, m)?)?;
     m.add_function(wrap_pyfunction!(_tensor_new_from_data, m)?)?;
     m.add_function(wrap_pyfunction!(_frombuffer, m)?)?;

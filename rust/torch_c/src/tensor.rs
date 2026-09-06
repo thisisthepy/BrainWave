@@ -80,6 +80,24 @@ pub enum Repr {
     /// means that cache survives across calls, which is where the repacked
     /// Q4K path's cost is amortised.
     Quantized(Arc<QTensor>),
+    /// A tensor whose bytes are in a `VkBuffer` on the `vulkan` device.
+    ///
+    /// **The fourth arm exists for the same structural reason as the third.**
+    /// `PyDevice::resolve()` returns a `candle_core::Device`, which is a closed
+    /// enum of `Cpu | Cuda | Metal` with nowhere to put a Vulkan handle, so a
+    /// Vulkan tensor cannot be a `candle::Tensor` wearing a label any more than
+    /// a GGML weight can. It has to live outside candle, and this is where.
+    /// docs/VULKAN2.md §5.1 sized it; docs/VULKAN3.md is what came of that.
+    ///
+    /// And it inherits `Quantized`'s safety property, which is the whole point
+    /// of putting it here rather than anywhere else: `tensor()` refuses on this
+    /// arm, and `tensor()` has 396 call sites. **No kernel can read CPU storage
+    /// off a Vulkan tensor by forgetting to check** -- it would have to handle
+    /// a `PyResult` whose only content is a refusal. A silent CPU fallback is
+    /// therefore not a discipline anyone has to keep; it is unrepresentable.
+    /// Ops opt in one at a time in `vulkan::dispatch`, by name, the way the
+    /// twenty `Repr::Quant` sites did.
+    Vulkan(crate::vulkan::VkTensor),
 }
 
 #[pyclass(name = "TensorBase", module = "torch._C", subclass, from_py_object)]
@@ -217,6 +235,21 @@ pub fn no_dense_storage(format: &str) -> PyErr {
     ))
 }
 
+/// Why a kernel cannot read a Vulkan tensor's bytes.
+///
+/// The mirror of `no_dense_storage`, and the message says the same thing about
+/// a different reason: the storage exists, it is simply not on this side of the
+/// PCIe/unified boundary and not in a layout candle can address. It names the
+/// way out (`.cpu()`) because there is exactly one.
+pub fn no_host_storage() -> PyErr {
+    pyo3::exceptions::PyNotImplementedError::new_err(
+        "torch._C shim: this tensor is on the vulkan device; its storage is a \
+         VkBuffer, not something a CPU kernel can read. Only the ops taught the \
+         vulkan device by name compute on one (torch._C._vulkan_ops()); bring it \
+         back with .cpu() for anything else. docs/VULKAN3.md",
+    )
+}
+
 impl PyTensorBase {
     /// A tensor whose torch dtype is whatever candle is already storing.
     pub fn new(inner: Tensor) -> PyResult<Self> {
@@ -285,6 +318,24 @@ impl PyTensorBase {
         }
     }
 
+    /// The single entrance for the Vulkan representation.
+    ///
+    /// The tag is carried the way `quantized` carries one: the buffer is bytes
+    /// and knows nothing about torch dtypes, so the tag is the authority. Only
+    /// `float32` can get here -- `vulkan::check_dtype` refuses everything else
+    /// at the factory, because there is one shader and it is f32.
+    pub fn vulkan(inner: crate::vulkan::VkTensor, tag: TorchDType) -> Self {
+        Self {
+            inner: Repr::Vulkan(inner),
+            tag,
+            requires_grad: false,
+            backward_hooks: None,
+            grad: None,
+            from_op: None,
+            retains_grad: false,
+        }
+    }
+
     /// The single entrance for the `torch.bool` tag (BOOL.md §6.3 item 1).
     /// The caller is asserting the bytes are already normalised to 0/1;
     /// `BRAINWAVE_CHECK_BOOL=1` turns that assertion into a check.
@@ -332,6 +383,21 @@ impl PyTensorBase {
             Repr::Dense(tensor) => Ok(tensor),
             Repr::Meta { .. } => Err(no_data()),
             Repr::Quantized(q) => Err(no_dense_storage(crate::quant::format_name(q.dtype()))),
+            Repr::Vulkan(_) => Err(no_host_storage()),
+        }
+    }
+
+    /// The Vulkan storage, for the ops `vulkan::dispatch` taught this device by
+    /// name. The mirror of `qtensor` and refusing for the same reason: nothing
+    /// can be handed a CPU tensor here and treat it as a device buffer.
+    #[inline]
+    pub fn vk_tensor(&self, op: &str) -> PyResult<&crate::vulkan::VkTensor> {
+        match &self.inner {
+            Repr::Vulkan(v) => Ok(v),
+            _ => Err(not_implemented(format!(
+                "{op}: expected a tensor on the vulkan device, got one on {}",
+                self.device_label().__str__()
+            ))),
         }
     }
 
@@ -352,11 +418,12 @@ impl PyTensorBase {
     pub fn qtensor(&self, op: &str) -> PyResult<&Arc<QTensor>> {
         match &self.inner {
             Repr::Quantized(q) => Ok(q),
-            Repr::Dense(_) | Repr::Meta { .. } => Err(not_implemented(format!(
+            Repr::Dense(_) | Repr::Meta { .. } | Repr::Vulkan(_) => Err(not_implemented(format!(
                 "{op}: expected a block-quantised tensor (torch._C._quantize), \
                  got a {} one",
                 match &self.inner {
                     Repr::Dense(_) => "dense",
+                    Repr::Vulkan(_) => "vulkan",
                     _ => "meta",
                 }
             ))),
@@ -371,6 +438,7 @@ impl PyTensorBase {
             Repr::Dense(tensor) => tensor.dims(),
             Repr::Meta { shape } => shape,
             Repr::Quantized(q) => q.shape().dims(),
+            Repr::Vulkan(v) => &v.shape,
         }
     }
 
@@ -380,6 +448,7 @@ impl PyTensorBase {
             Repr::Dense(tensor) => tensor.elem_count(),
             Repr::Meta { shape } => shape.iter().product(),
             Repr::Quantized(q) => q.shape().elem_count(),
+            Repr::Vulkan(v) => v.elem_count(),
         }
     }
 
@@ -399,6 +468,11 @@ impl PyTensorBase {
             // backend handle, not a `&Device`), so this binds a temporary
             // rather than borrowing like the dense arm.
             Repr::Quantized(q) => PyDevice::from_candle(&q.device()),
+            // Not `from_candle`: there is no candle handle to reconstruct
+            // from, which is the entire content of this arm. There is one
+            // Vulkan device and no index to invent, so the label is a
+            // constant, exactly as `meta`'s is.
+            Repr::Vulkan(_) => crate::vulkan::label(),
         }
     }
 
@@ -1409,6 +1483,10 @@ impl PyTensorBase {
             Repr::Dense(_) => false,
             Repr::Meta { .. } => false,
             Repr::Quantized(_) => false,
+            // The compiler asked, as the docstring above promised it would.
+            // A Vulkan tensor is dense and strided; what is different about it
+            // is where the bytes are, not how they are addressed.
+            Repr::Vulkan(_) => false,
         }
     }
 
@@ -1418,6 +1496,10 @@ impl PyTensorBase {
             Repr::Dense(_) => false,
             Repr::Meta { .. } => false,
             Repr::Quantized(_) => false,
+            // The compiler asked, as the docstring above promised it would.
+            // A Vulkan tensor is dense and strided; what is different about it
+            // is where the bytes are, not how they are addressed.
+            Repr::Vulkan(_) => false,
         }
     }
 
@@ -1438,6 +1520,7 @@ impl PyTensorBase {
             Repr::Dense(_) => false,
             Repr::Meta { .. } => false,
             Repr::Quantized(_) => true,
+            Repr::Vulkan(_) => false,
         }
     }
 
@@ -1474,6 +1557,10 @@ impl PyTensorBase {
             Repr::Dense(_) => false,
             Repr::Meta { .. } => false,
             Repr::Quantized(_) => false,
+            // The compiler asked, as the docstring above promised it would.
+            // A Vulkan tensor is dense and strided; what is different about it
+            // is where the bytes are, not how they are addressed.
+            Repr::Vulkan(_) => false,
         }
     }
 
@@ -1486,6 +1573,10 @@ impl PyTensorBase {
             Repr::Dense(_) => false,
             Repr::Meta { .. } => false,
             Repr::Quantized(_) => false,
+            // The compiler asked, as the docstring above promised it would.
+            // A Vulkan tensor is dense and strided; what is different about it
+            // is where the bytes are, not how they are addressed.
+            Repr::Vulkan(_) => false,
         }
     }
 
@@ -1512,6 +1603,10 @@ impl PyTensorBase {
             // is no GGML entry in that enumeration to report even if one
             // wanted to -- the format is reported by `_quantized_format()`.
             Repr::Quantized(_) => "strided",
+            // Upstream's `torch.zeros(2, device="vulkan").layout` is
+            // `torch.strided` too -- a Vulkan tensor is a flat contiguous
+            // buffer, which is what `strided` names.
+            Repr::Vulkan(_) => "strided",
         }
     }
 
@@ -1589,7 +1684,11 @@ impl PyTensorBase {
     /// answerable question.
     fn element_size(&self) -> PyResult<usize> {
         match &self.inner {
-            Repr::Dense(_) | Repr::Meta { .. } => Ok(self.tag.itemsize()),
+            // A Vulkan tensor answers from the tag like a dense one, and
+            // unlike a quantised one it is entitled to: the buffer really is
+            // `numel * 4` bytes of f32, so `numel() * element_size()` sizes it
+            // correctly.
+            Repr::Dense(_) | Repr::Meta { .. } | Repr::Vulkan(_) => Ok(self.tag.itemsize()),
             Repr::Quantized(q) => Err(not_implemented(format!(
                 "TensorBase.element_size: a {} tensor has no whole number of \
                  bytes per element ({} bytes per {} elements). Use \
@@ -1956,6 +2055,12 @@ impl PyTensorBase {
             // `Meta` is -- there is no operation that could produce a
             // non-contiguous one.
             Repr::Quantized(_) => true,
+            // Every Vulkan tensor this build can make is a flat row-major
+            // buffer: there is no view, transpose or slice kernel on this
+            // device, so there is nothing that could make a non-contiguous
+            // one. Same argument as the two arms above, and it stops being
+            // true the day a stride-taking kernel lands.
+            Repr::Vulkan(_) => true,
         }
     }
 

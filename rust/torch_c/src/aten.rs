@@ -816,6 +816,13 @@ pub fn aten_dispatch(
     float8_e4m3fn_gate(op, args, kwargs)?;
     let out = match check_devices_agree(op, args, kwargs)? {
         Some(Where::Meta) => meta_dispatch(py, op, args, kwargs)?,
+        // The vulkan half, structured exactly like the meta half and for the
+        // same reason: which ops work on that device is a list in one place,
+        // not a reading of ninety kernels. Everything not on the list refuses
+        // there, naming itself -- and `PyTensorBase::tensor()` refuses under
+        // it anyway, so a kernel reached by some other route still cannot read
+        // a `VkBuffer` as CPU storage. docs/VULKAN3.md.
+        Some(Where::Vulkan) => crate::vulkan::dispatch(py, op, args, kwargs)?,
         _ => aten_dispatch_inner(py, op, args, kwargs)?,
     };
     // One exit as well as one entrance: every tensor leaving the dispatcher
@@ -874,6 +881,11 @@ pub fn aten_dispatch(
 enum Where {
     Dense(Device),
     Meta,
+    /// No handle at all, like `Meta` -- but for the opposite reason. `Meta` has
+    /// no handle because it has no storage; this one has storage that candle's
+    /// `Device` enum has no variant for (docs/VULKAN2.md §5.1). There is one
+    /// Vulkan device, so there is nothing to compare and the arm is a unit.
+    Vulkan,
 }
 
 impl Where {
@@ -888,6 +900,7 @@ impl Where {
             // representation, not where it lives, and the door should not
             // mis-name that.
             crate::tensor::Repr::Quantized(q) => Where::Dense(q.device()),
+            crate::tensor::Repr::Vulkan(_) => Where::Vulkan,
         }
     }
 
@@ -895,6 +908,7 @@ impl Where {
         match self {
             Where::Dense(device) => PyDevice::from_candle(device),
             Where::Meta => PyDevice::meta(),
+            Where::Vulkan => crate::vulkan::label(),
         }
     }
 }
@@ -1034,6 +1048,11 @@ fn visit_for_device(
             seen.same_device(inner.device())
         }
         (Some(Where::Meta), crate::tensor::Repr::Meta { .. }) => true,
+        // Two Vulkan tensors agree: there is one Vulkan device. A Vulkan
+        // tensor mixed with a dense or a meta one falls to the `_` arm below
+        // and raises upstream's own mixed-device message, which is the
+        // refusal `torch.ones(2, device="vulkan") + torch.ones(2)` should get.
+        (Some(Where::Vulkan), crate::tensor::Repr::Vulkan(_)) => true,
         // Same reasoning as `Where::of`: a quantised tensor's device is real,
         // so it agrees with a dense argument on the same device and the op
         // goes on to refuse for the right reason.
@@ -4395,6 +4414,14 @@ fn zeros_or_ones(
     // it is upstream, while its CPU counterpart is refused by name.
     if label.is_meta() {
         return meta_result(py, size, dtype);
+    }
+    // The vulkan device, for the same reason meta is checked before
+    // `resolve()`: it has no `candle_core::Device` to resolve to. This is the
+    // one factory taught the device -- `torch.ones(2, 2, device="vulkan")` and
+    // `torch.empty(...)`/`torch.zeros(...)` beside it -- and every other
+    // factory still stops at `resolve()` naming `vulkan`. docs/VULKAN3.md.
+    if label.kind == "vulkan" {
+        return crate::vulkan::factory(py, op, size, dtype, if one { 1.0 } else { 0.0 });
     }
     let device = label.resolve()?;
     let storage = PyDtype::new(dtype).storage(op)?;
@@ -18456,7 +18483,7 @@ fn scalar_arg(
     )))
 }
 
-fn dtype_arg(
+pub(crate) fn dtype_arg(
     args: &Bound<'_, PyTuple>,
     kwargs: Option<&Bound<'_, PyDict>>,
     index: usize,
@@ -18638,7 +18665,7 @@ fn interned_name<'py>(py: Python<'py>, name: &str) -> Option<&'py Bound<'py, PyS
     })
 }
 
-fn optional<'py>(
+pub(crate) fn optional<'py>(
     args: &Bound<'py, PyTuple>,
     kwargs: Option<&Bound<'py, PyDict>>,
     index: usize,
@@ -18672,7 +18699,7 @@ fn required<'py>(
     })
 }
 
-fn tensor_arg(
+pub(crate) fn tensor_arg(
     op: &str,
     args: &Bound<'_, PyTuple>,
     kwargs: Option<&Bound<'_, PyDict>>,
@@ -18722,7 +18749,7 @@ fn optional_tensor_arg(
 /// process-wide default device lives above this layer, in the torch-function
 /// mode stack that `bootstrap.py` consults before a call ever reaches the
 /// dispatcher (docs/META.md §8), which is where upstream puts it too.
-fn device_arg_or_label(
+pub(crate) fn device_arg_or_label(
     args: &Bound<'_, PyTuple>,
     kwargs: Option<&Bound<'_, PyDict>>,
     index: usize,

@@ -22684,5 +22684,396 @@ def test_capture_refuses_demand8_inplace_names_and_lets_the_others_through():
 
 
 
+# --- the mps device: candle's own backend, reached by resolve() alone --------
+#
+# docs/VULKAN3.md §1 is the argument for why this landed before Vulkan and it
+# is worth restating where the tests are, because the two devices are checked
+# for *different* properties and confusing them would weaken both.
+#
+# `mps` is a `candle_core::Device` variant. So an mps tensor is an ordinary
+# `Repr::Dense` tensor with a Metal storage inside it, and there is no arm of
+# `tensor::Repr` for it, no `vk_tensor()`-style accessor, and nothing here that
+# had to be taught an op. What is being checked is therefore *arithmetic*: that
+# the values coming back from the GPU are the values the CPU computes. For
+# Vulkan the checks below it are the opposite shape -- there the values are
+# nearly the whole of what exists, and the property being defended is that
+# everything else refuses.
+#
+# These skip by name where no Metal device exists, which is every Linux and
+# Windows runner and also an Apple build with the `metal` feature off. A test
+# that failed on absence would be a broken gate on those machines, and one that
+# passed silently would not be a gate at all -- so it says which it did.
+
+
+def _mps_or_skip(what):
+    """A live `mps` device, or None having said why not."""
+    try:
+        _C._aten_dispatch("aten.ones.default", [1], device=_C.device("mps"))
+    except NotImplementedError as e:
+        print(f"   (skipped {what}: no mps device -- {str(e).splitlines()[0]})")
+        return None
+    return _C.device("mps")
+
+
+def _f32(values, shape):
+    return _C._tensor_from_flat([float(v) for v in values], shape, _C.float32)
+
+
+def test_mps_ones_round_trips_through_the_gpu():
+    mps = _mps_or_skip("mps ones")
+    if mps is None:
+        return
+    t = _C._aten_dispatch("aten.ones.default", [2, 2], device=mps)
+    # The label survives the factory. `mps:0` and not `mps`, because
+    # `from_candle` indexes what candle handed back.
+    assert t.device.type == "mps", t.device
+    assert not t.is_cpu
+    assert t.dtype == _C.float32, t.dtype
+    back = t.cpu()
+    assert back.device == _C.device("cpu"), back.device
+    assert back.tolist() == [[1.0, 1.0], [1.0, 1.0]], back.tolist()
+
+
+def test_mps_elementwise_and_matmul_agree_with_cpu_element_for_element():
+    """The values, against the same computation on the CPU.
+
+    Both operands are moved with `_to_copy` rather than built by a factory, so
+    a device that quietly ignored the label would have to also quietly produce
+    the right numbers from storage it never received.
+
+    Exact equality rather than a tolerance, and that is a claim about these
+    inputs and not about GPUs in general: the values are small integers and
+    halves, every product and every partial sum is exactly representable in
+    binary32, so there is no rounding for a different accumulation order to
+    expose. A tolerance here would hide a wrong kernel; on inputs where
+    accumulation order mattered it would be the honest comparison.
+    """
+    mps = _mps_or_skip("mps arithmetic")
+    if mps is None:
+        return
+    to = lambda t: _C._aten_dispatch("aten._to_copy.default", t, device=mps)
+    d = _C._aten_dispatch
+
+    a = _f32([1, 2, 3, 4, 5, 6], [2, 3])
+    b = _f32([0.5, -1, 2, 3, -4, 5], [2, 3])
+    c = _f32(range(1, 13), [3, 4])
+    a_g, b_g, c_g = to(a), to(b), to(c)
+    assert a_g.device.type == "mps"
+
+    # One elementwise op.
+    got = d("aten.mul.Tensor", a_g, b_g)
+    assert got.device.type == "mps", got.device
+    assert got.cpu().tolist() == d("aten.mul.Tensor", a, b).tolist()
+
+    # One matmul.
+    got = d("aten.matmul.default", a_g, c_g)
+    assert got.device.type == "mps", got.device
+    assert got.cpu().tolist() == d("aten.matmul.default", a, c).tolist()
+
+    # And a reduction, which is the case where a GPU has the most licence to
+    # accumulate in a different order -- with six exactly-representable
+    # summands it still may not disagree.
+    got = d("aten.sum.default", a_g)
+    assert got.cpu().tolist() == d("aten.sum.default", a).tolist()
+
+
+def test_two_mps_tensors_are_on_the_same_mps_device():
+    """A regression, and the defect it guards was live for one build.
+
+    `Device::new_metal` *constructs* a device -- its own command queue, its own
+    id -- and candle's `same_device` compares those ids. So while `resolve()`
+    called it per call, two `mps` tensors made by two dispatches disagreed, and
+    the mixed-device gate rejected them with a message naming the same device
+    twice:
+
+        Expected all tensors to be on the same device, but found at least two
+        devices, mps:0 and mps:0!
+
+    `device.rs::metal_device` caches one handle per index, which is what makes
+    `resolve()` an accessor rather than a constructor. This test is the one
+    thing that fails if that cache is removed.
+    """
+    mps = _mps_or_skip("mps device identity")
+    if mps is None:
+        return
+    d = _C._aten_dispatch
+    x = d("aten.ones.default", [2, 2], device=mps)
+    y = d("aten.ones.default", [2, 2], device=_C.device("mps", 0))
+    got = d("aten.add.Tensor", x, y)
+    assert got.cpu().tolist() == [[2.0, 2.0], [2.0, 2.0]], got.cpu().tolist()
+
+
+def test_an_op_mps_cannot_run_refuses_and_names_the_op():
+    """The no-silent-fallback check for this device, and it is a *weaker*
+    property than the Vulkan one below -- deliberately recorded as weaker.
+
+    An mps tensor is a `Repr::Dense` tensor, so `PyTensorBase::tensor()`
+    returns it and no call site is forced to check anything. What stands
+    between an unsupported op and a wrong answer here is candle's own Metal
+    backend refusing, not this crate's type system. That is enough to prevent a
+    *wrong* answer -- candle raises rather than guessing -- but it does not
+    prevent a **correct answer computed on the CPU**: candle will copy a Metal
+    tensor back to the host for the ops that need it, and the result is right
+    but the GPU did not compute it. docs/VULKAN3.md §3 names the two ops where
+    that was observed rather than leaving it as a possibility.
+
+    So what is asserted is what actually holds: an op the Metal backend does
+    not implement raises, the message names the op, and it says `Metal` -- and
+    a `NotImplementedError` naming the op is what an op this shim never
+    implemented gives on any device.
+    """
+    mps = _mps_or_skip("mps refusal")
+    if mps is None:
+        return
+    d = _C._aten_dispatch
+    a = d("aten._to_copy.default", _f32([3, 1, 2], [3]), device=mps)
+
+    # An op this shim implements, that candle's Metal backend cannot run.
+    try:
+        d("aten.sort.default", a)
+    except RuntimeError as e:
+        message = str(e)
+        assert "aten.sort.default" in message, message
+        assert "Metal" in message, message
+    else:
+        raise AssertionError("aten.sort.default must not silently run elsewhere")
+
+    # An op nothing implements, for the control: same shape of refusal, so the
+    # one above is not merely the generic path in disguise.
+    try:
+        d("aten.median.default", a)
+    except NotImplementedError as e:
+        assert "aten.median.default" in str(e), str(e)
+    else:
+        raise AssertionError("aten.median.default must refuse")
+
+
+def test_mps_is_refused_by_name_where_it_is_not_compiled_in():
+    """The other half of the skip, and the reason the skip is safe.
+
+    On a build without the Metal feature -- Android, Linux, wasm -- `resolve()`
+    has no `mps` arm and falls to the one that names the kind. The point is
+    that the failure is *loud and specific* rather than a fallback, so the
+    tests above are allowed to skip: on a machine where they skip, this is what
+    a caller gets.
+    """
+    for kind in ("cuda", "xpu", "hpu"):
+        try:
+            _C._aten_dispatch("aten.ones.default", [1], device=_C.device(kind))
+        except NotImplementedError as e:
+            assert kind in str(e), (kind, str(e))
+        else:
+            raise AssertionError(f"{kind} must refuse rather than fall back")
+    # And whichever way this build went for `mps`, it went there loudly.
+    try:
+        t = _C._aten_dispatch("aten.ones.default", [1], device=_C.device("mps"))
+    except NotImplementedError as e:
+        assert "mps" in str(e), str(e)
+    else:
+        assert t.device.type == "mps", t.device
+
+
+
+# --- the vulkan device: a representation candle has no variant for -----------
+#
+# The contrast with the mps tests above is the point, and docs/VULKAN3.md §4
+# is the long form of it.
+#
+# `mps` needed one arm of `resolve()` because candle owns the backend. `vulkan`
+# needs a fourth arm of `tensor::Repr` because candle's `Device` is a closed
+# enum with nowhere to put a `VkDevice` (docs/VULKAN2.md §5.1). That cost buys
+# something the mps path does not have: `PyTensorBase::tensor()` refuses on
+# every non-`Dense` arm, and it has 396 call sites, so a kernel that has not
+# been taught this device *cannot* read CPU storage off a Vulkan tensor by
+# forgetting to check. A silent CPU fallback is unrepresentable here rather
+# than merely unobserved.
+#
+# So these tests assert two different things and the second matters more:
+#
+#   1. the values come back right through real GPU memory, and
+#   2. everything not on `_C._vulkan_ops()` refuses **naming the op**.
+#
+# Nothing is installed to make these run. `docs/VULKAN2.md` §4 found a loader
+# and four ICDs already on disk inside the Android emulator bundle, and
+# `libkosmickrisp_icd.json` reaches the real Apple M1. Without `VK_DRIVER_FILES`
+# and `DYLD_LIBRARY_PATH` pointing there, `dlopen` finds nothing, so on an
+# ordinary run of this suite these skip and say the loader's own words.
+
+
+def _vulkan_or_skip(what):
+    """A live `vulkan` device, or None having said why not."""
+    probe = _C._vulkan_probe()
+    if not probe["available"]:
+        print(f"   (skipped {what}: no vulkan -- {str(probe['error']).splitlines()[0]})")
+        return None
+    return _C.device("vulkan")
+
+
+def test_vulkan_probe_answers_the_same_question_the_device_does():
+    """The probe is what lets everything below skip by name, so it is checked
+    against the device rather than trusted.
+
+    Both directions. A probe that said "available" while the factory refused
+    would turn every skip into a false pass; a probe that said "unavailable"
+    while the factory worked would silently retire this whole section. Neither
+    can happen without this disagreeing.
+    """
+    probe = _C._vulkan_probe()
+    assert set(probe) == {"available", "device", "type", "queue_family", "error"}, probe
+    try:
+        t = _C._aten_dispatch("aten.ones.default", [1], device=_C.device("vulkan"))
+    except NotImplementedError as e:
+        assert probe["available"] is False, probe
+        # The refusal carries the loader's own text, not a message of ours --
+        # on a machine with no Vulkan the useful thing to print is dlopen's.
+        assert probe["error"] and probe["error"][:40] in str(e), (probe, str(e))
+        assert probe["device"] is None, probe
+    else:
+        assert probe["available"] is True, probe
+        assert probe["device"], probe
+        assert t.device.type == "vulkan", t.device
+
+
+def test_vulkan_ones_round_trips_through_a_real_gpu_buffer():
+    vulkan = _vulkan_or_skip("vulkan ones")
+    if vulkan is None:
+        return
+    t = _C._aten_dispatch("aten.ones.default", [2, 2], device=vulkan)
+    # No index. There is one Vulkan device and none is invented, the mirror of
+    # `meta` -- so this is bare `vulkan`, not `vulkan:0` the way `mps:0` is.
+    assert t.device.type == "vulkan", t.device
+    assert t.device.index is None, t.device
+    assert not t.is_cpu
+    assert t.shape == (2, 2), t.shape
+    assert t.dtype == _C.float32, t.dtype
+    back = t.cpu()
+    assert back.device == _C.device("cpu"), back.device
+    assert back.tolist() == [[1.0, 1.0], [1.0, 1.0]], back.tolist()
+    # Zeros too, so that "1.0" is not a constant this path happens to produce.
+    z = _C._aten_dispatch("aten.zeros.default", [3], device=vulkan)
+    assert z.cpu().tolist() == [0.0, 0.0, 0.0], z.cpu().tolist()
+
+
+def test_vulkan_add_runs_the_spirv_kernel_and_agrees_with_cpu():
+    """The one elementwise op, against the CPU.
+
+    `add` of two `ones` would pass with a kernel that ignored both operands and
+    wrote 2.0, so the operands are made distinct by adding twice: the shader
+    has to read what it was given.
+    """
+    vulkan = _vulkan_or_skip("vulkan add")
+    if vulkan is None:
+        return
+    d = _C._aten_dispatch
+    a = d("aten.ones.default", [2, 3], device=vulkan)
+    b = d("aten.ones.default", [2, 3], device=vulkan)
+    two = d("aten.add.Tensor", a, b)
+    assert two.device.type == "vulkan", two.device
+    three = d("aten.add.Tensor", two, a)
+    assert three.cpu().tolist() == [[3.0] * 3] * 2, three.cpu().tolist()
+
+    # And the same computation on the CPU, element for element.
+    ca = d("aten.ones.default", [2, 3])
+    assert three.cpu().tolist() == d(
+        "aten.add.Tensor", d("aten.add.Tensor", ca, ca), ca
+    ).tolist()
+
+
+def test_an_op_vulkan_was_not_taught_refuses_and_names_the_op():
+    """The property this whole representation exists for.
+
+    `_C._vulkan_ops()` is the closed list, so the op picked here is chosen by
+    *not* being on it rather than by being one this author happened to think
+    of -- if a later round teaches `mul`, this test picks something else rather
+    than going quietly green on a list it no longer describes.
+
+    Checked with a live device on purpose. Without one, everything refuses for
+    the boring reason (no loader) and this would pass while proving nothing.
+    """
+    vulkan = _vulkan_or_skip("vulkan refusal")
+    if vulkan is None:
+        return
+    taught = set(_C._vulkan_ops())
+    assert "aten.add.Tensor" in taught, taught
+
+    d = _C._aten_dispatch
+    a = d("aten.ones.default", [2, 3], device=vulkan)
+    candidates = [
+        ("aten.mul.Tensor", (a, a)),
+        ("aten.sub.Tensor", (a, a)),
+        ("aten.matmul.default", (a, d("aten.ones.default", [3, 2], device=vulkan))),
+    ]
+    untaught = [(op, args) for op, args in candidates if op not in taught]
+    assert untaught, ("every candidate is now taught -- pick a new one", taught)
+
+    for op, args in untaught:
+        try:
+            d(op, *args)
+        except NotImplementedError as e:
+            message = str(e)
+            # The refusal names the op, which is what makes a wrong answer
+            # traceable to a missing kernel rather than to a wrong kernel.
+            assert op in message, (op, message)
+            assert "vulkan" in message, (op, message)
+        else:
+            raise AssertionError(
+                f"{op} must refuse on the vulkan device, not fall back to the CPU"
+            )
+
+
+def test_a_vulkan_tensor_has_no_cpu_storage_to_read():
+    """The mechanism, checked directly rather than inferred from the refusals.
+
+    `tensor()` refusing on `Repr::Vulkan` is what makes the test above a
+    structural property instead of a list of ops someone remembered to guard.
+    Anything that reaches for dense storage -- `tolist`, `numpy`, a buffer --
+    has to raise, and the message has to say `.cpu()` because that is the one
+    way out.
+    """
+    vulkan = _vulkan_or_skip("vulkan storage")
+    if vulkan is None:
+        return
+    t = _C._aten_dispatch("aten.ones.default", [2, 2], device=vulkan)
+    try:
+        t.tolist()
+    except NotImplementedError as e:
+        assert "vulkan" in str(e), str(e)
+        assert ".cpu()" in str(e), str(e)
+    else:
+        raise AssertionError("a vulkan tensor must not hand out CPU storage")
+    # And `.cpu()` really is the way out.
+    assert t.cpu().tolist() == [[1.0, 1.0], [1.0, 1.0]]
+
+
+def test_the_checked_in_spirv_is_not_stale():
+    """`vulkan.rs` `include_bytes!`s `shaders/*.spv`, and nothing in the build
+    compiles the `.comp` beside it -- deliberately, so that `cargo build`
+    needs no shader compiler on any of three platforms. The cost is that
+    editing a `.comp` and forgetting `shaders/compile.sh` ships the old kernel
+    silently, and this is the only thing that says so.
+
+    Compares mtimes rather than recompiling, because recompiling would put
+    `glslc` back on the critical path of the suite -- the exact dependency the
+    checked-in words exist to avoid.
+    """
+    shaders = pathlib.Path(__file__).resolve().parent.parent / "shaders"
+    if not shaders.is_dir():
+        print("   (skipped spirv staleness: no shaders/ directory)")
+        return
+    sources = sorted(shaders.glob("*.comp"))
+    assert sources, f"no .comp under {shaders}"
+    for source in sources:
+        words = source.with_suffix(".spv")
+        assert words.is_file(), f"{words.name} is missing -- run shaders/compile.sh"
+        # SPIR-V's magic number, little-endian. A truncated or text file here
+        # would otherwise be caught only by the driver, at runtime, on the one
+        # machine that has a driver.
+        assert words.read_bytes()[:4] == b"\x03\x02\x23\x07", words.name
+        assert words.stat().st_mtime >= source.stat().st_mtime, (
+            f"{words.name} is older than {source.name} -- run shaders/compile.sh"
+        )
+
+
+
 if __name__ == "__main__":
     raise SystemExit(_main())
