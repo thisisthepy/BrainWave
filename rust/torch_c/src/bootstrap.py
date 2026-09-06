@@ -10786,6 +10786,14 @@ def _install_repr_surface(module, varfns, tensorbase) -> None:
         # transform can start while the stack cannot be pushed to.
         if not _dynamic_layer_stack:
             return -1
+        if all(isinstance(entry, _VmapBroadcastInterpreter)
+               for entry in _dynamic_layer_stack):
+            # The vmap level below is a *broadcast* representation: its
+            # batched values are plain tensors with one dimension per level,
+            # not wrappers carrying a level. So `-1` is still the derived
+            # answer -- `is_functorch_wrapped_tensor` is asking whether this
+            # tensor is a wrapper, and here nothing ever is.
+            return -1
         raise NotImplementedError(
             "not implemented in torch._C shim: "
             "torch._C._functorch.maybe_get_level with a non-empty dynamic "
@@ -10815,7 +10823,9 @@ def _install_repr_surface(module, varfns, tensorbase) -> None:
         put it there, and every pusher is a raising stub. If functorch ever
         lands, this refuses instead of silently handing back a live wrapper.
         """
-        if _dynamic_layer_stack:
+        if _dynamic_layer_stack and not all(
+                isinstance(entry, _VmapBroadcastInterpreter)
+                for entry in _dynamic_layer_stack):
             raise NotImplementedError(
                 "not implemented in torch._C shim: "
                 "torch._C._functorch.unwrap_if_dead with a non-empty dynamic "
@@ -10831,6 +10841,431 @@ def _install_repr_surface(module, varfns, tensorbase) -> None:
         (maybe_current_level, "maybe_current_level"),
         (is_functorch_wrapped_tensor, "is_functorch_wrapped_tensor"),
         (unwrap_if_dead, "unwrap_if_dead"),
+    ):
+        _fn.__name__ = _fn.__qualname__ = _name
+        _fn.__module__ = "torch._C._functorch"
+        setattr(module._functorch, _name, _fn)
+
+    # -- `vmap`: a broadcast batching level for scalar index closures -------
+    #
+    # `docs/VMAP.md` is the round that built this; read §2 before widening it.
+    #
+    # The demand is `transformers/masking_utils.py:348`, reached by four
+    # architectures (`nemotron3_5_asr`, `nemotron_asr_streaming`,
+    # `nemotron_asr_streaming_encoder`, `t5gemma2`) because they pass an
+    # `and_mask_function` and so flip `use_vmap=True` at `masking_utils.py:962`.
+    # What they vmap is `_vmap_expansion_sdpa`: four nested `torch.vmap`s of a
+    # **scalar** closure `f(b_idx, h_idx, q_idx, kv_idx) -> 0-d bool`, each with
+    # `in_dims` one-hot (a single `0`, the rest `None`) over a 1-D `arange`, and
+    # `out_dims=0` throughout.
+    #
+    # For that shape -- and *only* that shape -- vmap is broadcasting. Level `L`
+    # owns dimension `L-1`, every batched value is a plain tensor of rank
+    # `_VMAP_MAX_RANK` whose non-owned dimensions are 1, and the elementwise ops
+    # in the closure line the levels up for free. `_remove_batch_dim` with
+    # `out_dims=0` is then bookkeeping, because the dimension is already where
+    # out_dim 0 wants it. transformers ships the same identity as
+    # `_non_vmap_expansion_sdpa` (`masking_utils.py:352`) and uses it as the
+    # *default* path, so this is not a novel claim -- and §3 of VMAP.md measures
+    # both paths against upstream torch and finds them bit-identical.
+    #
+    # Three things keep this from being the "no-op counter" `docs/COMPLEX.md` §7
+    # warned about, which would have produced a wrong attention mask rather than
+    # an error:
+    #
+    #   1. **The shape is checked, not assumed.** Every `_add_batch_dim` must be
+    #      a 1-D tensor with `in_dim == 0` (logical rank 0), and every
+    #      `_remove_batch_dim` must hand back a tensor whose dimensions are
+    #      exactly the level sizes or 1. A reduction, a reshape, a `cat` or a
+    #      matmul inside the closure moves that shape and is refused.
+    #   2. **The answer is checked against the definition of vmap.** A shape
+    #      that survives (1) can still be wrong if an op read *across* a level
+    #      -- `cumsum`, `flip`, `sort`. So at the innermost `_remove_batch_dim`
+    #      the closure is re-run on eight sampled index points with plain 0-d
+    #      scalars and no levels on the stack, which is what `vmap` *means*, and
+    #      any disagreement raises. This is why the frame of `_flat_vmap` is
+    #      required below: it is where the closure and its arguments live.
+    #   3. **Anything else still refuses.** `_vmap_increment_nesting` called
+    #      from anywhere but `torch/_functorch/vmap.py:_flat_vmap`, a
+    #      `randomness` other than `"error"`, `out_dims != 0`, more than one
+    #      output, a nesting deeper than the rank budget, or a self-check that
+    #      cannot be run all raise `NotImplementedError`. `grad`/`jvp`/`functionalize`
+    #      are untouched: `_wrap_for_grad` is still a raising stub.
+    #
+    # What this is *not* is a batching-rule system. There is no rule for `sum`,
+    # no rule for `matmul`, no rule for anything -- there is one representation
+    # that happens to be correct for pointwise-over-indices closures, plus two
+    # gates that refuse when it is not. VMAP.md §5 sizes the real thing.
+    import operator as _operator
+    import random as _random
+
+    _VMAP_MAX_RANK = 8
+    _vmap_stack = []
+    _vmap_logical = []
+    _vmap_unpaired = [0]
+
+    class _VmapBroadcastInterpreter:
+        """One entry of the functorch dynamic layer stack, for this vmap."""
+
+        __slots__ = ("lvl", "batch_size", "randomness", "func", "frame",
+                     "wrapped", "keep", "removed")
+
+        def __init__(self, lvl, batch_size, randomness):
+            self.lvl = lvl
+            self.batch_size = batch_size
+            self.randomness = randomness
+            self.func = None
+            self.frame = None
+            self.wrapped = {}
+            self.keep = []
+            self.removed = 0
+
+        def key(self):
+            return "Vmap"
+
+        def level(self):
+            return self.lvl
+
+        def __repr__(self):
+            return "<vmap interpreter level=%d batch_size=%d>" % (
+                self.lvl, self.batch_size)
+
+    def _vmap_refuse(what):
+        return NotImplementedError(
+            "not implemented in torch._C shim: " + what + ". This build's "
+            "`vmap` is a broadcast batching level for scalar index closures "
+            "only (docs/VMAP.md); a general vmap needs a batching rule per "
+            "operator, which does not exist here. Refusing rather than "
+            "returning a plausible wrong answer."
+        )
+
+    def _vmap_flat_vmap_frame():
+        """The `_flat_vmap` frame that drives this transform, or `None`.
+
+        `torch/_functorch/vmap.py:_flat_vmap` is the only caller of
+        `_vmap_increment_nesting` in the vendored tree, and it is where the
+        closure (`func`) and the batched arguments (`batched_inputs`, bound
+        after the increment) live. The self-check in `_remove_batch_dim`
+        cannot run without them, so a call from anywhere else is refused
+        instead of silently skipping the check.
+        """
+        f = sys._getframe(1)
+        for _ in range(8):
+            if f is None:
+                return None
+            code = f.f_code
+            if (code.co_name == "_flat_vmap"
+                    and code.co_filename.replace("\\", "/").endswith(
+                        "_functorch/vmap.py")):
+                return f
+            f = f.f_back
+        return None
+
+    def _vmap_lookup(obj):
+        """`(level, original_1d_tensor)` if `obj` came out of `_add_batch_dim`."""
+        if not isinstance(obj, tensorbase):
+            return None
+        for interp in _vmap_stack:
+            hit = interp.wrapped.get(id(obj))
+            if hit is not None and hit[0] is obj:
+                return interp.lvl, hit[1]
+        return None
+
+    def _vmap_increment_nesting_checked(batch_size, randomness):
+        if randomness != "error":
+            raise _vmap_refuse(
+                "torch._C._functorch._vmap_increment_nesting with "
+                "randomness=%r -- only 'error' is handled, because a "
+                "randomness mode is a statement about how random ops behave "
+                "under the transform and there are no batching rules here to "
+                "make that statement true" % (randomness,))
+        frame = _vmap_flat_vmap_frame()
+        if frame is None:
+            raise _vmap_refuse(
+                "torch._C._functorch._vmap_increment_nesting called from "
+                "outside torch/_functorch/vmap.py:_flat_vmap -- the batched "
+                "representation here is checked against the closure it "
+                "batches, and that closure is only reachable from that frame")
+        try:
+            batch_size = _operator.index(batch_size)
+        except TypeError:
+            raise _vmap_refuse(
+                "torch._C._functorch._vmap_increment_nesting with a "
+                "non-integer batch_size %r" % (batch_size,)) from None
+        if batch_size < 1:
+            raise _vmap_refuse(
+                "torch._C._functorch._vmap_increment_nesting with "
+                "batch_size=%d" % (batch_size,))
+        if len(_vmap_stack) >= _VMAP_MAX_RANK:
+            raise _vmap_refuse(
+                "vmap nested %d deep -- this representation gives each level "
+                "one of %d tensor dimensions"
+                % (len(_vmap_stack) + 1, _VMAP_MAX_RANK))
+        if not _vmap_stack and _vmap_logical:
+            del _vmap_logical[:]
+        if _vmap_logical:
+            raise _vmap_refuse(
+                "vmap pushed a level after an output was unwrapped at the "
+                "level below it -- this representation cannot hold a batched "
+                "value and a partially unwrapped one at once")
+        if "func" not in frame.f_locals:
+            raise _vmap_refuse(
+                "torch/_functorch/vmap.py:_flat_vmap does not bind `func` in "
+                "this torch build, so the self-check cannot be run")
+        interp = _VmapBroadcastInterpreter(
+            len(_vmap_stack) + 1, batch_size, randomness)
+        interp.func = frame.f_locals["func"]
+        interp.frame = frame
+        _vmap_stack.append(interp)
+        _dynamic_layer_stack.append(interp)
+        return interp.lvl
+
+    def _vmap_increment_nesting(batch_size, randomness):
+        """The refusal has to survive `vmap_increment_nesting`'s `finally`.
+
+        `torch/_functorch/vmap.py:487` is a context manager: it increments,
+        yields, and decrements in a `finally` that runs even when the
+        increment itself raised. So a refusal here is immediately followed by
+        an unpaired decrement, and if that decrement raises too it *replaces*
+        the refusal -- the caller is told "decrement with no level" and never
+        learns what was actually unsupported. Measured: `randomness=
+        "different"` reported the decrement error, not the randomness one.
+
+        So a refused increment leaves a debt, and the decrement pays it
+        instead of complaining. A hand-called decrement with no debt still
+        raises, which is what `test_vmap.py` pins.
+        """
+        try:
+            return _vmap_increment_nesting_checked(batch_size, randomness)
+        except NotImplementedError:
+            # Only when a `finally` is actually going to call the decrement.
+            # A hand call from outside `_flat_vmap` has no context manager
+            # behind it, so recording a debt there would make the *next*
+            # genuine decrement pay it and leak a live level -- measured, the
+            # dynamic layer stack ended one deep.
+            if _vmap_flat_vmap_frame() is not None:
+                _vmap_unpaired[0] += 1
+            raise
+
+    def _vmap_decrement_nesting():
+        # Debt first, and before looking at the stack: with nesting, a refused
+        # *inner* increment is followed by a decrement while the outer levels
+        # are still pushed, and popping one of those would unwind a level that
+        # is still live.
+        if _vmap_unpaired[0]:
+            _vmap_unpaired[0] -= 1
+            return -1
+        if not _vmap_stack:
+            raise RuntimeError(
+                "torch._C._functorch._vmap_decrement_nesting with no vmap "
+                "level on the dynamic layer stack")
+        interp = _vmap_stack.pop()
+        _dynamic_layer_stack.pop()
+        interp.frame = None
+        interp.func = None
+        interp.wrapped.clear()
+        del interp.keep[:]
+        if not _vmap_stack:
+            del _vmap_logical[:]
+        return interp.lvl
+
+    def _add_batch_dim(tensor, in_dim, level):
+        if not _vmap_stack or level != len(_vmap_stack):
+            raise _vmap_refuse(
+                "torch._C._functorch._add_batch_dim at level %r with %d vmap "
+                "levels on the stack -- a batched tensor can only be made "
+                "inside the transform that batches it"
+                % (level, len(_vmap_stack)))
+        interp = _vmap_stack[-1]
+        if not isinstance(tensor, tensorbase):
+            raise _vmap_refuse(
+                "torch._C._functorch._add_batch_dim on a %s"
+                % (type(tensor).__name__,))
+        if _operator.index(in_dim) != 0 or tensor.dim() != 1:
+            raise _vmap_refuse(
+                "torch._C._functorch._add_batch_dim of a %d-D tensor at "
+                "in_dim=%r -- this representation only holds a batched "
+                "*scalar* (a 1-D input mapped at dim 0), because it gives "
+                "level L tensor dimension L-1 and leaves nothing for a "
+                "logical shape to sit in"
+                % (tensor.dim(), in_dim))
+        if tensor.shape[0] != interp.batch_size:
+            raise _vmap_refuse(
+                "torch._C._functorch._add_batch_dim of a size-%d dimension at "
+                "a level whose batch size is %d"
+                % (tensor.shape[0], interp.batch_size))
+        shape = ((1,) * (level - 1) + (interp.batch_size,)
+                 + (1,) * (_VMAP_MAX_RANK - level))
+        out = tensor.reshape(shape)
+        interp.wrapped[id(out)] = (out, tensor)
+        interp.keep.append(out)
+        return out
+
+    def _vmap_self_check(interp, chk):
+        """Re-run the closure on sampled points, which is what vmap *means*.
+
+        `chk` is the broadcast answer, of shape `(b_1, ..., b_D)`. The
+        definition says `chk[i_1, ..., i_D] == f(a_1[i_1], ..., a_D[i_D])`
+        with plain scalars and no transform running, so that is what this
+        computes -- on the two corners and up to six deterministic interior
+        points. An op that read across a level (`cumsum`, `flip`, `sort`)
+        keeps the shape and so survives the shape gate; it does not survive
+        this one.
+        """
+        frame = interp.frame
+        loc = frame.f_locals if frame is not None else {}
+        if "batched_inputs" not in loc:
+            raise _vmap_refuse(
+                "the vmap self-check could not find `batched_inputs` in the "
+                "_flat_vmap frame, so the batched answer cannot be compared "
+                "against the closure it claims to batch")
+        from torch.utils import _pytree as _vmap_pytree
+
+        args = loc["batched_inputs"]
+        kwargs = loc.get("kwargs") or {}
+        func = interp.func
+        flat, spec = _vmap_pytree.tree_flatten(args)
+        origins = [_vmap_lookup(leaf) for leaf in flat]
+        sizes = [s.batch_size for s in _vmap_stack]
+        depth = len(sizes)
+        if not any(o is not None for o in origins):
+            raise _vmap_refuse(
+                "vmap's closure was called with no batched argument, so its "
+                "answer cannot be checked against the definition")
+
+        rng = _random.Random(0)
+        points = [tuple(0 for _ in sizes), tuple(n - 1 for n in sizes)]
+        while len(points) < 8:
+            p = tuple(rng.randrange(n) for n in sizes)
+            if p not in points:
+                points.append(p)
+            elif len(points) >= min(8, 1 + math.prod(sizes)):
+                break
+
+        saved_stack = list(_vmap_stack)
+        saved_layers = list(_dynamic_layer_stack)
+        saved_logical = list(_vmap_logical)
+        del _vmap_stack[:]
+        del _dynamic_layer_stack[:]
+        del _vmap_logical[:]
+        try:
+            for point in points:
+                leaves = []
+                for leaf, origin in zip(flat, origins):
+                    if origin is None:
+                        leaves.append(leaf)
+                    else:
+                        lvl, source = origin
+                        leaves.append(source[point[lvl - 1]])
+                try:
+                    ref = func(*_vmap_pytree.tree_unflatten(leaves, spec),
+                               **kwargs)
+                except NotImplementedError:
+                    raise
+                except Exception as exc:
+                    raise _vmap_refuse(
+                        "vmap's closure raised %s when re-run on plain "
+                        "scalars, so the batched answer cannot be checked "
+                        "against the definition of vmap: %s"
+                        % (type(exc).__name__, exc)) from None
+                if not isinstance(ref, tensorbase):
+                    if not isinstance(ref, (bool, int, float)):
+                        raise _vmap_refuse(
+                            "vmap's closure returned a %s for scalar inputs; "
+                            "this representation unwraps a single batched "
+                            "tensor" % (type(ref).__name__,))
+                    ref = sys.modules["torch"].tensor(ref)
+                if ref.dim() != 0:
+                    raise _vmap_refuse(
+                        "vmap's closure returned a %d-D result for scalar "
+                        "inputs; this representation only holds a batched "
+                        "scalar" % (ref.dim(),))
+                got = chk[point] if depth else chk
+                if ref.dtype != got.dtype:
+                    raise _vmap_refuse(
+                        "vmap's batched answer has dtype %s but the closure "
+                        "returns %s on the same point"
+                        % (got.dtype, ref.dtype))
+                if not bool((ref == got).all()):
+                    raise _vmap_refuse(
+                        "vmap's batched answer disagrees with the closure at "
+                        "index %r: broadcasting gave %r, the closure gives "
+                        "%r. The closure reads across a batched dimension, "
+                        "which needs a real batching rule"
+                        % (point, got, ref))
+        finally:
+            _vmap_stack[:] = saved_stack
+            _dynamic_layer_stack[:] = saved_layers
+            _vmap_logical[:] = saved_logical
+
+    def _remove_batch_dim(tensor, level, batch_size, out_dim):
+        if not _vmap_stack or level != len(_vmap_stack):
+            raise _vmap_refuse(
+                "torch._C._functorch._remove_batch_dim at level %r with %d "
+                "vmap levels on the stack" % (level, len(_vmap_stack)))
+        interp = _vmap_stack[-1]
+        if _operator.index(out_dim) != 0:
+            raise _vmap_refuse(
+                "torch._C._functorch._remove_batch_dim with out_dim=%r -- "
+                "only out_dims=0 is handled, which is where this "
+                "representation already puts the mapped dimension"
+                % (out_dim,))
+        if _operator.index(batch_size) != interp.batch_size:
+            raise _vmap_refuse(
+                "torch._C._functorch._remove_batch_dim with batch_size=%r at "
+                "a level whose batch size is %d"
+                % (batch_size, interp.batch_size))
+        if interp.removed:
+            raise _vmap_refuse(
+                "vmap's closure returned more than one output; this "
+                "representation unwraps one")
+        if not isinstance(tensor, tensorbase):
+            raise _vmap_refuse(
+                "torch._C._functorch._remove_batch_dim on a %s"
+                % (type(tensor).__name__,))
+        t = tensor
+        if t.dim() > _VMAP_MAX_RANK:
+            raise _vmap_refuse(
+                "vmap's closure returned a rank-%d result; this "
+                "representation budgets %d dimensions"
+                % (t.dim(), _VMAP_MAX_RANK))
+        if t.dim() < _VMAP_MAX_RANK:
+            # Right-alignment, which is what broadcasting would have done.
+            t = t.reshape((1,) * (_VMAP_MAX_RANK - t.dim()) + tuple(t.shape))
+        shape = tuple(t.shape)
+        for i, other in enumerate(_vmap_stack):
+            if shape[i] not in (1, other.batch_size):
+                raise _vmap_refuse(
+                    "vmap's closure returned shape %r; dimension %d belongs "
+                    "to the level with batch size %d and must be that or 1. "
+                    "An op inside the closure changed the shape, which needs "
+                    "a real batching rule"
+                    % (shape, i, other.batch_size))
+        tail = shape[level:]
+        want = tuple(_vmap_logical)
+        if tail[:len(want)] != want or any(d != 1 for d in tail[len(want):]):
+            raise _vmap_refuse(
+                "vmap's closure returned shape %r, whose dimensions after the "
+                "level slots are %r rather than the already-unwrapped %r"
+                % (shape, tail, want))
+        expanded = shape[:level - 1] + (interp.batch_size,) + shape[level:]
+        out = t.expand(expanded)
+        if not _vmap_logical:
+            sizes = tuple(s.batch_size for s in _vmap_stack)
+            chk = out.expand(sizes + (1,) * (_VMAP_MAX_RANK - len(sizes)))
+            chk = chk.contiguous().reshape(sizes)
+            _vmap_self_check(interp, chk)
+        interp.removed += 1
+        _vmap_logical.insert(0, interp.batch_size)
+        if level == 1:
+            return out.contiguous().reshape(tuple(_vmap_logical))
+        return out
+
+    for _fn, _name in (
+        (_vmap_increment_nesting, "_vmap_increment_nesting"),
+        (_vmap_decrement_nesting, "_vmap_decrement_nesting"),
+        (_add_batch_dim, "_add_batch_dim"),
+        (_remove_batch_dim, "_remove_batch_dim"),
     ):
         _fn.__name__ = _fn.__qualname__ = _name
         _fn.__module__ = "torch._C._functorch"

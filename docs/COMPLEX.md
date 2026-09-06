@@ -319,6 +319,15 @@ present, so nothing blocks it but the file.
 
 ## 7. `_vmap_increment_nesting`: real vmap, in all four
 
+> **Superseded by `docs/VMAP.md` (2026-09-07).** The sizing below is
+> correct — they do genuinely vmap, and a no-op counter would have
+> produced a wrong mask — but the conclusion that closing it needs "a
+> batching rule for every op reachable inside a vmapped closure" was
+> too pessimistic for *these* closures. They are pointwise over four
+> index scalars, and for that shape vmap is broadcasting. VMAP.md §2 is
+> the measurement, §4 is the fence, and §5 sizes the general thing,
+> which is still unbuilt.
+
 `nemotron3_5_asr`, `nemotron_asr_streaming`, `nemotron_asr_streaming_encoder`
 and `t5gemma2` (`docs/ARCH100.md:71`). The question worth asking was whether
 they genuinely vmap or merely touch an import path — because a counter with no
