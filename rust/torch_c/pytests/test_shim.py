@@ -14,6 +14,7 @@ adding a test dependency to a package that has none.
 """
 
 import math
+import pathlib
 
 import _C
 
@@ -20972,6 +20973,66 @@ def test_float8_to_float64_terminates():
     widened = _C._aten_dispatch("aten._to_copy.default", _f8(), dtype=_C.float64)
     assert str(widened.dtype) == "torch.float64", widened.dtype
     assert widened.tolist() == [1.0, 2.0], widened.tolist()
+
+
+# --- reachability (docs/REACH.md) -------------------------------------------
+
+
+def _reach_module():
+    """`tools/golden/reach.py`, imported off the repo this file lives in.
+
+    Not a copy of the check: the same module the standalone
+    `python3 tools/golden/reach.py` runs, so the suite and the tool cannot
+    disagree about what is connected.
+    """
+    import importlib
+    import sys
+
+    root = pathlib.Path(__file__).resolve().parents[3]
+    path = str(root / "tools" / "golden")
+    if path not in sys.path:
+        sys.path.insert(0, path)
+    return importlib.import_module("reach"), root
+
+
+def test_reach_probe_tells_a_missing_arm_from_a_refused_call():
+    """The check's own discrimination, before its verdict is trusted.
+
+    Everything below rests on "no dispatch arm" being distinguishable from "arm
+    exists and rejects an empty argument tuple". Both are exceptions from the
+    same call; only the wording separates them. If that wording changes, this
+    fails here rather than turning the whole audit into a silent all-clear.
+    """
+    reach, _ = _reach_module()
+    assert reach.self_test(_C) == []
+
+
+def test_reach_every_declared_name_reaches_a_kernel_and_every_kernel_a_name():
+    """The gap docs/GOLDEN.md names, made structural.
+
+    `compare.py` dispatches by key, so it cannot see a name with no arm behind
+    it, a kernel with no name in front of it, or a spelling nothing calls.
+    Those three have bitten four times (docs/REACH.md §1). This is the check
+    that fails on the fifth, in the suite, rather than months later in a sweep.
+    """
+    reach, root = _reach_module()
+    failures = reach.check(_C, root)
+    assert not failures, "\n".join(failures)
+
+
+def test_reach_allowlist_reasons_are_answerable_by_upstream():
+    """A deliberate gap and a forgotten one look identical unless the reason is
+    checkable. Every allowlist entry that says "upstream has no such spelling"
+    names the attribute path it is claiming that about, and this puts the claim
+    to a real upstream torch in a subprocess with `PYTHONPATH` stripped.
+    """
+    reach, _ = _reach_module()
+    ok, detail = reach.verify_upstream()
+    assert ok is not False, detail
+    if ok is None:
+        # Reported, never silently passed -- an unverifiable reason is a fact
+        # about this environment, not a green light.
+        print("NOTE: reach allowlist upstream claims not verified here -- %s" % detail)
 
 
 if __name__ == "__main__":
