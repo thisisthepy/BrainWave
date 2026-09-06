@@ -166,6 +166,12 @@ day it stops being true.
 
 ## 4. Three ops have kernels and no way to call them
 
+> **Closed since.** `upsample_nearest2d` and `linalg_qr` are bound in `bootstrap.py` now and
+> both allowlist entries are gone — `docs/BINDINGS.md`. `vilt` clears its wall; `rwkv` gets
+> past `torch.linalg.qr` and stops one line later at `torch.diag`. `nn.MSELoss` is still shut,
+> so the third of the three below stands. The section is left as written because its argument
+> (why these could not be `overloads.json` rows) is what the fix was built on.
+
 `upsample_nearest2d` and `linalg_qr` are reached upstream as `torch._C._nn.upsample_nearest2d`
 and `torch._C._linalg.linalg_qr` — **submodule bindings, not `torch.<name>` entries**. There is
 no `torch.upsample_nearest2d` and no `torch.linalg_qr` on 2.13.0 (checked, both directions), so

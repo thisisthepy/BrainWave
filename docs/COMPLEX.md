@@ -291,6 +291,11 @@ independent things, in that order, and only the first is available now.
 
 ## 6. `linalg_norm` is a binding, and the kernel is already there
 
+> **Closed since.** The install below was made — `docs/BINDINGS.md` §1.3. The vector cases are
+> compared element-wise against upstream; the matrix `ord`s (`'fro'`, `'nuc'`, `±2`, a 2-tuple
+> `dim`) refuse by name, because they are `linalg_matrix_norm` upstream and the flattened
+> vector norm would answer them with the right shape and the wrong number.
+
 `torch._C._linalg.linalg_norm` blocks `owlv2` and `owlvit`
 (`docs/ARCH100.md:76`). It is `missing_shim_name`, and the classification is
 accurate: `aten.linalg_vector_norm.default` **has a kernel** in `aten.rs` and is

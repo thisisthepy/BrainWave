@@ -267,6 +267,11 @@ refuses by naming the overload it needed.
 
 ### 4.4 `mish` — written, verified, and deliberately not landed
 
+> **Still not landed, and the reason has changed.** `bootstrap.py` is no longer the blocker —
+> the round that owned it looked at this and could not pay it, because the *kernel* is what is
+> missing: `aten.mish.default` is not in `_aten_implemented()`, so a `_nn.mish` composite would
+> be a door onto nothing. It is now a one-round job rather than two. `docs/BINDINGS.md` §5.
+
 `aten.mish.default` was implemented (`x * tanh(log1p(exp(x)))`, `f32` accumulator for the
 reduced floats, upstream's `"mish_cpu" not implemented` refusal for integral inputs) and matched
 upstream to within one ULP across `float64`/`float32`/`float16`/`bfloat16`, including the

@@ -2855,6 +2855,120 @@ def install(module, surface_json: str, overloads_json: str, methods_json: str) -
         "linalg_vector_norm", dispatch, overloads
     )
 
+    # `torch._C._linalg.linalg_qr` -- `rwkv`'s *construction* wall.
+    #
+    # `torch/linalg/__init__.py:2823` is `qr = _add_docstr(_linalg.linalg_qr,
+    # ...)`, so `torch.linalg.qr` **is** this binding rather than a wrapper
+    # around it, and `torch.nn.init.orthogonal_` (which `rwkv`'s
+    # `_init_weights` calls) reaches it on the first line of the model's
+    # constructor. There is no `torch.linalg_qr` and no `Tensor.linalg_qr` on
+    # 2.13.0 -- checked both directions -- so this cannot be an
+    # `overloads.json` row without inventing a door upstream does not have
+    # (docs/SPELLINGS.md). It is a composite here for the same reason
+    # `_install_nn`'s `upsample_bilinear2d` is one.
+    #
+    # The kernel already exists and is golden-compared (`aten.linalg_qr.default`,
+    # docs/TAIL1.md §5); it returns upstream's `linalg_qr(Q=..., R=...)`
+    # namedtuple, including the `mode="r"` one-dimensional empty `Q`, so
+    # nothing is reshaped or renamed on the way through.
+    #
+    # `out=` is refused by name rather than ignored: upstream writes into the
+    # supplied tensors and returns them, and silently returning fresh ones
+    # would leave a caller holding unwritten buffers it believes are results.
+    def linalg_qr(A, mode="reduced", *, out=None):
+        if out is not None:
+            raise NotImplementedError(
+                "not implemented in torch._C shim: torch._C._linalg.linalg_qr("
+                "out=...) -- upstream writes the factorisation into the tensors "
+                "given and returns them; this shim only allocates its own"
+            )
+        return dispatch("aten.linalg_qr.default", A, mode)
+
+    linalg_qr.__name__ = linalg_qr.__qualname__ = "linalg_qr"
+    linalg_qr.__module__ = "torch._C._linalg"
+    module._linalg.linalg_qr = linalg_qr
+
+    # `torch._C._linalg.linalg_norm` -- `owlv2`'s and `owlvit`'s wall
+    # (docs/COMPLEX.md §6). `torch/linalg/__init__.py:1353` is
+    # `norm = _add_docstr(_linalg.linalg_norm, ...)`, the same shape as `qr`
+    # above, and again with no `torch.linalg_norm` / `Tensor.linalg_norm` to
+    # hang a table row on.
+    #
+    # **`ord` selects between different computations, so this forwards the ones
+    # it can and refuses the rest by name.** `linalg.norm` is a vector norm or
+    # a matrix norm depending on `ord` *and* `dim` together:
+    #
+    #     dim is an int (or a 1-list)     -> vector norm, any numeric `ord`
+    #     dim is None, ord is None        -> flatten to 1-D, 2-norm
+    #     dim is a 2-tuple                -> MATRIX norm
+    #     dim is None, ord is not None    -> MATRIX norm when `A` is 2-D
+    #     ord is 'fro' or 'nuc'           -> MATRIX norm
+    #
+    # Only the vector cases go through `aten.linalg_vector_norm.default`, which
+    # is the kernel this shim has. The matrix cases are `linalg_matrix_norm`
+    # upstream -- `nuc` and `ord=±2` need singular values, and `fro`/`±1`/`±inf`
+    # are row/column reductions, none of which `vector_norm` computes -- so they
+    # raise naming themselves rather than quietly answering the flattened
+    # vector norm, which has the right shape and the wrong number.
+    #
+    # What the two blocked architectures actually spell, read out of
+    # `transformers` rather than guessed:
+    #
+    #     modeling_owlv2.py:975    torch.linalg.norm(x, ord=2, dim=-1, keepdim=True)
+    #     modeling_owlv2.py:1048   torch.linalg.norm(x, dim=-1, keepdim=True)
+    #     modeling_owlvit.py:957   (identical)
+    #     modeling_owlvit.py:1028  (identical)
+    #
+    # -- both vector norms over an `int` `dim`, i.e. inside the branch below.
+    def linalg_norm(A, ord=None, dim=None, keepdim=False, *, out=None, dtype=None):
+        if out is not None:
+            raise NotImplementedError(
+                "not implemented in torch._C shim: torch._C._linalg.linalg_norm("
+                "out=...)"
+            )
+        if isinstance(ord, str):
+            raise NotImplementedError(
+                f"not implemented in torch._C shim: torch._C._linalg.linalg_norm("
+                f"ord={ord!r}) -- a matrix norm. Upstream routes 'fro' and 'nuc' to "
+                "linalg_matrix_norm; 'nuc' needs singular values and 'fro' is a "
+                "different reduction from the flattened vector 2-norm. This shim has "
+                "aten.linalg_vector_norm.default and no matrix-norm kernel"
+            )
+        if dim is not None and not isinstance(dim, int):
+            axes = list(dim)
+            if len(axes) > 1:
+                raise NotImplementedError(
+                    f"not implemented in torch._C shim: torch._C._linalg.linalg_norm("
+                    f"dim={tuple(axes)!r}) -- a {len(axes)}-tuple `dim` selects "
+                    "upstream's matrix norm (linalg_matrix_norm), which this shim has "
+                    "no kernel for"
+                )
+            dim = axes
+        elif dim is not None:
+            dim = [dim]
+        if dim is None and ord is not None and A.dim() != 1:
+            raise NotImplementedError(
+                f"not implemented in torch._C shim: torch._C._linalg.linalg_norm("
+                f"ord={ord!r}, dim=None) on a {A.dim()}-dimensional input -- with "
+                "`dim=None` and an explicit `ord`, upstream requires a 1-D or 2-D "
+                "input and takes the MATRIX norm when it is 2-D. Only the 1-D case "
+                "is a vector norm, and only that one is implemented here. Pass "
+                "`dim=-1` for the per-row vector norm, which is what the callers "
+                "this was written for spell"
+            )
+        p = 2 if ord is None else ord
+        if dtype is None:
+            return dispatch(
+                "aten.linalg_vector_norm.default", A, p, dim, keepdim
+            )
+        return dispatch(
+            "aten.linalg_vector_norm.default", A, p, dim, keepdim, dtype=dtype
+        )
+
+    linalg_norm.__name__ = linalg_norm.__qualname__ = "linalg_norm"
+    linalg_norm.__module__ = "torch._C._linalg"
+    module._linalg.linalg_norm = linalg_norm
+
     # -- `_monitor._WaitCounter` -- a block that can be entered -------------
     #
     # `torch/distributed/c10d_logger.py:96` wraps every public collective in
@@ -7610,6 +7724,74 @@ def _install_nn(module, dispatch) -> None:
             scale_h, scale_w,
         )
 
+    def upsample_nearest2d(
+        input, output_size, scale_factors=None, scales_w=_LEAF_SENTINEL,
+    ):
+        """`torch._C._nn.upsample_nearest2d` -- `vilt`'s wall (docs/TAIL1.md §4).
+
+        `torch/nn/functional.py:5188` (`F.interpolate`, `mode="nearest"`) calls
+        this with **three** arguments -- `(input, output_size, scale_factors)`,
+        the `.vec` schema -- where bilinear's `.vec` has four because nearest
+        has no `align_corners` at all. The leaf schema is
+        `(self, output_size, scales_h, scales_w)`, so **a fourth argument is
+        the only thing that distinguishes the two shapes** and it is the
+        discriminator, the same way it is for `upsample_bicubic2d` one
+        argument further along.
+
+        Measured on torch 2.13.0 rather than inferred from bilinear, because
+        the argument counts differ:
+
+            F.interpolate((1,1,3,5), scale_factor=1.5, mode="nearest")
+                -> aten.upsample_nearest2d.default((1,1,3,5), [4, 7], 1.5, 1.5)
+            F.interpolate((1,1,3,5), size=(7,11), mode="nearest")
+                -> aten.upsample_nearest2d.default((1,1,3,5), [7, 11])
+            torch._C._nn.upsample_nearest2d(x, [4,7], [1.5,1.5])
+                -> RuntimeError: Must specify exactly one of output_size and
+                   scale_factors
+
+        -- so three positional arguments is `.vec` (that last line is upstream
+        refusing to be given both), and `output_size` and `scale_factors` are
+        mutually exclusive there exactly as they are for bilinear.
+
+        **The scale factors are forwarded, not merely used to size the
+        output.** `1/scale` and `in/out` coincide whenever the product is
+        integral, which is every case a `scale_factor=2` test produces, and
+        diverge as soon as it is not -- dropping them would sample a different
+        grid, silently, at the right output shape. They happen to agree on the
+        `3x5 -> 4x7` case above (checked), which is precisely why a test built
+        only from that case would not have noticed.
+        """
+        _leaf = scales_w is not _LEAF_SENTINEL
+        sizes = list(input.shape)
+        if _leaf:
+            if output_size is None:
+                raise RuntimeError(
+                    "It is expected output_size equals to 2, but got size 0"
+                )
+            return dispatch(
+                "aten.upsample_nearest2d.default", input,
+                [int(v) for v in output_size], scale_factors, scales_w,
+            )
+        if output_size is not None and scale_factors is not None:
+            raise RuntimeError(
+                "Must specify exactly one of output_size and scale_factors"
+            )
+        if output_size is not None:
+            osize = [int(v) for v in output_size]
+            scale_h = scale_w = None
+        else:
+            if scale_factors is None:
+                raise RuntimeError(
+                    "Must specify exactly one of output_size and scale_factors"
+                )
+            factors = list(scale_factors)
+            osize = [int(sizes[i + 2] * factors[i]) for i in range(len(factors))]
+            scale_h = float(factors[0]) if len(factors) > 0 else None
+            scale_w = float(factors[1]) if len(factors) > 1 else None
+        return dispatch(
+            "aten.upsample_nearest2d.default", input, osize, scale_h, scale_w,
+        )
+
     def leaky_relu(input, negative_slope=0.01):
         """`torch._C._nn.leaky_relu` -- `vits`' wall after the `IntTensor`
         constructor.
@@ -7766,6 +7948,7 @@ def _install_nn(module, dispatch) -> None:
         (softplus, "softplus"),
         (upsample_bilinear2d, "upsample_bilinear2d"),
         (upsample_bicubic2d, "upsample_bicubic2d"),
+        (upsample_nearest2d, "upsample_nearest2d"),
         (leaky_relu, "leaky_relu"),
         (adaptive_avg_pool2d, "adaptive_avg_pool2d"),
         (hardtanh, "hardtanh"),
@@ -7785,6 +7968,7 @@ def _install_nn(module, dispatch) -> None:
         "adaptive_avg_pool2d", "cross_entropy_loss", "gelu", "glu", "hardtanh", "leaky_relu", "linear", "nll_loss",
         "nll_loss_nd", "one_hot", "pad", "scaled_dot_product_attention", "silu",
         "softplus", "upsample_bicubic2d", "upsample_bilinear2d",
+        "upsample_nearest2d",
     ]
 
 

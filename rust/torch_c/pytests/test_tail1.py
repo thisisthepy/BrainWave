@@ -793,7 +793,7 @@ probe("is_all_true", lambda: bool(torch._is_all_true(torch.tensor([True, True]))
 probe("nn_upsample_nearest2d", lambda: torch._C._nn.upsample_nearest2d(
     torch.arange(16, dtype=torch.float32).reshape(1, 1, 4, 4), [2, 2]).tolist())
 probe("linalg_qr", lambda: [list(t.shape) for t in torch.linalg.qr(
-    torch.eye(3) if hasattr(torch, "eye") else torch.zeros(3, 3))])
+    torch.tensor([[1., 0., 0.], [0., 1., 0.], [0., 0., 1.]]))])
 probe("mse_loss", lambda: round(float(torch.nn.MSELoss()(
     torch.zeros(2, 2), torch.ones(2, 2))), 6))
 
@@ -841,34 +841,30 @@ def test_the_new_torch_level_spellings_reach_their_kernels_in_the_vendored_tree(
         assert r[name][1] == expected, (name, r[name][1], expected)
 
 
-def test_two_kernels_still_have_no_python_spelling_and_it_is_one_line_each():
-    """`upsample_nearest2d` and `linalg_qr` are reached upstream as
-    `torch._C._nn.upsample_nearest2d` and `torch._C._linalg.linalg_qr` --
-    submodule bindings, not `torch.<name>` resolution-table entries, so no
-    `overloads.json` row can reach them (a row would invent a `torch.<name>`
-    upstream does not have). Both kernels are implemented and golden-compared;
-    what is missing is one line in `bootstrap.py`, which this round did not
-    own.
+def test_the_two_submodule_bindings_landed_and_mse_loss_is_the_one_still_open():
+    """This test used to pin the *opposite* -- that `torch._C._nn.
+    upsample_nearest2d` and `torch._C._linalg.linalg_qr` had kernels and no way
+    to call them, because the round that wrote the kernels did not own
+    `bootstrap.py`. docs/TAIL1.md §4 said it would fail the moment the bindings
+    landed, and it did. They are inverted here rather than deleted: the
+    coverage that mattered was never "the gap exists", it was "somebody checks
+    these two names through the vendored tree", and that is worth keeping now
+    that they answer. docs/BINDINGS.md.
 
-    This pins the gap so it cannot be forgotten and cannot be miscounted as
-    "op implemented, architecture cleared". `vilt` and `rwkv` are still shut.
-    When the bindings land, this test fails -- delete it and update
-    docs/TAIL1.md §4 and `tools/golden/reach_allow.json` in the same change."""
+    `mse_loss` is the one still open, and it is a `bootstrap.py` stub of the
+    same shape -- docs/BACKWARD9.md §1's hand-spelled criterion stands until it
+    lands."""
     if not os.path.isfile(_CKPT_VENDOR_SHIM):
         return
     r = _vendor_probe()
-    assert r["nn_upsample_nearest2d"][0] == "raised", (
-        "torch._C._nn.upsample_nearest2d now computes -- the binding landed, so "
-        "delete this test, its reach_allow.json sibling is only for linalg_qr, "
-        "and rewrite docs/TAIL1.md §4"
+    assert r["nn_upsample_nearest2d"][0] == "ok", r["nn_upsample_nearest2d"]
+    assert r["nn_upsample_nearest2d"][1] == [[[[0.0, 2.0], [8.0, 10.0]]]], (
+        r["nn_upsample_nearest2d"][1]
     )
-    assert r["linalg_qr"][0] == "raised", (
-        "torch.linalg.qr now computes -- the _linalg binding landed, so delete "
-        "this test and the aten.linalg_qr.default entry in reach_allow.json"
-    )
+    assert r["linalg_qr"][0] == "ok", r["linalg_qr"]
+    assert r["linalg_qr"][1] == [[3, 3], [3, 3]], r["linalg_qr"][1]
     # And the loss that motivated `broadcast_tensors`: the table row landed and
     # the *next* wall is `torch._C._nn.mse_loss`, also a bootstrap.py stub.
-    # docs/BACKWARD9.md's hand-spelled criterion stands until that lands too.
     assert r["mse_loss"][0] == "raised", (
         "nn.MSELoss now computes -- the _nn.mse_loss binding landed. "
         "docs/BACKWARD9.md §1 can stop spelling its criterion out by hand, and "

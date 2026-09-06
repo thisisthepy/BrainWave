@@ -146,6 +146,8 @@ PROBES = {
     "stft_real": lambda: torch.stft(torch.arange(64).float(), n_fft=16,
                                     return_complex=False),
     "linalg_norm": lambda: torch._C._linalg.linalg_norm(torch.ones(2, 2)),
+    "linalg_norm_fro": lambda: torch._C._linalg.linalg_norm(
+        torch.ones(2, 2), "fro"),
     "vmap_increment_nesting":
         lambda: torch._C._functorch._vmap_increment_nesting(2, "error"),
     "add_batch_dim":
@@ -348,28 +350,43 @@ def test_fft_and_stft_are_not_implemented():
         )
 
 
-def test_linalg_norm_is_a_binding_gap_not_a_kernel_gap():
-    """OWL-ViT's wall (`owlv2`, `owlvit`), and the reason it is not closed here.
+def test_linalg_norm_binding_landed_on_the_kernel_that_was_already_there():
+    """OWL-ViT's wall (`owlv2`, `owlvit`). This test used to pin the *gap* --
+    the kernel present, the name unreachable, COMPLEX.md §6 naming the install
+    site -- and said in its own message that when the binding landed it should
+    become an element-wise comparison instead. It has landed (docs/BINDINGS.md),
+    so this is the other half: the kernel is still what the binding is built
+    on, and the binding computes rather than raising.
 
-    `linalg_vector_norm` already has a kernel in `aten.rs` -- so
-    `torch._C._linalg.linalg_norm` is a *name*, installed alongside it in
-    `bootstrap.py`, not arithmetic. COMPLEX.md §6 gives the exact install.
-    Asserted here so the claim "the kernel is already present" is checked
-    rather than asserted.
+    The element-wise agreement with upstream lives in `test_bindings.py`, which
+    runs upstream in a second subprocess. What is kept here is the *pairing* --
+    that the name and the kernel it depends on do not come apart.
     """
     assert "aten.linalg_vector_norm.default" in set(_C._aten_implemented()), (
-        "the kernel linalg_norm would be built on is gone; COMPLEX.md §6 is "
-        "stale"
+        "the kernel linalg_norm is built on is gone -- the binding in "
+        "bootstrap.py now dispatches to nothing"
     )
     r = _raised("linalg_norm")
     if r == "skip":
         return
-    assert r is not None, (
-        "torch._C._linalg.linalg_norm computed something -- if it was "
-        "installed, COMPLEX.md §6 is done and this test should compare it "
-        "against upstream element-wise instead"
+    assert r is None, (
+        f"torch._C._linalg.linalg_norm raised: {r}. It is installed in "
+        "bootstrap.py beside linalg_vector_norm; `linalg_norm(ones(2,2))` is "
+        "the flattened 2-norm and should answer 2.0"
     )
-    exc, msg = r
+    # `ones(2, 2)` flattens to four ones, so the 2-norm is exactly 2.
+    assert "2." in _probe()["linalg_norm"]["ok"], _probe()["linalg_norm"]
+
+    # And the half that is deliberately still shut: `ord` selects between
+    # different computations, and the matrix ones are `linalg_matrix_norm`
+    # upstream. Answering the flattened vector norm there would have the right
+    # shape and the wrong number, so it refuses by name.
+    fro = _raised("linalg_norm_fro")
+    assert fro is not None and fro != "skip", (
+        "linalg_norm(ord='fro') computed something. That is a matrix norm; if "
+        "a matrix-norm kernel landed, compare it against upstream here"
+    )
+    exc, msg = fro
     assert exc == "NotImplementedError", f"{exc}: {msg}"
     assert "linalg_norm" in msg, msg
 
