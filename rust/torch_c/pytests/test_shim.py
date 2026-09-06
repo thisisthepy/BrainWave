@@ -22684,5 +22684,554 @@ def test_capture_refuses_demand8_inplace_names_and_lets_the_others_through():
 
 
 
+# ---------------------------------------------------------------------------
+# docs/REACH.md shape 3 -- closing part of the 54-name backlog
+#
+# `tools/golden/reach.py` cannot see whether a spelling golden compares by
+# dispatch key is reachable from Python at all (docs/REACH.md's whole point).
+# The names below were in `reach_allow.json`'s `shape3_unexercised_spelling`
+# with a "backlog" reason and nothing in `pytests/` calling
+# `torch.<name>(...)` or `<something>.<name>(...)`. This road script closes
+# 27 of them with a real `import torch` against the vendored tree, each
+# value checked against upstream torch 2.13.0 run on this same script with
+# `PYTHONPATH` stripped (the oracle, not this shim) -- transcribed into the
+# assertions below, not derived from the shim's own output.
+#
+# `cat`, `where`, `erf` and `sigmoid` are first because docs/REACH.md's
+# check found them appearing in this file only inside a comment or a
+# docstring -- four of the most common ops in the library, uncalled.
+#
+# `Tensor.where` is a genuine gap this script found: `torch.where(...)`
+# works, but `x.where(cond, y)` raises `NotImplementedError` in the shim
+# where upstream succeeds. That is reported, not fixed here (shape 3's
+# allowlist entry for `where` is removed because the *function* spelling now
+# has real coverage; the method gap is not this check's shape and is not
+# tracked by an allowlist entry of its own).
+_REACH_BACKLOG_ROAD_SCRIPT = r"""
+import json, sys
+import torch
+
+out = {}
+
+def rec(key, value_fn):
+    try:
+        out[key] = value_fn()
+    except Exception as e:
+        out[key] = f"ERROR:{type(e).__name__}:{e}"
+
+torch.manual_seed(0)
+
+# --- cat -------------------------------------------------------------
+a = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+b = torch.tensor([[5.0, 6.0]])
+rec("cat_dim0", lambda: torch.cat([a, b], dim=0).tolist())
+c = torch.tensor([[1.0], [2.0]])
+rec("cat_dim1", lambda: torch.cat([a, c], dim=1).tolist())
+
+# --- where -- function spelling only; `Tensor.where` is a separate,
+# broken finding recorded outside this script (shim raises
+# NotImplementedError, upstream succeeds -- see the test docstring).
+cond = torch.tensor([True, False, True, False])
+wx = torch.tensor([1.0, 2.0, 3.0, 4.0])
+wy = torch.tensor([10.0, 20.0, 30.0, 40.0])
+rec("where_fn", lambda: torch.where(cond, wx, wy).tolist())
+
+# --- erf -----------------------------------------------------------------
+ev = torch.tensor([0.3, -0.7, 1.2, -2.0])
+rec("erf_fn", lambda: torch.erf(ev).tolist())
+rec("erf_member", lambda: ev.erf().tolist())
+
+# --- sigmoid ---------------------------------------------------------------
+sv = torch.tensor([0.5, -1.5, 2.5, -0.25])
+rec("sigmoid_fn", lambda: torch.sigmoid(sv).tolist())
+rec("sigmoid_member", lambda: sv.sigmoid().tolist())
+
+
+def inplace_check(name, base, fn_call, member_call):
+    t1 = base.clone()
+    r1 = fn_call(t1)
+    rec(f"{name}_fn", lambda: [r1.tolist(), r1 is t1])
+    t2 = base.clone()
+    r2 = member_call(t2)
+    rec(f"{name}_member", lambda: [r2.tolist(), r2 is t2])
+
+
+inplace_check("erf_", torch.tensor([0.3, -0.7, 1.2, -2.0]),
+              lambda t: torch.erf_(t), lambda t: t.erf_())
+inplace_check("sigmoid_", torch.tensor([0.5, -1.5, 2.5, -0.25]),
+              lambda t: torch.sigmoid_(t), lambda t: t.sigmoid_())
+inplace_check("abs_", torch.tensor([-3.5, 2.0, -1.0, 0.0]),
+              lambda t: torch.abs_(t), lambda t: t.abs_())
+inplace_check("cos_", torch.tensor([0.3, 1.1, -0.6]),
+              lambda t: torch.cos_(t), lambda t: t.cos_())
+inplace_check("sin_", torch.tensor([0.3, 1.1, -0.6]),
+              lambda t: torch.sin_(t), lambda t: t.sin_())
+inplace_check("tanh_", torch.tensor([0.5, -1.0, 2.0]),
+              lambda t: torch.tanh_(t), lambda t: t.tanh_())
+inplace_check("sqrt_", torch.tensor([4.0, 9.0, 16.0]),
+              lambda t: torch.sqrt_(t), lambda t: t.sqrt_())
+inplace_check("rsqrt_", torch.tensor([4.0, 9.0, 16.0]),
+              lambda t: torch.rsqrt_(t), lambda t: t.rsqrt_())
+inplace_check("reciprocal_", torch.tensor([2.0, -4.0, 0.5]),
+              lambda t: torch.reciprocal_(t), lambda t: t.reciprocal_())
+inplace_check("log_", torch.tensor([1.0, 2.5, 10.0]),
+              lambda t: torch.log_(t), lambda t: t.log_())
+inplace_check("expm1_", torch.tensor([0.5, -0.5, 2.0]),
+              lambda t: torch.expm1_(t), lambda t: t.expm1_())
+inplace_check("ceil_", torch.tensor([1.2, -1.2, 2.9]),
+              lambda t: torch.ceil_(t), lambda t: t.ceil_())
+inplace_check("zero_", torch.tensor([1.0, 2.0, 3.0]),
+              lambda t: torch.zero_(t), lambda t: t.zero_())
+
+# log2 -- both the out-of-place spelling and its in-place counterpart.
+l2v = torch.tensor([1.0, 8.0, 32.0])
+rec("log2_fn", lambda: torch.log2(l2v).tolist())
+rec("log2_member", lambda: l2v.log2().tolist())
+inplace_check("log2_", torch.tensor([1.0, 8.0, 32.0]),
+              lambda t: torch.log2_(t), lambda t: t.log2_())
+
+# --- sign / neg ------------------------------------------------------
+sgv = torch.tensor([-5.0, 0.0, 3.0])
+rec("sign_fn", lambda: torch.sign(sgv).tolist())
+rec("sign_member", lambda: sgv.sign().tolist())
+
+negv = torch.tensor([1.0, -2.0, 3.0])
+rec("neg_fn", lambda: torch.neg(negv).tolist())
+rec("neg_member", lambda: negv.neg().tolist())
+
+# --- le / lt -----------------------------------------------------------
+lev = torch.tensor([1.0, 2.0, 3.0])
+lew = torch.tensor([2.0, 2.0, 1.0])
+rec("le_fn", lambda: torch.le(lev, lew).tolist())
+rec("le_member", lambda: lev.le(lew).tolist())
+rec("lt_fn", lambda: torch.lt(lev, lew).tolist())
+rec("lt_member", lambda: lev.lt(lew).tolist())
+
+# --- rsub ------------------------------------------------------------
+rsv = torch.tensor([1.0, 2.0, 3.0])
+rec("rsub_fn", lambda: torch.rsub(rsv, 10.0).tolist())
+
+# --- matmul / bmm / addmm -----------------------------------------------
+m1 = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+m2 = torch.tensor([[5.0, 6.0], [7.0, 8.0]])
+rec("matmul_fn", lambda: torch.matmul(m1, m2).tolist())
+rec("matmul_member", lambda: m1.matmul(m2).tolist())
+
+bm1 = torch.arange(1.0, 9.0).reshape(2, 2, 2)
+bm2 = torch.arange(9.0, 17.0).reshape(2, 2, 2)
+rec("bmm_fn", lambda: torch.bmm(bm1, bm2).tolist())
+rec("bmm_member", lambda: bm1.bmm(bm2).tolist())
+
+am_base = torch.tensor([[1.0, 1.0], [1.0, 1.0]])
+rec("addmm_fn", lambda: torch.addmm(am_base, m1, m2).tolist())
+rec("addmm_member", lambda: am_base.addmm(m1, m2).tolist())
+
+# --- cumsum ------------------------------------------------------------
+csv = torch.tensor([1.0, 2.0, 3.0, 4.0])
+rec("cumsum_fn", lambda: torch.cumsum(csv, dim=0).tolist())
+rec("cumsum_member", lambda: csv.cumsum(dim=0).tolist())
+
+# --- masked_select -------------------------------------------------------
+msv = torch.tensor([1.0, 2.0, 3.0, 4.0])
+mask = torch.tensor([True, False, True, False])
+rec("masked_select_fn", lambda: torch.masked_select(msv, mask).tolist())
+rec("masked_select_member", lambda: msv.masked_select(mask).tolist())
+
+# --- permute / expand / squeeze -----------------------------------------
+pv = torch.arange(24.0).reshape(2, 3, 4)
+rec("permute_shape", lambda: list(pv.permute(2, 0, 1).shape))
+rec("permute_vals", lambda: pv.permute(2, 0, 1)[0].tolist())
+
+exv = torch.tensor([[1.0], [2.0], [3.0]])
+rec("expand_fn", lambda: exv.expand(3, 4).tolist())
+
+sqv = torch.zeros(2, 1, 3, 1)
+rec("squeeze_fn", lambda: list(torch.squeeze(sqv).shape))
+rec("squeeze_member", lambda: list(sqv.squeeze().shape))
+
+# --- embedding ------------------------------------------------------------
+weight = torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])
+idx = torch.tensor([2, 0, 1])
+rec("embedding_fn", lambda: torch.nn.functional.embedding(idx, weight).tolist())
+
+json.dump(out, sys.stdout)
+
+"""
+
+
+def _reach_backlog_road_fixture():
+    env = dict(os.environ)
+    env["PYTHONPATH"] = _CKPT_VENDOR_DIR
+    env["TORCH_USE_RTLD_GLOBAL"] = "1"  # VENDOR.md wall 1
+    proc = subprocess.run(
+        [sys.executable, "-c", _REACH_BACKLOG_ROAD_SCRIPT],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=180,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"reach-backlog-road subprocess exited {proc.returncode}\n"
+            f"--- stdout ---\n{proc.stdout}\n--- stderr ---\n{proc.stderr}"
+        )
+    return json.loads(proc.stdout)
+
+
+def test_reach_backlog_27_unexercised_spellings_reach_their_kernels_and_match_upstream():
+    """docs/REACH.md shape 3's backlog, 27 names, through the vendored tree.
+
+    Each value is transcribed from upstream torch 2.13.0 run on the same
+    script (`env -u PYTHONPATH -u TORCH_USE_RTLD_GLOBAL`), not read off this
+    shim -- a wrong kernel that returns *a* value would not pass this test
+    just by returning without error.
+
+    `Tensor.where` is deliberately not asserted here: the shim raises
+    `NotImplementedError: not implemented in torch._C shim: TensorBase.where`
+    where upstream succeeds and returns the same values `torch.where(...)`
+    does. That gap is real; `torch.where` closes the function spelling, which
+    is what makes `reach.py`'s "any spelling" test pass -- the method gap is
+    a finding for this round, not fixed here (see the module docstring
+    above)."""
+    if not os.path.isfile(_CKPT_VENDOR_SHIM):
+        return  # vendor tree not installed -- see vendor/install_shim.sh
+    out = _reach_backlog_road_fixture()
+
+    def eq(key, expected):
+        got = out.get(key, "<missing>")
+        assert got == expected, f"{key}: expected {expected!r}, got {got!r}"
+
+    def close(key, expected, tol=1e-4):
+        got = out.get(key, "<missing>")
+        assert isinstance(got, list) and len(got) == len(expected), f"{key}: got {got!r}"
+        for g, e in zip(got, expected):
+            assert abs(g - e) < tol, f"{key}: expected {expected!r}, got {got!r}"
+
+    def close_writethrough(key, expected, tol=1e-4):
+        got = out.get(key, "<missing>")
+        assert isinstance(got, list) and len(got) == 2, f"{key}: got {got!r}"
+        values, is_self = got
+        assert isinstance(values, list) and len(values) == len(expected), f"{key}: got {got!r}"
+        for g, e in zip(values, expected):
+            assert abs(g - e) < tol, f"{key}: expected {expected!r}, got {got!r}"
+        assert is_self is True, f"{key}: did not return the receiver itself"
+
+    eq("cat_dim0", [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])
+    eq("cat_dim1", [[1.0, 2.0, 1.0], [3.0, 4.0, 2.0]])
+
+    eq("where_fn", [1.0, 20.0, 3.0, 40.0])
+
+    close("erf_fn", [0.32862669229507446, -0.6778011322021484, 0.9103140234947205, -0.9953221678733826])
+    close("erf_member", [0.32862669229507446, -0.6778011322021484, 0.9103140234947205, -0.9953221678733826])
+
+    close("sigmoid_fn", [0.622459352016449, 0.18242552876472473, 0.9241418242454529, 0.43782350420951843])
+    close("sigmoid_member", [0.622459352016449, 0.18242552876472473, 0.9241418242454529, 0.43782350420951843])
+
+    close_writethrough("erf__fn", [0.32862669229507446, -0.6778011322021484, 0.9103140234947205, -0.9953221678733826])
+    close_writethrough("erf__member", [0.32862669229507446, -0.6778011322021484, 0.9103140234947205, -0.9953221678733826])
+    close_writethrough("sigmoid__fn", [0.622459352016449, 0.18242552876472473, 0.9241418242454529, 0.43782350420951843])
+    close_writethrough("sigmoid__member", [0.622459352016449, 0.18242552876472473, 0.9241418242454529, 0.43782350420951843])
+    close_writethrough("abs__fn", [3.5, 2.0, 1.0, 0.0])
+    close_writethrough("abs__member", [3.5, 2.0, 1.0, 0.0])
+    close_writethrough("cos__fn", [0.9553365111351013, 0.4535961151123047, 0.8253356218338013])
+    close_writethrough("cos__member", [0.9553365111351013, 0.4535961151123047, 0.8253356218338013])
+    close_writethrough("sin__fn", [0.29552021622657776, 0.8912073969841003, -0.5646424889564514])
+    close_writethrough("sin__member", [0.29552021622657776, 0.8912073969841003, -0.5646424889564514])
+    close_writethrough("tanh__fn", [0.46211716532707214, -0.7615941762924194, 0.9640275835990906])
+    close_writethrough("tanh__member", [0.46211716532707214, -0.7615941762924194, 0.9640275835990906])
+    close_writethrough("sqrt__fn", [2.0, 3.0, 4.0])
+    close_writethrough("sqrt__member", [2.0, 3.0, 4.0])
+    close_writethrough("rsqrt__fn", [0.5, 0.3333333432674408, 0.25])
+    close_writethrough("rsqrt__member", [0.5, 0.3333333432674408, 0.25])
+    close_writethrough("reciprocal__fn", [0.5, -0.25, 2.0])
+    close_writethrough("reciprocal__member", [0.5, -0.25, 2.0])
+    close_writethrough("log__fn", [0.0, 0.9162907600402832, 2.3025851249694824])
+    close_writethrough("log__member", [0.0, 0.9162907600402832, 2.3025851249694824])
+    close_writethrough("expm1__fn", [0.6487212777137756, -0.39346933364868164, 6.389056205749512])
+    close_writethrough("expm1__member", [0.6487212777137756, -0.39346933364868164, 6.389056205749512])
+    close_writethrough("ceil__fn", [2.0, -1.0, 3.0])
+    close_writethrough("ceil__member", [2.0, -1.0, 3.0])
+    close_writethrough("zero__fn", [0.0, 0.0, 0.0])
+    close_writethrough("zero__member", [0.0, 0.0, 0.0])
+
+    close("log2_fn", [0.0, 3.0, 5.0])
+    close("log2_member", [0.0, 3.0, 5.0])
+    close_writethrough("log2__fn", [0.0, 3.0, 5.0])
+    close_writethrough("log2__member", [0.0, 3.0, 5.0])
+
+    eq("sign_fn", [-1.0, 0.0, 1.0])
+    eq("sign_member", [-1.0, 0.0, 1.0])
+    eq("neg_fn", [-1.0, 2.0, -3.0])
+    eq("neg_member", [-1.0, 2.0, -3.0])
+
+    eq("le_fn", [True, True, False])
+    eq("le_member", [True, True, False])
+    eq("lt_fn", [True, False, False])
+    eq("lt_member", [True, False, False])
+
+    eq("rsub_fn", [9.0, 8.0, 7.0])
+
+    eq("matmul_fn", [[19.0, 22.0], [43.0, 50.0]])
+    eq("matmul_member", [[19.0, 22.0], [43.0, 50.0]])
+    eq("bmm_fn", [[[31.0, 34.0], [71.0, 78.0]], [[155.0, 166.0], [211.0, 226.0]]])
+    eq("bmm_member", [[[31.0, 34.0], [71.0, 78.0]], [[155.0, 166.0], [211.0, 226.0]]])
+    eq("addmm_fn", [[20.0, 23.0], [44.0, 51.0]])
+    eq("addmm_member", [[20.0, 23.0], [44.0, 51.0]])
+
+    eq("cumsum_fn", [1.0, 3.0, 6.0, 10.0])
+    eq("cumsum_member", [1.0, 3.0, 6.0, 10.0])
+
+    eq("masked_select_fn", [1.0, 3.0])
+    eq("masked_select_member", [1.0, 3.0])
+
+    eq("permute_shape", [4, 2, 3])
+    eq("permute_vals", [[0.0, 4.0, 8.0], [12.0, 16.0, 20.0]])
+    eq("expand_fn", [[1.0, 1.0, 1.0, 1.0], [2.0, 2.0, 2.0, 2.0], [3.0, 3.0, 3.0, 3.0]])
+    eq("squeeze_fn", [2, 3])
+    eq("squeeze_member", [2, 3])
+
+    eq("embedding_fn", [[5.0, 6.0], [1.0, 2.0], [3.0, 4.0]])
+
+
+# ---------------------------------------------------------------------------
+# docs/REACH.md shape 3 -- second pass over the backlog
+#
+# Same shape as the road script above: each name was in `reach_allow.json`'s
+# `shape3_unexercised_spelling` with a "backlog" reason and nothing in
+# `pytests/` calling `torch.<name>(...)` or `t.<name>(...)`. Values are
+# transcribed from upstream torch run on this same script with `PYTHONPATH`
+# stripped, not read off the shim.
+#
+# Three real gaps came out of writing this and are recorded, not fixed here
+# (Rust and bootstrap.py are out of scope for this round):
+#
+#   - `Tensor.floor_divide` (the method) raises `NotImplementedError` in the
+#     shim; `torch.floor_divide(...)` (the function) works and matches
+#     upstream. Only the function spelling is asserted below and closes the
+#     `floor_divide` allowlist entry -- same treatment as `where` got in the
+#     first road script.
+#   - `Tensor.histc` (the method) raises `NotImplementedError` in the shim;
+#     `torch.histc(...)` (the function) works and matches upstream. Same
+#     treatment: function spelling asserted, method gap recorded here only.
+#   - `torch.nn.functional.adaptive_avg_pool2d(x, 2)` (a bare int
+#     `output_size`, which upstream normalizes to `(2, 2)`) raises
+#     `RuntimeError: adaptive_avg_pool2d: output_size must be 2` in the shim.
+#     `adaptive_avg_pool2d(x, (2, 2))` (the tuple form) works and matches
+#     upstream exactly. The tuple form is asserted below.
+_REACH_BACKLOG2_ROAD_SCRIPT = r"""
+import json, sys
+import torch
+
+out = {}
+
+def rec(key, value_fn):
+    try:
+        out[key] = value_fn()
+    except Exception as e:
+        out[key] = f"ERROR:{type(e).__name__}:{e}"
+
+torch.manual_seed(0)
+
+# --- tanh ------------------------------------------------------------
+tv = torch.tensor([0.5, -1.0, 2.0])
+rec("tanh_fn", lambda: torch.tanh(tv).tolist())
+rec("tanh_member", lambda: tv.tanh().tolist())
+
+# --- floor_divide -- function spelling only; `Tensor.floor_divide` is a
+# separate, broken finding (shim raises NotImplementedError where upstream
+# succeeds) recorded in the module docstring above, not fixed here.
+fdv = torch.tensor([7.0, -7.0, 8.0])
+fdw = torch.tensor([2.0, 2.0, 3.0])
+rec("floor_divide_fn", lambda: torch.floor_divide(fdv, fdw).tolist())
+
+# --- empty_like -- values are uninitialized upstream and in the shim, so
+# only shape and dtype are checked (a value assertion would be asserting
+# nothing meaningful and calling it coverage).
+elv = torch.tensor([7.0, -7.0, 8.0])
+rec("empty_like_shape", lambda: list(torch.empty_like(elv).shape))
+rec("empty_like_dtype", lambda: str(torch.empty_like(elv).dtype))
+
+# --- linspace ----------------------------------------------------------
+rec("linspace_fn", lambda: torch.linspace(0.0, 10.0, 5).tolist())
+
+# --- new_ones ------------------------------------------------------------
+noBase = torch.tensor([1.0, 2.0])
+rec("new_ones_fn", lambda: noBase.new_ones(3).tolist())
+
+# --- sort ------------------------------------------------------------------
+sv = torch.tensor([3.0, 1.0, 2.0])
+rec("sort_fn_values", lambda: torch.sort(sv).values.tolist())
+rec("sort_fn_indices", lambda: torch.sort(sv).indices.tolist())
+rec("sort_member_values", lambda: sv.sort().values.tolist())
+
+# --- topk ------------------------------------------------------------------
+tkv = torch.tensor([1.0, 5.0, 3.0, 2.0])
+rec("topk_fn_values", lambda: torch.topk(tkv, 2).values.tolist())
+rec("topk_fn_indices", lambda: torch.topk(tkv, 2).indices.tolist())
+rec("topk_member_values", lambda: tkv.topk(2).values.tolist())
+
+# --- split_with_sizes ------------------------------------------------------
+swv = torch.arange(10.0)
+rec("split_with_sizes_fn", lambda: [p.tolist() for p in torch.split_with_sizes(swv, [3, 3, 4])])
+rec("split_with_sizes_member", lambda: [p.tolist() for p in swv.split_with_sizes([3, 3, 4])])
+
+# --- hardtanh ------------------------------------------------------------
+htv = torch.tensor([-3.0, -0.5, 0.5, 3.0])
+rec("hardtanh_fn", lambda: torch.nn.functional.hardtanh(htv).tolist())
+
+# --- one_hot -----------------------------------------------------------
+ohv = torch.tensor([0, 2, 1])
+rec("one_hot_fn", lambda: torch.nn.functional.one_hot(ohv, num_classes=3).tolist())
+
+# --- isin ------------------------------------------------------------------
+iv = torch.tensor([1, 2, 3, 4, 5])
+test_elem = torch.tensor([2, 4])
+rec("isin_fn", lambda: torch.isin(iv, test_elem).tolist())
+
+# --- histc -- function spelling only; `Tensor.histc` is a separate, broken
+# finding (shim raises NotImplementedError where upstream succeeds) recorded
+# in the module docstring above, not fixed here.
+hcv = torch.tensor([1.0, 2.0, 1.0, 3.0, 4.0])
+rec("histc_fn", lambda: torch.histc(hcv, bins=4, min=1.0, max=4.0).tolist())
+
+# --- baddbmm -------------------------------------------------------------
+bb1 = torch.arange(1.0, 9.0).reshape(2, 2, 2)
+bb2 = torch.arange(9.0, 17.0).reshape(2, 2, 2)
+bbase = torch.ones(2, 2, 2)
+rec("baddbmm_fn", lambda: torch.baddbmm(bbase, bb1, bb2).tolist())
+rec("baddbmm_member", lambda: bbase.baddbmm(bb1, bb2).tolist())
+
+# --- constant_pad_nd -----------------------------------------------------
+cpv = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+rec("constant_pad_nd_fn", lambda: torch.constant_pad_nd(cpv, [1, 1], 0.0).tolist())
+
+# --- linalg_vector_norm -- upstream's own public name is `torch.linalg.
+# vector_norm`, a different (Python-level) spelling from the dispatcher name
+# `linalg_vector_norm` that `reach.py`'s allowlist entry names; bootstrap.py
+# wires the declared name onto `torch._C._linalg.linalg_vector_norm`, which
+# is exactly what `torch/nn/functional.py`'s own `normalize` calls, and
+# upstream exposes the same attribute for the same reason. That is the
+# spelling exercised here.
+lvv = torch.tensor([3.0, 4.0, 0.0, -2.0])
+rec("linalg_vector_norm_fn", lambda: float(torch._C._linalg.linalg_vector_norm(lvv)))
+rec("linalg_vector_norm_ord1", lambda: float(torch._C._linalg.linalg_vector_norm(lvv, 1.0)))
+
+# --- adaptive_avg_pool1d --------------------------------------------------
+apv = torch.tensor([[[1.0, 2.0, 3.0, 4.0]]])
+rec("adaptive_avg_pool1d_fn", lambda: torch.nn.functional.adaptive_avg_pool1d(apv, 2).tolist())
+
+# --- adaptive_avg_pool2d -- tuple output_size only; the bare-int form is a
+# separate, broken finding recorded in the module docstring above.
+ap2v = torch.arange(16.0).reshape(1, 1, 4, 4)
+rec("adaptive_avg_pool2d_fn", lambda: torch.nn.functional.adaptive_avg_pool2d(ap2v, (2, 2)).tolist())
+
+# --- max_pool2d ------------------------------------------------------------
+mpv = torch.arange(16.0).reshape(1, 1, 4, 4)
+rec("max_pool2d_fn", lambda: torch.nn.functional.max_pool2d(mpv, 2).tolist())
+
+# --- _log_softmax ------------------------------------------------------
+lsv = torch.tensor([1.0, 2.0, 3.0])
+rec("_log_softmax_fn", lambda: torch._log_softmax(lsv, 0, False).tolist())
+
+json.dump(out, sys.stdout)
+
+"""
+
+
+def _reach_backlog2_road_fixture():
+    env = dict(os.environ)
+    env["PYTHONPATH"] = _CKPT_VENDOR_DIR
+    env["TORCH_USE_RTLD_GLOBAL"] = "1"  # VENDOR.md wall 1
+    proc = subprocess.run(
+        [sys.executable, "-c", _REACH_BACKLOG2_ROAD_SCRIPT],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=180,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"reach-backlog2-road subprocess exited {proc.returncode}\n"
+            f"--- stdout ---\n{proc.stdout}\n--- stderr ---\n{proc.stderr}"
+        )
+    return json.loads(proc.stdout)
+
+
+def test_reach_backlog2_19_more_unexercised_spellings_reach_their_kernels_and_match_upstream():
+    """docs/REACH.md shape 3's backlog, second pass: 19 more names, through the
+    vendored tree.
+
+    Each value is transcribed from upstream torch 2.13.0 run on the same
+    script (`env -u PYTHONPATH -u TORCH_USE_RTLD_GLOBAL`), not read off this
+    shim.
+
+    Three gaps this script found are deliberately not asserted here and are
+    not fixed by this test (see the module docstring above for detail):
+    `Tensor.floor_divide`, `Tensor.histc`, and
+    `nn.functional.adaptive_avg_pool2d(x, <int>)` (only the tuple
+    `output_size` form is asserted). Each has a working alternate spelling
+    that is asserted and that is what closes its allowlist entry."""
+    if not os.path.isfile(_CKPT_VENDOR_SHIM):
+        return  # vendor tree not installed -- see vendor/install_shim.sh
+    out = _reach_backlog2_road_fixture()
+
+    def eq(key, expected):
+        got = out.get(key, "<missing>")
+        assert got == expected, f"{key}: expected {expected!r}, got {got!r}"
+
+    def close(key, expected, tol=1e-4):
+        got = out.get(key, "<missing>")
+        assert isinstance(got, list) and len(got) == len(expected), f"{key}: got {got!r}"
+        for g, e in zip(got, expected):
+            assert abs(g - e) < tol, f"{key}: expected {expected!r}, got {got!r}"
+
+    close("tanh_fn", [0.46211716532707214, -0.7615941762924194, 0.9640275835990906])
+    close("tanh_member", [0.46211716532707214, -0.7615941762924194, 0.9640275835990906])
+
+    eq("floor_divide_fn", [3.0, -4.0, 2.0])
+
+    eq("empty_like_shape", [3])
+    eq("empty_like_dtype", "torch.float32")
+
+    close("linspace_fn", [0.0, 2.5, 5.0, 7.5, 10.0])
+
+    eq("new_ones_fn", [1.0, 1.0, 1.0])
+
+    eq("sort_fn_values", [1.0, 2.0, 3.0])
+    eq("sort_fn_indices", [1, 2, 0])
+    eq("sort_member_values", [1.0, 2.0, 3.0])
+
+    eq("topk_fn_values", [5.0, 3.0])
+    eq("topk_fn_indices", [1, 2])
+    eq("topk_member_values", [5.0, 3.0])
+
+    eq("split_with_sizes_fn", [[0.0, 1.0, 2.0], [3.0, 4.0, 5.0], [6.0, 7.0, 8.0, 9.0]])
+    eq("split_with_sizes_member", [[0.0, 1.0, 2.0], [3.0, 4.0, 5.0], [6.0, 7.0, 8.0, 9.0]])
+
+    eq("hardtanh_fn", [-1.0, -0.5, 0.5, 1.0])
+
+    eq("one_hot_fn", [[1, 0, 0], [0, 0, 1], [0, 1, 0]])
+
+    eq("isin_fn", [False, True, False, True, False])
+
+    eq("histc_fn", [2.0, 1.0, 1.0, 1.0])
+
+    eq("baddbmm_fn", [[[32.0, 35.0], [72.0, 79.0]], [[156.0, 167.0], [212.0, 227.0]]])
+    eq("baddbmm_member", [[[32.0, 35.0], [72.0, 79.0]], [[156.0, 167.0], [212.0, 227.0]]])
+
+    eq("constant_pad_nd_fn", [[0.0, 1.0, 2.0, 0.0], [0.0, 3.0, 4.0, 0.0]])
+
+    got_norm = out.get("linalg_vector_norm_fn", "<missing>")
+    assert isinstance(got_norm, float) and abs(got_norm - 5.385164737701416) < 1e-4, got_norm
+    got_norm1 = out.get("linalg_vector_norm_ord1", "<missing>")
+    assert isinstance(got_norm1, float) and abs(got_norm1 - 9.0) < 1e-4, got_norm1
+
+    eq("adaptive_avg_pool1d_fn", [[[1.5, 3.5]]])
+    eq("adaptive_avg_pool2d_fn", [[[[2.5, 4.5], [10.5, 12.5]]]])
+    eq("max_pool2d_fn", [[[[5.0, 7.0], [13.0, 15.0]]]])
+
+    close("_log_softmax_fn", [-2.4076058864593506, -1.4076058864593506, -0.40760594606399536])
+
+
 if __name__ == "__main__":
     raise SystemExit(_main())
