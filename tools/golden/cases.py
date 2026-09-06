@@ -28801,8 +28801,509 @@ def upsample_nearest1d_cases(torch_module, c_module, torch_call) -> list[Case]:
     return cases
 
 
+# --- docs/TAIL4.md: index_copy_, index_copy, round (x4), logsumexp, t_ -----
+#
+# One block, appended together, because a second agent was adding builders to
+# this file at the same time.
+
+_TAIL4_FLOAT_DTYPES = ["float64", "float32", "float16", "bfloat16"]
+
+
+def _tail4_same_values(t_res, c_res) -> tuple[bool, str]:
+    """Shape, dtype and values, for the `value_check`s below.
+
+    Every one of them exists to assert something the default pipeline cannot
+    see -- object identity, or a mutation of the receiver -- and a
+    `value_check` **replaces** the pipeline rather than adding to it. So each
+    has to re-do the ordinary comparison as well, or it is blind to a wrong
+    answer: `compare.py --self-test` caught exactly that, reporting
+    `_index_copy_cases + permute: the comparator accepted a wrong answer`.
+    """
+    t_shape = tuple(int(x) for x in t_res.shape)
+    c_shape = tuple(int(x) for x in c_res.shape)
+    if t_shape != c_shape:
+        return False, f"shape mismatch: torch={t_shape} c={c_shape}"
+    t_dtype, c_dtype = dt.dtype_name(t_res.dtype), dt.dtype_name(c_res.dtype)
+    if t_dtype != c_dtype:
+        return False, f"dtype mismatch: torch={t_dtype} c={c_dtype}"
+    t_flat = _flatten_values(t_res.tolist())
+    c_flat = _flatten_values(c_res.tolist())
+    if len(t_flat) != len(c_flat):
+        return False, f"length differs: torch={len(t_flat)} c={len(c_flat)}"
+    tol = dt.tolerance_for(t_dtype)
+    return _values_close_local(t_flat, c_flat, tol.atol, tol.rtol)
+
+
+def _index_copy_cases(torch_module, c_module, torch_call, op, in_place) -> list[Case]:
+    cases: list[Case] = []
+
+    def case(name, self_flat, self_shape, dtype_name, dim, idx_flat, idx_shape,
+             src_flat, src_shape, idx_dtype="int64", src_dtype=None,
+             expect="match", note=""):
+        s_t, s_c = pair_from_flat(torch_module, c_module, self_flat, self_shape, dtype_name)
+        i_t, i_c = pair_from_flat(torch_module, c_module, idx_flat, idx_shape, idx_dtype)
+        v_t, v_c = pair_from_flat(torch_module, c_module, src_flat, src_shape,
+                                  src_dtype or dtype_name)
+        cases.append(Case(
+            name=f"{op.split('.')[1]}({name})",
+            op=op,
+            run_torch=lambda s_t=s_t, i_t=i_t, v_t=v_t: torch_call(s_t, dim, i_t, v_t),
+            run_c=lambda s_c=s_c, i_c=i_c, v_c=v_c: c_module._aten_dispatch(
+                op, s_c, dim, i_c, v_c),
+            expect=expect,
+            note=note,
+        ))
+
+    zeros8 = [0.0] * 8
+    for dtype_name in _TAIL4_FLOAT_DTYPES:
+        case(f"dtype={dtype_name}, 2-D, dim=0", zeros8, (4, 2), dtype_name, 0,
+             [0, 2], (2,), [1.0, 2.0, 3.0, 4.0], (2, 2),
+             note="aria's un-permute shape")
+        case(f"dtype={dtype_name}, duplicate indices: LAST WRITE WINS",
+             [0.0, 0.0, 0.0], (3,), dtype_name, 0, [1, 1, 1], (3,),
+             [1.0, 2.0, 3.0], (3,),
+             note="[0, 3, 0]. index_add_ on the same input gives [0, 6, 0] -- "
+                  "an accumulating kernel here would be wrong and no "
+                  "repeat-free index can see it")
+        case(f"dtype={dtype_name}, dim=1", zeros8, (2, 4), dtype_name, 1,
+             [0, 3], (2,), [1.0, 2.0, 3.0, 4.0], (2, 2))
+        case(f"dtype={dtype_name}, dim=-1 wraps", zeros8, (2, 4), dtype_name, -1,
+             [0, 3], (2,), [1.0, 2.0, 3.0, 4.0], (2, 2))
+        case(f"dtype={dtype_name}, self is not zero to start with",
+             [1.0, -2.0, 3.0], (3,), dtype_name, 0, [0, 2], (2,), [10.0, 20.0], (2,),
+             note="a kernel that ignored `self` passes every zeros case")
+        case(f"dtype={dtype_name}, a partial overwrite keeps the rest",
+             [1.0, 2.0, 3.0, 4.0, 5.0], (5,), dtype_name, 0, [3], (1,), [-9.0], (1,))
+
+    # Integral and bool receivers: `index_copy_` copies, so no wrap, no OR.
+    case("dtype=int64", [0, 0, 0], (3,), "int64", 0, [0, 2], (2,), [5, 7], (2,))
+    case("dtype=int32", [0, 0, 0], (3,), "int32", 0, [1], (1,), [7], (1,))
+    case("dtype=uint8 does NOT wrap -- it overwrites", [200, 200], (2,), "uint8", 0,
+         [0, 0], (2,), [200, 200], (2,),
+         note="200, not 144: index_add_ wraps here and index_copy_ cannot")
+    case("dtype=bool is an overwrite, not an OR", [1, 1], (2,), "bool", 0,
+         [0, 0], (2,), [0, 0], (2,),
+         note="False, where index_add_'s logical OR would leave True")
+
+    # 0-d receivers and 0-d sources, all four legal combinations.
+    case("a 0-d self with a 0-d source", [1.0], (), "float32", 0, [0], (1,), [9.0], ())
+    case("a 0-d self with a 1-d source", [1.0], (), "float32", 0, [0], (1,), [9.0], (1,))
+    case("a 0-d index", [0.0, 0.0, 0.0], (3,), "float32", 0, [1], (), [5.0], (1,))
+    case("a 1-d self with a 0-d source", [0.0, 0.0, 0.0], (3,), "float32", 0,
+         [1], (1,), [5.0], ())
+    case("a 0-d self with dim=-1", [1.0], (), "float32", -1, [0], (1,), [9.0], ())
+
+    # An empty index writes nothing, after every check.
+    case("an empty index writes nothing", [1.0, 2.0, 3.0], (3,), "float32", 0,
+         [], (0,), [], (0,))
+
+    # Higher rank, so that the stride walk is exercised on a non-leading axis.
+    case("3-D, dim=1, out-of-order indices", [0.0] * 12, (2, 3, 2), "float32", 1,
+         [2, 0], (2,), [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0], (2, 2, 2),
+         note="the index permutes the middle axis; a kernel that ignored the "
+              "order writes the same values in the wrong slices")
+
+    # The seven refusals, in upstream's own order.
+    case("a NEGATIVE index is refused, and the message carries it",
+         [0.0, 0.0, 0.0], (3,), "float32", 0, [-1], (1,), [5.0], (1,),
+         expect="both_error",
+         note="'index -1 is out of bounds for dimension 0 with size 3'. "
+              "index_add_ refuses too but says only 'index out of range in "
+              "self' -- neither the index nor the extent")
+    case("an out-of-range index", [0.0, 0.0, 0.0], (3,), "float32", 0, [3], (1,),
+         [5.0], (1,), expect="both_error")
+    case("an int32 index is REFUSED -- unlike index_add_, which accepts one",
+         [0.0, 0.0, 0.0], (3,), "float32", 0, [0], (1,), [5.0], (1,),
+         idx_dtype="int32", expect="both_error",
+         note="'Expected a long tensor for index, but got Int'. This is the "
+              "row that would have shipped if the dtype gate had been copied "
+              "from index_add_ three thousand lines up")
+    case("a float index", [0.0, 0.0, 0.0], (3,), "float32", 0, [0.0], (1,),
+         [5.0], (1,), idx_dtype="float32", expect="both_error")
+    case("a 2-D index", [0.0, 0.0, 0.0], (3,), "float32", 0, [0, 1], (1, 2),
+         [1.0, 2.0], (2,), expect="both_error",
+         note="'Index should have dimension 1 or 0 (got 2)'")
+    case("self and source dtypes must match exactly", [0.0, 0.0, 0.0], (3,),
+         "float32", 0, [0], (1,), [5], (1,), src_dtype="int64", expect="both_error")
+    case("the number of indices must equal source.size(dim)", [0.0, 0.0, 0.0], (3,),
+         "float32", 0, [0, 1], (2,), [5.0], (1,), expect="both_error")
+    case("a rank mismatch is its own message", [0.0] * 6, (3, 2), "float32", 0,
+         [0], (1,), [1.0, 2.0], (2,), expect="both_error",
+         note="'their dimensionality must match. Source dimensionality (1), "
+              "destination dimensionality (2)'")
+    case("a slice-shape mismatch is a DIFFERENT message", [0.0] * 6, (3, 2),
+         "float32", 0, [0], (1,), [1.0, 2.0, 3.0], (1, 3), expect="both_error",
+         note="'Destination slice shape: 2 at dimension 0 and source slice "
+              "shape: 3 at dimension 0.'")
+    case("a 0-d source with a 2-D self falls through to the slice message",
+         [0.0] * 6, (2, 3), "float32", 0, [1], (1,), [5.0], (), expect="both_error",
+         note="and the source slice shape prints EMPTY, which is the two "
+              "spaces in 'source slice shape:  at dimension 0.'")
+    case("a scalar source wants exactly one index", [1.0], (), "float32", 0,
+         [0, 0], (2,), [9.0], (), expect="both_error",
+         note="'When source is scalar, index should have one element (got 2)'")
+    case("dim out of range", [0.0, 0.0, 0.0], (3,), "float32", 2, [0], (1,),
+         [1.0], (1,), expect="both_error",
+         note="and the message carries NO op prefix, unlike normalise_dim's")
+
+    if in_place:
+        # The receiver identity and the write-through, neither of which the
+        # value pipeline can see.
+        recv_t, recv_c = pair_from_flat(torch_module, c_module, [0.0] * 3, (3,), "float32")
+        idx_t, idx_c = pair_from_flat(torch_module, c_module, [1], (1,), "int64")
+        src_t, src_c = pair_from_flat(torch_module, c_module, [7.0], (1,), "float32")
+
+        def _identity(t_res, c_res):
+            if t_res is not recv_t or c_res is not recv_c:
+                return False, "index_copy_ must return the receiver object itself"
+            return _tail4_same_values(t_res, c_res)
+
+        cases.append(Case(
+            name="index_copy_(returns the receiver, not a copy)",
+            op=op,
+            run_torch=lambda: torch_call(recv_t, 0, idx_t, src_t),
+            run_c=lambda: c_module._aten_dispatch(op, recv_c, 0, idx_c, src_c),
+            value_check=_identity,
+            note="`x.index_copy_(...) is x` on both sides",
+        ))
+
+        # An expanded receiver has two elements at one address; upstream
+        # refuses and so does `write_back`'s Overlap::Refuse.
+        exp_t, exp_c = pair_from_flat(torch_module, c_module, [0.0] * 3, (1, 3), "float32")
+        eidx_t, eidx_c = pair_from_flat(torch_module, c_module, [0], (1,), "int64")
+        esrc_t, esrc_c = pair_from_flat(torch_module, c_module, [1.0] * 3, (1, 3), "float32")
+        cases.append(Case(
+            name="index_copy_(an EXPANDED receiver is refused)",
+            op=op,
+            run_torch=lambda: torch_call(
+                torch_module.ops.aten.expand.default(exp_t, [2, 3]), 0, eidx_t, esrc_t),
+            run_c=lambda: c_module._aten_dispatch(
+                op, c_module._aten_dispatch("aten.expand.default", exp_c, [2, 3]),
+                0, eidx_c, esrc_c),
+            expect="both_error",
+            note="'more than one element of the written-to tensor refers to a "
+                 "single memory location'",
+        ))
+    else:
+        # Out of place leaves `self` alone AND returns a different object,
+        # even when nothing is written.
+        base_t, base_c = pair_from_flat(torch_module, c_module, [1.0, 2.0, 3.0], (3,), "float32")
+        e_t, e_c = pair_from_flat(torch_module, c_module, [], (0,), "int64")
+        es_t, es_c = pair_from_flat(torch_module, c_module, [], (0,), "float32")
+
+        def _fresh(t_res, c_res):
+            if t_res is base_t or c_res is base_c:
+                return False, "index_copy must not return the receiver"
+            return _tail4_same_values(t_res, c_res)
+
+        cases.append(Case(
+            name="index_copy(an empty index still returns a NEW tensor)",
+            op=op,
+            run_torch=lambda: torch_call(base_t, 0, e_t, es_t),
+            run_c=lambda: c_module._aten_dispatch(op, base_c, 0, e_c, es_c),
+            value_check=_fresh,
+            note="`x.index_copy(0, empty, empty) is x` is False upstream",
+        ))
+    return cases
+
+
+def index_copy_inplace_cases(torch_module, c_module, torch_call) -> list[Case]:
+    return _index_copy_cases(torch_module, c_module, torch_call,
+                             "aten.index_copy_.default", True)
+
+
+def index_copy_cases(torch_module, c_module, torch_call) -> list[Case]:
+    return _index_copy_cases(torch_module, c_module, torch_call,
+                             "aten.index_copy.default", False)
+
+
+# The values every `round` case runs on. The half-integer grid is the whole
+# point: `[-2.5, -1.5, -0.5, 0.5, 1.5, 2.5, 3.5]` separates round-half-to-even
+# (`[-2, -2, -0, 0, 2, 2, 4]`) from round-half-away-from-zero
+# (`[-3, -2, -1, 1, 2, 3, 4]`), and *five* of the seven differ. A test on 0.3
+# and 0.7 agrees with both.
+_ROUND_TIES = [-3.5, -2.5, -1.5, -0.5, 0.5, 1.5, 2.5, 3.5, 4.5]
+_ROUND_ORDINARY = [-2.675, -1.2, -0.4, 0.0, 0.3, 0.7, 1.2, 2.675, 12.5, -12.5]
+_ROUND_DECIMAL_PROBES = [2.675, 1.005, -2.675, 0.125, 0.135, 15.0, 25.0, 35.0, -15.0]
+
+
+def _round_cases(torch_module, c_module, torch_call, op, decimals, in_place) -> list[Case]:
+    cases: list[Case] = []
+    short = op.split(".", 1)[1]
+
+    def case(name, flat, dtype_name, kwargs=None, expect="match", note=""):
+        a_t, a_c = pair_from_flat(torch_module, c_module, flat, (len(flat),), dtype_name)
+        kw = kwargs or {}
+        cases.append(Case(
+            name=f"{short}({name})",
+            op=op,
+            run_torch=lambda a_t=a_t, kw=kw: torch_call(a_t, **kw),
+            run_c=lambda a_c=a_c, kw=kw: c_module._aten_dispatch(op, a_c, **kw),
+            expect=expect,
+            note=note,
+        ))
+
+    kw_sets = [{"decimals": d} for d in (-2, -1, 0, 1, 2, 3)] if decimals else [None]
+    for dtype_name in _TAIL4_FLOAT_DTYPES:
+        for kw in kw_sets:
+            label = "" if kw is None else f", decimals={kw['decimals']}"
+            case(f"dtype={dtype_name}{label}, HALF-INTEGER GRID", _ROUND_TIES,
+                 dtype_name, kw,
+                 note="round half to EVEN. Five of these nine differ from "
+                      "round-half-away-from-zero, which is what candle's own "
+                      "Tensor::round would have given")
+            case(f"dtype={dtype_name}{label}, ordinary values", _ROUND_ORDINARY,
+                 dtype_name, kw)
+            case(f"dtype={dtype_name}{label}, decimal probes",
+                 _ROUND_DECIMAL_PROBES, dtype_name, kw,
+                 note="2.675 at two decimals is 2.68 for float32 and 2.671875 "
+                      "for bfloat16 -- the scaling happens at the storage "
+                      "dtype for one and in float for the other")
+            case(f"dtype={dtype_name}{label}, inf and nan",
+                 [float("inf"), float("-inf"), float("nan"), 0.0], dtype_name, kw,
+                 note="falls out of the floor/frac form: frac is nan there, "
+                      "every comparison against nan is false, so nothing is "
+                      "added to floor")
+        if not decimals:
+            case(f"dtype={dtype_name}, large magnitudes",
+                 [1e20, -1e20, 8388608.0, 16777216.0], dtype_name, None,
+                 note="already integral; the parity test must not overflow")
+
+    # Integral dtypes: the bare overload is the identity and the `.decimals`
+    # overload has no integral kernel at all -- upstream's table, not a rule.
+    for dtype_name in ["int64", "int32", "uint8"]:
+        if decimals:
+            for d in (0, 2):
+                case(f"dtype={dtype_name}, decimals={d} has NO integral kernel",
+                     [0, 1, 2], dtype_name, {"decimals": d}, expect="both_error",
+                     note=('"round_vml_cpu" for decimals=0 and "round_cpu" '
+                           "otherwise -- two different stubs, and the bare "
+                           "overload refuses neither"))
+        else:
+            case(f"dtype={dtype_name} is the identity", [0, 1, 2], dtype_name, None,
+                 note="upstream hands an integral tensor straight back")
+    case("dtype=bool is refused", [1, 0], "bool",
+         {"decimals": 2} if decimals else None, expect="both_error",
+         note='"round_vml_cpu" not implemented for \'Bool\'')
+
+    if in_place:
+        recv_t, recv_c = pair_from_flat(torch_module, c_module, [0.5, 1.5], (2,), "float32")
+        kw = {"decimals": 0} if decimals else {}
+
+        def _identity(t_res, c_res):
+            if t_res is not recv_t or c_res is not recv_c:
+                return False, "an in-place round must return the receiver object"
+            return _tail4_same_values(t_res, c_res)
+
+        cases.append(Case(
+            name=f"{short}(returns the receiver, not a copy)",
+            op=op,
+            run_torch=lambda: torch_call(recv_t, **kw),
+            run_c=lambda: c_module._aten_dispatch(op, recv_c, **kw),
+            value_check=_identity,
+        ))
+    return cases
+
+
+def round_default_cases(torch_module, c_module, torch_call) -> list[Case]:
+    return _round_cases(torch_module, c_module, torch_call, "aten.round.default", False, False)
+
+
+def round_decimals_cases(torch_module, c_module, torch_call) -> list[Case]:
+    return _round_cases(torch_module, c_module, torch_call, "aten.round.decimals", True, False)
+
+
+def round_inplace_cases(torch_module, c_module, torch_call) -> list[Case]:
+    return _round_cases(torch_module, c_module, torch_call, "aten.round_.default", False, True)
+
+
+def round_inplace_decimals_cases(torch_module, c_module, torch_call) -> list[Case]:
+    return _round_cases(torch_module, c_module, torch_call, "aten.round_.decimals", True, True)
+
+
+
+def logical_not_cases(torch_module, c_module, torch_call) -> list[Case]:
+    """docs/TAIL4.md §10. The result is always `bool`, and the values are
+    `bitwise_not`'s for `bool` and nobody else's for anything else."""
+    op = "aten.logical_not.default"
+    cases: list[Case] = []
+
+    def case(name, flat, shape, dtype_name, note=""):
+        a_t, a_c = pair_from_flat(torch_module, c_module, flat, shape, dtype_name)
+        cases.append(Case(
+            name=f"logical_not({name})",
+            op=op,
+            run_torch=lambda a_t=a_t: torch_call(a_t),
+            run_c=lambda a_c=a_c: c_module._aten_dispatch(op, a_c),
+            note=note,
+        ))
+
+    # The separator from `bitwise_not`: on these five values the two agree for
+    # `bool` and differ for every integral dtype, in values AND in result
+    # dtype (`bitwise_not(int64([0,1,2,-1,3]))` is `int64 [-1,-2,-3,0,-4]`).
+    probe = [0, 1, 2, -1, 3]
+    for dtype_name in ["bool", "int64", "int32", "uint8",
+                       "float64", "float32", "float16", "bfloat16"]:
+        values = [abs(v) for v in probe] if dtype_name in ("bool", "uint8") else probe
+        case(f"dtype={dtype_name}, mixed truthiness", values, (len(values),), dtype_name,
+             note="the answer is torch.bool whatever the input dtype -- a "
+                  "kernel that kept the input dtype returns plausible values "
+                  "(1.0/0.0) and the wrong type")
+        case(f"dtype={dtype_name}, all zero", [0] * 4, (2, 2), dtype_name)
+        case(f"dtype={dtype_name}, none zero", [1] * 4, (2, 2), dtype_name)
+        case(f"dtype={dtype_name}, 0-d", [0], (), dtype_name)
+        case(f"dtype={dtype_name}, empty", [], (0,), dtype_name)
+
+    for dtype_name in ["float64", "float32", "float16", "bfloat16"]:
+        case(f"dtype={dtype_name}, -0.0 / +0.0 / nan / inf",
+             [-0.0, 0.0, float("nan"), float("inf")], (4,), dtype_name,
+             note="nan is TRUTHY (logical_not(nan) is False) and -0.0 is "
+                  "falsy. `!(x != 0)` gets nan wrong; `x == 0` gets it right, "
+                  "because the comparison against nan is false either way")
+    return cases
+
+
+def logsumexp_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.logsumexp.default"
+    cases: list[Case] = []
+
+    def case(name, flat, shape, dtype_name, dim, keepdim=None,
+             expect="match", note=""):
+        a_t, a_c = pair_from_flat(torch_module, c_module, flat, shape, dtype_name)
+        kw = {} if keepdim is None else {"keepdim": keepdim}
+        cases.append(Case(
+            name=f"logsumexp({name})",
+            op=op,
+            run_torch=lambda a_t=a_t, kw=kw: torch_call(a_t, dim, **kw),
+            run_c=lambda a_c=a_c, kw=kw: c_module._aten_dispatch(op, a_c, dim, **kw),
+            expect=expect,
+            note=note,
+        ))
+
+    rows = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+    for dtype_name in _TAIL4_FLOAT_DTYPES:
+        case(f"dtype={dtype_name}, dim=-1", rows, (2, 3), dtype_name, -1,
+             note="granite_swa's own call")
+        case(f"dtype={dtype_name}, dim=0", rows, (2, 3), dtype_name, 0)
+        case(f"dtype={dtype_name}, dim=1, keepdim", rows, (2, 3), dtype_name, 1,
+             keepdim=True)
+        case(f"dtype={dtype_name}, dim=[0, 1]", rows, (2, 3), dtype_name, [0, 1])
+        case(f"dtype={dtype_name}, dim=[] with keepdim reduces EVERYTHING",
+             rows, (2, 3), dtype_name, [], keepdim=True,
+             note="amax's reading of an empty list, not sum's: the answer is "
+                  "shaped [1, 1] and holds the reduction over all six")
+        case(f"dtype={dtype_name}, large values do not overflow",
+             [1000.0, 1000.0], (2,), dtype_name, 0,
+             note="1000.6931 -- exp(1000) is inf, so a kernel without the "
+                  "max shift answers inf here")
+        case(f"dtype={dtype_name}, very negative values do not underflow",
+             [-1000.0, -1000.0], (2,), dtype_name, 0)
+        case(f"dtype={dtype_name}, all -inf is -inf, not nan",
+             [float("-inf")] * 3, (3,), dtype_name, 0,
+             note="the naive stabilised form gives nan: -inf - -inf")
+        case(f"dtype={dtype_name}, +inf is inf, not nan",
+             [float("inf"), 0.0], (2,), dtype_name, 0)
+        case(f"dtype={dtype_name}, one -inf is simply ignored",
+             [float("-inf"), 0.0], (2,), dtype_name, 0)
+        case(f"dtype={dtype_name}, a nan poisons the row",
+             [float("nan"), 0.0], (2,), dtype_name, 0,
+             note="a nan maximum is not an infinite one, so it is NOT zeroed")
+        case(f"dtype={dtype_name}, a 0-d input", [3.0], (), dtype_name, 0,
+             note="the value itself, exactly")
+        case(f"dtype={dtype_name}, an empty reduction axis is -inf",
+             [], (2, 0), dtype_name, 1,
+             note="log of a sum over nothing; upstream's other branch")
+
+    # Integral and bool inputs answer float32 -- not their own dtype (amax)
+    # and not int64 (sum).
+    for dtype_name in ["int64", "int32", "uint8", "bool"]:
+        case(f"dtype={dtype_name} answers float32", [1, 0, 1], (3,), dtype_name, 0,
+             note="neither amax's rule (keep the dtype) nor sum's (promote to "
+                  "int64)")
+
+    case("a repeated dim is refused", rows, (2, 3), "float32", [0, 0],
+         expect="both_error", note="'dim 0 appears multiple times in the list of dims'")
+    case("dim=[] WITHOUT keepdim raises upstream", rows, (2, 3), "float32", [],
+         expect="both_error",
+         note="'output with shape [] doesn't match the broadcast shape [1, 1]' "
+              "-- upstream sizes the result for no reduction and then reduces "
+              "all of them. Reproduced, not fixed")
+    case("dim out of range", rows, (2, 3), "float32", 5, expect="both_error",
+         note="and the message carries no op prefix")
+    return cases
+
+
+def t_inplace_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.t_.default"
+    cases: list[Case] = []
+    for dtype_name in ["float64", "float32", "float16", "bfloat16", "int64",
+                       "int32", "uint8", "bool"]:
+        for flat, shape, note in [
+            ([1], (), "0-d comes back unchanged"),
+            ([1, 1, 0], (3,), "1-d comes back unchanged -- NOT transposed"),
+            ([1, 2, 3, 4, 5, 6], (2, 3), "2-d swaps"),
+            ([1, 0, 1, 1], (1, 4), "row vector -> column vector"),
+            ([1, 0, 1, 1], (4, 1), "column vector -> row vector"),
+        ]:
+            a_t, a_c = pair_from_flat(torch_module, c_module, flat, shape, dtype_name)
+            cases.append(Case(
+                name=f"t_(dtype={dtype_name}, shape={shape}) [{note}]",
+                op=op,
+                run_torch=lambda a_t=a_t: torch_call(a_t),
+                run_c=lambda a_c=a_c: c_module._aten_dispatch(op, a_c),
+                note=note,
+            ))
+
+    a_t, a_c = pair_from_flat(torch_module, c_module, [1.0] * 24, (2, 3, 4), "float32")
+    cases.append(Case(
+        name="t_(3-D is refused, exactly as t() is)",
+        op=op,
+        run_torch=lambda: torch_call(a_t),
+        run_c=lambda: c_module._aten_dispatch(op, a_c),
+        expect="both_error",
+        note="'t_() expects a tensor with <= 2 dimensions, but self is 3D' -- "
+             "not a batched transpose(-2, -1)",
+    ))
+
+    # The receiver identity, which the value pipeline cannot see: `t_` is the
+    # first in-place op here that changes the receiver's SHAPE, so it goes
+    # through `replace_with` rather than `write_into`, and the thing to check
+    # is that the wrapper the caller holds is the one that moved.
+    recv_t, recv_c = pair_from_flat(torch_module, c_module, [1.0] * 6, (2, 3), "float32")
+
+    def _identity_and_shape(t_res, c_res):
+        if t_res is not recv_t or c_res is not recv_c:
+            return False, "t_ must return the receiver object itself"
+        t_shape = tuple(int(x) for x in recv_t.shape)
+        c_shape = tuple(int(x) for x in recv_c.shape)
+        if t_shape != (3, 2) or c_shape != (3, 2):
+            return False, f"the receiver itself must be (3, 2): torch={t_shape} c={c_shape}"
+        return _tail4_same_values(t_res, c_res)
+
+    cases.append(Case(
+        name="t_(mutates the receiver's own shape and returns it)",
+        op=op,
+        run_torch=lambda: torch_call(recv_t),
+        run_c=lambda: c_module._aten_dispatch(op, recv_c),
+        value_check=_identity_and_shape,
+        note="`x.t_() is x` and `x.shape` is (3, 2) afterwards, on both sides",
+    ))
+    return cases
+
+
 CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
     "aten.i0.default": i0_cases,
+
+    # docs/TAIL4.md
+    "aten.index_copy_.default": index_copy_inplace_cases,
+    "aten.index_copy.default": index_copy_cases,
+    "aten.round.default": round_default_cases,
+    "aten.round.decimals": round_decimals_cases,
+    "aten.round_.default": round_inplace_cases,
+    "aten.round_.decimals": round_inplace_decimals_cases,
+    "aten.logsumexp.default": logsumexp_cases,
+    "aten.t_.default": t_inplace_cases,
+    "aten.logical_not.default": logical_not_cases,
     "aten.kaiser_window.default": kaiser_window_default_cases,
     "aten.kaiser_window.periodic": kaiser_window_periodic_cases,
     "aten.kaiser_window.beta": kaiser_window_beta_cases,

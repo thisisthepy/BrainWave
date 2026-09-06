@@ -717,5 +717,28 @@
     "aten::std(Tensor self, bool unbiased=True) -> Tensor",
     "aten::std.dim(Tensor self, int[1]? dim, bool unbiased=True, bool keepdim=False) -> Tensor",
     "aten::std.correction(Tensor self, int[1]? dim=None, *, Scalar? correction=None, bool keepdim=False) -> Tensor"
+  ],
+  "round": [
+    "aten::round.decimals(Tensor self, *, int decimals) -> Tensor",
+    "aten::round(Tensor self) -> Tensor"
+  ],
+  "round_": [
+    "aten::round_.decimals(Tensor(a!) self, *, int decimals) -> Tensor(a!)",
+    "aten::round_(Tensor(a!) self) -> Tensor(a!)"
+  ],
+  "logsumexp": [
+    "aten::logsumexp(Tensor self, int[1] dim, bool keepdim=False) -> Tensor"
+  ],
+  "index_copy": [
+    "aten::index_copy(Tensor self, int dim, Tensor index, Tensor source) -> Tensor"
+  ],
+  "index_copy_": [
+    "aten::index_copy_(Tensor(a!) self, int dim, Tensor index, Tensor source) -> Tensor(a!)"
+  ],
+  "t_": [
+    "aten::t_(Tensor(a!) self) -> Tensor(a!)"
+  ],
+  "logical_not": [
+    "aten::logical_not(Tensor self) -> Tensor"
   ]
 }
