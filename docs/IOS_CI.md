@@ -31,13 +31,28 @@ repository records where any of them came from.**
 
 ## So the blocker is provenance, not configuration
 
-Putting this in CI means answering "where does an `arm64-iphonesimulator`
+> **Answered — see [`docs/TARGET_PYTHON.md`](TARGET_PYTHON.md).** It is neither
+> candidate guessed at below. It is a **local build of CPython's own in-tree
+> `iOS/` support**, made on a Mac on 18 October 2024 at commit `d894d467a61`
+> (branch `3.13`, which resolves upstream). There is no URL, because there was
+> never a published artefact — but there is a pinned source and a documented
+> build procedure, which is enough to reconstruct an equivalent one. Never a
+> byte-identical one: the build embeds its own timestamp and paths, and the
+> versions of OpenSSL, xz, bzip2 and libffi it linked were never recorded.
+>
+> So the CI job is now sized rather than blocked: a macOS runner with Xcode 16+,
+> roughly 30–60 minutes to build host-python, four dependencies and the iOS
+> configuration — cacheable on commit plus Xcode version — and
+> `TARGET_PYTHON_IOS_SIM` pointed at the prefix. `verify_ios_sim.py` already
+> reads that variable, so the harness itself needs no change. The device half
+> rides the same build and needs no hardware.
+
+Putting this in CI meant answering "where does an `arm64-iphonesimulator`
 CPython 3.13 come from, reproducibly" — a published artefact with a URL and a
-checksum, fetched by the workflow. Candidates exist (CPython 3.13 supports iOS
+checksum, fetched by the workflow. Candidates existed (CPython 3.13 supports iOS
 as a tier-3 target; BeeWare's `Python-Apple-support` publishes simulator
-XCFrameworks) but **none of them is what is in that directory**, because nothing
-says what is. Adopting one means re-establishing that the harness still works
-against a differently-laid-out distribution, which is a round, not a step.
+XCFrameworks) and **neither of them is what is in that directory**, which is why
+guessing would have been worse than looking.
 
 ## What is true today
 
