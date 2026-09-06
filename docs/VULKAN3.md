@@ -122,6 +122,13 @@ Expected all tensors to be on the same device, but found at least two devices, m
 
 ## 3. 사이징이 예상하지 않았던 것 — **`mps` 는 조용한 CPU 폴백이 가능하다**
 
+> **정정 (docs/MPS.md).** 이 절의 발견은 옳았고 **원인 지목이 틀렸습니다.** 되읽기는 candle 이
+> 아니라 이 크레이트의 커널들이 합니다 — candle 의 Metal 백엔드에는 조용한 CPU 폴백 경로가
+> 없고, 못 하는 op 은 전부 에러를 냅니다. 그리고 `aten.tril.default` 는 CPU 에서 계산되지
+> **않았습니다**(`where_cond` 는 진짜 Metal 커널입니다); 그 지목의 근거였던 "성공했고 값이
+> 맞았다" 로는 두 경우가 구분되지 않습니다. 실제 규모는 둘이 아니라 **54개**이고,
+> `aten._softmax.default` 가 그 안에 있습니다. 이제 문 앞에서 이름을 대며 거절합니다.
+
 이것이 이 라운드에서 가장 보고할 가치가 있는 발견이고, **두 장치가 같은 등급의 안전성을 갖지
 않는다**는 뜻입니다.
 

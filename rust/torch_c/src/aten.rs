@@ -843,6 +843,19 @@ pub fn aten_dispatch(
         // it anyway, so a kernel reached by some other route still cannot read
         // a `VkBuffer` as CPU storage. docs/VULKAN3.md.
         Some(Where::Vulkan) => crate::vulkan::dispatch(py, op, args, kwargs)?,
+        // The mps half, and it is one line here because the whole of it is a
+        // table lookup in `device.rs` (docs/MPS.md). An mps tensor is an
+        // ordinary `Repr::Dense`, so unlike Vulkan there is no representation
+        // to make the mistake unrepresentable -- but there is also nothing to
+        // *find*: candle's Metal backend never falls back to the CPU silently,
+        // so the only ops that can compute on the host under an `mps` label
+        // are the ones whose kernels in this file read the tensor back
+        // themselves. `mps_host_readback_gate` refuses exactly those, by name,
+        // before the kernel runs.
+        Some(Where::Dense(ref device)) if crate::device::is_metal(device) => {
+            crate::device::mps_host_readback_gate(op)?;
+            aten_dispatch_inner(py, op, args, kwargs)?
+        }
         _ => aten_dispatch_inner(py, op, args, kwargs)?,
     };
     // One exit as well as one entrance: every tensor leaving the dispatcher

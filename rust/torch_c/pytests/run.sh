@@ -103,6 +103,45 @@ EOF
     exit 1
 fi
 
+# macOS SIP strips every `DYLD_*` variable from the environment when it execs
+# a protected binary, and `/bin/sh` is one. So `DYLD_LIBRARY_PATH=... sh run.sh`
+# arrives here with that variable already gone -- it was in the caller's shell
+# and is not in this one. Nothing in this script can restore it, because
+# nothing in this script ever saw it.
+#
+# docs/VULKAN3.md §6.1 is what that cost: the four Vulkan tests skipped saying
+# "no vulkan" while the loader was pointed at correctly, and the person who had
+# just supplied the loader had no way to tell. A skip that gives a false reason
+# is worse than a failure, because it is counted as a pass.
+#
+# `TORCH_C_DYLD_LIBRARY_PATH` is the way in. It is not a `DYLD_*` name, so it
+# survives the exec, and it is re-exported below for the two Python
+# invocations that need it -- exporting it here rather than at the top so it is
+# obvious that its only purpose is to reach the loader.
+if [ -n "${TORCH_C_DYLD_LIBRARY_PATH:-}" ]; then
+    DYLD_LIBRARY_PATH="$TORCH_C_DYLD_LIBRARY_PATH${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}"
+    export DYLD_LIBRARY_PATH
+fi
+
+# The trap leaves no trace of itself -- a stripped variable is simply absent --
+# but it does leave a signature, and this is it. `VK_DRIVER_FILES` is not a
+# `DYLD_*` name, so SIP does not strip it; a caller who set one and not the
+# other set both and lost one on the way in. Said here as well as in the skip
+# line, because this is where a reader is looking when they wonder why.
+if [ -n "${VK_DRIVER_FILES:-}" ] && [ -z "${DYLD_LIBRARY_PATH:-}" ]; then
+    cat >&2 <<EOF
+run.sh: VK_DRIVER_FILES is set but DYLD_LIBRARY_PATH is not.
+
+macOS SIP strips DYLD_* when exec'ing /bin/sh, so if you passed
+DYLD_LIBRARY_PATH on this command line it did not reach this script and will
+not reach Python. The Vulkan tests will skip -- truthfully, but for a reason
+that is about this process and not about your machine.
+
+Pass it as TORCH_C_DYLD_LIBRARY_PATH instead; this script re-exports it.
+(docs/VULKAN3.md §6.1)
+EOF
+fi
+
 PYTHONPATH="$stage" "${PYTHON:-python3}" "$crate_dir/pytests/test_shim.py" || exit $?
 
 # The golden harness has its own self-test -- it injects a fault shaped like a
