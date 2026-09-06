@@ -9287,7 +9287,7 @@ def test_core_ops_and_op_tags_agree():
     # would have written 123 here and the test would still have passed the
     # day it was written, which is exactly the failure mode `min.dim` vs
     # `max.dim` above already recorded once.
-    assert r["tag_core_count"] == 122, r["tag_core_count"]
+    assert r["tag_core_count"] == 125, r["tag_core_count"]
 
 
 def test_decompose_lowers_the_op_capture_md_named():
@@ -10890,7 +10890,7 @@ def test_schema_text_survives_the_round_trip_through_the_transcribed_tables():
     # spelling for them -- a row would invent a door upstream lacks. Measured
     # here rather than summed from either report, since each branch's count
     # was correct only against its own base.
-    assert len(keys) == 328, len(keys)
+    assert len(keys) == 337, len(keys)
     from_tables = sorted(
         k for k in keys
         if report["table"][f"{k[0]}|{k[1]}"]["from"] == "tables"
