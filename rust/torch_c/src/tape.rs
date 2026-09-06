@@ -395,6 +395,7 @@ pub const RULE_OPS: &[&str] = &[
     "aten.mul.Scalar",
     "aten.mul.Tensor",
     "aten.native_dropout.default",
+    "aten.native_batch_norm.default",
     "aten.native_layer_norm.default",
     "aten.neg.default",
     "aten.nll_loss_forward.default",
@@ -1063,6 +1064,9 @@ fn derivative<'py>(
         "aten.native_layer_norm.default" => {
             layer_norm_backward(py, node, env, gouts, outs)
         }
+        "aten.native_batch_norm.default" => {
+            batch_norm_backward(py, node, env, gouts, outs)
+        }
 
         // ------------------------------------------------------------ dropout
         "aten.native_dropout.default" => {
@@ -1323,6 +1327,211 @@ fn cast_like<'py>(py: Python<'py>, g: Obj<'py>, like: &Obj<'py>) -> PyResult<Obj
 /// it is the reading that matters under mixed precision, where `aten.rs`
 /// measured the statistics following the *parameter* dtype and not the input's.
 /// Recomputing them would silently substitute the input's precision there.
+/// **W11** (docs/BACKWARD8.md §2): the derivative of `native_batch_norm`.
+///
+/// The reason it is here is a measurement, not a checklist. `docs/BACKWARD7.md`
+/// §10 row 3 predicted that a model writing a buffer mid-forward -- a KV cache,
+/// a batch-norm running statistic -- would be refused where upstream answers,
+/// and had not checked it against a real model. Checked: a real
+/// `nn.Sequential(Conv2d, BatchNorm2d, ReLU)` in `train()` mode was refused,
+/// and behind the storage-version defect that `Recorder::forgive_own_write`
+/// closes stood a second wall -- there was no rule here at all, so the fixed
+/// guard would have handed back *"no derivative rule"* instead. Fixing one of
+/// two walls buys nothing, so this is the other one.
+///
+/// Two modes, and they are different functions:
+///
+/// * **`training=true`.** The statistics are the batch's own, so `x` reaches
+///   the output through the mean and the variance as well as directly, and the
+///   two extra terms are the whole content of the rule. It reads `save_mean`
+///   and `save_invstd`, which the forward *returns* precisely so a backward
+///   need not recompute them -- and, importantly, it does **not** read
+///   `running_mean`/`running_var`. That is what makes the storage-version
+///   forgiveness in `capture.rs` safe: the buffers this op writes are an output
+///   of the forward and an input to nothing.
+/// * **`training=false`.** The statistics are constants, `x` reaches the output
+///   only directly, and the rule is one multiply. Here `running_mean` and
+///   `running_var` *are* read -- and in this mode the op writes nothing, so
+///   they are held to the ordinary freshness rule with no forgiveness.
+///
+/// The channel axis is 1 by definition of this op and the reduction is every
+/// other axis, which is the one structural difference from
+/// `layer_norm_backward` above: layer norm reduces a *suffix* and keeps the
+/// statistics at the input's rank, batch norm reduces the complement of one
+/// axis and keeps its statistics at rank 1. The reshape to `[1, C, 1, ...]` is
+/// therefore explicit here and absent there.
+fn batch_norm_backward<'py>(
+    py: Python<'py>,
+    node: &Node,
+    env: &Env,
+    gouts: &[Option<Obj<'py>>],
+    outs: &[Obj<'py>],
+) -> PyResult<Rule<'py>> {
+    const OP: &str = "aten.native_batch_norm.default";
+    let ops = bind(
+        py,
+        node,
+        env,
+        &[
+            "input",
+            "weight",
+            "bias",
+            "running_mean",
+            "running_var",
+            "training",
+            "momentum",
+            "eps",
+        ],
+    )?;
+    // The same refusal `layer_norm_backward` makes, for the same reason: these
+    // two results exist so that a backward need not recompute them, and
+    // nothing here differentiates a saved statistic.
+    for (slot, name) in [(1usize, "save_mean"), (2usize, "save_invstd")] {
+        if gouts.len() > slot && gouts[slot].is_some() {
+            return Err(crate::err::not_implemented(format!(
+                "torch._C tape: a gradient reached native_batch_norm's {name}, which this \
+                 op returns so that a backward need not recompute it; nothing here \
+                 differentiates a saved statistic"
+            )));
+        }
+    }
+    let g = gouts
+        .first()
+        .and_then(|slot| slot.clone())
+        .ok_or_else(|| missing(OP, "grad"))?;
+
+    let input = required(OP, &ops, 0, "input")?;
+    let xshape = input.shape()?;
+    let rank = xshape.len();
+    if rank < 2 {
+        return Err(crate::err::not_implemented(format!(
+            "torch._C tape: native_batch_norm's gradient was given a rank-{rank} input, and \
+             this op's channel axis is 1 by definition"
+        )));
+    }
+    let channels = xshape[1];
+    // Every axis but the channel one. `[N, C, *spatial]` reduces over `N` and
+    // the spatial axes, which is what makes `M` the count *per channel* rather
+    // than per row.
+    let reduce: Vec<i64> = (0..rank as i64).filter(|d| *d != 1).collect();
+    let count: f64 = reduce
+        .iter()
+        .map(|d| xshape[*d as usize])
+        .product::<usize>() as f64;
+    // The shape a `[C]` statistic has to take to broadcast against `x`.
+    let mut broadcast = vec![1usize; rank];
+    broadcast[1] = channels;
+
+    let training = opt_bool(&ops, 5, true)?;
+    let eps = opt_f64(&ops, 7, 1e-5)?;
+
+    let weight = ops
+        .get(1)
+        .and_then(|slot| slot.as_ref())
+        .filter(|operand| !operand.value.is_none());
+    let bias = ops
+        .get(2)
+        .and_then(|slot| slot.as_ref())
+        .filter(|operand| !operand.value.is_none());
+
+    // Where the interior is computed. Under mixed precision the statistics are
+    // the parameters' dtype and the input is not, and `layer_norm_backward`
+    // above records what happens to a rule that ignores that: `x - mean` with
+    // a `bfloat16` x against a `float32` mean is a promotion this shim declines
+    // by name, so the rule would not lose precision, it would refuse.
+    let (mean, invstd) = if training {
+        if outs.len() < 3 {
+            return Err(crate::err::not_implemented(format!(
+                "torch._C tape: native_batch_norm's training gradient reads the save_mean \
+                 and save_invstd this op returns, and this node recorded {} result(s)",
+                outs.len()
+            )));
+        }
+        (
+            reshape(py, outs[1].clone(), &broadcast)?,
+            reshape(py, outs[2].clone(), &broadcast)?,
+        )
+    } else {
+        // Eval. `save_mean`/`save_invstd` come back empty in this mode
+        // (measured on 2.13.0: both are shape `[0]`), so the statistics are the
+        // running buffers and the reciprocal square root has to be formed here.
+        let rm = required(OP, &ops, 3, "running_mean")?;
+        let rv = required(OP, &ops, 4, "running_var")?;
+        if rm.value.is_none() || rv.value.is_none() {
+            return Err(crate::err::not_implemented(
+                "torch._C tape: native_batch_norm with training=False and no running \
+                 statistics normalises by nothing this rule can name -- upstream's kernel \
+                 rejects that combination too"
+                    .to_string(),
+            ));
+        }
+        let shifted = call(py, "aten.add.Scalar", vec![rv.value.clone(), scalar(py, eps)?])?;
+        let rstd = call(py, "aten.rsqrt.default", vec![shifted])?;
+        (
+            reshape(py, rm.value.clone(), &broadcast)?,
+            reshape(py, rstd, &broadcast)?,
+        )
+    };
+
+    let xa = cast_like(py, input.value.clone(), &mean)?;
+    let ga = cast_like(py, g.clone(), &mean)?;
+    let xhat = mul(py, sub(py, xa, mean)?, invstd.clone())?;
+
+    // `g * weight`, which is `dL/dy_normalised`.
+    let gh = match weight {
+        Some(w) => {
+            let wb = reshape(py, cast_like(py, w.value.clone(), &ga)?, &broadcast)?;
+            mul(py, ga.clone(), wb)?
+        }
+        None => ga.clone(),
+    };
+
+    let gi = if training {
+        // The batch's own statistics depend on every element, so `x` reaches
+        // the loss three ways. Dropping either mean term gives a gradient that
+        // is right to a few percent on a large batch and wrong on a small one,
+        // which is why the test for this rule is element-wise against upstream
+        // on N=2 rather than a tolerance on N=64.
+        let per = |py: Python<'py>, t: Obj<'py>| -> PyResult<Obj<'py>> {
+            let summed = sum_dims(py, t, &reduce, true)?;
+            call(py, "aten.div.Scalar", vec![summed, scalar(py, count)?])
+        };
+        let mean_gh = per(py, gh.clone())?;
+        let mean_gh_xhat = per(py, mul(py, gh.clone(), xhat.clone())?)?;
+        let centred = sub(
+            py,
+            sub(py, gh, mean_gh)?,
+            mul(py, xhat.clone(), mean_gh_xhat)?,
+        )?;
+        mul(py, centred, invstd)?
+    } else {
+        // Eval: the statistics are constants, so this is the chain rule and
+        // nothing else.
+        mul(py, gh, invstd)?
+    };
+    let gi = cast_like(py, gi, &input.value)?;
+
+    let gw = match weight {
+        None => None,
+        Some(w) => {
+            let summed = sum_dims(py, mul(py, ga.clone(), xhat)?, &reduce, false)?;
+            Some(cast_like(py, reshape(py, summed, &[channels])?, &w.value)?)
+        }
+    };
+    let gb = match bias {
+        None => None,
+        Some(b) => {
+            let summed = sum_dims(py, ga, &reduce, false)?;
+            Some(cast_like(py, reshape(py, summed, &[channels])?, &b.value)?)
+        }
+    };
+
+    // `running_mean` and `running_var` get no gradient: they are buffers, they
+    // are `requires_grad=False` upstream, and in training mode this rule does
+    // not even read them.
+    Ok((ops, vec![Some(gi), gw, gb, None, None]))
+}
+
 fn layer_norm_backward<'py>(
     py: Python<'py>,
     node: &Node,

@@ -15431,6 +15431,36 @@ def _tape_case_bodies():
 
     cases["aten.native_layer_norm.default"] = shape_case([2, 3, 4], _layer_norm)
 
+    # `training=False`, and it has to be: capture refuses a training-mode
+    # `native_batch_norm` by name (`MUTATES_WITHOUT_UNDERSCORE`, because that
+    # call writes its running statistics and a trace must stay
+    # single-assignment), so the finite-difference oracle can only reach the
+    # eval arm of the rule. The training arm -- the two mean terms, which are
+    # the whole content of the rule -- is checked in closed form on the eager
+    # tape instead, by
+    # `test_the_eager_graph_differentiates_a_training_mode_batch_norm_that_wrote_its_buffers`
+    # and against a real model in docs/BACKWARD8.md §2. That split is worth
+    # noticing rather than hiding: this entry proves coverage of the op, not of
+    # both its modes.
+    #
+    # `weight` and `bias` are built from the input for `_layer_norm`'s reason,
+    # and by different functions of it so that swapping them is visible. The
+    # running statistics are burned-in constants -- in eval mode they are read
+    # and not written, which is exactly the case where the freshness guard
+    # still applies to them.
+    bn_mean = _tape_f64(_tape_ramp(4, 0.1, 0.4), [4])
+    bn_var = _tape_f64(_tape_ramp(4, 0.7, 1.3), [4])
+
+    def _batch_norm(x):
+        w = d("aten.mean.dim", x, [0], False)
+        b = d("aten.mean.dim", d("aten.sin.default", x), [0], False)
+        return s(d(
+            "aten.native_batch_norm.default",
+            x, w, b, bn_mean, bn_var, False, 0.1, 1e-5,
+        )[0])
+
+    cases["aten.native_batch_norm.default"] = shape_case([3, 4], _batch_norm)
+
     # -- matmul ------------------------------------------------------------
     rhs = _tape_f64(_tape_ramp(12, 0.2, 1.2), [3, 4])
     bias = _tape_f64(_tape_ramp(4, 0.1, 0.5), [4])
@@ -25103,6 +25133,501 @@ def test_an_op_with_no_mil_lowering_is_refused_by_name():
         len(r["supported_ops"]), r["registry_size"]
     )
 
+
+
+
+# ---------------------------------------------------------------------------
+# W11 (docs/BACKWARD8.md): what docs/BACKWARD7.md §10 left unestablished
+# ---------------------------------------------------------------------------
+
+
+def test_the_eager_graph_differentiates_a_training_mode_batch_norm_that_wrote_its_buffers():
+    """docs/BACKWARD8.md §2 -- **docs/BACKWARD7.md §10 row 3, measured and then
+    fixed.**
+
+    §10 row 3 predicted that a model writing a buffer *mid-forward* -- a KV
+    cache, a batch-norm running statistic -- would be refused where upstream
+    answers, and said it had not been checked against a real model. Checked, on
+    a real `nn.Sequential(Linear, BatchNorm1d, Tanh)` in `train()` mode: **it
+    was refused.** Not by the guard §5 described -- `_eager_reason()` was
+    `None`, because `note_mutation`'s `MUTATES_WITHOUT_UNDERSCORE` arm bumps
+    the running statistics without poisoning -- but by W10a's constant
+    freshness, at `backward()`, exactly one version late.
+
+    One version, and the write was the op's *own*. `aten.rs` calls
+    `eager_record`, which stamps `running_mean` the first time it sees it, and
+    then calls `note_mutation`, which bumps that same storage for the write the
+    kernel had already made before either ran. So a training-mode BatchNorm
+    invalidated its own tape on its own call, with nothing in between having
+    written anything. `Recorder::forgive_own_write` counts that write once.
+
+    This test is the fixed behaviour, and it asserts all three of the things
+    that had to hold at once:
+
+    1. the buffer really did move, so this is still the program §10 row 3 asked
+       about and not a program that never writes;
+    2. the tape is not poisoned and `backward()` **answers**;
+    3. the answer is right, checked against the closed form of the
+       training-mode rule rather than against a shape.
+
+    The closed form, with `M` the count per channel and `xhat` the normalised
+    input:
+
+        dL/dx = invstd * (gh - mean(gh) - xhat * mean(gh * xhat)),  gh = g * w
+        dL/dw = sum(g * xhat)
+        dL/db = sum(g)
+
+    with `loss = sum(out)` so that `g` is all ones -- which is *not* a
+    degenerate choice here: with `g = 1` the two mean terms cancel the direct
+    term exactly and `dL/dx` is zero to rounding, which is the property a rule
+    that dropped either mean term would fail. `dL/dw` is `sum(xhat) = 0` for
+    the same reason, so the discriminating quantity is `dL/db = M`, and the
+    input gradient is asserted *small* rather than merely present.
+
+    docs/BACKWARD8.md §2.3 nullifies `forgive_own_write` and records that this
+    goes red with the freshness message when it is removed.
+    """
+    _C._eager_reset()
+    features, rows = 4, 3
+    weight = _tape_f64(_tape_ramp(features), [features]).to(_C.float32)
+    bias = _tape_f64(_tape_ramp(features, 0.5, 2.5), [features]).to(_C.float32)
+    running_mean = _tape_f64([0.0] * features, [features]).to(_C.float32)
+    running_var = _tape_f64([1.0] * features, [features]).to(_C.float32)
+    x = _tape_f64(_tape_ramp(rows * features), [rows, features]).to(_C.float32)
+    x.requires_grad = True
+    weight.requires_grad = True
+    bias.requires_grad = True
+
+    before = [float(v) for v in running_mean.flatten()]
+    out, save_mean, save_invstd = _C._aten_dispatch(
+        "aten.native_batch_norm.default",
+        x, weight, bias, running_mean, running_var, True, 0.1, 1e-5,
+    )
+    after = [float(v) for v in running_mean.flatten()]
+    assert before != after, (
+        "the running statistics did not move -- this program no longer poses "
+        "the question docs/BACKWARD7.md §10 row 3 asked"
+    )
+    assert _C._eager_tape_size() > 0, "the batch norm was not recorded at all"
+    assert _C._eager_reason() is None, _C._eager_reason()
+
+    loss = _C._aten_dispatch("aten.sum.default", out)
+    grads = _eager_grad(loss, [x, weight, bias])
+    assert all(g is not None for g in grads), (
+        "a training-mode batch norm was refused -- if this is the freshness "
+        "message again, forgive_own_write has stopped working"
+    )
+    gx, gw, gb = grads
+
+    # dL/db = M, the count per channel. The one quantity here that is not zero
+    # by symmetry, so it is what says the reduction axes are right.
+    assert [round(float(v), 5) for v in gb.flatten()] == [float(rows)] * features, (
+        [float(v) for v in gb.flatten()]
+    )
+    # dL/dw = sum(xhat) = 0, and dL/dx = 0: both are the two mean terms
+    # cancelling the direct term. A rule missing either would be O(1) here.
+    assert max(abs(float(v)) for v in gw.flatten()) < 1e-4, (
+        [float(v) for v in gw.flatten()]
+    )
+    assert max(abs(float(v)) for v in gx.flatten()) < 1e-4, (
+        [float(v) for v in gx.flatten()]
+    )
+
+    # The statistics the rule reads are the op's own results, not the buffers
+    # it wrote -- which is what makes forgiving that write safe. Asserted by
+    # value: save_mean is the batch mean of x, per channel.
+    columns = [
+        [float(x.flatten()[r * features + c]) for r in range(rows)]
+        for c in range(features)
+    ]
+    assert max(
+        abs(float(m) - sum(col) / rows)
+        for m, col in zip(save_mean.flatten(), columns)
+    ) < 1e-5, ([float(v) for v in save_mean.flatten()], columns)
+    assert len(list(save_invstd.flatten())) == features
+    _C._eager_reset()
+
+
+def test_the_eager_guard_still_refuses_a_second_write_to_a_batch_norm_buffer():
+    """docs/BACKWARD8.md §2.2 -- the control on the test above.
+
+    `forgive_own_write` advances the stamp by **one**, for the write the op
+    being recorded has already made. It would have been a line shorter to
+    re-read the storage's current version instead, and that version would have
+    forgiven everything that had ever happened to the buffer. This is the test
+    that tells the two apart: the same program, with one extra write to
+    `running_mean` between the forward and the backward, must still be refused
+    by name.
+
+    Widening the forgiveness to "whatever the buffer is at now" leaves the test
+    above green and turns this one red, which is the only reason it exists.
+    """
+    _C._eager_reset()
+    features, rows = 4, 3
+    weight = _tape_f64(_tape_ramp(features), [features]).to(_C.float32)
+    bias = _tape_f64(_tape_ramp(features, 0.5, 2.5), [features]).to(_C.float32)
+    running_mean = _tape_f64([0.0] * features, [features]).to(_C.float32)
+    running_var = _tape_f64([1.0] * features, [features]).to(_C.float32)
+    x = _tape_f64(_tape_ramp(rows * features), [rows, features]).to(_C.float32)
+    weight.requires_grad = True
+
+    out = _C._aten_dispatch(
+        "aten.native_batch_norm.default",
+        x, weight, bias, running_mean, running_var, True, 0.1, 1e-5,
+    )[0]
+    loss = _C._aten_dispatch("aten.sum.default", out)
+    # The second write. Nothing about it is the op's own.
+    assert _C._eager_reason() is None, (
+        "the tape was already refused before the second write, so this test "
+        "cannot tell the second write from the op's own: " + str(_C._eager_reason())
+    )
+    _C._aten_dispatch("aten.zero_.default", running_mean)
+    assert _C._eager_reason() is not None, (
+        "a zero_ on a buffer the graph holds left the tape answering"
+    )
+    try:
+        _eager_grad(loss, [weight])
+    except RuntimeError as exc:
+        message = str(exc)
+    else:
+        raise AssertionError(
+            "a write to running_mean between the forward and the backward was "
+            "differentiated -- forgive_own_write has been widened past the "
+            "op's own write"
+        )
+    # **Which guard catches it is itself the finding.** The second write is an
+    # `aten.zero_.default`, and `note_mutation`'s ordinary in-place arm calls
+    # `poison_on_write_to_recorded_storage`, so the tape is refused at the
+    # *write* rather than one guard later at `backward()`. That is the guard
+    # docs/BACKWARD7.md §5 described, firing on the case it was written for --
+    # and its absence on the batch-norm forward above is why the fix belonged
+    # in the stamp and not here.
+    assert "an in-place operation wrote into a tensor the eager graph holds" in message, message
+    _C._eager_reset()
+
+
+def test_the_batch_norm_rule_agrees_with_the_eval_mode_closed_form_too():
+    """docs/BACKWARD8.md §2.4.
+
+    `training=False` is a different function, not a special case: the
+    statistics are the running buffers rather than the batch's, `x` reaches the
+    output only directly, and the two mean terms are absent. It is also the
+    mode in which this op writes nothing, so `forgive_own_write` does not run
+    and the buffers are held to the ordinary freshness rule -- which is why the
+    eval arm has to be checked separately rather than assumed to follow.
+
+    `save_mean` and `save_invstd` come back empty in this mode (measured on
+    2.13.0: both shape `[0]`), so a rule that read them regardless would divide
+    by an empty tensor rather than answer wrongly. The closed form:
+
+        dL/dx = g * w / sqrt(running_var + eps),  dL/dw = sum(g * xhat)
+    """
+    _C._eager_reset()
+    features, rows, eps = 4, 3, 1e-5
+    weight = _tape_f64(_tape_ramp(features), [features]).to(_C.float32)
+    bias = _tape_f64(_tape_ramp(features, 0.5, 2.5), [features]).to(_C.float32)
+    means = _tape_ramp(features, 0.1, 0.4)
+    variances = _tape_ramp(features, 0.5, 2.0)
+    running_mean = _tape_f64(means, [features]).to(_C.float32)
+    running_var = _tape_f64(variances, [features]).to(_C.float32)
+    xs = _tape_ramp(rows * features)
+    x = _tape_f64(xs, [rows, features]).to(_C.float32)
+    x.requires_grad = True
+    weight.requires_grad = True
+
+    out = _C._aten_dispatch(
+        "aten.native_batch_norm.default",
+        x, weight, bias, running_mean, running_var, False, 0.1, eps,
+    )[0]
+    assert [float(v) for v in running_mean.flatten()] == [
+        float(v) for v in _tape_f64(means, [features]).to(_C.float32).flatten()
+    ], "eval mode wrote its running statistics, which is not what it does"
+
+    loss = _C._aten_dispatch("aten.sum.default", out)
+    gx, gw = _eager_grad(loss, [x, weight])
+    invstd = [1.0 / ((v + eps) ** 0.5) for v in variances]
+    want_gx = [invstd[c] * _tape_ramp(features)[c] for _ in range(rows) for c in range(features)]
+    got_gx = [float(v) for v in gx.flatten()]
+    assert max(abs(a - b) for a, b in zip(got_gx, want_gx)) < 1e-5, (got_gx, want_gx)
+    want_gw = [
+        sum((xs[r * features + c] - means[c]) * invstd[c] for r in range(rows))
+        for c in range(features)
+    ]
+    got_gw = [float(v) for v in gw.flatten()]
+    assert max(abs(a - b) for a, b in zip(got_gw, want_gw)) < 1e-4, (got_gw, want_gw)
+    _C._eager_reset()
+
+
+def test_the_eager_graph_survives_a_kv_cache_update_because_the_cache_is_concatenated():
+    """docs/BACKWARD8.md §2 -- the other half of docs/BACKWARD7.md §10 row 3,
+    and the half the prediction got wrong.
+
+    Measured on real SmolLM2-135M with `use_cache=True` (§2): a prefill and a
+    decode step record 1510 nodes each, `_eager_reason()` stays `None`, and the
+    gradient of the tied embedding matrix comes back and agrees with torch
+    2.13.0. **The guard does not fire, and the reason is not that it is weak:
+    transformers' `DynamicCache` grows by `torch.cat`, which allocates.** There
+    is no in-place write for a storage guard to see, so a "KV cache update" is
+    not the mutation shape §10 row 3 assumed it was.
+
+    This test is that shape without the 135M parameters: a cache extended by
+    `cat` and read back into a loss, differentiated through both steps.
+    """
+    _C._eager_reset()
+    w = _tape_f64(_tape_ramp(3), [3])
+    w.requires_grad = True
+    step1 = _C._aten_dispatch("aten.mul.Tensor", w, w)
+    cache = _C._aten_dispatch("aten.cat.default", [step1])
+    step2 = _C._aten_dispatch("aten.mul.Scalar", w, 3.0)
+    cache = _C._aten_dispatch("aten.cat.default", [cache, step2])
+    assert _C._eager_reason() is None, _C._eager_reason()
+    loss = _C._aten_dispatch("aten.sum.default", cache)
+    grad = _eager_grad(loss, [w])[0]
+    # d/dw sum(w*w) + d/dw sum(3w) = 2w + 3
+    want = [2.0 * v + 3.0 for v in _tape_ramp(3)]
+    got = [float(v) for v in grad.flatten()]
+    assert max(abs(a - b) for a, b in zip(got, want)) < 1e-12, (got, want)
+    _C._eager_reset()
+
+
+def test_the_eager_backward_uses_the_dropout_draw_the_forward_made():
+    """docs/BACKWARD8.md §3 -- **docs/BACKWARD7.md §10 row 5, tested.**
+
+    §10 row 5 recorded an *argument* that docs/CAPTURE.md §9-1's failure -- a
+    gradient taken at a different dropout draw than the one reported -- cannot
+    happen on the eager path, because the draw is held in `node_objects` rather
+    than replayed, and said the argument had not been tested because the two
+    RNG streams make a direct upstream comparison impossible.
+
+    The streams do not have to agree. `native_dropout` hands back the mask it
+    drew, so the gradient has a closed form *in that mask* and the comparison
+    is element-wise and exact against it:
+
+        y = x * mask / (1 - p);  loss = sum(y*y)
+        dloss/dx = 2 * x * mask^2 / (1 - p)^2
+
+    The last block is why this is a test and not a restatement: the same
+    gradient is compared against an *independent* draw and must **not** match.
+    A comparator that accepts any mask would have accepted a redraw.
+    """
+    n, p = 256, 0.5
+    scale = 1.0 / (1.0 - p)
+    x_values = [(i + 1) / n for i in range(n)]
+    seen = []
+    for _ in range(3):
+        _C._eager_reset()
+        x = _tape_f64(x_values, [n]).to(_C.float32)
+        x.requires_grad = True
+        y, mask = _C._aten_dispatch("aten.native_dropout.default", x, p, True)
+        loss = _C._aten_dispatch(
+            "aten.sum.default", _C._aten_dispatch("aten.mul.Tensor", y, y)
+        )
+        grad = _eager_grad(loss, [x])[0]
+        kept = [1.0 if bool(v) else 0.0 for v in mask.flatten()]
+        seen.append(kept)
+        want = [2.0 * xv * k * k * scale * scale for xv, k in zip(x_values, kept)]
+        got = [float(v) for v in grad.flatten()]
+        # Exact: the backward multiplies by the very tensor the forward
+        # returned, so there is no rounding to allow for.
+        assert got == want, max(abs(a - b) for a, b in zip(got, want))
+        assert 0 < sum(kept) < n, (
+            "the draw kept everything or nothing, so this iteration could not "
+            "have told a held draw from a redrawn one"
+        )
+
+    # The draws are independent, so the check above is not vacuous.
+    differ = sum(1 for a, b in zip(seen[0], seen[1]) if a != b)
+    assert differ > n // 8, (
+        "two dropout draws agreed almost everywhere -- either the generator is "
+        "stuck or this test is asserting nothing", differ
+    )
+
+    # And the comparator discriminates: the last gradient must NOT match the
+    # closed form of a *different* draw. This is the line that goes red if the
+    # backward ever redraws.
+    _C._eager_reset()
+    other = _C._aten_dispatch(
+        "aten.native_dropout.default", _tape_f64(x_values, [n]).to(_C.float32), p, True
+    )[1]
+    other_kept = [1.0 if bool(v) else 0.0 for v in other.flatten()]
+    if other_kept != seen[-1]:
+        wrong = [2.0 * xv * k * k * scale * scale for xv, k in zip(x_values, other_kept)]
+        assert got != wrong, (
+            "the gradient matched a draw the forward never made"
+        )
+
+    # **The nullification, with real machinery rather than a hypothetical.**
+    # CLAUDE.md §5.5: a check that cannot fail is not a check, and the
+    # assertion above would be worthless if nothing in this tree could actually
+    # produce a gradient at the wrong draw. Something can. The *capture* tape
+    # differentiates by replaying the forward, so `native_dropout` draws a
+    # second time -- that is
+    # `test_the_tape_replays_a_dropout_forward_and_therefore_redraws_its_mask`,
+    # and docs/ADAPT.md §14.3 measures it as the larger error term on a real
+    # gpt2 Tent step by two orders of magnitude. Running the same program that
+    # way and applying the same comparator to it **fails**, on almost every
+    # element, which is what says the eager result above was earned.
+    _C._eager_reset()
+    xs = _tape_f64(x_values, [n]).to(_C.float32)
+    _C._capture_begin([xs])
+    try:
+        y, mask = _C._aten_dispatch("aten.native_dropout.default", xs, p, True)
+        captured = _C._capture_end(
+            _C._aten_dispatch(
+                "aten.sum.default", _C._aten_dispatch("aten.mul.Tensor", y, y)
+            )
+        )
+    except BaseException:
+        try:
+            _C._capture_abandon()
+        except RuntimeError:
+            pass
+        raise
+    forward_kept = [1.0 if bool(v) else 0.0 for v in mask.flatten()]
+    at_forward_draw = [
+        2.0 * xv * k * k * scale * scale for xv, k in zip(x_values, forward_kept)
+    ]
+    replayed = [float(v) for v in captured.backward([xs])["inputs"][0].flatten()]
+    disagreements = sum(
+        1 for a, b in zip(replayed, at_forward_draw) if abs(a - b) > 1e-6
+    )
+    assert disagreements > n // 8, (
+        "the replay path agreed with the forward's draw, so this comparator "
+        "could not have detected a redraw and the eager assertion above is "
+        "vacuous", disagreements,
+    )
+    _C._eager_reset()
+
+
+def test_the_tape_byte_count_excludes_parameters_and_counts_each_storage_once():
+    """docs/BACKWARD8.md §4.1 -- the instrument the growth measurement rests on.
+
+    `_eager_tape_bytes` exists because RSS is not an instrument on this
+    machine: `ru_maxrss` is a peak and reported `+0.0 MiB` for a tape that had
+    grown by fourteen thousand nodes, and `ps -o rss=` reported a growth that
+    then went **negative by 599 MiB** between two consecutive decode steps
+    while eight other agents were running. A number the tape computes about
+    itself cannot be corrupted that way.
+
+    But the naive form of that number is a fiction, and this test is the two
+    corrections that make it a size. Summing `numel * itemsize` over every
+    recorded result reported **529 MiB for a single SmolLM2-135M prefill**,
+    against an RSS that moved by single-digit MiB. Both errors are here in
+    miniature:
+
+    * every `Linear` records a `t()` of its weight, and that result is a *view
+      of a parameter* -- the `lm_head` transpose alone is 108 MiB of buffer the
+      model owns and freeing the tape would not return;
+    * a `view` of a recorded result is a second object over one storage, and
+      counting both double-counts bytes that exist once.
+
+    So: a transpose of a leaf contributes zero, and a view of a recorded result
+    contributes nothing beyond what it aliases. The figures in §4 are what is
+    left, and they agree in order with what RSS could be got to say before the
+    machine took the reading away.
+    """
+    _C._eager_reset()
+    assert _C._eager_tape_bytes() == 0, "an empty tape holds bytes"
+
+    # A leaf, in the position a parameter occupies: 8x8 float32 = 256 bytes,
+    # owned by the caller and held by the tape only by reference.
+    weight = _tape_f64(_tape_ramp(64), [8, 8]).to(_C.float32)
+    weight.requires_grad = True
+
+    transposed = _C._aten_dispatch("aten.t.default", weight)
+    assert _C._eager_tape_size() == 1, "the transpose was not recorded"
+    assert _C._eager_tape_bytes() == 0, (
+        "a transpose of a parameter was counted as tape -- this is the 108 MiB "
+        "lm_head view that made the naive count read 529 MiB for one prefill",
+        _C._eager_tape_bytes(),
+    )
+
+    # An allocation. This one the tape really is keeping alive.
+    doubled = _C._aten_dispatch("aten.mul.Scalar", transposed, 2.0)
+    assert _C._eager_tape_bytes() == 256, _C._eager_tape_bytes()
+
+    viewed = _C._aten_dispatch("aten.view.default", doubled, [64])
+    assert _C._eager_tape_size() == 3
+    assert _C._eager_tape_bytes() == 256, (
+        "a view of a recorded result was counted a second time",
+        _C._eager_tape_bytes(),
+    )
+
+    _C._aten_dispatch("aten.mul.Scalar", viewed, 3.0)
+    assert _C._eager_tape_bytes() == 512, (
+        "a second allocation did not show up, so this counter is not "
+        "responding to the thing it measures",
+        _C._eager_tape_bytes(),
+    )
+
+    _C._eager_reset()
+    assert _C._eager_tape_bytes() == 0, "a reset tape still holds bytes"
+
+
+def test_the_eager_tape_refuses_and_releases_when_it_grows_past_its_bound():
+    """docs/BACKWARD8.md §4 -- **docs/BACKWARD7.md §10 row 2, closed.**
+
+    §10 row 2: the tape is freed by `backward()` and by nothing else, so a
+    forward that is never differentiated retains every intermediate, and
+    upstream is bounded here for free because its graph hangs off the output
+    tensors. Measured on real SmolLM2-135M, a hand-written decode loop grows
+    1721 nodes and ~4.0 MiB per step against an upstream that is flat (§4).
+
+    The contract chosen is a **bound with a named refusal, and a release** --
+    not a documented requirement, because a silent unbounded leak in a library
+    that exists for on-device inference is the wrong default, and not a bare
+    refusal, because refusing while still holding the bytes protects nothing.
+
+    `_eager_set_max_nodes(0)` nullifies the bound, and the assertions below
+    that depend on it are re-run under it: the same program then records every
+    node and answers. That is the control that says this test is testing the
+    bound and not the program.
+    """
+    default = _C._eager_max_nodes()
+    assert default == 100000, (
+        "the default bound moved -- docs/BACKWARD8.md §4 derives 100000 from a "
+        "measured 1720-node SmolLM2-135M prefill; move the derivation with it",
+        default,
+    )
+    try:
+        _C._eager_set_max_nodes(8)
+        _C._eager_reset()
+        x = _tape_f64(_tape_ramp(4), [4])
+        x.requires_grad = True
+        h = x
+        for _ in range(20):
+            h = _C._aten_dispatch("aten.mul.Scalar", h, 1.0001)
+        reason = _C._eager_reason()
+        assert reason is not None, "the tape grew past its bound without saying so"
+        assert "grew past 8 nodes" in reason, reason
+        assert "no_grad" in reason and "_eager_reset" in reason, (
+            "the refusal does not say what to do about it: " + reason
+        )
+        # The release, not just the refusal: nothing is still held.
+        assert _C._eager_tape_size() == 0, (
+            "the bound refused but kept the values it refused over, which is "
+            "the leak it exists to stop"
+        )
+        try:
+            _C._eager_backward(_C._aten_dispatch("aten.sum.default", h))
+        except (RuntimeError, NotImplementedError) as exc:
+            assert "grew past 8 nodes" in str(exc), str(exc)
+        else:
+            raise AssertionError("a tape over its bound answered")
+
+        # Nullified: the same program, unbounded, records all of it and answers.
+        _C._eager_set_max_nodes(0)
+        _C._eager_reset()
+        h = x
+        for _ in range(20):
+            h = _C._aten_dispatch("aten.mul.Scalar", h, 1.0001)
+        assert _C._eager_tape_size() == 20, _C._eager_tape_size()
+        assert _C._eager_reason() is None
+        grad = _eager_grad(_C._aten_dispatch("aten.sum.default", h), [x])[0]
+        assert abs(float(grad.flatten()[0]) - 1.0001 ** 20) < 1e-9, float(grad.flatten()[0])
+    finally:
+        _C._eager_set_max_nodes(default)
+        _C._eager_reset()
 
 
 if __name__ == "__main__":
