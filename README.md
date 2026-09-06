@@ -219,14 +219,14 @@ loads on 3.13, 3.14 and later without a rebuild.
 
 <table>
 <tr><th align="left">Working</th><th align="left"></th></tr>
-<tr><td>ATen operators</td><td><b>224</b>, each compared against upstream</td></tr>
-<!-- DOCWATCH: count golden_ops_covered ge 224 -->
-<tr><td>Golden comparison cases</td><td><b>9,137 / 9,137</b> — values, shapes, dtypes, positional <i>and</i> keyword, through the door <i>and</i> through the member</td></tr>
-<!-- DOCWATCH: count golden_cases_total ge 9137 -->
-<!-- DOCWATCH: count golden_cases_passed ge 9137 -->
+<tr><td>ATen operators</td><td><b>255</b>, each compared against upstream</td></tr>
+<!-- DOCWATCH: count golden_ops_covered ge 255 -->
+<tr><td>Golden comparison cases</td><td><b>9,691 / 9,691</b> — values, shapes, dtypes, positional <i>and</i> keyword, through the door <i>and</i> through the member</td></tr>
+<!-- DOCWATCH: count golden_cases_total ge 9691 -->
+<!-- DOCWATCH: count golden_cases_passed ge 9691 -->
 <!-- DOCWATCH: count golden_pending eq 0 -->
-<tr><td>Smoke tests</td><td><b>490</b> — <b>479</b> in <code>test_shim.py</code>, which is what the marker below counts, and 11 more in the files split off it (<code>test_split_probe.py</code>, <code>test_release.py</code>)</td></tr>
-<!-- DOCWATCH: count smoke_ok ge 479 -->
+<tr><td>Smoke tests</td><td><b>601</b> — <b>480</b> in <code>test_shim.py</code>, which is what the marker below counts, and 121 more in the files split off it, one per round (<code>test_bindings.py</code>, <code>test_scatter.py</code>, <code>test_setitem.py</code>, <code>test_glu.py</code>, <code>test_tail1.py</code>, <code>test_indexsel.py</code>, <code>test_argform.py</code>, <code>test_release.py</code>, <code>test_split_probe.py</code>)</td></tr>
+<!-- DOCWATCH: count smoke_ok ge 480 -->
 <tr><td><code>from_pretrained</code></td><td>works for models whose init computes on the <b>meta</b> device — the Llama-3.2 <code>rope_scaling</code> path needed 30-odd meta kernels that were absent (<a href="docs/META.md">META.md</a>)</td></tr>
 <tr><td>Signature and schema tables</td><td><b>4,641</b> entries checked against upstream</td></tr>
 <!-- DOCWATCH: count schema_entries_matched ge 4641 -->
