@@ -18915,12 +18915,21 @@ def convolution_cases(torch_module, c_module, torch_call) -> list[Case]:
                                 padding, dilation, groups, note))
 
     # The documented gap: candle's `conv2d` takes one scalar per argument, so
-    # an ASYMMETRIC stride/padding/dilation is refused. torch computes all
-    # three. Carried as `c_error` so the harness watches the gap -- and so that
+    # a per-axis-differing stride/dilation is refused. torch computes both.
+    # Carried as `c_error` so the harness watches the gap -- and so that
     # implementing it later flips these to failures rather than being silent.
+    #
+    # **`padding` used to be the third row here and is not any more**
+    # (docs/LAST7.md §4). It was the row that closed: the difference between the
+    # two axes' paddings is spent as explicit zero padding on the input and the
+    # convolution runs with the common remainder, so this case went red as a
+    # `c_error` the day the lowering landed. Inverted rather than deleted, and
+    # into the *stronger* form -- the rows below diff real values against
+    # upstream instead of asserting that one side refuses. `stride` and
+    # `dilation` stay, because there is nothing to add to an input that makes an
+    # unequal stride equal.
     for stride, padding, dilation, which in [
         ((2, 1), (0, 0), (1, 1), "stride"),
-        ((1, 1), (2, 0), (1, 1), "padding"),
         ((1, 1), (0, 0), (2, 1), "dilation"),
     ]:
         cases.append(
@@ -18928,6 +18937,33 @@ def convolution_cases(torch_module, c_module, torch_call) -> list[Case]:
                    dilation, 1, f"asymmetric {which} -- c_error, torch computes",
                    expect="c_error")
         )
+
+    # Per-axis-differing PADDING, computed and compared element by element.
+    # Both orderings of the difference are here, because a lowering that padded
+    # the wrong candle axis would give the right *shape* on one of them: with
+    # `(2, 0)` on a square input, padding width instead of height produces
+    # `(1, 2, 5, 7)` where upstream gives `(1, 2, 7, 5)` -- distinguishable --
+    # but on a square kernel and a square input the two shapes swap into each
+    # other, so the values are what separate them. The non-square input rows
+    # exist for exactly that.
+    for dtype_name in ["float64", "float32"]:
+        for in_shape, w_shape, padding, groups, note in [
+            ((1, 2, 7, 7), (2, 2, 3, 3), (2, 0), 1, "more on height than width"),
+            ((1, 2, 7, 7), (2, 2, 3, 3), (0, 2), 1, "the other way round"),
+            ((1, 2, 7, 5), (2, 2, 3, 3), (3, 1), 1,
+             "NON-square input, and both axes padded by different non-zero amounts"),
+            ((1, 2, 5, 7), (2, 2, 2, 4), (1, 3), 1,
+             "non-square input AND non-square kernel"),
+            # nystromformer's own call: nn.Conv2d(heads, heads,
+            # kernel_size=(k, 1), padding=(k // 2, 0), groups=heads).
+            ((2, 4, 8, 3), (4, 1, 5, 1), (2, 0), 4,
+             "nystromformer's shape: (k, 1) kernel, (k//2, 0) padding, depthwise"),
+        ]:
+            cases.append(
+                make2d(dtype_name, in_shape, w_shape, True, (1, 1), padding,
+                       (1, 1), groups,
+                       f"per-axis padding {padding} -- {note}. docs/LAST7.md §4")
+            )
 
     # **A single value broadcasts to both axes**, which is torch's own
     # `expand_param_if_needed` -- measured, and initially got wrong here: this
@@ -29826,7 +29862,180 @@ def t_inplace_cases(torch_module, c_module, torch_call) -> list[Case]:
     return cases
 
 
+# --- aten.unfold.default (docs/LAST7.md) ------------------------------------
+
+
+def unfold_cases(torch_module, c_module, torch_call) -> list[Case]:
+    """`Tensor.unfold(dim, size, step)`, `univnet`'s wall.
+
+    **Every value case here overlaps its windows** (`step < size`), which is the
+    only shape of input that can tell the four plausible wrong answers apart. A
+    step equal to the size is a plain reshape, so it agrees with a stride read
+    off the wrong axis, with a window axis inserted in the wrong place, and with
+    a gather that walks storage order rather than the receiver's logical order.
+    The `(0, 2, 1)` and `(1, 2, 1)` cases below are the same tensor unfolded on
+    two different axes and they disagree with each other, so a kernel that
+    folded `dimension` into the wrong slot cannot pass both.
+
+    The non-contiguous receiver is its own case and it is the one that separates
+    this op from `as_strided`: `as_strided` addresses the raw storage and
+    refuses a non-contiguous receiver by name (docs/STRIDED.md §4.1), while
+    `unfold` is defined on the *logical* index space, so a transposed receiver
+    must read the transposed order. A kernel that flattened the receiver without
+    materialising it would pass every other case in this builder.
+
+    The last two cases are the narrowing, in `expect="c_error"` and one per
+    direction so that closing one cannot hide the other -- the same register
+    `as_strided_cases` uses, for the same reason: upstream's `unfold` is a
+    two-way view and this is a gather, so a write is refused rather than
+    silently lost. docs/LAST7.md §3.
+    """
+    op = "aten.unfold.default"
+    cases: list[Case] = []
+    flat24 = [float(i) / 3.0 for i in range(24)]
+
+    for dtype_name in ["float64", "float32", "int64", "uint8"]:
+        b_t, b_c = pair_from_flat(torch_module, c_module, flat24, (2, 3, 4), dtype_name)
+        for dim, size, step, note in [
+            (2, 3, 1, "OVERLAPPING windows on the last axis -- univnet's shape"),
+            (2, 2, 1, "overlapping, an even window"),
+            (1, 2, 1, "a middle axis: the window axis stays at `dim`, the size goes last"),
+            (0, 2, 1, "the leading axis -- disagrees with dim=1 on the same tensor"),
+            (-1, 2, 2, "a negative dimension, and a step that skips one element"),
+            (2, 4, 1, "the whole axis as one window"),
+            (2, 2, 3, "step > size: windows that SKIP elements, not overlap"),
+        ]:
+            cases.append(
+                Case(
+                    name=f"unfold(dtype={dtype_name}, dim={dim}, size={size}, step={step})",
+                    op=op,
+                    run_torch=(lambda b_t=b_t, dim=dim, size=size, step=step:
+                               torch_call(b_t, dim, size, step)),
+                    run_c=(lambda b_c=b_c, dim=dim, size=size, step=step:
+                           c_module._aten_dispatch(op, b_c, dim, size, step)),
+                    note=note,
+                )
+            )
+
+    # A receiver whose logical order is not its storage order.
+    flat12 = [float(i) for i in range(12)]
+    t_t, t_c = pair_from_flat(torch_module, c_module, flat12, (3, 4), "float32")
+    cases.append(
+        Case(
+            name="unfold(a TRANSPOSED receiver, dim=0, size=2, step=1)",
+            op=op,
+            run_torch=lambda: torch_call(torch_module.ops.aten.t.default(t_t), 0, 2, 1),
+            run_c=lambda: c_module._aten_dispatch(
+                op, c_module._aten_dispatch("aten.t.default", t_c), 0, 2, 1
+            ),
+            note="unfold reads the receiver's LOGICAL order, unlike as_strided, "
+                 "which reads the storage. docs/LAST7.md §3.1",
+        )
+    )
+
+    s_t, s_c = pair_from_flat(torch_module, c_module, [7.5], (), "float32")
+    for size, note in [(1, "a 0-d receiver gives [size], not [1, size]"),
+                       (0, "and size=0 on a 0-d receiver is an empty 1-D tensor")]:
+        cases.append(
+            Case(
+                name=f"unfold(0-d receiver, size={size})",
+                op=op,
+                run_torch=(lambda size=size: torch_call(s_t, 0, size, 1)),
+                run_c=(lambda size=size: c_module._aten_dispatch(op, s_c, 0, size, 1)),
+                note=note,
+            )
+        )
+
+    e_t, e_c = pair_from_flat(torch_module, c_module, flat12, (12,), "float32")
+    for size, step, note in [(0, 1, "size=0 gives (n+1, 0) -- an empty window per position"),
+                             (0, 2, "and the window count still follows the step")]:
+        cases.append(
+            Case(
+                name=f"unfold(empty window, size={size}, step={step})",
+                op=op,
+                run_torch=(lambda size=size, step=step: torch_call(e_t, 0, size, step)),
+                run_c=(lambda size=size, step=step:
+                       c_module._aten_dispatch(op, e_c, 0, size, step)),
+                note=note,
+            )
+        )
+
+    # The four refusals, in upstream's own words and upstream's own ORDER --
+    # `(0, 7, 0)` is wrong twice and reports the size, not the step.
+    for dim, size, step, note in [
+        (3, 1, 1, "'Dimension out of range (expected to be in range of [-1, 0], but got 3)'"),
+        (0, -1, 1, "'size is -1 but must be >= 0'"),
+        (0, 13, 1, "'maximum size for tensor at dimension 0 is 12 but size is 13'"),
+        (0, 3, 0, "'step is 0 but must be > 0'"),
+        (0, 13, 0, "wrong twice: the SIZE check fires first, not the step check"),
+    ]:
+        cases.append(
+            Case(
+                name=f"unfold(dim={dim}, size={size}, step={step}) [refused]",
+                op=op,
+                run_torch=(lambda dim=dim, size=size, step=step:
+                           torch_call(e_t, dim, size, step)),
+                run_c=(lambda dim=dim, size=size, step=step:
+                       c_module._aten_dispatch(op, e_c, dim, size, step)),
+                expect="both_error",
+                note=note,
+            )
+        )
+
+    # The narrowing, both directions, one case each.
+    cases.append(
+        Case(
+            name="unfold: writing THROUGH the window reaches the base upstream, refused here",
+            op=op,
+            run_torch=lambda: (
+                lambda base: (
+                    torch_module.ops.aten.fill_.Scalar(torch_call(base, 0, 3, 1), 7.0),
+                    base,
+                )[1]
+            )(torch_module.tensor(flat12, dtype=dt.torch_dtype(torch_module, "float32"))),
+            run_c=lambda: (
+                lambda base: (
+                    c_module._aten_dispatch(
+                        "aten.fill_.Scalar",
+                        c_module._aten_dispatch(op, base, 0, 3, 1),
+                        7.0,
+                    ),
+                    base,
+                )[1]
+            )(c_module._tensor_from_flat(flat12, [12], dtype=dt.c_dtype(c_module, "float32"))),
+            expect="c_error",
+            note="upstream's unfold is a two-way view; this is a gather, so the "
+                 "write would be lost. storage.rs::StridedBarrier refuses it. "
+                 "docs/LAST7.md §3",
+        )
+    )
+    cases.append(
+        Case(
+            name="unfold: writing to the BASE shows through the window upstream, refused here",
+            op=op,
+            run_torch=lambda: (
+                lambda base: (
+                    torch_call(base, 0, 3, 1),
+                    torch_module.ops.aten.fill_.Scalar(base, 7.0),
+                )[0]
+            )(torch_module.tensor(flat12, dtype=dt.torch_dtype(torch_module, "float32"))),
+            run_c=lambda: (
+                lambda base: (
+                    c_module._aten_dispatch(op, base, 0, 3, 1),
+                    c_module._aten_dispatch("aten.fill_.Scalar", base, 7.0),
+                )[0]
+            )(c_module._tensor_from_flat(flat12, [12], dtype=dt.c_dtype(c_module, "float32"))),
+            expect="c_error",
+            note="the other direction of the same view. docs/LAST7.md §3",
+        )
+    )
+    return cases
+
+
 CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
+    # docs/LAST7.md
+    "aten.unfold.default": unfold_cases,
+
     "aten.i0.default": i0_cases,
 
     # docs/TAIL4.md

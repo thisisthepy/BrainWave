@@ -275,6 +275,7 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.triu.default",
     "aten.unbind.int",
     "aten.unflatten.int",
+    "aten.unfold.default",
     "aten.uniform_.default",
     "aten.unsqueeze.default",
     "aten.upsample_bicubic2d.default",
@@ -2371,6 +2372,8 @@ fn aten_dispatch_inner(
         "aten.addmm.default" => addmm_default(py, args, kwargs),
         "aten.alias.default" => alias_default(py, args, kwargs),
         "aten.as_strided.default" => as_strided_default(py, args, kwargs),
+        // -- docs/LAST7.md: the sliding-window view -----------------------
+        "aten.unfold.default" => unfold_default(py, args, kwargs),
         "aten.arange.default" => arange(py, args, kwargs, ArangeForm::End),
         "aten.arange.start" => arange(py, args, kwargs, ArangeForm::Start),
         "aten.arange.start_step" => arange(py, args, kwargs, ArangeForm::StartStep),
@@ -16308,7 +16311,7 @@ fn convolution_default(
         }
     };
     let stride = expand("stride", stride)?;
-    let padding = expand("padding", padding)?;
+    let mut padding = expand("padding", padding)?;
     let dilation = expand("dilation", dilation)?;
     let output_padding = if transposed {
         expand("output_padding", output_padding)?
@@ -16333,6 +16336,38 @@ fn convolution_default(
     // Nothing measured needs it: `Dinov2`'s patch embedding, which is what
     // ARCH26.md §3.2 stopped on, is `nn.Conv2d(3, hidden, kernel_size=16,
     // stride=16)` -- square kernel, square stride, no padding.
+    // **Per-axis-differing PADDING is lowered rather than refused
+    // (docs/LAST7.md §4).** docs/ARGFORM.md §1 measured that `padding=[0, 5]`
+    // is not asymmetric padding at all -- it is two axes each padded
+    // symmetrically by a different amount, which upstream computes fine -- and
+    // classified the refusal below as a genuine backend limitation. It is a
+    // real limitation of candle's `conv2d`, whose padding is one scalar, but it
+    // is not a limitation of this shim: the difference can be spent as explicit
+    // zero padding on the input, exactly as docs/RNN.md §2 did for
+    // `conv1d(padding='same')` with an odd total. Convolve with the *common*
+    // part and pad the remainder, which is zero on one axis by construction
+    // because the common part is the minimum.
+    //
+    // `nystromformer` is the caller: `nn.Conv2d(heads, heads,
+    // kernel_size=(conv_kernel_size, 1), padding=(conv_kernel_size // 2, 0),
+    // groups=heads)` in `NystromformerSelfAttention`, so its call is
+    // `padding=[k // 2, 0]` -- the whole difference lands on the height axis.
+    //
+    // **Only padding.** A per-axis-differing `stride` or `dilation` has no such
+    // lowering -- there is nothing to add to the input that makes an unequal
+    // stride equal -- so those two still refuse by name below, and `transposed`
+    // is left alone as well: padding a transposed convolution's input is not
+    // the same operation as reducing its output-side padding, and nothing
+    // measured reaches it.
+    let mut pre_pad: Option<(usize, usize)> = None;
+    if spatial == 2 && !transposed && padding[0] != padding[1] {
+        let common = padding[0].min(padding[1]);
+        pre_pad = Some((
+            (padding[0] - common) as usize,
+            (padding[1] - common) as usize,
+        ));
+        padding = vec![common, common];
+    }
     if spatial == 2 {
         let mut axed: Vec<(&str, &Vec<isize>)> =
             vec![("stride", &stride), ("padding", &padding), ("dilation", &dilation)];
@@ -16429,6 +16464,25 @@ fn convolution_default(
     }
     let storage = PyDtype::new(tag).storage(OP)?;
     let x = input.tensor()?.fast_to(storage).map_err(|e| candle_err(OP, e))?;
+    // The explicit half of the per-axis padding, spent before the convolution
+    // sees the input. Zeros, because that is what a convolution's `padding`
+    // means; `pad_with_zeros` is candle's `aten::constant_pad_nd` with a value
+    // of 0 and one axis at a time.
+    let x = match pre_pad {
+        Some((h, w_pad)) => {
+            let t = if h > 0 {
+                x.pad_with_zeros(2, h, h).map_err(|e| candle_err(OP, e))?
+            } else {
+                x
+            };
+            if w_pad > 0 {
+                t.pad_with_zeros(3, w_pad, w_pad).map_err(|e| candle_err(OP, e))?
+            } else {
+                t
+            }
+        }
+        None => x,
+    };
     let w = weight.tensor()?.fast_to(storage).map_err(|e| candle_err(OP, e))?;
     let raw = if transposed {
         // **The weight layout is `(in_channels, out_channels/groups, kH, kW)`,
@@ -29279,4 +29333,185 @@ fn complex_default(
         .and_then(|t| t.contiguous())
         .map_err(|e| candle_err(OP, e))?;
     finish_complex(py, re, im)
+}
+
+// ===========================================================================
+// docs/LAST7.md -- `TensorBase.unfold`, the sliding-window view
+// ===========================================================================
+
+/// `aten::unfold(Tensor(a) self, int dimension, int size, int step) -> Tensor(a)`
+///
+/// **Not `nn.Unfold`.** `F.unfold` is `im2col` (docs/BIND3.md, `im2col_default`
+/// further up this file); this is the `TensorBase` method, which slides a
+/// window of `size` along one axis with a stride of `step` and appends the
+/// window as a **new trailing dimension**. `univnet`'s
+/// `location_variable_convolution` is the caller
+/// (`modeling_univnet.py:312` -- `hidden_states.unfold(2, hop_size + 2 * padding,
+/// hop_size)`), and its windows **overlap**, which is the case that separates a
+/// correct implementation from three wrong ones.
+///
+/// **Upstream it is a two-way view; here it is a copy, and the barrier is what
+/// makes that honest.** Measured on 2.13.0:
+///
+/// ```text
+/// y = torch.arange(6.); v = y.unfold(0, 3, 1); v[0, 0] = 99.  -> y[0] is 99.
+/// z = torch.arange(6.); w = z.unfold(0, 3, 1); z[1] = -5.     -> w[0, 1] is -5.
+/// ```
+///
+/// docs/STRIDED.md establishes why candle 0.11.0 cannot produce that view --
+/// the struct that joins a `Layout` to a shared `Storage` has no public fields
+/// -- and `unfold` is the same class of op for the same reason: consecutive
+/// windows share `size - step` elements, so the second stride is *smaller than
+/// the extent it indexes* and no composition of `narrow`/`reshape`/`transpose`
+/// produces it. So this gathers, and it takes `storage.rs::StridedBarrier` over
+/// **both** the receiver and the result, exactly as `as_strided_default` does.
+/// It is the second caller of that barrier and the first since it was written;
+/// `test_strided.py::test_as_strided_and_unfold_are_the_two_ops_that_take_the_barrier`
+/// is the inverted form of the test that used to assert there was only one.
+///
+/// **The receiver's own layout is respected, unlike `as_strided`.** That is not
+/// a shortcut, it is the difference between the two ops: `as_strided` addresses
+/// the raw storage and ignores the receiver's strides (docs/STRIDED.md §4.1),
+/// while `unfold` is defined on the receiver's *logical* index space. Measured:
+/// `torch.arange(12.).reshape(3, 4).t().unfold(0, 2, 1)` reads the transposed
+/// order, not the storage order. So a `.contiguous()` here is sound where the
+/// same call in `as_strided_default` would have been wrong, and the refusal
+/// that file carries has no analogue in this one.
+///
+/// Every refusal below was read off real torch 2.13.0, **including their
+/// order**, which is not the order a reader would guess: the maximum-size check
+/// fires *before* the step check, so `unfold(0, 7, 0)` on a length-6 tensor
+/// reports the size and not the step.
+///
+/// A zero-dimensional receiver is a case of its own and not a corollary:
+/// `torch.tensor(3.).unfold(0, 1, 1)` is `tensor([3.])` -- shape `[1]`, not
+/// `[1, 1]` -- and `unfold(0, 0, 1)` on it is shape `[0]`. So the rule for rank
+/// 0 is "the result is `[size]`", measured rather than derived from the general
+/// formula, which would have given the extra axis.
+///
+/// No element is read back to the host: the index odometer is built out of the
+/// *shape*, so this op does not join `device.rs::MPS_HOST_READBACK_OPS`.
+fn unfold_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.unfold.default";
+    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let dimension = dim_arg(args, kwargs, 1, "dimension")?.ok_or_else(|| {
+        pyo3::exceptions::PyTypeError::new_err(format!("{OP}: missing argument 'dimension'"))
+    })?;
+    let size = int_arg(args, kwargs, 2, "size")?.ok_or_else(|| {
+        pyo3::exceptions::PyTypeError::new_err(format!("{OP}: missing argument 'size'"))
+    })?;
+    let step = int_arg(args, kwargs, 3, "step")?.ok_or_else(|| {
+        pyo3::exceptions::PyTypeError::new_err(format!("{OP}: missing argument 'step'"))
+    })?;
+
+    let base = input.tensor()?;
+    let rank = base.rank();
+    let dims = base.dims().to_vec();
+
+    // 1. the dimension, with upstream's own wording. `normalise_dim` prefixes
+    //    the op name; upstream does not, and the golden harness compares the
+    //    messages, so the check is written out here.
+    let extent_axes = rank.max(1) as isize;
+    let axis = if dimension < 0 { dimension + extent_axes } else { dimension };
+    if axis < 0 || axis >= extent_axes {
+        return Err(pyo3::exceptions::PyIndexError::new_err(format!(
+            "Dimension out of range (expected to be in range of [{}, {}], but got {dimension})",
+            -extent_axes,
+            extent_axes - 1
+        )));
+    }
+    let axis = axis as usize;
+
+    // 2. size, 3. the maximum, 4. step -- in that order, measured.
+    if size < 0 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "size is {size} but must be >= 0"
+        )));
+    }
+    let extent = if rank == 0 { 1i64 } else { dims[axis] as i64 };
+    if size > extent {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "maximum size for tensor at dimension {axis} is {extent} but size is {size}"
+        )));
+    }
+    if step <= 0 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "step is {step} but must be > 0"
+        )));
+    }
+
+    let windows = ((extent - size) / step + 1) as usize;
+    let out_dims: Vec<usize> = if rank == 0 {
+        // Measured, not derived. See the docstring.
+        vec![size as usize]
+    } else {
+        let mut d = dims.clone();
+        d[axis] = windows;
+        d.push(size as usize);
+        d
+    };
+
+    // The gather runs over the receiver's LOGICAL order, so a non-contiguous
+    // receiver is materialised first rather than refused.
+    let flat = base
+        .contiguous()
+        .and_then(|t| t.flatten_all())
+        .map_err(|e| candle_err(OP, e))?;
+
+    let total: usize = out_dims.iter().product();
+    let out = if total == 0 {
+        // `index_select` with an empty picker is not worth relying on, and an
+        // empty result has no elements to get wrong.
+        flat.narrow(0, 0, 0)
+            .and_then(|t| t.reshape(out_dims.as_slice()))
+            .map_err(|e| candle_err(OP, e))?
+    } else {
+        // Contiguous strides of the *input*, in elements.
+        let mut in_stride = vec![1i64; rank];
+        for k in (0..rank.saturating_sub(1)).rev() {
+            in_stride[k] = in_stride[k + 1] * dims[k + 1] as i64;
+        }
+        let mut indices: Vec<i64> = Vec::with_capacity(total);
+        let mut counter = vec![0usize; out_dims.len()];
+        for _ in 0..total {
+            let mut at = 0i64;
+            if rank > 0 {
+                // The last output axis is the window offset `j`; it folds into
+                // the receiver's own axis `axis` together with `i * step`.
+                let j = counter[out_dims.len() - 1] as i64;
+                for k in 0..rank {
+                    let c = counter[k] as i64;
+                    at += if k == axis { c * step + j } else { c } * in_stride[k];
+                }
+            }
+            indices.push(at);
+            for k in (0..out_dims.len()).rev() {
+                counter[k] += 1;
+                if counter[k] < out_dims[k] {
+                    break;
+                }
+                counter[k] = 0;
+            }
+        }
+        let picker =
+            Tensor::from_vec(indices, total, base.device()).map_err(|e| candle_err(OP, e))?;
+        flat.index_select(&picker, 0)
+            .and_then(|t| t.reshape(out_dims.as_slice()))
+            .map_err(|e| candle_err(OP, e))?
+    };
+
+    // Both directions of upstream's view are refused rather than silently lost.
+    // docs/LAST7.md §3, docs/STRIDED.md §2 for the mechanism.
+    let barrier = crate::storage::StridedBarrier::new(&base, &out);
+    let mut wrapped = if input.tag() == TorchDType::Bool {
+        PyTensorBase::boolean(out)?
+    } else {
+        PyTensorBase::new(out)?
+    };
+    wrapped.bar_writes_as_strided_view(barrier);
+    Ok(wrapped.into_pyobject(py)?.into_any().unbind())
 }

@@ -100,9 +100,6 @@
     },
     "_grouped_mm": {
       "reason": "backlog: the kernel is golden-compared by dispatch key, but no test spells the name. docs/REACH.md §3."
-    },
-    "multinomial": {
-      "reason": "backlog: the kernel is golden-compared by dispatch key, but no test spells the name. Deliberately not attempted in this round: `multinomial` is a random sample, and a test asserting a value against upstream on a random op is exactly the shallow-coverage failure mode this file warns against (a fixed seed narrows the risk but does not remove it, since the shim and upstream draw from different RNG implementations even with the same seed). docs/REACH.md §3."
     }
   }
 }

@@ -11010,7 +11010,17 @@ def test_schema_text_survives_the_round_trip_through_the_transcribed_tables():
     # ops contribute **zero**: `_to_copy`, `slice`, `constant_pad_nd` and
     # `view` were all already in the tables, and what this round gave them is a
     # complex arm on an existing kernel, not a new spelling.
-    assert len(keys) == 363, len(keys)
+    # 364 with docs/LAST7.md's `unfold`. **+1**, and which table it comes from
+    # is the check, mirrored from the `complex` note above: `methods.json`-only,
+    # because upstream has `Tensor.unfold` and **no** `torch.unfold` (measured
+    # on 2.13.0: `hasattr(torch, "unfold")` is False), so `aten::unfold|default`
+    # is a new identity rather than a second spelling of an `overloads.json`
+    # row. Getting +2 would mean an `overloads.json` row had been added for a
+    # door upstream does not have -- the same trap in the opposite direction.
+    # The round's other landed change contributes **zero**:
+    # `aten::convolution` was already in the tables and what LAST7 gave it is a
+    # padding lowering inside the existing kernel, not a new spelling.
+    assert len(keys) == 364, len(keys)
     from_tables = sorted(
         k for k in keys
         if report["table"][f"{k[0]}|{k[1]}"]["from"] == "tables"
