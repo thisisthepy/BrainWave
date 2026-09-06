@@ -228,7 +228,7 @@ loads on 3.13, 3.14 and later without a rebuild.
 <tr><td>Smoke tests</td><td><b>389</b></td></tr>
 <!-- DOCWATCH: count smoke_ok ge 389 -->
 <tr><td><code>from_pretrained</code></td><td>works for models whose init computes on the <b>meta</b> device — the Llama-3.2 <code>rope_scaling</code> path needed 30-odd meta kernels that were absent (<a href="docs/META.md">META.md</a>)</td></tr>
-<tr><td>Signature and schema tables</td><td><b>4,641</b> entries checked against upstream (<i>corrected from 4479 — docs/DOCWATCH-round, 2026-09: another round's schema work had already moved this number before this README caught up</i>)</td></tr>
+<tr><td>Signature and schema tables</td><td><b>4,641</b> entries checked against upstream</td></tr>
 <!-- DOCWATCH: count schema_entries_matched ge 4641 -->
 <!-- DOCWATCH: count schema_entries_total ge 4641 -->
 <tr><td>Architectures — operator coverage</td><td><b>26 of 26</b> reach zero missing operators in the traced sweep</td></tr>
