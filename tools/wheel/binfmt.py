@@ -21,6 +21,13 @@ directly instead:
            and the `.gnu.version_r` symbol-version requirements, and the highest
            `GLIBC_x.y` in there *is* the manylinux floor (docs/LINUX.md §5.2).
            There is no Mach-O analogue for that, and no Android one either.
+  wasm     no symbol table at all. The import and export sections *are* the
+           answer -- every name the host must resolve and every name offered,
+           spelled out in the module. That makes linkage easier to read here
+           than in ELF and makes the platform unreadable: a wasm module records
+           no version of anything, so nothing in `pyemscripten_2026_0_wasm32`
+           except `wasm32` can be checked against the bytes. See the WASM
+           section below, which says which questions it declines.
 
 Everything returns `None` rather than raising when the bytes are not of that
 format, so a caller can ask both questions and use whichever answered.
@@ -599,6 +606,356 @@ def pe_exports(data: bytes) -> set[str] | None:
     return exported
 
 
+# --------------------------------------------------------------------- WASM
+#
+# The three readers above all answer their questions out of a *symbol table*:
+# ELF has `.dynsym` and `.dynamic`, Mach-O has `LC_LOAD_DYLIB` and the symtab,
+# PE has an import directory and an export directory. A WebAssembly module has
+# none of those. What it has instead is two mandatory sections in the module
+# itself -- `import` (id 2) and `export` (id 7) -- which name every symbol the
+# host must supply and every symbol the module offers, by string, in the binary.
+#
+# That makes the *linkage* questions easier to answer than in ELF (no string
+# table indirection, no versioning records, no address-to-offset mapping) and
+# some other questions impossible. Specifically:
+#
+#   answerable    which symbols must be resolved by the host, under which
+#                 import module name -- `wasm_imports`, the `DT_NEEDED` +
+#                 undefined-symbol pair in one structure
+#                 which symbols are offered, and of which kind --
+#                 `wasm_exports`. `PyInit__C` has to be there, and has to be a
+#                 *function*: an exported global of that name is a linker
+#                 accident that no loader would call.
+#                 whether the module is loadable by `dlopen` at all -- a side
+#                 module imports its memory and function table, a main module
+#                 defines them, and Emscripten's `dlopen` refuses a main-module
+#                 link (docs/WASM.md §9.2). Not `dylink.0`, which both have.
+#                 wasm32 vs wasm64, from the memory type's limits flags
+#
+#   NOT answerable  the platform, the way `LC_BUILD_VERSION` gives it. A wasm
+#                 module records no Emscripten version, no Pyodide ABI version
+#                 and no minimum anything; two modules built a major release
+#                 apart are byte-indistinguishable in their headers. Every
+#                 version component of `pyemscripten_2026_0_wasm32` is
+#                 therefore unverifiable *from the artefact*, and the caller has
+#                 to say so rather than checking a nearby easier thing.
+#                 the manylinux-style floor. No counterpart, same as Mach-O.
+#                 which imports come from libpython rather than from the C
+#                 runtime. Emscripten puts every undefined symbol under the
+#                 single import module `env`, so the `python3.dll` vs
+#                 `python313.dll` distinction that `pe_imports` uses to prove
+#                 an abi3 binding has no wasm spelling at all.
+#
+# Everything here returns `None` on bytes that are not a well-formed module,
+# never a plausible empty answer: an unreadable module must be reported as
+# unreadable, not as one that imports nothing.
+
+WASM_MAGIC = b"\0asm"
+
+# Section ids from the core specification, §5.5.2.
+WASM_SECTIONS = {
+    0: "custom", 1: "type", 2: "import", 3: "function", 4: "table",
+    5: "memory", 6: "global", 7: "export", 8: "start", 9: "element",
+    10: "code", 11: "data", 12: "datacount", 13: "tag",
+}
+
+# External kinds, shared by the import and export sections (§5.5.5, §5.5.10).
+# `tag` is the exception-handling proposal's, which matters here: every module
+# in this process is built `-fwasm-exceptions` (docs/WASM.md §7.4a), so a real
+# artefact does carry kind 4 and a reader that stopped at 3 would fail on it.
+WASM_KINDS = {0: "func", 1: "table", 2: "memory", 3: "global", 4: "tag"}
+
+# `dylink.0` subsection ids, from Emscripten's dynamic-linking ABI.
+_DYLINK_MEM_INFO = 1
+_DYLINK_NEEDED = 2
+
+
+def _uleb(data: bytes, i: int) -> tuple[int, int]:
+    """LEB128, bounded. Raises `_WasmTruncated` past the end or past 5 bytes."""
+    result = shift = 0
+    for _ in range(5):
+        if i >= len(data):
+            raise _WasmTruncated
+        byte = data[i]
+        i += 1
+        result |= (byte & 0x7F) << shift
+        if not byte & 0x80:
+            return result, i
+        shift += 7
+    raise _WasmTruncated
+
+
+class _WasmTruncated(Exception):
+    """The bytes ran out, or a length field pointed past the end."""
+
+
+def _wasm_name(data: bytes, i: int) -> tuple[str, int]:
+    length, i = _uleb(data, i)
+    if i + length > len(data):
+        raise _WasmTruncated
+    return data[i:i + length].decode("utf-8", "replace"), i + length
+
+
+def _wasm_sections(data: bytes) -> list[tuple[int, bytes]] | None:
+    """`[(section id, body)]` for a well-formed module, else `None`.
+
+    Deliberately strict about the trailing bytes: a section whose declared size
+    runs past the end of the file makes the whole module unreadable rather than
+    yielding the sections before it. A truncated `_C.wasm` that still had a
+    valid export section would otherwise pass every export check while being
+    unloadable.
+    """
+    if len(data) < 8 or data[:4] != WASM_MAGIC:
+        return None
+    version = int.from_bytes(data[4:8], "little")
+    if version != 1:
+        return None
+    out: list[tuple[int, bytes]] = []
+    i = 8
+    try:
+        while i < len(data):
+            sid = data[i]
+            i += 1
+            if sid not in WASM_SECTIONS:
+                return None
+            size, i = _uleb(data, i)
+            if i + size > len(data):
+                raise _WasmTruncated
+            out.append((sid, data[i:i + size]))
+            i += size
+    except _WasmTruncated:
+        return None
+    return out
+
+
+def _dylink(body: bytes) -> dict | None:
+    """The `dylink.0` custom section's contents, or `None` if unreadable."""
+    try:
+        name, i = _wasm_name(body, 0)
+        if name != "dylink.0":
+            return None
+        info: dict = {"needed": [], "mem_size": None, "table_size": None}
+        while i < len(body):
+            sub = body[i]
+            i += 1
+            size, i = _uleb(body, i)
+            if i + size > len(body):
+                raise _WasmTruncated
+            end = i + size
+            if sub == _DYLINK_MEM_INFO:
+                j = i
+                info["mem_size"], j = _uleb(body, j)
+                _align, j = _uleb(body, j)
+                info["table_size"], j = _uleb(body, j)
+            elif sub == _DYLINK_NEEDED:
+                count, j = _uleb(body, i)
+                for _ in range(count):
+                    lib, j = _wasm_name(body, j)
+                    info["needed"].append(lib)
+            i = end
+        return info
+    except _WasmTruncated:
+        return None
+
+
+def wasm_info(data: bytes) -> dict | None:
+    """Header facts about a WebAssembly module. `None` if it is not one.
+
+    `side_module` is the load-bearing field and it has no analogue in the other
+    three formats' `info` dicts, because in those formats "is this loadable"
+    is a type field in the header. A main-module link cannot be `dlopen`ed --
+    and therefore cannot be a `ctypes.CDLL` or an extension module
+    (docs/WASM.md §9.2) -- so this is the wasm spelling of PE's `dll` bit.
+
+    It is **not** the presence of `dylink.0`, which was the first guess here and
+    is wrong: Pyodide's own `pyodide.asm.wasm` is a `-sMAIN_MODULE` link and
+    carries a `dylink.0` too (with `mem_size` 0). The distinction that does hold,
+    measured across all 31 wasm modules in the six Pyodide wheels on this machine
+    plus that main module, is *who owns the memory and the function table*: a
+    side module imports `env.memory` and `env.__indirect_function_table`, and a
+    main module defines both and exports them under `memory` and `table`.
+    """
+    sections = _wasm_sections(data)
+    if sections is None:
+        return None
+    bits = 32
+    dylink = None
+    defines_memory = False
+    for sid, body in sections:
+        if sid == 0 and dylink is None:
+            dylink = _dylink(body)
+        elif sid == 5:                                   # defined memory
+            try:
+                count, i = _uleb(body, 0)
+                if count:
+                    defines_memory = True
+                    bits = 64 if body[i] & 0x04 else 32
+            except _WasmTruncated:                       # pragma: no cover
+                return None
+    imported_memory = _wasm_memory_bits(sections)
+    if imported_memory is not None:
+        bits = imported_memory
+    return {
+        "format": "wasm",
+        "version": int.from_bytes(data[4:8], "little"),
+        "bits": bits,
+        "machine": f"wasm{bits}",
+        "dylink": dylink is not None,
+        "side_module": (dylink is not None and imported_memory is not None
+                        and not defines_memory),
+        "needed": list(dylink["needed"]) if dylink else [],
+        "mem_size": dylink["mem_size"] if dylink else None,
+        "table_size": dylink["table_size"] if dylink else None,
+        "sections": [WASM_SECTIONS[sid] for sid, _ in sections],
+    }
+
+
+def _wasm_memory_bits(sections) -> int | None:
+    """32 or 64 from an *imported* memory's limits flags, or `None` if none.
+
+    A side module imports `env.memory` rather than defining one, so the bit that
+    says wasm32 lives in the import section for exactly the modules this
+    repository builds -- reading only section 5 would report every one of them
+    as 32-bit by default rather than by observation.
+    """
+    for sid, body in sections:
+        if sid != 2:
+            continue
+        try:
+            count, i = _uleb(body, 0)
+            for _ in range(count):
+                _module, i = _wasm_name(body, i)
+                _field, i = _wasm_name(body, i)
+                kind = body[i]
+                i += 1
+                if kind == 0:
+                    _, i = _uleb(body, i)
+                elif kind == 1:
+                    i += 1
+                    flags = body[i]
+                    i += 1
+                    _, i = _uleb(body, i)
+                    if flags & 0x01:
+                        _, i = _uleb(body, i)
+                elif kind == 2:
+                    flags = body[i]
+                    i += 1
+                    _, i = _uleb(body, i)
+                    if flags & 0x01:
+                        _, i = _uleb(body, i)
+                    return 64 if flags & 0x04 else 32
+                elif kind == 3:
+                    i += 2
+                elif kind == 4:
+                    i += 1
+                    _, i = _uleb(body, i)
+                else:
+                    return None
+        except (_WasmTruncated, IndexError):
+            return None
+    return None
+
+
+def wasm_imports(data: bytes) -> dict[str, set[str]] | None:
+    """`{import module: {field}}` -- what the host has to supply.
+
+    Same shape as `pe_imports` on purpose, so the two can be read side by side,
+    but the resemblance stops at the shape. In PE the keys are DLL filenames and
+    carry information (`python3.dll` vs `python313.dll` is the whole abi3
+    check); under Emscripten the keys are `env` for real undefined symbols and
+    `GOT.mem` / `GOT.func` for the dynamic-linking global-offset-table entries
+    the loader fills in. There is no per-library grouping to read.
+
+    A module with no import section imports nothing, which is a real answer;
+    `None` is reserved for bytes that could not be read as a module at all.
+    """
+    records = wasm_import_records(data)
+    if records is None:
+        return None
+    out: dict[str, set[str]] = {}
+    for module, field, _kind in records:
+        out.setdefault(module, set()).add(field)
+    return out
+
+
+def wasm_import_records(data: bytes) -> list[tuple[str, str, str]] | None:
+    """`[(import module, field, kind)]`, kind spelled as in `WASM_KINDS`."""
+    sections = _wasm_sections(data)
+    if sections is None:
+        return None
+    out: list[tuple[str, str, str]] = []
+    for sid, body in sections:
+        if sid != 2:
+            continue
+        try:
+            count, i = _uleb(body, 0)
+            for _ in range(count):
+                module, i = _wasm_name(body, i)
+                field, i = _wasm_name(body, i)
+                if i >= len(body):
+                    raise _WasmTruncated
+                kind = body[i]
+                i += 1
+                if kind == 0:                            # typeidx
+                    _, i = _uleb(body, i)
+                elif kind == 1:                          # reftype + limits
+                    i += 1
+                    flags = body[i]
+                    i += 1
+                    _, i = _uleb(body, i)
+                    if flags & 0x01:
+                        _, i = _uleb(body, i)
+                elif kind == 2:                          # limits
+                    flags = body[i]
+                    i += 1
+                    _, i = _uleb(body, i)
+                    if flags & 0x01:
+                        _, i = _uleb(body, i)
+                elif kind == 3:                          # valtype + mutability
+                    i += 2
+                elif kind == 4:                          # tag: attribute + type
+                    i += 1
+                    _, i = _uleb(body, i)
+                else:
+                    return None
+                out.append((module, field, WASM_KINDS.get(kind, f"kind{kind}")))
+        except (_WasmTruncated, IndexError):
+            return None
+    return out
+
+
+def wasm_exports(data: bytes) -> dict[str, str] | None:
+    """`{exported name: kind}` -- what the module offers.
+
+    `pe_exports` returns a bare set because a PE export is always callable-ish;
+    here the kind is kept because it is checkable and worth checking. An
+    extension module is found by `dlsym`-ing `PyInit__C` and *calling* it, so
+    `PyInit__C` exported as kind `global` -- which a data symbol of that name
+    would be -- is a wheel that fails at import with nothing pointing at the
+    export section.
+    """
+    sections = _wasm_sections(data)
+    if sections is None:
+        return None
+    out: dict[str, str] = {}
+    for sid, body in sections:
+        if sid != 7:
+            continue
+        try:
+            count, i = _uleb(body, 0)
+            for _ in range(count):
+                field, i = _wasm_name(body, i)
+                if i >= len(body):
+                    raise _WasmTruncated
+                kind = body[i]
+                i += 1
+                _index, i = _uleb(body, i)
+                out[field] = WASM_KINDS.get(kind, f"kind{kind}")
+        except (_WasmTruncated, IndexError):
+            return None
+    return out
+
+
 def describe(data: bytes) -> str:
     """One line, for printing next to a filename."""
     macho = macho_info(data)
@@ -616,6 +973,10 @@ def describe(data: bytes) -> str:
     if pe:
         return (f"PE{'32+' if pe['bits'] == 64 else '32'} "
                 f"{pe['machine']} {'dll' if pe['dll'] else 'exe'}")
+    wasm = wasm_info(data)
+    if wasm:
+        return (f"wasm {wasm['bits']}-bit v{wasm['version']} "
+                f"{'side module' if wasm['side_module'] else 'main module'}")
     if macho_arches(data):
         return "Mach-O fat: " + "+".join(macho_arches(data))
     return "not a recognised binary"

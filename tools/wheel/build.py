@@ -91,6 +91,7 @@ import base64
 import csv
 import hashlib
 import io
+import json
 import os
 import re
 import shutil
@@ -103,7 +104,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from binfmt import (describe, elf_dynamic, elf_info, macho_arches,  # noqa: E402
                     pe_imports, pe_info,
-                    macho_info)
+                    macho_info, wasm_info)
 
 REPO = Path(__file__).resolve().parents[2]
 SRC = REPO / "torchnative" / "src" / "main"
@@ -391,6 +392,15 @@ TARGET_PYTHON_ROOT = Path(os.environ.get(
 # variable rather than inventing a third convention.
 CARGO_TARGET_DIR = Path(os.environ.get(
     "CARGO_TARGET_DIR", REPO / "rust" / "torch_c" / "target"))
+
+#: Where the Pyodide distribution lives, and deliberately **not** a
+#: subdirectory of `TARGET_PYTHON_ROOT`. Everything under that root is a
+#: cross-compiled *CPython*, and every target above derives its tag by reading
+#: one. `pyemscripten_<abi>_wasm32` cannot: the number in it is Pyodide's, and
+#: the CPython inside Pyodide has never heard of it. Two roots because they are
+#: two kinds of thing -- see `PyEmscriptenTarget.sysconfig`.
+PYODIDE_ROOT = Path(os.environ.get(
+    "TORCHNATIVE_PYODIDE", "/Volumes/macMini/caches/pyodide/pyodide"))
 
 CRATE = REPO / "rust" / "torch_c"
 
@@ -1328,6 +1338,173 @@ class WindowsTarget(Target):
             _fail(f"{what} is {describe(data)}, expected PE32+ x86_64 dll")
 
 
+class PyEmscriptenTarget(Target):
+    """`pyemscripten_<abi-version>_wasm32` -- Pyodide, and the one target whose
+    tag does not come from a CPython.
+
+    Everything else in this file rests on the principle stated in the header at
+    line 55: the tag is *derived from the target CPython distribution* rather
+    than written down here. `AndroidTarget` reads `ANDROID_API_LEVEL`,
+    `IOSTarget` reads `IPHONEOS_DEPLOYMENT_TARGET`, `LinuxTarget` reads the
+    artefact's own `.gnu.version_r`. **The principle survives here and its usual
+    implementation does not**, and the gap between those two sentences is the
+    whole of docs/WASM.md §9.4a:
+
+        pyodide-lock.json  ->  info.abi_version = "2026_0"     <- the tag
+                               info.platform    = "emscripten_5_0_3"
+                               info.python      = "3.14.2"
+
+    `2026_0` is Pyodide's `PYODIDE_ABI_VERSION`. CPython's build never sees it,
+    so it is in no `_sysconfigdata_*.py`, and it cannot be: it is a property of
+    the *runtime distribution*, not of the interpreter build. Ask the
+    interpreter the way every other target does and it answers
+    `emscripten-5.0.3-wasm32`, which normalises to `emscripten_5_0_3_wasm32` --
+    a tag `packaging` accepts, that Pyodide's own `sys_tags()` yields, and that
+    **nothing on PyPI is published under**. Wrong in the shape that works.
+
+    That is not a warning, it is a trap: anyone adding a target by copying
+    `AndroidTarget` reaches for `self.sysconfig()` first, gets a plausible
+    answer, and ships it. So `sysconfig()` below **refuses** rather than
+    answering, and names the alternative. A comment would have been read after
+    the mistake; an exception is read instead of it. `WindowsTarget.sysconfig`
+    refuses for a different reason (the file genuinely does not exist), and this
+    is the same shape of guard for the opposite problem -- here the file exists,
+    is readable, and is the wrong source.
+
+    The rest is small, which is the finding of docs/WASM.md §9.3: `abi3` is
+    inert on this target rather than harmful, so `extension_member` and
+    `global_deps_name` are both inherited unchanged. `.abi3.so` really is in
+    Pyodide's `EXTENSION_SUFFIXES` and `cp313-abi3-pyemscripten_2026_0_wasm32`
+    really is in its `sys_tags()`; this class asserts neither, and
+    `verify_cross.py` checks the first against the interpreter's own bytes.
+    """
+
+    #: Cargo does not apply the Emscripten `.so` convention to a `cdylib`; the
+    #: file it writes is `_C.wasm`, with no `lib` prefix, and it is a wasm side
+    #: module rather than an ELF shared object. It becomes `torch/_C.abi3.so`
+    #: inside the archive like every other POSIX target's.
+    ARTEFACT_NAME = "_C.wasm"
+
+    def __init__(self):
+        super().__init__("wasm32-emscripten", "wasm32-unknown-emscripten",
+                         PYODIDE_ROOT, self.ARTEFACT_NAME)
+
+    rebuild_hint = (
+        "EM_CACHE=/tmp/em-cache-<scratch> "
+        "PATH=<emsdk>/upstream/emscripten:$PATH "
+        "cargo build --release --target wasm32-unknown-emscripten, from "
+        "rust/torch_c (docs/WASM.md §9.6; never write to the shared emsdk "
+        "cache -- set EM_CACHE first)"
+    )
+
+    def sysconfig(self) -> dict[str, object]:
+        """Refuses. The tag is not in there, and the plausible answer is wrong.
+
+        Structural on purpose (docs/WASM.md §9.4a). The file this would read --
+        `_sysconfigdata__emscripten_wasm32-emscripten.py`, inside Pyodide's
+        `python_stdlib.zip` -- exists and is readable, and every value in it is
+        about CPython's build rather than about Pyodide. Its
+        `sysconfig.get_platform()` answer is `emscripten-5.0.3-wasm32`. Using it
+        would produce a wheel tagged for a platform that is real, accepted by
+        `packaging`, and matched by nothing anyone installs.
+        """
+        _fail(
+            "PyEmscriptenTarget.sysconfig() is refused by design.\n"
+            "  The pyemscripten tag's version component is Pyodide's "
+            "PYODIDE_ABI_VERSION, which\n"
+            "  CPython's build never sees. The target's "
+            "_sysconfigdata__emscripten_wasm32-emscripten.py\n"
+            "  exists (inside python_stdlib.zip) and answers "
+            "`emscripten_5_0_3_wasm32` -- a real tag,\n"
+            "  accepted by packaging, published by nobody. Read\n"
+            f"  {PYODIDE_ROOT / 'pyodide-lock.json'} instead; `platform_tag` "
+            "does. docs/WASM.md §9.4a."
+        )
+
+    def _lock(self) -> dict:
+        """`info` out of `pyodide-lock.json` -- the distribution, still."""
+        lock = self.python_root / "pyodide-lock.json"
+        if not lock.exists():
+            _fail(
+                f"no {lock} -- this is the only machine-readable place "
+                "PYODIDE_ABI_VERSION exists\n"
+                "  (docs/WASM.md §9.4a), so without it the tag cannot be "
+                "derived at all. Set\n"
+                "  TORCHNATIVE_PYODIDE to a Pyodide distribution."
+            )
+        try:
+            info = json.loads(lock.read_text())["info"]
+        except (ValueError, KeyError) as exc:
+            _fail(f"{lock} has no readable info block: {exc}")
+        for key in ("abi_version", "arch"):
+            if not info.get(key):
+                _fail(f"{lock} info block has no {key}")
+        return info
+
+    def platform_tag(self, artefact: bytes) -> str:
+        info = self._lock()
+        tag = _normalise(f"pyemscripten_{info['abi_version']}_{info['arch']}")
+        # No `_confirm_with_packaging`: there is no `pyemscripten_platforms`
+        # generator to ask. `packaging` on the *target* does yield this tag
+        # (docs/WASM.md §9.3 read it off the real interpreter), but that path
+        # reads Pyodide's own patched `sys.implementation`, which does not exist
+        # on this machine. Said out loud rather than skipped silently, the same
+        # way `_confirm_with_packaging` reports a `packaging` too old to know a
+        # family.
+        print(f"  tag {tag} derived from pyodide-lock.json info.abi_version\n"
+              f"      (python {info.get('python')}, platform "
+              f"{info.get('platform')})")
+        print("  ! packaging has no pyemscripten_platforms, so the spelling is "
+              "not confirmed\n"
+              "      against pip's own generator -- unlike android and ios")
+        return tag
+
+    def cc(self) -> list[str]:
+        """`emcc`, with the two flags that are the whole difference from Android.
+
+        `-fwasm-exceptions` because docs/WASM.md §7.4a found it mandatory for
+        *every* module in the process once any module uses it, side modules
+        included. `-sSIDE_MODULE=2` because `ctypes.CDLL` on Emscripten is
+        `dlopen`, and `dlopen` cannot take a main-module link -- which is the
+        same fact `check_image` enforces for the extension.
+        """
+        emcc = shutil.which("emcc")
+        if not emcc:
+            _fail(
+                "no emcc on PATH -- cannot build the global-deps side module.\n"
+                "  Add <emsdk>/upstream/emscripten to PATH, and set EM_CACHE to "
+                "a scratch\n"
+                "  directory first: the shared emsdk cache must not be written "
+                "to (docs/WASM.md §9.6)."
+            )
+        if not os.environ.get("EM_CACHE"):
+            _fail(
+                "EM_CACHE is unset. emcc writes sysroot artefacts into its "
+                "cache on first use,\n"
+                "  and the emsdk on this machine is shared and must not be "
+                "modified. Set\n"
+                "  EM_CACHE to a scratch directory (docs/WASM.md §9.6)."
+            )
+        return [emcc, "-shared", "-fPIC", "-fwasm-exceptions",
+                "-sSIDE_MODULE=2"]
+
+    def check_image(self, data: bytes, what: str) -> None:
+        info = wasm_info(data)
+        if info is None:
+            _fail(f"{what} is not a WebAssembly module ({describe(data)}) -- "
+                  "a pyemscripten wheel cannot carry it")
+        if info["machine"] != "wasm32":
+            _fail(f"{what} is {info['machine']}, expected wasm32")
+        if not info["side_module"]:
+            _fail(
+                f"{what} is a main-module link, not a side module: it defines "
+                "its own memory\n"
+                "  instead of importing one, and Emscripten's dlopen cannot "
+                "load it. Build it\n"
+                "  with -sSIDE_MODULE (docs/WASM.md §9.2)."
+            )
+
+
 def _confirm_with_packaging(tag: str, family: str, **kwargs) -> None:
     """Ask `packaging` whether an installer would accept this tag.
 
@@ -1365,13 +1542,15 @@ TARGETS: dict[str, Target] = {
                   "arm64-iphonesimulator", "iphonesimulator", "iossimulator"),
         LinuxTarget(),
         WindowsTarget(),
+        PyEmscriptenTarget(),
     )
 }
 
 #: Prefixes `verify` will accept as a cross tag. One entry per target family, so
 #: that adding a family and forgetting this is a build failure rather than a
 #: wheel tagged for one platform and checked as another.
-CROSS_TAG_PREFIXES = ("android_", "ios_", "manylinux_", "win_")
+CROSS_TAG_PREFIXES = ("android_", "ios_", "manylinux_", "win_",
+                      "pyemscripten_")
 
 
 def _repack(wheel: Path, extra: dict[str, bytes], dist_info: str,
@@ -2336,6 +2515,100 @@ def self_test_upstream_dist_info() -> int:
     return bad
 
 
+def self_test_pyemscripten() -> int:
+    """`PyEmscriptenTarget`'s one structural claim, exercised rather than
+    asserted in a comment.
+
+    docs/WASM.md §9.4a: this is the only target whose tag is not derivable from
+    a CPython, and the failure mode is that someone copies `AndroidTarget`,
+    calls `self.sysconfig()`, gets `emscripten_5_0_3_wasm32` -- a tag
+    `packaging` accepts and nothing on PyPI uses -- and ships it. A comment
+    saying "do not do this" is read after the mistake. These four cases are the
+    check that the refusal is real, that the number genuinely comes out of
+    `pyodide-lock.json` (case 2 changes it and watches the tag follow), and that
+    a main-module link is still rejected.
+    """
+    import json as _json
+    import tempfile
+
+    target = PyEmscriptenTarget()
+    checks: list[tuple[str, bool, str]] = []
+
+    # 1. sysconfig() refuses. Structural, not advisory.
+    try:
+        target.sysconfig()
+        refused, detail = False, "it returned instead of failing"
+    except SystemExit as exc:
+        refused = "refused by design" in str(exc)
+        detail = str(exc).splitlines()[0]
+    checks.append((
+        "PyEmscriptenTarget.sysconfig() refuses rather than answering",
+        refused, detail))
+
+    # 2. The tag really is read from pyodide-lock.json. Changing the number
+    #    there has to change the tag -- otherwise it is written down somewhere
+    #    and the derivation is a story about the code rather than the code.
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        (root / "pyodide-lock.json").write_text(_json.dumps(
+            {"info": {"abi_version": "1999_7", "arch": "wasm32",
+                      "platform": "emscripten_0_0_0", "python": "3.14.2"}}))
+        scratch = PyEmscriptenTarget()
+        scratch.python_root = root
+        derived = scratch.platform_tag(b"")
+    checks.append((
+        "the tag follows pyodide-lock.json's info.abi_version",
+        derived == "pyemscripten_1999_7_wasm32",
+        f"expected pyemscripten_1999_7_wasm32, got {derived!r}"))
+
+    # 3. No lock file at all is a hard failure, not a guessed tag.
+    with tempfile.TemporaryDirectory() as tmp:
+        scratch = PyEmscriptenTarget()
+        scratch.python_root = Path(tmp)
+        try:
+            scratch.platform_tag(b"")
+            no_lock, detail3 = False, "it produced a tag with no distribution"
+        except SystemExit as exc:
+            no_lock = "pyodide-lock.json" in str(exc)
+            detail3 = str(exc).splitlines()[0]
+    checks.append((
+        "a missing pyodide-lock.json fails rather than guessing",
+        no_lock, detail3))
+
+    # 4. check_image refuses a main-module link. Pyodide's own
+    #    `pyodide.asm.wasm` is one, so this uses a real main module rather than
+    #    a synthesised near-miss -- the same reason self_test_linux insists on
+    #    real ELF.
+    main = PYODIDE_ROOT / "pyodide.asm.wasm"
+    if main.exists():
+        try:
+            target.check_image(main.read_bytes(), str(main))
+            rejected, detail4 = False, "it accepted a main-module link"
+        except SystemExit as exc:
+            rejected = "main-module link" in str(exc)
+            detail4 = str(exc).splitlines()[0]
+        checks.append((
+            "check_image refuses a main-module link (real pyodide.asm.wasm)",
+            rejected, detail4))
+    else:
+        print(f"  ! main-module case skipped -- no {main}")
+
+    print("\nPYEMSCRIPTEN SELF-TEST of the tag derivation and the "
+          "sysconfig refusal")
+    bad = 0
+    for label, ok, detail in checks:
+        bad += not ok
+        print(f"  {'ok    ' if ok else 'WRONG '}{label}")
+        if not ok:
+            print(f"          {detail}")
+    if bad:
+        print(f"PYEMSCRIPTEN SELF-TEST: FAIL -- {bad}/{len(checks)} wrong")
+    else:
+        print(f"PYEMSCRIPTEN SELF-TEST: PASS -- {len(checks)}/{len(checks)} "
+              "cases")
+    return bad
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--python", default=sys.executable,
@@ -2360,6 +2633,8 @@ def main() -> None:
             failed.append("preflight's stale-build-cache refusal")
         if self_test_upstream_dist_info():
             failed.append("upstream_dist_info's missing-tree refusal")
+        if self_test_pyemscripten():
+            failed.append("PyEmscriptenTarget's tag derivation")
         if failed:
             sys.exit("SELF-TEST: FAIL -- " + ", ".join(failed))
         return
