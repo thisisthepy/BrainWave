@@ -367,7 +367,7 @@ module does not have, and a target this repo cannot check would ship unchecked
 |---|:--:|:--:|:--:|:--:|:--:|:--:|---|
 | `cpu` | ✅ | ✅ | ⚠️ | ⚠️ | ⚠️ | ✅ | the only device that holds a tensor |
 | `meta` | ✅ | ✅ | ⚠️ | ⚠️ | ⚠️ | 🔲 | shape and dtype, no storage |
-| `mps` | ✅ | — | 🔲 | — | — | — | candle's Metal backend, on. `ones`/`_to_copy`, elementwise and matmul checked against `cpu` |
+| `mps` | ⚠️ | — | 🔲 | — | — | — | candle's Metal backend, on — but an op Metal lacks is computed on the **CPU under an `mps` label**, silently ([`docs/VULKAN3.md`](docs/VULKAN3.md) §3) |
 | `vulkan` | ✅ | ❌ | — | 🔲 | 🔲 | — | four ops by name through real `VkBuffer`s; every other op refuses naming itself |
 | NNAPI · CoreML | — | ❌ | ❌ | — | — | — | needs the graph path, blocked at decomposition |
 | `cuda` | ❌ | ❌ | ❌ | 🔲 | 🔲 | — | constructible as a label, refuses to allocate |
