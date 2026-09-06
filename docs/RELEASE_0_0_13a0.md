@@ -12,6 +12,61 @@ Read §5 first if you are deciding whether to upgrade: what this release does
 
 ---
 
+## 0. The claim this release can make that no previous one could
+
+Every coverage number this project has published — `docs/ARCH100.md`'s 215, `ARCH200.md`'s
+270, `ARCH300.md`'s 290 — measured **reachability**. Each of those documents ends on the same
+sentence and none of them acted on it: *a forward is not a match.* "It imports and runs" and
+"it computes upstream's numbers" are different claims, and only the second supports the word
+**drop-in**, which is what this package's own description calls it.
+
+`docs/AGREE.md` is the first measurement of the second claim, and it is this release's
+strongest result:
+
+```text
+of the architectures that forward, after excluding what cannot be judged:
+  284 of 285 judgeable architectures AGREE with upstream numerically   (99.6%)
+  nine of them are CLOSER to the float64 answer than upstream is
+  worst single-operator error across 775 replayed leaf modules:  8.4 ulp
+```
+
+**The tolerance is derived, not chosen.** Every architecture was additionally run upstream in
+`float64` and both float32 answers scored against it; the threshold is the **p90 of upstream's
+own float32-vs-float64 error distribution** over the 263 architectures that have a working
+oracle, floored at 8 ulp — 1.186e-06. Its defence is that anything tighter fails *upstream*
+against float64 on a tenth of the same set, and a threshold that would have to call upstream
+wrong is not measuring the shim. Above it, a per-architecture rule rather than a bigger
+constant: a difference is not a defect if it is within 4× upstream's own distance from the
+float64 truth for that same output. That factor is pinned by
+`test_agree.py::test_the_oracle_factor_is_stated_and_is_not_a_free_parameter`, so widening it
+to make a number look better is a failing test.
+
+**And the result is negative about operators, which is the part worth stating plainly.**
+Replaying every leaf module in isolation on upstream's own recorded input — so that nothing
+accumulates — the worst single kernel invocation anywhere in 775 leaf modules is 8.4 ulp
+(a `Conv2d` in `hgnet_v2`); the median top row is 2 ulp. The large end-to-end differences are
+float32 accumulation over depth. §3 of `AGREE.md` is a ranking of depth, not of defects.
+
+### 0.1 The caveats, which are part of the claim and not footnotes to it
+
+* **5 architectures could not be judged, and are excluded from the denominator rather than
+  counted as passes.** Three underflowed (`efficientnet` at 8.0e-29, `sam_vision_model` and
+  `sam_hq_vision_model` at 8.0e-21) — both sides agreeing on noise is not agreement. Two are
+  cases where **upstream does not reproduce itself**: `vit_mae` re-draws its patch mask and
+  `vits` samples a duration, so there is no fixed answer to match and any number about them
+  measures a sampler. 288 of 290 were bit-identical to themselves across two upstream runs.
+* **22 MoE models have no float64 oracle at all**, so only the fixed tolerance applies to them
+  and the ratio rule cannot. The reason is upstream's own and not ours: `qwen3_moe`,
+  `qwen2_moe`, `glm4_moe`, `nemotron_h`, `zaya` and the rest **refuse `Double` at their grouped
+  matmul**. All 22 land in `agree` and none sits near the tolerance, but they are held to a
+  weaker test than the other 263 and that has to be said.
+* **`chinese_clip` is left flagged**, as the one `DIVERGE`, even though the round that measured
+  it believed the flag spurious — its absolute difference is 1.4e-06 on a tensor of scale 0.49
+  (twelve ulp), no operator in the whole model exceeds 2.5 ulp, and it crossed the 4× rule only
+  because upstream's own oracle error on that output is unusually *small*. It stays flagged
+  because **a rule that is edited whenever it fires is not a rule**, and tuning one until a flag
+  disappears is not a result.
+
 ## 1. Features added
 
 | | |
@@ -30,20 +85,24 @@ Read §5 first if you are deciding whether to upgrade: what this release does
 | **float8 (E4M3) computes what upstream computes** | Across the 23 op rows that previously hung or refused, without forking candle |
 | **A verifiable WASM/Pyodide wheel** | `PyEmscriptenTarget` and a checker for it; the ABI trap is closed structurally rather than by convention |
 | **`from_pretrained(dtype=torch.int8)`** | Beside a `TorchnativeConfig`, widens to float32 and *discloses* rather than raising |
+| **Landed after this note was first drafted** | `torch.fft.fftn` and **complex tensors** (`complex64` arithmetic, `.real`/`.imag`); `as_strided` as a read-only view and `TensorBase.unfold` beside it; `lstm`; per-axis convolution padding; `torch.multinomial(Tensor, Tensor)`'s argument form. Each is checked against upstream on this host by `tools/ci/verify_published.py`'s new `signal_and_complex` section, where all four agree **exactly** — `fftn` of an impulse, `[1,2,3,4]`'s transform real and imaginary, `(2i)^2 = -4`, a non-descending `as_strided`, and a two-step `LSTM` — so those are identities on a new platform rather than tolerances (`docs/FFT.md`, `docs/STRIDED.md`, `docs/RNN.md`, `docs/COMPLEX.md`, `docs/LAST7.md`, `docs/BIND5.md`) |
 
-Counted at the tip of this branch rather than on the day the note was
-drafted, which is why they are higher than the figures the README still
-carries: **255 ATen operators**, **9,691 / 9,691** golden comparison cases
-with **none pending**, **587** tests passing across the suite (480 of them
-in `test_shim.py`, which is what `smoke_ok` counts) and **562 / 562**
-DOCWATCH markers holding. Operator work was still landing on five branches
-while this was written, so every marker below is `ge`: a later round that
-raises one of these is progress, and `eq` would turn it into a red suite
+Counted at the tip of this branch on the day of the build rather than on the
+day the note was drafted, which is why they are higher than the paragraph they
+replace (255 operators, 9,691 cases, 587 tests): **300 ATen operators**,
+**11,385 / 11,385** golden comparison cases with **none pending**, **929** tests
+passing across 30 files (480 of them in `test_shim.py`, which is what `smoke_ok`
+counts) and **830 / 830** DOCWATCH markers holding, at `EXIT=0`.
+
+**Three other agents were landing operator work while this was written, so every
+number here is a snapshot rather than a ceiling** — which is why every marker
+below is `ge`. A later round that raises one of these is progress, and `eq`
+would turn it into a red suite
 (`test_release.py::test_count_markers_use_ge_wherever_another_round_could_raise_them`).
 
-<!-- DOCWATCH: count golden_ops_covered ge 255 -->
-<!-- DOCWATCH: count golden_cases_total ge 9691 -->
-<!-- DOCWATCH: count golden_cases_passed ge 9691 -->
+<!-- DOCWATCH: count golden_ops_covered ge 300 -->
+<!-- DOCWATCH: count golden_cases_total ge 11385 -->
+<!-- DOCWATCH: count golden_cases_passed ge 11385 -->
 <!-- DOCWATCH: count golden_pending eq 0 -->
 <!-- DOCWATCH: count smoke_ok ge 480 -->
 
@@ -100,8 +159,19 @@ would otherwise count these as features.
   recording walls (`torch.floor`, `upsample_bicubic2d`, `index_add_`,
   `ndimension`) without closing them.
 
+- **`docs/AGREE.md`** — the reachability sweep's own closing sentence, acted on for the first
+  time: of the architectures that forward, **284 of 285 judgeable ones agree with upstream
+  numerically**, at a tolerance derived from upstream's own float32-vs-float64 error
+  distribution rather than chosen. §0 above is the summary and §0.1 the caveats. It changed
+  **no Rust, no `bootstrap.py` and no `aten.rs`** — golden stayed exactly unmoved, which is the
+  correct result for a round that changed no kernel — and it is listed here because *the number
+  is the deliverable*. It also produced a **negative** result about operators, and the technique
+  that would have found a positive one is the same technique, so its silence is informative.
+
 <!-- DOCWATCH: symbol-in-file docs/ARCH300.md 290 present -->
 <!-- DOCWATCH: symbol-in-file docs/ARCH300.md 7 present -->
+<!-- DOCWATCH: symbol-in-file docs/AGREE.md 284 present -->
+<!-- DOCWATCH: symbol-in-file docs/AGREE.md 285 present -->
 
 ## 4. Documentation corrected
 
@@ -123,20 +193,40 @@ would otherwise count these as features.
 
 ## 5. What this release does not do
 
-- **7 of 297 architectures do not forward**, down from 82 in `docs/ARCH100.md`
-  and 27 in `docs/ARCH200.md` (`docs/ARCH300.md`). The denominator is not 528:
-  of the 528 model types `AutoModel` can build, 231 fail on *upstream* torch
-  under the same shrunk-config sweep and are excluded as not this project's
-  gap. *290 of 528* would be a different and wrong claim. And a forward is
-  not a match — only 26 architectures have been checked for numerical
-  agreement against upstream; a separate, concurrent round is measuring more
-  of that right now, and its number is not anticipated here.
+- **3 of 297 architectures do not forward.** `docs/ARCH300.md` recorded 7 of 297; at release
+  time each of those seven was re-run individually against this build and **four of them now
+  forward** (`univnet`, `nystromformer`, `vilt`, `sam3_lite_text_text_model`), taking coverage
+  to **294 of 297** — from 82 blocked in `docs/ARCH100.md` and 27 in `docs/ARCH200.md`.
+  **What that number does and does not rest on:** ARCH300's 290 plus four individual runs. The
+  other 290 were **not** re-swept here, so this is a spot re-measurement and not a fresh full
+  sweep, and `ARCH300.md`'s own §2 gap list is left standing verbatim rather than edited to
+  match — the round that measured it is the round that owns it.
+  The denominator is not 528: of the 528 model types `AutoModel` can build, 231 fail on
+  *upstream* torch under the same shrunk-config sweep and are excluded as not this project's
+  gap. *294 of 528* would be a different and wrong claim.
+  The three still blocked are `fastspeech2_conformer` (`torch.repeat_interleave` with a tensor
+  `repeats`) and `led`/`longformer` — and those two have **moved wall**, from
+  `Tensor.new_zeros` with a tuple size to `TensorBase.where`. That is ARCH300 §1's own
+  *first-wall* caveat firing for the third time in three rounds, not a new problem, and it is
+  the reason 294 should not be read as "three operators from 297".
 - **`torch.compile` is not coming.** `docs/COMPILE.md` recommends refusing it
   by name, permanently. Nothing here has ever implemented any part of it.
   `torch.export` is the direction and it is not implemented either.
-- **No transformer trains through `loss.backward()` yet.** What is verified is
-  a small `nn.Sequential` with a real optimizer. There is no convolution
-  backward rule, so vision models stop; `create_graph=True`, double backward,
+- **A transformer now does train through `loss.backward()`** — this bullet said the opposite
+  when it was drafted, and it was checked rather than restated. A BERT encoder built from a
+  shrunk config runs three `zero_grad` / `backward` / `step` iterations under the real
+  `torch.optim.SGD` and its loss trajectory matches upstream's to float32 (5.12 → 0.0 → −5.12
+  on both sides), with a gradient on 21 of its 23 parameters — the two without one being the
+  unused pooler, which upstream also leaves ungradiented. **Two qualifications that belong to
+  that sentence:** it was measured with dropout disabled, because with dropout on the two sides
+  diverge after the first step where the RNG streams differ (a sampler difference, not a
+  gradient defect); and it is one encoder at a shrunk config, not a training run anyone would
+  call converged. **Convolution backward landed after this bullet was
+  drafted** — the sentence here said it was missing, which was true when written and was
+  re-checked rather than assumed; it is now false. A small CNN with strided, depthwise and
+  pointwise convolutions, three batch-norms in training mode and a linear head trains
+  end to end through five SGD steps, agreeing with upstream to 2.98e-08
+  (`docs/TRAIN2.md`). `create_graph=True`, double backward,
   multiple root tensors, `GradientEdge` inputs, `torch.autograd.Function`,
   hooks and `retain_grad` on non-leaves refuse by name. Mutation through a view
   is refused rather than differentiated — deliberately less than upstream.
@@ -144,8 +234,8 @@ would otherwise count these as features.
   set of ops refused there, and every attention block passes through it.
 - **Vulkan is four ops.** Correctness is testable on this host; performance
   needs a phone and has not been measured.
-- **No *hardware* NPU has been reached.** Both halves now execute
-  (`docs/NPU2.md`), and neither is on an accelerator. The CoreML models this
+- **One hardware accelerator has been reached; the graphs credited above were not on it.**
+  Both halves now execute (`docs/NPU2.md`). The CoreML models this
   document credited above ran on the **CPU**: `MLComputePlan` reports the
   Neural Engine as not even *supported* for a float32 program, so the
   `float32=True` that makes the 2–3e-08 claim meaningful is the same flag that
@@ -170,8 +260,8 @@ made below only where something ran.
 | | |
 |---|---|
 | macOS arm64 | the machine everything above was measured on. The `macosx_11_0_arm64` wheel installs into a clean venv and its torch computes (`tools/wheel/verify.py` PASS) |
-| Linux x86_64 · Windows amd64 | verified by CI installing the **published** wheel and computing — but the green runs installed the version the workflow defaults to. `tools/ci/verify_published.py` gained a `loss.backward()` training step and three operator checks for this release, each skipping by name on an older wheel; **those have not run green on Linux or Windows yet**, because the wheel they check is this one. The `manylinux_2_17_x86_64` and `win_amd64` wheels for this release build and pass `verify_cross.py` — glibc floor 2.17 read off the artefact's own `.gnu.version_r`, `DT_NEEDED` inside the PEP 599 policy list, 123 `python3.dll` imports on the Windows side — which is a symbol-level claim and not a run |
-| iOS simulator arm64 | **computes on this machine; CI is still red as published.** This release's `0.0.13a0` simulator wheel was unpacked into an iOS CPython inside a booted simulator here and its torch computed (`verify_ios_sim.py` PASS, 1,282 `_C` names, 896 aten ops). The CI leg is a separate question: it builds its own simulator CPython, reaches the wheel, and last failed staging the pure-Python requirements — setuptools 84 dropped `pkg_resources`, which the wheel's METADATA requires (run 34021836088). The `setuptools<81` pin was reproduced locally against the **published** `0.0.12a0` wheel: staging resolves setuptools 80.10.2, `stage_dependencies` returns all twelve entries, and the whole harness then reaches PASS. **The runner has not yet executed that fix** — the workflow change is unpushed |
+| Linux x86_64 · Windows amd64 | verified by CI installing the **published** wheel and computing — but the green runs installed the version the workflow defaults to, which is `0.0.12a0`. `tools/ci/verify_published.py` carries a `loss.backward()` training step, three operator checks, and now a `signal_and_complex` section for `torch.fft.fftn`, complex tensors, `as_strided` and `lstm` — each skipping **by name** on an older wheel. **None of those have run green on Linux or Windows**, because the wheel they check is this one and it is not uploaded; they skip themselves, and a skip is not a platform result. The `manylinux_2_17_x86_64` and `win_amd64` wheels for this release build and pass `verify_cross.py` — glibc floor 2.17 read off the artefact's own `.gnu.version_r`, `DT_NEEDED` inside the PEP 599 policy list, 123 `python3.dll` imports on the Windows side — which is a **symbol-level** claim, as `verify_cross.py` says of itself, and not a run |
+| iOS simulator arm64 | **computes on this machine, and CI is now green.** An earlier `0.0.13a0` simulator wheel was unpacked into an iOS CPython inside a booted simulator here and its torch computed (`verify_ios_sim.py` PASS, 1,282 `_C` names, 896 aten ops); that has **not** been re-run against the wheel rebuilt for §7 below. The CI leg was the separate question and it is answered: the `setuptools<81` pin landed, was pushed, and **run 34038982934 is green on all three legs** — `linux-x86_64` 43s, `windows-amd64` 1m38s, `ios-simulator-arm64` 5m5s. That run installs the **published `0.0.12a0`** wheel, which is what the workflow's default says and what it should say until an upload happens; it is a green result for the iOS staging harness and for the checks that predate 0.0.13a0, and not for the ones that skip themselves by name |
 | iOS device | never executed, on any release. The `ios_12_0_arm64_iphoneos` wheel builds and passes `verify_cross.py`; nothing has imported it |
 | Android arm64 | emulator and device runs exist for earlier releases; **not re-run for this one**. The `android_21_arm64_v8a` wheel builds and passes `verify_cross.py` |
 | WASM | `build.py --target wasm32-emscripten` now produces one — `PyEmscriptenTarget` landed this batch, and the sentence that `build.py` cannot is no longer true. The `pyemscripten_2026_0_wasm32` wheel builds and passes `verify_cross.py`'s wasm reader: `PyInit__C` exported as a **function**, 133 exports, both binaries wasm32 side modules, and **96 `Py*` imports all resolved against `pyodide.asm.wasm`**. Two things that check does not cover and says so: the non-`Py*` `env` imports, and the abi3 binding, which has no wasm spelling. Nothing has imported *this* wheel under Pyodide — the computing claim still rests on the earlier hand-built one |
@@ -181,28 +271,54 @@ made below only where something ran.
 ## 7. What is left for the release itself
 
 This document and the version bump are prepared; **nothing has been published.**
-In order:
 
-1. ~~Build the wheels~~ **done.** All seven are in `dist/` at `0.0.13a0`:
-   `macosx_11_0_arm64`, `android_21_arm64_v8a`, `ios_12_0_arm64_iphoneos`,
-   `ios_14_0_arm64_iphonesimulator`, `manylinux_2_17_x86_64`, `win_amd64`,
-   `pyemscripten_2026_0_wasm32`. Each cross wheel passes `verify_cross.py`; the
-   host wheel passes `verify.py` (which installs it) and the simulator wheel
-   passes `verify_ios_sim.py` (which runs it). Disk was at 92% / 30 GB free
-   afterwards — check before rebuilding, and note `build.py` refuses while a
-   `build/` cache from a previous target is present, so it must be cleared
-   between targets.
+### 7.1 The seven wheels, rebuilt at this head
+
+All seven were built again from this checkout after `cargo build --release` and
+`vendor/install_shim.sh`, one target at a time with `rm -rf build` between them —
+`build.py` refuses while a `build/` cache from a previous target is present. The Linux leg
+needs `/Volumes/macMini/caches/zig-venv/bin` on `PATH` (`cargo zigbuild`), the Windows leg
+`/Volumes/macMini/caches/msvc-shims` (`cargo xwin`), and the WASM leg an `EM_CACHE` pointed
+**away from** the shared emsdk, which must not be written to.
+
+| platform | tag | size | check | pass |
+|---|---|---|---|---|
+| macOS arm64 | `cp313-abi3-macosx_11_0_arm64` | 14,644,677 B | `verify.py` — **installs into a clean venv and computes** | ✅ |
+| Android arm64 | `cp313-abi3-android_21_arm64_v8a` | 14,740,236 B | `verify_cross.py` — symbol level | ✅ |
+| iOS device | `cp313-abi3-ios_12_0_arm64_iphoneos` | 14,714,150 B | `verify_cross.py` — symbol level | ✅ |
+| iOS simulator | `cp313-abi3-ios_14_0_arm64_iphonesimulator` | 14,618,730 B | `verify_cross.py` — symbol level | ✅ |
+| Linux x86_64 | `cp313-abi3-manylinux_2_17_x86_64` | 14,760,075 B | `verify_cross.py` — symbol level | ✅ |
+| Windows amd64 | `cp313-abi3-win_amd64` | 14,792,216 B | `verify_cross.py` — symbol level | ✅ |
+| WASM | `cp313-abi3-pyemscripten_2026_0_wasm32` | 13,679,733 B | `verify_cross.py` — symbol level | ✅ |
+
+**Six of those seven rows are not compute claims and must not be read as ones.**
+`verify_cross.py` says so itself in its own PASS line: *"NOT established here: that it loads,
+imports, or computes."* It establishes that the archive is tagged for a platform an installer
+will match and holds binaries for that platform. The only compute claim in the table is the
+macOS row, where `verify.py` installs the wheel into a clean venv and runs it (1,283 `_C`
+names, 896 aten ops, `aten.mm.default` and `x + x` both correct). The iOS simulator wheel
+**was not re-run** through `verify_ios_sim.py` after this rebuild, so §6's simulator compute
+claim belongs to the earlier build of that wheel and not to this one.
+
+Disk was at **67% with 116 GB free** afterwards, on the external volume, with three other
+agents building concurrently.
+
+### 7.2 In order, from here
+
+1. ~~Build the wheels~~ **done** — §7.1.
 2. Upload. The token is not in this worktree and was not read here.
-3. **Then** bump two things that must not lead the upload, and which two tests
-   in `rust/torch_c/pytests/test_release.py` hold to that rule:
-   `.github/workflows/verify-published-wheel.yml`'s default version, and the
-   README platform table's **on PyPI `…`** row, both to `0.0.13a0`.
-4. Re-run the workflow. The Linux and Windows legs will then exercise the
-   `loss.backward()` training step and the three new operator checks for the
-   first time — until step 3 they skip themselves by name against `0.0.12a0`,
-   which is correct and is not a green result for those checks.
-5. The iOS leg's staging fix (`setuptools<81`, plus the CI default moving off
-   `0.0.9a0`) is verified locally against the published `0.0.12a0` wheel and has
-   **never run on a runner** — the workflow change is unpushed. Pushing it is
-   what triggers the run; it is a `push` trigger on this workflow's own path.
-   Until that run exists, §6's iOS row is a claim about this machine.
+3. **Then** bump two things that must not lead the upload, and which two tests in
+   `rust/torch_c/pytests/test_release.py` hold to that rule:
+   `.github/workflows/verify-published-wheel.yml`'s default version, and the README platform
+   table's **on PyPI `…`** row, both to `0.0.13a0`. **Both still read `0.0.12a0`, and that is
+   correct** — CI installs *from PyPI*, so defaulting it to an unpublished version makes every
+   push a red run that says nothing about any platform, and a red CI that is expected to be red
+   is a check nobody reads. Bumping it early would be the mistake, not the fix.
+4. Re-run the workflow. The Linux and Windows legs will then exercise the `loss.backward()`
+   training step, the three operator checks, and the new `signal_and_complex` section
+   (`torch.fft.fftn`, complex tensors, `as_strided`, `lstm`) for the first time — until step 3
+   they skip themselves by name against `0.0.12a0`, which is correct and **is not a green
+   result for those checks**.
+5. ~~The iOS leg's staging fix has never run on a runner~~ **it has.** `setuptools<81` is in
+   the workflow on `develop`, and run **34038982934** is green on all three legs. What remains
+   untested there is everything gated behind step 3.

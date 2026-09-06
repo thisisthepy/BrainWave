@@ -287,6 +287,96 @@ def newer_ops(torch):
         check(label, fn(), want)
 
 
+def signal_and_complex(torch):
+    """What 0.0.13a0 newly contains beyond the autograd engine: `torch.fft.fftn`,
+    complex tensors, `as_strided` as a read-only view, and `lstm`.
+
+    Two different skip mechanisms, because the two groups can be asked
+    different questions and the more precise question wins:
+
+    * `as_strided` and `lstm` are ATen operators, so the wheel can be asked
+      whether it has them by name -- the per-op probe `newer_ops()` established.
+      That is more precise than a release comparison, since these arrive one
+      round at a time rather than one release at a time.
+    * `torch.fft.fftn` and complex arithmetic have **no ATen table entry to
+      probe** (`fft` and `complex` are both absent from `_aten_implemented()`
+      even on a wheel where they work), so those fall back to `_predates()`.
+      A capability probe would be wrong here for the reason `_predates`
+      documents: an older wheel refuses these *by name*, and a probe cannot
+      tell a deliberate refusal apart from a regression.
+
+    Every expected value below was produced on macOS arm64 and checked against
+    **upstream torch 2.13.0 on the same host**, where all four agree exactly --
+    so these are identities, not tolerances, and a platform that disagrees has
+    an arithmetic fault rather than a rounding difference.
+    """
+    have = set(torch._C._aten_implemented())
+
+    old, version = _predates("0.0.13a0")
+    if old:
+        print(
+            f"SKIP  torch.fft.fftn and complex tensors -- torchnative "
+            f"{version} predates them (both refuse by name there). "
+            f"Not a platform result."
+        )
+    else:
+        # A unit impulse at the origin transforms to all-ones with zero
+        # imaginary part -- exact in float32, and it exercises the 2-D
+        # multi-axis path rather than a single 1-D transform.
+        impulse = torch.zeros(2, 2)
+        impulse[0, 0] = 1.0
+        spectrum = torch.fft.fftn(impulse)
+        check("fftn dtype is complex64", str(spectrum.dtype), "torch.complex64")
+        check("fftn of an impulse is ones", spectrum.real.tolist(), [[1.0, 1.0], [1.0, 1.0]])
+        check("fftn of an impulse has no phase", spectrum.imag.tolist(), [[0.0, 0.0], [0.0, 0.0]])
+
+        # [1,2,3,4] has an exactly-representable transform whose imaginary part
+        # is antisymmetric -- a sign or conjugation error shows up here and
+        # nowhere in the impulse above.
+        line = torch.fft.fftn(torch.tensor([1.0, 2.0, 3.0, 4.0]))
+        check("fftn real part", line.real.tolist(), [10.0, -2.0, -2.0, -2.0])
+        check("fftn imaginary part", line.imag.tolist(), [0.0, 2.0, 0.0, -2.0])
+
+        # i*i = -1 is the one multiplication that is wrong under any
+        # implementation treating a complex tensor as two independent floats,
+        # which is the mistake worth catching on a platform nobody has run.
+        z = torch.complex(torch.tensor([1.0, 0.0]), torch.tensor([0.0, 2.0]))
+        zz = z * z
+        check("complex dtype", str(zz.dtype), "torch.complex64")
+        check("(1)^2 and (2i)^2 real", zz.real.tolist(), [1.0, -4.0])
+        check("(1)^2 and (2i)^2 imag", zz.imag.tolist(), [0.0, 0.0])
+
+    if "aten.as_strided.default" in have:
+        # Strides deliberately not in descending order, so an implementation
+        # that ignores the stride argument and reshapes instead answers
+        # [[0,1],[2,3]] and is caught.
+        base = torch.arange(6.0)
+        check("as_strided reads its strides",
+              torch.as_strided(base, (2, 2), (1, 2)).tolist(),
+              [[0.0, 2.0], [1.0, 3.0]])
+    else:
+        print("SKIP  as_strided                       -- this wheel has no "
+              "aten.as_strided.default. Not a platform result.")
+
+    if "aten.lstm.input" in have:
+        lstm = torch.nn.LSTM(3, 4, batch_first=True)
+        with torch.no_grad():
+            for p in lstm.parameters():
+                p.fill_(0.1)
+        out, (h_n, c_n) = lstm(torch.ones(1, 2, 3))
+        flat = [round(v, 6) for v in out.reshape(-1).tolist()]
+        check("lstm output shape", tuple(out.shape), (1, 2, 4))
+        check("lstm output values", flat, [0.17427] * 4 + [0.301514] * 4)
+        # The second timestep differing from the first is what makes this a
+        # recurrence rather than one affine map applied twice.
+        check("lstm carried state between steps", flat[0] != flat[4], True)
+        check("lstm returned h_n and c_n",
+              (tuple(h_n.shape), tuple(c_n.shape)), ((1, 1, 4), (1, 1, 4)))
+    else:
+        print("SKIP  lstm                             -- this wheel has no "
+              "aten.lstm.input. Not a platform result.")
+
+
 def main():
     want_model = "--model" in sys.argv
     torch = provenance()
@@ -298,6 +388,7 @@ def main():
         promotion(torch)
         newer_ops(torch)
         training(torch)
+        signal_and_complex(torch)
 
     print()
     if FAILURES:
