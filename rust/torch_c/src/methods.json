@@ -626,5 +626,12 @@
   ],
   "roll": [
     "aten::roll(Tensor self, SymInt[1] shifts, int[1] dims=[]) -> Tensor"
+  ],
+  "floor_divide": [
+    "aten::floor_divide(Tensor self, Tensor other) -> Tensor",
+    "aten::floor_divide.Scalar(Tensor self, Scalar other) -> Tensor"
+  ],
+  "histc": [
+    "aten::histc(Tensor self, int bins=100, Scalar min=0, Scalar max=0) -> Tensor"
   ]
 }

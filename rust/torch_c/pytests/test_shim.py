@@ -9201,7 +9201,16 @@ def test_core_ops_and_op_tags_agree():
     # here would be 108 even with the gap closed; the reason it is 108 today
     # is weaker than the reason it should be, and that distinction is what
     # §5 records.
-    assert r["tag_core_count"] == 108, r["tag_core_count"]
+    #
+    # 110 with docs/FIXES.md's `torch.fmod`: `overloads.json` had no row for
+    # `fmod` at all, so neither overload reached a kernel before this.
+    # `aten.fmod.Tensor` and `aten.fmod.Scalar` both landed kernels and both
+    # are `core` upstream -- `torch.ops.aten.fmod.Tensor.tags` is
+    # `[core, pointwise, pt2_compliant_tag]`, read off a real torch, the same
+    # three tags `remainder`'s two overloads already carry. **+2 for one op**,
+    # unlike every prior entry in this list, because both overloads landed
+    # together.
+    assert r["tag_core_count"] == 110, r["tag_core_count"]
 
 
 def test_decompose_lowers_the_op_capture_md_named():
@@ -10737,7 +10746,24 @@ def test_schema_text_survives_the_round_trip_through_the_transcribed_tables():
     # `torch.broadcast_in_dim` does not exist upstream. A prims entry here
     # would be inventing a surface, which is why `reach.py` reaches them
     # through `torch.ops.prims.<op>.<overload>` instead.
-    assert len(keys) == 293, len(keys)
+    #
+    # 295 with docs/FIXES.md's backlog. **+2, not +5**: `floor_divide.default`
+    # and `floor_divide.Scalar` went into `methods.json` so `Tensor.floor_divide`
+    # reaches the kernel `torch.floor_divide` already had -- both schemas were
+    # already declared identities through `overloads.json`, so a second door
+    # onto each adds nothing, the `detach`/`maximum` shape again. `histc.default`
+    # is the same shape: `methods.json` gained it, `overloads.json` already had
+    # it. `fmod.Tensor` and `fmod.Scalar` are the two genuinely new identities
+    # -- neither table had named `fmod` in any form before, so `torch.fmod` and
+    # `Tensor.fmod` both refused by `AttributeError` rather than resolving to a
+    # missing kernel. Only `overloads.json` carries them (no `.out` pair --
+    # `aten::fmod.Scalar_out`/`Tensor_out` exist upstream but adding them would
+    # grow `reach_allow.json`'s `shape1_dead_overload_keys_ceiling`, the
+    # `maximum` reasoning just above, repeated), and `methods.json`'s `fmod` was
+    # left alone -- `Tensor.fmod` was not part of this round's measured gap and
+    # is not asserted anywhere, so adding it here would be inventing a check
+    # rather than recording one.
+    assert len(keys) == 295, len(keys)
     from_tables = sorted(
         k for k in keys
         if report["table"][f"{k[0]}|{k[1]}"]["from"] == "tables"
