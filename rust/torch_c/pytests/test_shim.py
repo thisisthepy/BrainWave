@@ -9170,7 +9170,9 @@ def test_core_ops_and_op_tags_agree():
     #
     # Both rounds landed together, so both increments apply: +1 for
     # `squeeze.dims` and +1 for `randperm.default`.
-    assert r["tag_core_count"] == 105, r["tag_core_count"]
+    #
+    # 106 with `nonzero.default` (docs/NONZERO.md).
+    assert r["tag_core_count"] == 106, r["tag_core_count"]
 
 
 def test_decompose_lowers_the_op_capture_md_named():

@@ -235,6 +235,7 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.view.default",
     "aten.view.dtype",
     "aten.where.ScalarOther",
+    "aten.nonzero.default",
     "aten.where.default",
     "aten.where.self",
     "aten.zero_.default",
@@ -532,6 +533,7 @@ static FLOAT8_E4M3FN_REFUSALS: &[(&str, &str)] = &[
     ("aten.triu.default", "triu"),
     ("aten.uniform_.default", "check_uniform_bounds"),
     ("aten.upsample_bilinear2d.default", "upsample_bilinear2d_channels_last"),
+    ("aten.nonzero.default", "nonzero_count_cpu"),
     ("aten.where.default", "nonzero_count_cpu"),
 ];
 
@@ -1218,6 +1220,41 @@ fn meta_dispatch(
         // used -- `where` on a float condition raises upstream and the meta
         // path has to raise too, since the condition's dtype is one of the
         // few things a meta tensor does carry.
+                "aten.where.default" | "aten.nonzero.default" => {
+            let input = tensor_arg(op, args, kwargs, 0, if op == "aten.where.default" { "condition" } else { "self" })?;
+            let assume = py
+                .import("torch.fx.experimental._config")?
+                .getattr("meta_nonzero_assume_all_nonzero")?
+                .is_truthy()?;
+            if !assume {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                    "The register_meta function for torch.nonzero() raises unimplemented by default, \
+                     as a correct data-independent implementation does not exist. This implementation \
+                     returns a fake value, assuming all elements of the tensor are non-zero. To enable \
+                     this registration, please set 'torch.fx.experimental._config.meta_nonzero_assume_all_nonzero' to True."
+                ));
+            }
+            
+            let shape = input.dims();
+            let mut numel = 1;
+            for &s in shape {
+                numel *= s;
+            }
+            
+            let tag = TorchDType::Int64;
+            
+            if op == "aten.nonzero.default" {
+                meta_result(py, vec![numel as usize, shape.len()], tag)
+            } else {
+                let mut out_tensors = Vec::with_capacity(shape.len());
+                for _ in 0..shape.len() {
+                    let out_t = meta_result(py, vec![numel as usize], tag.clone())?;
+                    out_tensors.push(out_t.into_any());
+                }
+                let tuple = pyo3::types::PyTuple::new(py, out_tensors)?;
+                Ok(tuple.into_any().unbind())
+            }
+        }
         "aten.where.self" => {
             let condition = tensor_arg(op, args, kwargs, 0, "condition")?;
             let lhs = tensor_arg(op, args, kwargs, 1, "self")?;
@@ -1793,6 +1830,7 @@ fn aten_dispatch_inner(
 
         "aten.masked_fill.Scalar" => masked_fill(py, args, kwargs, "aten.masked_fill.Scalar"),
         "aten.masked_fill.Tensor" => masked_fill(py, args, kwargs, "aten.masked_fill.Tensor"),
+        "aten.nonzero.default" => nonzero_default(py, args, kwargs),
         "aten.where.default" => where_default(py, args, kwargs),
         "aten.where.self" => where_self(py, args, kwargs),
         "aten.where.ScalarOther" => where_scalar_other(py, args, kwargs),
@@ -18580,6 +18618,59 @@ fn max_pool2d_default(
     
     let py_t = pyo3::Py::new(py, PyTensorBase::new(out_t)?)?;
     Ok(py_t.into_any())
+}
+
+
+fn nonzero_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.nonzero.default";
+    let condition = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let t = condition.tensor()?;
+
+    let zeros = t.zeros_like().map_err(|e| candle_err(OP, e))?;
+    let mask = t.ne(&zeros).map_err(|e| candle_err(OP, e))?;
+    let mask_u8 = mask.flatten_all().map_err(|e| candle_err(OP, e))?.to_vec1::<u8>().map_err(|e| candle_err(OP, e))?;
+
+    let shape = t.dims();
+    let num_dims = shape.len();
+
+    let mut z = 0;
+    for &val in mask_u8.iter() {
+        if val != 0 {
+            z += 1;
+        }
+    }
+
+    if num_dims == 0 {
+        let out_t = Tensor::from_vec(Vec::<i64>::new(), (z, 0), t.device()).map_err(|e| candle_err(OP, e))?;
+        let out = pyo3::Py::new(py, PyTensorBase::new(out_t)?)?;
+        return Ok(out.into_any());
+    }
+
+    let mut indices: Vec<i64> = Vec::with_capacity(z * num_dims);
+    let mut strides = vec![0i64; num_dims];
+    let mut current_stride = 1i64;
+    for i in (0..num_dims).rev() {
+        strides[i] = current_stride;
+        current_stride *= shape[i] as i64;
+    }
+
+    for (flat_idx, &val) in mask_u8.iter().enumerate() {
+        if val != 0 {
+            let mut rem = flat_idx as i64;
+            for i in 0..num_dims {
+                indices.push(rem / strides[i]);
+                rem %= strides[i];
+            }
+        }
+    }
+
+    let out_t = Tensor::from_vec(indices, (z, num_dims), t.device()).map_err(|e| candle_err(OP, e))?;
+    let out = pyo3::Py::new(py, PyTensorBase::new(out_t)?)?;
+    Ok(out.into_any())
 }
 
 fn where_default(

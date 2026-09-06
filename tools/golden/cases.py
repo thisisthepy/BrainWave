@@ -22765,6 +22765,15 @@ def adaptive_avg_pool1d_cases(torch_module, c_module, torch_call):
     a_t, a_c = pair_from_flat(torch_module, c_module, [1.0, 2.0, 3.0, 4.0], (1, 1, 4), "float32")
     return [Case(name="adaptive_avg_pool1d", op="aten.adaptive_avg_pool1d.default", run_torch=lambda: torch_call(a_t, [2]), run_c=lambda: c_module._aten_dispatch("aten.adaptive_avg_pool1d.default", a_c, [2]))]
 
+
+def nonzero_default_cases(torch_module, c_module, torch_call):
+    a_t, a_c = pair_from_flat(torch_module, c_module, [0.0, 1.0, 0.0, 2.0], (2, 2), "float32")
+    return [
+        Case(name="nonzero_default", op="aten.nonzero.default",
+             run_torch=lambda: torch_call(a_t),
+             run_c=lambda: c_module._aten_dispatch("aten.nonzero.default", a_c))
+    ]
+
 def where_default_cases(torch_module, c_module, torch_call):
     a_t, a_c = pair_from_flat(torch_module, c_module, [0.0, 1.0], (2,), "float32")
     return [
@@ -23078,6 +23087,7 @@ CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
     "aten.hardtanh.default": hardtanh_cases,
     "aten.one_hot.default": one_hot_cases,
     "aten.adaptive_avg_pool1d.default": adaptive_avg_pool1d_cases,
+    "aten.nonzero.default": nonzero_default_cases,
     "aten.where.default": where_default_cases,
 
 }

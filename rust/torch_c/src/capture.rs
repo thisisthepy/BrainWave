@@ -288,7 +288,18 @@ const HOST_READS: &[&str] = &["aten._local_scalar_dense.default"];
 /// the allowlist explicit is what stops it from growing by accident.
 const METADATA_ONLY: &[&str] = &["aten.is_floating_point.default"];
 
+const DATA_DEPENDENT_SHAPE: &[&str] = &[
+    "aten.nonzero.default",
+    "aten.where.default",
+];
+
 fn refusal_for(op: &str) -> Option<String> {
+    if DATA_DEPENDENT_SHAPE.contains(&op) {
+        return Some(format!(
+            "{op} produces an output shape that depends on tensor values; a trace whose node output shape is not a function of its inputs cannot be recorded, because a replay with different inputs might produce a different shape."
+        ));
+    }
+
     if HOST_READS.contains(&op) {
         return Some(format!(
             "{op} reads a tensor value onto the host; a Python branch taken on \

@@ -4697,13 +4697,19 @@ def _install_tensor_indexing(module, tensorbase, dispatch) -> None:
                     "basic indexing first and then aten.index.Tensor, and this shim "
                     "does not reproduce that composition yet"
                 )
+            result = self
+            dim = 0
+            for item in index:
+                if item is None:
+                    result = dispatch("aten.unsqueeze.default", result, dim)
+                dim += 1
             indices = [
                 _lift_sequence_index(item)
                 if _is_sequence_index(item)
                 else (item if isinstance(item, tensorbase) else None)
                 for item in index
             ]
-            return dispatch("aten.index.Tensor", self, indices)
+            return dispatch("aten.index.Tensor", result, indices)
 
         result = self
         dim = 0
@@ -8343,6 +8349,25 @@ def _install_composites(module, varfns, dispatch) -> None:
     tile.__name__ = tile.__qualname__ = "tile"
     tile.__module__ = "torch._C"
     setattr(varfns, "tile", tile)
+
+
+    def nonzero(input, *, out=None, as_tuple=False):
+        _refuse_out("nonzero", out)
+        if as_tuple:
+            return module._aten_dispatch("aten.where.default", input)
+        return module._aten_dispatch("aten.nonzero.default", input)
+
+    nonzero.__module__ = "torch._C"
+    setattr(varfns, "nonzero", nonzero)
+
+    def tensor_nonzero(self, *, as_tuple=False):
+        if as_tuple:
+            return module._aten_dispatch("aten.where.default", self)
+        return module._aten_dispatch("aten.nonzero.default", self)
+
+    tensor_nonzero.__module__ = "torch._C"
+    tensor_nonzero.__name__ = tensor_nonzero.__qualname__ = "nonzero"
+    setattr(module.TensorBase, "nonzero", tensor_nonzero)
 
     # -- `torch.randn` / `torch.rand` and their `_like`/`normal` siblings ----
     #
