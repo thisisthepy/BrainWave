@@ -442,10 +442,69 @@ impl TorchDType {
         match self {
             Complex128 => 16,
             Float64 | Complex64 | Int64 | UInt64 => 8,
-            Float32 | Int32 | UInt32 | QInt32 => 4,
-            Float16 | BFloat16 | Int16 | UInt16 | Complex32 | Bits16 => 2,
+            // `complex32` is **4**, not 2: it is a pair of `float16`, and
+            // `itemsize` is the width of the whole complex element. Measured
+            // on 2.13.0 (`torch.complex32.itemsize` is 4) -- this row said 2
+            // until docs/COMPLEX2.md, which is the silent-wrong-number shape:
+            // `numel * element_size` would have sized a complex32 buffer at
+            // half its bytes. Nothing checked it, because the only assertion
+            // in the tree was about `complex64`.
+            Complex32 | Float32 | Int32 | UInt32 | QInt32 => 4,
+            Float16 | BFloat16 | Int16 | UInt16 | Bits16 => 2,
             _ => 1,
         }
+    }
+
+    /// The complex tag whose *component* dtype candle is storing, for
+    /// `Repr::Complex`'s two halves.
+    ///
+    /// The Rust-level counterpart of the `to_complex()` pymethod below, and
+    /// deliberately keyed on `candle_core::DType` rather than on `TorchDType`:
+    /// `PyTensorBase::complex` is handed two candle tensors and has to name
+    /// the tag from what they actually store, not from what a caller says
+    /// they store. `None` is the whole guard on the arm's invariant -- there
+    /// is no complex tag over `int64` or `bfloat16` (upstream has no
+    /// `complex(bfloat16)` either), so a pair of those cannot be built.
+    ///
+    /// It is the same table as `to_complex`, read from the storage side, and
+    /// `pytests/test_complex.py` asserts the two agree rather than trusting
+    /// that they were kept in step by hand.
+    pub fn complex_for_component(component: DType) -> Option<Self> {
+        Some(match component {
+            DType::F16 => Complex32,
+            DType::F32 => Complex64,
+            DType::F64 => Complex128,
+            _ => return None,
+        })
+    }
+
+    /// The inverse: the component dtype behind a complex tag. `None` for every
+    /// tag that is not complex, which is what makes `is_complex_tag` a derived
+    /// question rather than a second list to keep in step.
+    pub fn complex_component(self) -> Option<DType> {
+        Some(match self {
+            Complex32 => DType::F16,
+            Complex64 => DType::F32,
+            Complex128 => DType::F64,
+            _ => return None,
+        })
+    }
+
+    /// Is this one of the three complex tags?
+    pub fn is_complex_tag(self) -> bool {
+        self.complex_component().is_some()
+    }
+
+    /// The real tag a complex tag's halves wear -- the Rust-level `to_real()`.
+    /// `None` on every non-complex tag, so `view_as_real` cannot be reached
+    /// with a tag that has no real partner.
+    pub fn to_real_tag(self) -> Option<Self> {
+        Some(match self {
+            Complex32 => Float16,
+            Complex64 => Float32,
+            Complex128 => Float64,
+            _ => return None,
+        })
     }
 }
 
@@ -553,6 +612,22 @@ impl PyDtype {
             Float16 => Complex32,
             Float32 => Complex64,
             Float64 => Complex128,
+            // **`bfloat16` maps to `complex64`, not to itself.** Measured on
+            // 2.13.0: `torch.bfloat16.to_complex()` is `torch.complex64`,
+            // because there is no `complex(bfloat16)` and upstream promotes to
+            // the next complex type that can hold it rather than returning the
+            // input. This row returned `bfloat16` until docs/COMPLEX2.md.
+            //
+            // The complex tags map to themselves, as upstream.
+            //
+            // Still divergent, and recorded rather than fixed: upstream
+            // *raises* `RuntimeError` for `to_complex()` on an integral, bool
+            // or float8 dtype, where this returns the input unchanged. That is
+            // a wider change than this round's subject (it turns a total
+            // function partial for thirty tags with no measured caller), and
+            // it is written down in docs/COMPLEX2.md §7 rather than left
+            // silent.
+            BFloat16 => Complex64,
             other => other,
         })
     }

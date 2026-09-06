@@ -98,6 +98,45 @@ pub enum Repr {
     /// Ops opt in one at a time in `vulkan::dispatch`, by name, the way the
     /// twenty `Repr::Quant` sites did.
     Vulkan(crate::vulkan::VkTensor),
+    /// A complex tensor, held as **two real tensors** rather than one
+    /// interleaved buffer.
+    ///
+    /// **The fifth arm exists for the same structural reason as the third and
+    /// the fourth: candle cannot hold the thing.** `candle_core::DType`
+    /// enumerates fourteen real dtypes and no complex one, in 0.11.0 and on
+    /// `main` alike, and -- unlike `torch.int8` (docs/INT8.md) -- it cannot get
+    /// one by adding an arm. `WithDType` is bounded on `std::cmp::PartialOrd`
+    /// and `cpu::kernels::VecOps` requires `min`/`max`; the complex numbers
+    /// are not ordered, so a complex `DType` means *removing* a bound from
+    /// candle's core numeric trait and re-bounding every comparison,
+    /// reduction, sort, clamp and argmax generic over it, across three
+    /// backends, carried against upstream forever. docs/COMPLEX.md §2.2 sized
+    /// that and refused it; no `[patch]` is offered and none should be added.
+    ///
+    /// **A pair, not interleaving.** Upstream's own representation interleaves
+    /// real and imaginary in a trailing dimension of size 2 -- which is exactly
+    /// what `view_as_complex` views -- and that is the wrong choice *here*:
+    /// `Repr::Dense`'s shape is candle's shape, so an interleaved complex
+    /// tensor would report a trailing `2` in `.shape` that then has to be
+    /// hidden at every shape-reporting site. Hiding a dimension in one place
+    /// and not another is the silent-wrong-answer shape. With a pair,
+    /// `re.shape()` **is** the complex tensor's shape, by construction.
+    ///
+    /// The invariants, established once in `PyTensorBase::complex` and relied
+    /// on everywhere below: `re` and `im` have the same dims, the same candle
+    /// dtype, and the same device, and that dtype is one of `F16`/`F32`/`F64`
+    /// so that `TorchDType::to_complex` names the tag.
+    ///
+    /// And it inherits the property that is the whole reason it lives here:
+    /// **`tensor()` refuses on this arm**, and `tensor()` has ~400 call sites.
+    /// No kernel can read a complex tensor's storage and get back a real
+    /// buffer that happens to be the real part -- it would have to handle a
+    /// `PyResult` whose only content is a refusal. Dropping the imaginary part
+    /// and returning plausible numbers is therefore not a discipline anyone
+    /// has to keep; it is unrepresentable, which is the standard
+    /// docs/VULKAN2.md set. Ops opt in one at a time, by name, in
+    /// `complex_ops` below.
+    Complex { re: Tensor, im: Tensor },
 }
 
 #[pyclass(name = "TensorBase", module = "torch._C", subclass, from_py_object)]
@@ -250,6 +289,30 @@ pub fn no_host_storage() -> PyErr {
     )
 }
 
+/// The refusal that carries `Repr::Complex`'s safety, and the reason it is
+/// worded the way it is.
+///
+/// A complex tensor *does* have two dense buffers behind it, and either one of
+/// them would satisfy a caller's type. That is precisely why this cannot
+/// return one: a kernel handed `re` alone computes a plausible answer with the
+/// imaginary part dropped, which survives a smoke test, survives a shape check
+/// and is only caught by an element-wise comparison nobody runs. So `tensor()`
+/// refuses here, and the message says which half would have been lost rather
+/// than "no storage", because the reader's next question is whether their gap
+/// is the dtype or the operator. docs/COMPLEX2.md §2.
+pub fn no_real_storage(tag: TorchDType) -> PyErr {
+    pyo3::exceptions::PyNotImplementedError::new_err(format!(
+        "torch._C shim: this is a {} tensor, held as a pair of real tensors \
+         (torch._C shim has no complex candle dtype -- docs/COMPLEX.md §2). \
+         Handing a kernel its real part alone would drop the imaginary part \
+         and return plausible numbers, so there is no dense storage to read. \
+         Only the ops taught the complex representation by name compute on \
+         one (torch._C._complex_ops()); torch.view_as_real(z) is the way back \
+         to a real tensor.",
+        tag.name()
+    ))
+}
+
 impl PyTensorBase {
     /// A tensor whose torch dtype is whatever candle is already storing.
     pub fn new(inner: Tensor) -> PyResult<Self> {
@@ -336,6 +399,85 @@ impl PyTensorBase {
         }
     }
 
+    /// **The single entrance for the complex representation**, and the only
+    /// place the arm's invariants are established.
+    ///
+    /// Mirrors `boolean()`'s role exactly: there is one way to attach a
+    /// complex tag and it is this, so every complex tensor in the process has
+    /// been through these four checks. A caller cannot assemble the arm
+    /// directly -- `Repr` is public but `PyTensorBase::inner` is not.
+    ///
+    /// The tag is derived from the component dtype rather than accepted from
+    /// the caller (`TorchDType::complex_for_component`), which is what makes
+    /// "the tag agrees with the storage" true by construction rather than by
+    /// discipline. The mismatched-shape and mismatched-dtype checks are
+    /// internal errors in the sense that no op below can produce one -- they
+    /// are here because the arm's every consumer reads `re` and `im` as
+    /// parallel, and a violated invariant there is silent.
+    pub fn complex(re: Tensor, im: Tensor) -> PyResult<Self> {
+        if re.dtype() != im.dtype() {
+            return Err(not_implemented(format!(
+                "torch._C shim: a complex tensor's real and imaginary parts \
+                 must have one dtype, got {} and {}",
+                re.dtype().as_str(),
+                im.dtype().as_str()
+            )));
+        }
+        if re.dims() != im.dims() {
+            return Err(not_implemented(format!(
+                "torch._C shim: a complex tensor's real and imaginary parts \
+                 must have one shape, got {:?} and {:?}",
+                re.dims(),
+                im.dims()
+            )));
+        }
+        if !re.device().same_device(im.device()) {
+            return Err(not_implemented(
+                "torch._C shim: a complex tensor's real and imaginary parts \
+                 must be on one device",
+            ));
+        }
+        let tag = TorchDType::complex_for_component(re.dtype()).ok_or_else(|| {
+            not_implemented(format!(
+                "torch._C shim: no complex dtype over {} -- complex tensors \
+                 here are pairs of half, float or double (docs/COMPLEX.md §3)",
+                re.dtype().as_str()
+            ))
+        })?;
+        Ok(Self {
+            inner: Repr::Complex { re, im },
+            tag,
+            requires_grad: false,
+            backward_hooks: None,
+            grad: None,
+            from_op: None,
+            retains_grad: false,
+        })
+    }
+
+    /// The two halves, for the ops `complex_ops` taught this arm by name. The
+    /// mirror of `qtensor` and `vk_tensor`: nothing can be handed a real
+    /// tensor here and treat it as a complex one.
+    #[inline]
+    pub fn complex_parts(&self, op: &str) -> PyResult<(&Tensor, &Tensor)> {
+        match &self.inner {
+            Repr::Complex { re, im } => Ok((re, im)),
+            _ => Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "{op}: expected a complex tensor, got a {} one",
+                self.tag.name()
+            ))),
+        }
+    }
+
+    /// Whether this tensor is held as a pair. Used by the two dispatch sites
+    /// in `aten.rs` that have to choose between the real kernel and the
+    /// complex one *before* parsing, and by nothing else -- every other site
+    /// gets its refusal from `tensor()`.
+    #[inline]
+    pub fn is_complex_repr(&self) -> bool {
+        matches!(self.inner, Repr::Complex { .. })
+    }
+
     /// The single entrance for the `torch.bool` tag (BOOL.md §6.3 item 1).
     /// The caller is asserting the bytes are already normalised to 0/1;
     /// `BRAINWAVE_CHECK_BOOL=1` turns that assertion into a check.
@@ -384,6 +526,12 @@ impl PyTensorBase {
             Repr::Meta { .. } => Err(no_data()),
             Repr::Quantized(q) => Err(no_dense_storage(crate::quant::format_name(q.dtype()))),
             Repr::Vulkan(_) => Err(no_host_storage()),
+            // **The arm that carries the whole representation's safety.**
+            // Returning `re` here would compile, would type-check at all ~400
+            // call sites, and would make every existing kernel silently
+            // compute the real part of a complex expression. See
+            // `no_real_storage`.
+            Repr::Complex { .. } => Err(no_real_storage(self.tag)),
         }
     }
 
@@ -418,12 +566,13 @@ impl PyTensorBase {
     pub fn qtensor(&self, op: &str) -> PyResult<&Arc<QTensor>> {
         match &self.inner {
             Repr::Quantized(q) => Ok(q),
-            Repr::Dense(_) | Repr::Meta { .. } | Repr::Vulkan(_) => Err(not_implemented(format!(
+            Repr::Dense(_) | Repr::Meta { .. } | Repr::Vulkan(_) | Repr::Complex { .. } => Err(not_implemented(format!(
                 "{op}: expected a block-quantised tensor (torch._C._quantize), \
                  got a {} one",
                 match &self.inner {
                     Repr::Dense(_) => "dense",
                     Repr::Vulkan(_) => "vulkan",
+                    Repr::Complex { .. } => "complex",
                     _ => "meta",
                 }
             ))),
@@ -439,6 +588,11 @@ impl PyTensorBase {
             Repr::Meta { shape } => shape,
             Repr::Quantized(q) => q.shape().dims(),
             Repr::Vulkan(v) => &v.shape,
+            // `re.dims()` **is** the complex tensor's shape -- that is the
+            // whole reason §3.2 chose a pair over interleaving. There is no
+            // trailing `2` to hide here, and if there were, this is the site
+            // that would have to lie about it.
+            Repr::Complex { re, .. } => re.dims(),
         }
     }
 
@@ -449,6 +603,12 @@ impl PyTensorBase {
             Repr::Meta { shape } => shape.iter().product(),
             Repr::Quantized(q) => q.shape().elem_count(),
             Repr::Vulkan(v) => v.elem_count(),
+            // `numel` counts *complex* elements, not floats, which is
+            // upstream's answer: `torch.view_as_complex(torch.ones(3,2))
+            // .numel()` is 3. The buffers hold twice that many floats, and
+            // `element_size` below is 8 rather than 4 for exactly that reason,
+            // so `numel * element_size` still sizes the storage correctly.
+            Repr::Complex { re, .. } => re.elem_count(),
         }
     }
 
@@ -473,6 +633,9 @@ impl PyTensorBase {
             // Vulkan device and no index to invent, so the label is a
             // constant, exactly as `meta`'s is.
             Repr::Vulkan(_) => crate::vulkan::label(),
+            // Both halves are on one device (checked in `complex`), so either
+            // answers. `re` by convention.
+            Repr::Complex { re, .. } => PyDevice::from_candle(re.device()),
         }
     }
 
@@ -1487,6 +1650,11 @@ impl PyTensorBase {
             // A Vulkan tensor is dense and strided; what is different about it
             // is where the bytes are, not how they are addressed.
             Repr::Vulkan(_) => false,
+            // It asked again for the complex arm. A pair of dense tensors is
+            // not nested, not sparse, not quantised, not a zero tensor and
+            // carries no negative-view bit; what is different about it is that
+            // there are two buffers, not how either is addressed.
+            Repr::Complex { .. } => false,
         }
     }
 
@@ -1500,6 +1668,11 @@ impl PyTensorBase {
             // A Vulkan tensor is dense and strided; what is different about it
             // is where the bytes are, not how they are addressed.
             Repr::Vulkan(_) => false,
+            // It asked again for the complex arm. A pair of dense tensors is
+            // not nested, not sparse, not quantised, not a zero tensor and
+            // carries no negative-view bit; what is different about it is that
+            // there are two buffers, not how either is addressed.
+            Repr::Complex { .. } => false,
         }
     }
 
@@ -1521,6 +1694,7 @@ impl PyTensorBase {
             Repr::Meta { .. } => false,
             Repr::Quantized(_) => true,
             Repr::Vulkan(_) => false,
+            Repr::Complex { .. } => false,
         }
     }
 
@@ -1561,6 +1735,11 @@ impl PyTensorBase {
             // A Vulkan tensor is dense and strided; what is different about it
             // is where the bytes are, not how they are addressed.
             Repr::Vulkan(_) => false,
+            // It asked again for the complex arm. A pair of dense tensors is
+            // not nested, not sparse, not quantised, not a zero tensor and
+            // carries no negative-view bit; what is different about it is that
+            // there are two buffers, not how either is addressed.
+            Repr::Complex { .. } => false,
         }
     }
 
@@ -1577,6 +1756,11 @@ impl PyTensorBase {
             // A Vulkan tensor is dense and strided; what is different about it
             // is where the bytes are, not how they are addressed.
             Repr::Vulkan(_) => false,
+            // It asked again for the complex arm. A pair of dense tensors is
+            // not nested, not sparse, not quantised, not a zero tensor and
+            // carries no negative-view bit; what is different about it is that
+            // there are two buffers, not how either is addressed.
+            Repr::Complex { .. } => false,
         }
     }
 
@@ -1607,6 +1791,12 @@ impl PyTensorBase {
             // `torch.strided` too -- a Vulkan tensor is a flat contiguous
             // buffer, which is what `strided` names.
             Repr::Vulkan(_) => "strided",
+            // Upstream's complex tensors are `torch.strided` too --
+            // `torch.view_as_complex(torch.ones(3,2)).layout` is
+            // `torch.strided`, measured on 2.13.0. `torch.layout` names how
+            // the elements are addressed, and each half here is addressed
+            // exactly as a dense tensor is.
+            Repr::Complex { .. } => "strided",
         }
     }
 
@@ -1688,7 +1878,15 @@ impl PyTensorBase {
             // unlike a quantised one it is entitled to: the buffer really is
             // `numel * 4` bytes of f32, so `numel() * element_size()` sizes it
             // correctly.
-            Repr::Dense(_) | Repr::Meta { .. } | Repr::Vulkan(_) => Ok(self.tag.itemsize()),
+            // A complex tensor answers from the tag as well, and the tag is
+            // the *pair* width: `complex64` is 8, not 4. That is upstream's
+            // answer and it is the one that makes `numel() * element_size()`
+            // size the two buffers together. If this ever answered 4, someone
+            // had aliased complex64 onto float32 -- the exact drop this arm
+            // exists to prevent.
+            Repr::Dense(_) | Repr::Meta { .. } | Repr::Vulkan(_) | Repr::Complex { .. } => {
+                Ok(self.tag.itemsize())
+            }
             Repr::Quantized(q) => Err(not_implemented(format!(
                 "TensorBase.element_size: a {} tensor has no whole number of \
                  bytes per element ({} bytes per {} elements). Use \
@@ -2061,6 +2259,11 @@ impl PyTensorBase {
             // one. Same argument as the two arms above, and it stops being
             // true the day a stride-taking kernel lands.
             Repr::Vulkan(_) => true,
+            // Both halves are made contiguous at construction (every producer
+            // in `complex_ops` calls `.contiguous()`), so this is true by the
+            // same argument as the three arms above rather than by inspection
+            // -- and it is checked, not assumed: this reads them.
+            Repr::Complex { re, im } => re.is_contiguous() && im.is_contiguous(),
         }
     }
 
@@ -3222,6 +3425,395 @@ pub fn mark_from_op(
     marked
 }
 
+
+// ---------------------------------------------------------------------------
+// `complex_ops` -- the ops taught `Repr::Complex` by name
+// ---------------------------------------------------------------------------
+//
+// docs/COMPLEX2.md. This module is the counterpart of `quant.rs` and
+// `vulkan::dispatch`: the arm refuses everywhere by default (`tensor()`), and
+// capability arrives here, one operator at a time, each one having to say what
+// it does with *both* halves.
+//
+// **The set is deliberately small and it is `llama4`'s, not "complex support".**
+// `Llama4VisionRotaryEmbedding` / `apply_rotary_emb` is a closed pipeline --
+// every complex value is produced by `polar` or `view_as_complex` and consumed
+// by `view_as_real` inside one function, never escaping it -- so five ops carry
+// the architecture. Anything outside that set refuses rather than approximates.
+pub mod complex_ops {
+    use super::*;
+
+    /// `torch.view_as_complex(x)` -- the entrance from real data.
+    ///
+    /// **This is a copy, and upstream's is a view.** Measured on 2.13.0:
+    ///
+    /// ```text
+    /// base = torch.tensor([[1., 2.]]); v = torch.view_as_complex(base)
+    /// base[0, 0] = 99.;  v.tolist()   ->  [(99+2j)]
+    /// ```
+    ///
+    /// A pair-of-tensors representation cannot alias an interleaved buffer,
+    /// and choosing the pair was the decision that bought the correct `.shape`
+    /// (docs/COMPLEX.md §3.2). So this is a **narrowing**, it is stated here
+    /// rather than left to be discovered, it is asserted as a narrowing in
+    /// `pytests/test_complex.py::test_view_as_complex_copies_where_upstream_aliases`,
+    /// and it is safe for the models measured only because all three of
+    /// `llama4`'s call sites feed a freshly computed expression that is never
+    /// written to again. docs/COMPLEX2.md §6.
+    pub fn view_as_complex(py: Python<'_>, input: &PyTensorBase) -> PyResult<Py<PyAny>> {
+        const OP: &str = "aten.view_as_complex.default";
+        // Upstream's own message, verbatim, for the dtype it cannot take.
+        // `bfloat16` is refused by upstream too -- there is no
+        // `complex(bfloat16)` -- so `complex_for_component` returning `None`
+        // and this check are the same rule read from two sides.
+        if TorchDType::complex_for_component(
+            input.tag.storage().unwrap_or(candle_core::DType::U8),
+        )
+        .is_none()
+        {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "view_as_complex is only supported for half, float and double \
+                 tensors, but got a tensor of scalar type: {}",
+                crate::aten::scalar_type_name(input.tag)
+            )));
+        }
+        let t = input.tensor()?;
+        let dims = t.dims();
+        if dims.last().copied() != Some(2) {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "Tensor must have a last dimension of size 2",
+            ));
+        }
+        let last = dims.len() - 1;
+        // **`copy()`, not `contiguous()`, and the difference is measurable.**
+        // candle's `contiguous()` returns `self.clone()` when the layout is
+        // already contiguous, and a narrow to length 1 on the last axis *is*
+        // contiguous -- so `torch.tensor([[1., 2.]])` produced halves that
+        // still shared the base's storage, and `base[0,0] = 99.` showed
+        // through. That is upstream's own behaviour, but only for the shapes
+        // where the narrow happens to stay contiguous; for every other shape
+        // the same code copied. **An aliasing rule that holds for some shapes
+        // and not others is worse than either answer**, and it was found by
+        // the narrowing test below rather than by reading this.
+        //
+        // `copy()` allocates unconditionally, which makes "a complex tensor in
+        // this shim never shares storage with anything" true by construction.
+        // Two other things lean on that: the `copy_` narrowing (there is no
+        // view that could observe `replace_with`), and the absence of any need
+        // to version-stamp the halves in `capture.rs`.
+        let re = t
+            .narrow(last, 0, 1)
+            .and_then(|v| v.squeeze(last))
+            .and_then(|v| v.copy())
+            .map_err(|e| candle_err(OP, e))?;
+        let im = t
+            .narrow(last, 1, 1)
+            .and_then(|v| v.squeeze(last))
+            .and_then(|v| v.copy())
+            .map_err(|e| candle_err(OP, e))?;
+        wrap(py, PyTensorBase::complex(re, im)?)
+    }
+
+    /// `torch.view_as_real(z)` -- the exit, and the op that makes the pipeline
+    /// closed.
+    ///
+    /// `stack([re, im], -1)`, which is the exact inverse of the narrow-and-
+    /// squeeze above. Round-tripping is what `pytests/test_complex.py` checks
+    /// element-wise against upstream, because losing the imaginary part is the
+    /// failure that still returns plausible numbers and this is the one op
+    /// that would show it.
+    pub fn view_as_real(py: Python<'_>, input: &PyTensorBase) -> PyResult<Py<PyAny>> {
+        const OP: &str = "aten.view_as_real.default";
+        let (re, im) = match input.repr() {
+            Repr::Complex { re, im } => (re, im),
+            // Upstream's message, verbatim.
+            _ => {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                    "view_as_real is only supported for complex tensors",
+                ))
+            }
+        };
+        let out = Tensor::stack(&[re, im], re.dims().len()).map_err(|e| candle_err(OP, e))?;
+        let tag = input
+            .tag
+            .to_real_tag()
+            .expect("a Repr::Complex tag always has a real partner");
+        finish_real(py, out, tag)
+    }
+
+    /// `torch.polar(abs, angle)` -- `llama4_text`'s entrance.
+    ///
+    /// `re = abs*cos(angle)`, `im = abs*sin(angle)`, computed in the component
+    /// dtype. Both arguments must agree on dtype, which is upstream's rule and
+    /// upstream's message.
+    pub fn polar(
+        py: Python<'_>,
+        abs: &PyTensorBase,
+        angle: &PyTensorBase,
+    ) -> PyResult<Py<PyAny>> {
+        const OP: &str = "aten.polar.default";
+        if abs.tag != angle.tag {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "Expected object of scalar type {} but got scalar type {} for \
+                 second argument",
+                crate::aten::scalar_type_name(abs.tag),
+                crate::aten::scalar_type_name(angle.tag)
+            )));
+        }
+        let a = abs.tensor()?;
+        let th = angle.tensor()?;
+        let re = th
+            .cos()
+            .and_then(|c| a.broadcast_mul(&c))
+            .and_then(|v| v.contiguous())
+            .map_err(|e| candle_err(OP, e))?;
+        let im = th
+            .sin()
+            .and_then(|s| a.broadcast_mul(&s))
+            .and_then(|v| v.contiguous())
+            .map_err(|e| candle_err(OP, e))?;
+        wrap(py, PyTensorBase::complex(re, im)?)
+    }
+
+    /// `z * w` for the three combinations that have a complex operand.
+    ///
+    /// `(a+bi)(c+di) = (ac-bd) + (ad+bc)i`, and the mixed complex-by-real case
+    /// scales both halves. **The fourth combination, real-by-complex, is not a
+    /// separate rule** -- multiplication commutes and both orders route here.
+    ///
+    /// Everything else refuses: a complex operand against a meta, quantised or
+    /// Vulkan one falls to `tensor()`'s refusal, which names the *other*
+    /// tensor's representation rather than pretending this op knows what to do
+    /// with it.
+    pub fn mul(py: Python<'_>, lhs: &PyTensorBase, rhs: &PyTensorBase) -> PyResult<Py<PyAny>> {
+        const OP: &str = "aten.mul.Tensor";
+        match (lhs.repr(), rhs.repr()) {
+            (Repr::Complex { re: a, im: b }, Repr::Complex { re: c, im: d }) => {
+                let real = a
+                    .broadcast_mul(c)
+                    .and_then(|ac| b.broadcast_mul(d).and_then(|bd| ac.broadcast_sub(&bd)))
+                    .and_then(|v| v.contiguous())
+                    .map_err(|e| candle_err(OP, e))?;
+                let imag = a
+                    .broadcast_mul(d)
+                    .and_then(|ad| b.broadcast_mul(c).and_then(|bc| ad.broadcast_add(&bc)))
+                    .and_then(|v| v.contiguous())
+                    .map_err(|e| candle_err(OP, e))?;
+                wrap(py, PyTensorBase::complex(real, imag)?)
+            }
+            (Repr::Complex { re, im }, _) => {
+                let r = rhs.tensor()?;
+                let real = re
+                    .broadcast_mul(r)
+                    .and_then(|v| v.contiguous())
+                    .map_err(|e| candle_err(OP, e))?;
+                let imag = im
+                    .broadcast_mul(r)
+                    .and_then(|v| v.contiguous())
+                    .map_err(|e| candle_err(OP, e))?;
+                wrap(py, PyTensorBase::complex(real, imag)?)
+            }
+            (_, Repr::Complex { re, im }) => {
+                let l = lhs.tensor()?;
+                let real = re
+                    .broadcast_mul(l)
+                    .and_then(|v| v.contiguous())
+                    .map_err(|e| candle_err(OP, e))?;
+                let imag = im
+                    .broadcast_mul(l)
+                    .and_then(|v| v.contiguous())
+                    .map_err(|e| candle_err(OP, e))?;
+                wrap(py, PyTensorBase::complex(real, imag)?)
+            }
+            // Not reachable through `aten.rs`'s guard, which only routes here
+            // when one side is complex. A `RuntimeError` rather than an
+            // `unreachable!`, because a panic across the FFI boundary is worse
+            // than a refusal and this is the arm a future caller gets wrong.
+            _ => Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "aten.mul.Tensor: complex kernel reached with two real operands",
+            )),
+        }
+    }
+
+    /// `z.real` and `z.imag`, which is how a test reads the two halves apart
+    /// without `view_as_real` in the way. Field access, no arithmetic.
+    pub fn part(py: Python<'_>, input: &PyTensorBase, imaginary: bool) -> PyResult<Py<PyAny>> {
+        let op = if imaginary { "aten.imag.default" } else { "aten.real.default" };
+        let (re, im) = input.complex_parts(op)?;
+        let tag = input
+            .tag
+            .to_real_tag()
+            .expect("a Repr::Complex tag always has a real partner");
+        finish_real(py, if imaginary { im.clone() } else { re.clone() }, tag)
+    }
+
+    /// The ops taught this arm by name -- the complex counterpart of
+    /// `torch._C._vulkan_ops()`, and the list `no_real_storage`'s refusal
+    /// points a reader at.
+    ///
+    /// A constant rather than a doc sentence because the refusal names it and
+    /// a refusal that names a stale list is worse than one that names none:
+    /// `pytests/test_complex.py` checks this against the dispatch table, so
+    /// the two cannot drift.
+    pub const COMPLEX_OPS: &[&str] = &[
+        "aten.alias.default",
+        "aten.clone.default",
+        "aten.contiguous.default",
+        "aten.copy_.default",
+        "aten.detach.default",
+        "aten.imag.default",
+        "aten.lift_fresh.default",
+        "aten.mul.Scalar",
+        "aten.mul.Tensor",
+        "aten.polar.default",
+        "aten.real.default",
+        "aten.unsqueeze.default",
+        "aten.view_as_complex.default",
+        "aten.view_as_real.default",
+    ];
+
+    #[pyfunction]
+    #[pyo3(name = "_complex_ops")]
+    pub fn complex_ops_list() -> Vec<&'static str> {
+        COMPLEX_OPS.to_vec()
+    }
+
+    /// `detach` / `alias` / `clone` / `contiguous` / `lift_fresh` on a complex
+    /// tensor.
+    ///
+    /// **This is the op `llama4` needed that the five arithmetic ones did not
+    /// cover, and it was found by running the sweep rather than by reasoning.**
+    /// `Llama4VisionRotaryEmbedding.__init__` wraps its computed `freqs_ci` in
+    /// an `nn.Buffer`, and `nn/parameter.py` opens with
+    /// `data.detach().requires_grad_(...)`, so construction reaches `detach`
+    /// before anything else can look at the tensor.
+    ///
+    /// A copy of both halves, which is what this shim's dense `detach`/`alias`
+    /// already do -- they copy rather than alias (docs/OPS4.md §8) -- so the
+    /// complex arm is not losing an aliasing property the real one had. The
+    /// autograd flags are dropped exactly as `detach` drops them.
+    pub fn passthrough(py: Python<'_>, input: &PyTensorBase) -> PyResult<Py<PyAny>> {
+        let (re, im) = input.complex_parts("complex pass-through")?;
+        wrap(py, PyTensorBase::complex(re.clone(), im.clone())?)
+    }
+
+    /// `z * s` for a real Python scalar -- `llama4_text`'s
+    /// `freqs_cis * self.attention_scaling`.
+    ///
+    /// Scaling a complex number by a real one scales both components, so this
+    /// is the one complex op with no cross terms. A *complex* scalar is not
+    /// accepted: `PyComplex` never reaches the dispatcher here (there is no
+    /// complex `Scalar` in this shim's argument forms), and inventing one
+    /// would be a second entrance to the representation that
+    /// `PyTensorBase::complex` is supposed to be the only one of.
+    pub fn mul_scalar(py: Python<'_>, input: &PyTensorBase, value: f64) -> PyResult<Py<PyAny>> {
+        const OP: &str = "aten.mul.Scalar";
+        let (re, im) = input.complex_parts(OP)?;
+        let real = (re * value)
+            .and_then(|v| v.contiguous())
+            .map_err(|e| candle_err(OP, e))?;
+        let imag = (im * value)
+            .and_then(|v| v.contiguous())
+            .map_err(|e| candle_err(OP, e))?;
+        wrap(py, PyTensorBase::complex(real, imag)?)
+    }
+
+    /// The replacement value for `dst.copy_(src)` when either side is complex.
+    ///
+    /// `copy_` in this shim already *replaces* the receiver's representation
+    /// rather than writing through its buffer (`write_back`), so the complex
+    /// path is the same shape as the dense one and not a new mechanism.
+    ///
+    /// **Both sides must be complex.** Upstream's `copy_` will cast a real
+    /// source into a complex destination (imaginary part zero) and refuses the
+    /// other direction; neither is implemented here, because a real->complex
+    /// cast is a *constructor* for the representation and there is exactly one
+    /// of those by design. Refusing names which side was which, so a caller
+    /// can see that the gap is the cast and not `copy_`.
+    pub fn copy_replacement(dst: &PyTensorBase, src: &PyTensorBase) -> PyResult<PyTensorBase> {
+        const OP: &str = "aten.copy_.default";
+        match (dst.repr(), src.repr()) {
+            (Repr::Complex { re: dre, .. }, Repr::Complex { re, im }) => {
+                let shape = dre.shape().clone();
+                let real = re
+                    .broadcast_as(shape.clone())
+                    .and_then(|t| t.contiguous())
+                    .map_err(|e| candle_err(OP, e))?;
+                let imag = im
+                    .broadcast_as(shape)
+                    .and_then(|t| t.contiguous())
+                    .map_err(|e| candle_err(OP, e))?;
+                PyTensorBase::complex(real, imag)
+            }
+            (Repr::Complex { .. }, _) => Err(not_implemented(format!(
+                "aten.copy_.default: copying a {} tensor into a {} one would                  have to invent an imaginary part. torch._C shim builds                  complex tensors only through torch.view_as_complex and                  torch.polar (torch._C._complex_ops()).",
+                src.tag.name(),
+                dst.tag.name()
+            ))),
+            _ => Err(not_implemented(format!(
+                "aten.copy_.default: copying a {} tensor into a {} one would                  drop the imaginary part. Use torch.view_as_real(src) to say                  what should be copied.",
+                src.tag.name(),
+                dst.tag.name()
+            ))),
+        }
+    }
+
+    /// `z.unsqueeze(dim)` -- and, through `__getitem__`, `z[:, :, None, :]`.
+    ///
+    /// **The last op `llama4_text`'s rope needs, and the only shape op here.**
+    /// `apply_rotary_emb` writes `xq_ * freqs_cis[:, :, None, :]`, and
+    /// `bootstrap.py`'s `__getitem__` turns a `None` index into exactly one
+    /// `aten.unsqueeze.default`; the three full slices are skipped without
+    /// dispatching anything.
+    ///
+    /// `slice`, `select` and `index` are deliberately **not** here even though
+    /// the same one-line "do it to both halves" would work for each. Every op
+    /// added to this module is surface that has to be compared against
+    /// upstream, and no measured caller reaches them on a complex tensor; they
+    /// refuse at `tensor()` until one does. docs/COMPLEX2.md §5.
+    pub fn unsqueeze(py: Python<'_>, input: &PyTensorBase, dim: i64) -> PyResult<Py<PyAny>> {
+        const OP: &str = "aten.unsqueeze.default";
+        let (re, im) = input.complex_parts(OP)?;
+        let rank = re.dims().len() as i64;
+        // Upstream's range for `unsqueeze` is [-rank-1, rank], one wider than
+        // for the other shape ops because the new axis may go after the last.
+        let normalised = if dim < 0 { dim + rank + 1 } else { dim };
+        if normalised < 0 || normalised > rank {
+            return Err(pyo3::exceptions::PyIndexError::new_err(format!(
+                "Dimension out of range (expected to be in range of [{}, {}],                  but got {dim})",
+                -rank - 1,
+                rank
+            )));
+        }
+        let at = normalised as usize;
+        let real = re.unsqueeze(at).map_err(|e| candle_err(OP, e))?;
+        let imag = im.unsqueeze(at).map_err(|e| candle_err(OP, e))?;
+        wrap(py, PyTensorBase::complex(real, imag)?)
+    }
+
+    fn wrap(py: Python<'_>, t: PyTensorBase) -> PyResult<Py<PyAny>> {
+        Ok(t.into_pyobject(py)?.into_any().unbind())
+    }
+
+    /// Wrap a real result. `PyTensorBase::new` derives the tag from what
+    /// candle is storing, so `tag` is not passed through -- it is *checked*
+    /// against what came back, which is the only way this can catch a caller
+    /// that computed `view_as_real` of a `complex64` and got `float64` halves.
+    fn finish_real(py: Python<'_>, t: Tensor, tag: TorchDType) -> PyResult<Py<PyAny>> {
+        let wrapped = PyTensorBase::new(t)?;
+        if wrapped.tag != tag {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "torch._C shim internal error -- a complex op produced a \
+                 torch.{} result where its tag says torch.{} \
+                 (tensor.rs::complex_ops)",
+                wrapped.tag.name(),
+                tag.name()
+            )));
+        }
+        Ok(wrapped.into_pyobject(py)?.into_any().unbind())
+    }
+}
+
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyTensorBase>()?;
     m.add_function(wrap_pyfunction!(set_tensor_class, m)?)?;
@@ -3229,6 +3821,7 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(has_storage, m)?)?;
     m.add_function(wrap_pyfunction!(set_grad_enabled_flag, m)?)?;
     m.add_function(wrap_pyfunction!(grad_enabled_flag, m)?)?;
+    m.add_function(wrap_pyfunction!(complex_ops::complex_ops_list, m)?)?;
     Ok(())
 }
 

@@ -10853,7 +10853,20 @@ def test_schema_text_survives_the_round_trip_through_the_transcribed_tables():
     # 310 on the merged tree. Same reason as `tag_core_count` above: four
     # rounds added schema identities in parallel and no branch could see the
     # others' totals, so this is measured here rather than summed from reports.
-    assert len(keys) == 322, len(keys)
+    # 327 with docs/COMPLEX2.md's five. **+5, not +10**, and which table each
+    # came from is the check: all five are `overloads.json`-only, because
+    # upstream has no `Tensor.view_as_complex`/`Tensor.polar` bound method at
+    # all, and `Tensor.real`/`Tensor.imag` are *properties* rather than
+    # methods -- so none of the five is a second spelling of anything in
+    # `methods.json`:
+    #
+    #     view_as_complex.default, view_as_real.default, polar.default,
+    #     real.default, imag.default                                   -- 5
+    #
+    # `polar`'s five TorchScript numeric overloads (`polar.int`,
+    # `polar.float`, ...) are deliberately not in the table -- see
+    # `overloads.json`'s own note -- so `polar` adds one identity, not six.
+    assert len(keys) == 327, len(keys)
     from_tables = sorted(
         k for k in keys
         if report["table"][f"{k[0]}|{k[1]}"]["from"] == "tables"

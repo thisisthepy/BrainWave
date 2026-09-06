@@ -161,7 +161,15 @@ for name, fn in PROBES.items():
     except Exception as e:
         out[name] = {"raised": type(e).__name__, "msg": str(e)}
     else:
-        out[name] = {"ok": repr(r)[:200]}
+        # NOT `repr(r)`. Once `view_as_complex` started returning a tensor
+        # (docs/COMPLEX2.md), `repr` of it reached `torch/_tensor_str.py`,
+        # which calls `self.resolve_conj()` for every complex tensor -- and
+        # that is not implemented, so formatting the *success* of one probe
+        # crashed the whole script and reported every other probe as a
+        # failure to run. A probe that cannot survive its own subject
+        # succeeding is not a probe. Recorded as a live gap in
+        # docs/COMPLEX2.md §7: `print(z)` on a complex tensor still refuses.
+        out[name] = {"ok": f"{type(r).__name__}{tuple(getattr(r, 'shape', ()))}"}
 json.dump(out, sys.stdout)
 """
 
@@ -198,6 +206,27 @@ def _probe():
     )
     _probe_cache["r"] = data
     return data
+
+
+def _eval_in_vendored_tree(body):
+    """Run `body` in a subprocess with the vendored shim on PYTHONPATH and
+    return its `OUT` dict. The marker check is the same one `_probe` makes and
+    for the same reason: without it the assertions could be about upstream."""
+    script = (
+        body
+        + "\nimport json, sys\n"
+        "assert hasattr(torch._C, '_aten_implemented'), 'not the shim'\n"
+        "json.dump(OUT, sys.stdout)\n"
+    )
+    env = dict(os.environ)
+    env["PYTHONPATH"] = _VENDOR_DIR
+    env["TORCH_USE_RTLD_GLOBAL"] = "1"
+    proc = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True, text=True, env=env, cwd=_REPO_ROOT,
+    )
+    assert proc.returncode == 0, proc.stderr[-2000:]
+    return json.loads(proc.stdout)
 
 
 def _raised(name):
@@ -301,23 +330,89 @@ def test_constructing_a_complex_tensor_refuses_by_name():
 # --------------------------------------------------------------------------
 
 
-def test_view_as_complex_and_polar_are_not_implemented():
-    """`llama4` and `llama4_text`'s walls, in `docs/ARCH100.md`'s tail.
+def test_view_as_complex_and_polar_compute_against_the_recorded_spec():
+    """`llama4` and `llama4_text`'s walls, **now closed** (docs/COMPLEX2.md).
 
-    `llama4` is the one blocked at *construction*
-    (`Llama4VisionRotaryEmbedding.__init__` builds a complex buffer), which is
-    why it cannot be tested at all until this moves.
+    This test asserted the *absence* of these three operators, exactly as this
+    module's docstring says such tests should: a work item that goes red when
+    the work is done. It went red. What replaces it is the inversion that
+    docstring asks for -- the same probes, compared against
+    `_VIEW_AS_COMPLEX_SPEC`, which was transcribed from upstream 2.13.0 in a
+    separate process *before* any of this existed.
+
+    Deliberately checked against the recorded spec rather than against a live
+    upstream run: `pytests/test_complex.py` does the live element-wise
+    comparison, and having one of the two be a transcription made before the
+    implementation is what makes them independent. If the implementation and a
+    live oracle ever agreed on something both got wrong, this is the copy that
+    would not move.
     """
-    for label in ("view_as_complex", "view_as_real", "polar"):
-        r = _raised(label)
-        if r == "skip":
-            return
-        assert r is not None, (
-            f"torch.{label} computed something. If a complex representation "
-            f"landed, this file's specs are the oracle to check it against."
+    p = _probe()
+    if p is None:
+        return
+    s = _VIEW_AS_COMPLEX_SPEC
+    for label in ("view_as_complex", "polar"):
+        r = p[label]
+        assert "ok" in r, (
+            f"torch.{label} refused after docs/COMPLEX2.md landed it: {r}"
         )
-        exc, msg = r
-        assert exc == "NotImplementedError", f"{label}: {exc}: {msg}"
+    # `view_as_real` is the third op and its probe passes a *real* tensor, so
+    # it still raises -- and must, with upstream's own sentence. That is a
+    # different assertion from the two above, not a weaker one: it is the
+    # refusal transcribed in `_UPSTREAM_REFUSALS`.
+    assert p["view_as_real"].get("raised") == "RuntimeError", p["view_as_real"]
+    assert p["view_as_real"]["msg"] == _UPSTREAM_REFUSALS["view_as_real_on_real"]
+
+    # The values, not merely the absence of an exception. `_probe`'s script
+    # only reports a repr, so the numbers come from a second subprocess that
+    # evaluates the spec's own fixture.
+    got = _eval_in_vendored_tree(
+        "import torch\n"
+        "z = torch.view_as_complex(torch.tensor([[1.,2.],[3.,4.],[5.,6.]]))\n"
+        "OUT = {'shape': list(z.shape), 'dtype': str(z.dtype),\n"
+        "       'element_size': z.element_size(),\n"
+        "       'real': torch.real(z).tolist(),\n"
+        "       'imag': torch.imag(z).tolist(),\n"
+        "       'roundtrip': torch.view_as_real(z).tolist()}\n"
+    )
+    assert got["shape"] == list(s["shape"]), got["shape"]
+    assert got["dtype"] == s["dtype"], got["dtype"]
+    assert got["element_size"] == s["element_size"], got["element_size"]
+    assert got["real"] == s["real"], got["real"]
+    # **The one that matters.** A representation that dropped the imaginary
+    # part would satisfy every line above and fail only here.
+    assert got["imag"] == s["imag"], (
+        f"the imaginary part is {got['imag']}, upstream's is {s['imag']}. "
+        f"Losing it is the failure that still returns plausible numbers."
+    )
+    assert got["roundtrip"] == s["view_as_real_roundtrip"], got["roundtrip"]
+
+
+def test_view_as_complex_copies_rather_than_aliasing():
+    """The narrowing `_VIEW_AS_COMPLEX_SPEC["aliases_its_base"]` recorded.
+
+    Upstream's `view_as_complex` is a view; `Repr::Complex` is a pair of real
+    tensors and cannot alias an interleaved base. The spec above says upstream
+    aliases; this asserts the shim does not, so the divergence is pinned in the
+    file that recorded it rather than only in `test_complex.py`.
+    """
+    p = _probe()
+    if p is None:
+        return
+    assert _VIEW_AS_COMPLEX_SPEC["aliases_its_base"] is True
+    got = _eval_in_vendored_tree(
+        "import torch\n"
+        "b = torch.tensor([[1., 2.]])\n"
+        "v = torch.view_as_complex(b)\n"
+        "b[0, 0] = 99.\n"
+        "OUT = {'through': torch.view_as_real(v).tolist()[0][0]}\n"
+    )
+    assert got["through"] == 1.0, (
+        f"the shim's view_as_complex now aliases its base (saw "
+        f"{got['through']}). That matches upstream and is an improvement, but "
+        f"docs/COMPLEX2.md records the copy as a narrowing -- remove it there "
+        f"first."
+    )
 
 
 def test_fft_and_stft_are_not_implemented():
@@ -463,26 +558,44 @@ def test_the_recorded_upstream_spec_is_self_consistent():
     assert r["checksum_abs_sum"] >= abs(r["checksum_sum"])
 
 
-def test_complex_is_absent_from_the_implemented_op_list():
-    """Nothing named complex has quietly appeared in `_aten_implemented()`.
+def test_only_the_expected_complex_ops_landed():
+    """The cheap sweep, re-pointed rather than deleted.
 
-    The op list is the tree's own answer to "what computes here", and
-    `docs/ARCH100.md`'s tail was derived from it. This is the cheap sweep that
-    would catch a complex op landing without this file being revisited.
+    It asserted that nothing named complex had appeared in the op list. Five
+    such ops now exist -- but in `_aten_implemented_awaiting_golden()`, not in
+    `_aten_implemented()`, because golden compares by reading both sides as
+    real tensors and a complex tensor has nothing to read (aten.rs's note on
+    that list). So the sweep still holds for the advertised list, and the
+    parked list is pinned to exactly the five.
+
+    `fft_` and `_vmap_` are unchanged: neither landed, and if either appears
+    this file is the thing that has to be revisited.
     """
     implemented = set(_C._aten_implemented())
+    parked = set(_C._aten_implemented_awaiting_golden())
+
     leaked = sorted(
-        op
-        for op in implemented
-        if any(
-            k in op
-            for k in ("view_as_complex", "view_as_real", "polar", "fft_", "_vmap_")
-        )
+        op for op in implemented
+        if any(k in op for k in ("view_as_complex", "view_as_real", "polar",
+                                 "fft_", "_vmap_"))
     )
     assert not leaked, (
-        f"these landed without this file being updated: {leaked}. Each needs "
-        f"an element-wise comparison against upstream, not just a table entry."
+        f"these are advertised to golden but golden has no way to compare a "
+        f"complex result: {leaked}"
     )
+    assert sorted(op for op in parked if any(
+        k in op for k in ("view_as_complex", "view_as_real", "polar", "real",
+                          "imag"))) == [
+        "aten.imag.default",
+        "aten.polar.default",
+        "aten.real.default",
+        "aten.view_as_complex.default",
+        "aten.view_as_real.default",
+    ]
+    # Still nothing: docs/COMPLEX.md §3.3 step 5 (`fft_fftn`, for `fnet`) and
+    # §7 (vmap) are separate decisions and neither was taken.
+    assert not [op for op in implemented | parked
+                if "fft_" in op or "_vmap_" in op]
 
 
 def _main():
