@@ -1,96 +1,99 @@
 {
- "_README": [
-  "Allowlist for tools/golden/reach.py. Every entry is a connection that is",
-  "*absent on purpose*; docs/REACH.md is the inventory and the argument.",
-  "",
-  "Matched exactly, in both directions. An unlisted gap fails the suite, and an",
-  "entry whose gap has since closed fails it too -- so closing a gap deletes its",
-  "entry in the same change and this file always describes the present.",
-  "",
-  "`reason` is prose for the reader. `upstream_absent` / `upstream_present` are",
-  "for the checker: attribute paths on real upstream torch that the reason is",
-  "staking itself on, verified by `reach.py --verify-upstream` (a subprocess",
-  "with PYTHONPATH stripped). A reason nobody can put a question to is how",
-  "docs/SPELLINGS.md's deliberate gaps would otherwise become indistinguishable",
-  "from forgotten ones."
- ],
- "shape1_no_dispatch_arm": {},
- "shape1_dead_overload_keys_ceiling": 110,
- "shape2_kernel_without_spelling": {
-  "aten.alias.default": {
-   "reason": "Upstream exposes no `torch.alias` and no `Tensor.alias` -- `aten::alias` is a dispatcher-internal view op that upstream's own Python surface never names. Inventing a spelling for it would be exactly what docs/SPELLINGS.md refuses (a door upstream does not have). The kernel is reached, and needs to be, through `_aten_dispatch` from traced/exported graphs and through the vendored `__getitem__`'s view path.",
-   "upstream_absent": [
-    "torch.alias",
-    "torch.Tensor.alias"
-   ]
+  "_README": [
+    "Allowlist for tools/golden/reach.py. Every entry is a connection that is",
+    "*absent on purpose*; docs/REACH.md is the inventory and the argument.",
+    "",
+    "Matched exactly, in both directions. An unlisted gap fails the suite, and an",
+    "entry whose gap has since closed fails it too -- so closing a gap deletes its",
+    "entry in the same change and this file always describes the present.",
+    "",
+    "`reason` is prose for the reader. `upstream_absent` / `upstream_present` are",
+    "for the checker: attribute paths on real upstream torch that the reason is",
+    "staking itself on, verified by `reach.py --verify-upstream` (a subprocess",
+    "with PYTHONPATH stripped). A reason nobody can put a question to is how",
+    "docs/SPELLINGS.md's deliberate gaps would otherwise become indistinguishable",
+    "from forgotten ones."
+  ],
+  "shape1_no_dispatch_arm": {},
+  "shape1_dead_overload_keys_ceiling": 110,
+  "shape2_kernel_without_spelling": {
+    "aten.alias.default": {
+      "reason": "Upstream exposes no `torch.alias` and no `Tensor.alias` -- `aten::alias` is a dispatcher-internal view op that upstream's own Python surface never names. Inventing a spelling for it would be exactly what docs/SPELLINGS.md refuses (a door upstream does not have). The kernel is reached, and needs to be, through `_aten_dispatch` from traced/exported graphs and through the vendored `__getitem__`'s view path.",
+      "upstream_absent": [
+        "torch.alias",
+        "torch.Tensor.alias"
+      ]
+    },
+    "aten.glu.default": {
+      "reason": "OWED, not deliberate. The kernel landed in fc202e3 and is golden-compared; the binding `F.glu` calls -- `torch._C._nn.glu`, an `_install_nn` composite -- could not be written in the same round because `bootstrap.py` belonged to a concurrent agent. docs/GLU.md §1.1 carries the exact three lines. This entry exists so the gap is recorded rather than silently allowed, and because the allowlist matches in both directions it will FAIL the moment the binding lands -- which is how it gets deleted. glu blocks seven ASR encoders."
+    }
+  },
+  "shape3_unexercised_spelling": {
+    "__add__": {
+      "reason": "operator spelling. Tests exercise it as syntax (`a + b`, `a @ b`, `~a`), which this check reads as text and cannot attribute back to the dunder. A grep for `.__add__(` would be a lie in the other direction."
+    },
+    "__and__": {
+      "reason": "operator spelling. Tests exercise it as syntax (`a + b`, `a @ b`, `~a`), which this check reads as text and cannot attribute back to the dunder. A grep for `.__add__(` would be a lie in the other direction."
+    },
+    "__eq__": {
+      "reason": "operator spelling. Tests exercise it as syntax (`a + b`, `a @ b`, `~a`), which this check reads as text and cannot attribute back to the dunder. A grep for `.__add__(` would be a lie in the other direction."
+    },
+    "__gt__": {
+      "reason": "operator spelling. Tests exercise it as syntax (`a + b`, `a @ b`, `~a`), which this check reads as text and cannot attribute back to the dunder. A grep for `.__add__(` would be a lie in the other direction."
+    },
+    "__imul__": {
+      "reason": "operator spelling. Tests exercise it as syntax (`a + b`, `a @ b`, `~a`), which this check reads as text and cannot attribute back to the dunder. A grep for `.__add__(` would be a lie in the other direction."
+    },
+    "__invert__": {
+      "reason": "operator spelling. Tests exercise it as syntax (`a + b`, `a @ b`, `~a`), which this check reads as text and cannot attribute back to the dunder. A grep for `.__add__(` would be a lie in the other direction."
+    },
+    "__isub__": {
+      "reason": "operator spelling. Tests exercise it as syntax (`a + b`, `a @ b`, `~a`), which this check reads as text and cannot attribute back to the dunder. A grep for `.__add__(` would be a lie in the other direction."
+    },
+    "__le__": {
+      "reason": "operator spelling. Tests exercise it as syntax (`a + b`, `a @ b`, `~a`), which this check reads as text and cannot attribute back to the dunder. A grep for `.__add__(` would be a lie in the other direction."
+    },
+    "__lt__": {
+      "reason": "operator spelling. Tests exercise it as syntax (`a + b`, `a @ b`, `~a`), which this check reads as text and cannot attribute back to the dunder. A grep for `.__add__(` would be a lie in the other direction."
+    },
+    "__matmul__": {
+      "reason": "operator spelling. Tests exercise it as syntax (`a + b`, `a @ b`, `~a`), which this check reads as text and cannot attribute back to the dunder. A grep for `.__add__(` would be a lie in the other direction."
+    },
+    "__mod__": {
+      "reason": "operator spelling. Tests exercise it as syntax (`a + b`, `a @ b`, `~a`), which this check reads as text and cannot attribute back to the dunder. A grep for `.__add__(` would be a lie in the other direction."
+    },
+    "__mul__": {
+      "reason": "operator spelling. Tests exercise it as syntax (`a + b`, `a @ b`, `~a`), which this check reads as text and cannot attribute back to the dunder. A grep for `.__add__(` would be a lie in the other direction."
+    },
+    "__ne__": {
+      "reason": "operator spelling. Tests exercise it as syntax (`a + b`, `a @ b`, `~a`), which this check reads as text and cannot attribute back to the dunder. A grep for `.__add__(` would be a lie in the other direction."
+    },
+    "__neg__": {
+      "reason": "operator spelling. Tests exercise it as syntax (`a + b`, `a @ b`, `~a`), which this check reads as text and cannot attribute back to the dunder. A grep for `.__add__(` would be a lie in the other direction."
+    },
+    "__or__": {
+      "reason": "operator spelling. Tests exercise it as syntax (`a + b`, `a @ b`, `~a`), which this check reads as text and cannot attribute back to the dunder. A grep for `.__add__(` would be a lie in the other direction."
+    },
+    "__radd__": {
+      "reason": "operator spelling. Tests exercise it as syntax (`a + b`, `a @ b`, `~a`), which this check reads as text and cannot attribute back to the dunder. A grep for `.__add__(` would be a lie in the other direction."
+    },
+    "__rmul__": {
+      "reason": "operator spelling. Tests exercise it as syntax (`a + b`, `a @ b`, `~a`), which this check reads as text and cannot attribute back to the dunder. A grep for `.__add__(` would be a lie in the other direction."
+    },
+    "__rsub__": {
+      "reason": "operator spelling. Tests exercise it as syntax (`a + b`, `a @ b`, `~a`), which this check reads as text and cannot attribute back to the dunder. A grep for `.__add__(` would be a lie in the other direction."
+    },
+    "__sub__": {
+      "reason": "operator spelling. Tests exercise it as syntax (`a + b`, `a @ b`, `~a`), which this check reads as text and cannot attribute back to the dunder. A grep for `.__add__(` would be a lie in the other direction."
+    },
+    "__truediv__": {
+      "reason": "operator spelling. Tests exercise it as syntax (`a + b`, `a @ b`, `~a`), which this check reads as text and cannot attribute back to the dunder. A grep for `.__add__(` would be a lie in the other direction."
+    },
+    "_grouped_mm": {
+      "reason": "backlog: the kernel is golden-compared by dispatch key, but no test spells the name. docs/REACH.md §3."
+    },
+    "multinomial": {
+      "reason": "backlog: the kernel is golden-compared by dispatch key, but no test spells the name. Deliberately not attempted in this round: `multinomial` is a random sample, and a test asserting a value against upstream on a random op is exactly the shallow-coverage failure mode this file warns against (a fixed seed narrows the risk but does not remove it, since the shim and upstream draw from different RNG implementations even with the same seed). docs/REACH.md §3."
+    }
   }
- },
- "shape3_unexercised_spelling": {
-  "__add__": {
-   "reason": "operator spelling. Tests exercise it as syntax (`a + b`, `a @ b`, `~a`), which this check reads as text and cannot attribute back to the dunder. A grep for `.__add__(` would be a lie in the other direction."
-  },
-  "__and__": {
-   "reason": "operator spelling. Tests exercise it as syntax (`a + b`, `a @ b`, `~a`), which this check reads as text and cannot attribute back to the dunder. A grep for `.__add__(` would be a lie in the other direction."
-  },
-  "__eq__": {
-   "reason": "operator spelling. Tests exercise it as syntax (`a + b`, `a @ b`, `~a`), which this check reads as text and cannot attribute back to the dunder. A grep for `.__add__(` would be a lie in the other direction."
-  },
-  "__gt__": {
-   "reason": "operator spelling. Tests exercise it as syntax (`a + b`, `a @ b`, `~a`), which this check reads as text and cannot attribute back to the dunder. A grep for `.__add__(` would be a lie in the other direction."
-  },
-  "__imul__": {
-   "reason": "operator spelling. Tests exercise it as syntax (`a + b`, `a @ b`, `~a`), which this check reads as text and cannot attribute back to the dunder. A grep for `.__add__(` would be a lie in the other direction."
-  },
-  "__invert__": {
-   "reason": "operator spelling. Tests exercise it as syntax (`a + b`, `a @ b`, `~a`), which this check reads as text and cannot attribute back to the dunder. A grep for `.__add__(` would be a lie in the other direction."
-  },
-  "__isub__": {
-   "reason": "operator spelling. Tests exercise it as syntax (`a + b`, `a @ b`, `~a`), which this check reads as text and cannot attribute back to the dunder. A grep for `.__add__(` would be a lie in the other direction."
-  },
-  "__le__": {
-   "reason": "operator spelling. Tests exercise it as syntax (`a + b`, `a @ b`, `~a`), which this check reads as text and cannot attribute back to the dunder. A grep for `.__add__(` would be a lie in the other direction."
-  },
-  "__lt__": {
-   "reason": "operator spelling. Tests exercise it as syntax (`a + b`, `a @ b`, `~a`), which this check reads as text and cannot attribute back to the dunder. A grep for `.__add__(` would be a lie in the other direction."
-  },
-  "__matmul__": {
-   "reason": "operator spelling. Tests exercise it as syntax (`a + b`, `a @ b`, `~a`), which this check reads as text and cannot attribute back to the dunder. A grep for `.__add__(` would be a lie in the other direction."
-  },
-  "__mod__": {
-   "reason": "operator spelling. Tests exercise it as syntax (`a + b`, `a @ b`, `~a`), which this check reads as text and cannot attribute back to the dunder. A grep for `.__add__(` would be a lie in the other direction."
-  },
-  "__mul__": {
-   "reason": "operator spelling. Tests exercise it as syntax (`a + b`, `a @ b`, `~a`), which this check reads as text and cannot attribute back to the dunder. A grep for `.__add__(` would be a lie in the other direction."
-  },
-  "__ne__": {
-   "reason": "operator spelling. Tests exercise it as syntax (`a + b`, `a @ b`, `~a`), which this check reads as text and cannot attribute back to the dunder. A grep for `.__add__(` would be a lie in the other direction."
-  },
-  "__neg__": {
-   "reason": "operator spelling. Tests exercise it as syntax (`a + b`, `a @ b`, `~a`), which this check reads as text and cannot attribute back to the dunder. A grep for `.__add__(` would be a lie in the other direction."
-  },
-  "__or__": {
-   "reason": "operator spelling. Tests exercise it as syntax (`a + b`, `a @ b`, `~a`), which this check reads as text and cannot attribute back to the dunder. A grep for `.__add__(` would be a lie in the other direction."
-  },
-  "__radd__": {
-   "reason": "operator spelling. Tests exercise it as syntax (`a + b`, `a @ b`, `~a`), which this check reads as text and cannot attribute back to the dunder. A grep for `.__add__(` would be a lie in the other direction."
-  },
-  "__rmul__": {
-   "reason": "operator spelling. Tests exercise it as syntax (`a + b`, `a @ b`, `~a`), which this check reads as text and cannot attribute back to the dunder. A grep for `.__add__(` would be a lie in the other direction."
-  },
-  "__rsub__": {
-   "reason": "operator spelling. Tests exercise it as syntax (`a + b`, `a @ b`, `~a`), which this check reads as text and cannot attribute back to the dunder. A grep for `.__add__(` would be a lie in the other direction."
-  },
-  "__sub__": {
-   "reason": "operator spelling. Tests exercise it as syntax (`a + b`, `a @ b`, `~a`), which this check reads as text and cannot attribute back to the dunder. A grep for `.__add__(` would be a lie in the other direction."
-  },
-  "__truediv__": {
-   "reason": "operator spelling. Tests exercise it as syntax (`a + b`, `a @ b`, `~a`), which this check reads as text and cannot attribute back to the dunder. A grep for `.__add__(` would be a lie in the other direction."
-  },
-  "_grouped_mm": {
-   "reason": "backlog: the kernel is golden-compared by dispatch key, but no test spells the name. docs/REACH.md \u00a73."
-  },
-  "multinomial": {
-   "reason": "backlog: the kernel is golden-compared by dispatch key, but no test spells the name. Deliberately not attempted in this round: `multinomial` is a random sample, and a test asserting a value against upstream on a random op is exactly the shallow-coverage failure mode this file warns against (a fixed seed narrows the risk but does not remove it, since the shim and upstream draw from different RNG implementations even with the same seed). docs/REACH.md \u00a73."
-  }
- }
 }
