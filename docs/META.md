@@ -675,7 +675,7 @@ DEVICE_ABS §6 이 혼합 장치 게이트에 디스패치당 **+21 ns (+6%)** �
 | **`TensorBase` 멤버 부재** | 8 | 장치와 무관. `.stride()`·`.data_ptr()`·`.untyped_storage()`·`.numpy()`·`.add_`·`.new_empty`·`torch.save` |
 | **게이트 메시지 문면** (§5.1) | 7 | 의도한 발산. 문이 하나면 메시지도 하나 |
 | **autograd 부재** | 2 | 기존. `requires_grad=True` 를 이 셰임이 거부합니다 |
-| **그 외** | 3 | `torch.Size` 대신 튜플(기존, `TORCH_C.md` 기록), `__enter__` 의 `repr` 이 `torch._C.device` 로 찍힘, `state_dict` 의 shape 이 튜플 |
+| **그 외** | 3 | ~~`torch.Size` 대신 튜플~~ — **해소됨, docs/SCALAR2.md §5.** `shape` 과 `size()` 가 이제 `torch.Size` 를 돌려주고 `state_dict` 의 shape 도 함께 따라옵니다. 당시 근거로 적힌 `TORCH_C.md` 에는 이 기록이 실제로 없었습니다(SCALAR2.md §5.3). 남은 둘: `__enter__` 의 `repr` 이 `torch._C.device` 로 찍힘 |
 
 **meta 를 구현해서 새로 생긴 발산은 게이트 메시지 7 개뿐입니다.** 나머지 59 개는 meta 이전에도
 같은 이유로 실패하던 것들이고, 19 개는 §7 이 의도적으로 남긴 경계입니다.

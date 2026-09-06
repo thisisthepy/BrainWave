@@ -1084,6 +1084,18 @@ pub fn set_tensor_class(cls: Py<PyAny>) {
     let _ = TENSOR_CLASS.set(cls);
 }
 
+/// `torch.Size`, registered the same way and for the same reason as
+/// `TENSOR_CLASS` above: `_C` cannot build the class (it is a Python `tuple`
+/// subclass declared in `bootstrap.py`) and must not import `torch` to find it,
+/// because the golden loader runs `_C` with no `torch` package present.
+static SIZE_CLASS: std::sync::OnceLock<Py<PyAny>> = std::sync::OnceLock::new();
+
+#[pyfunction]
+#[pyo3(name = "_set_size_class")]
+pub fn set_size_class(cls: Py<PyAny>) {
+    let _ = SIZE_CLASS.set(cls);
+}
+
 /// Wrap a bare `TensorBase` in the registered Python tensor class.
 ///
 /// Idempotent and narrow on purpose: anything that is already an instance of a
@@ -1257,12 +1269,29 @@ impl PyTensorBase {
         Self::new(inner)
     }
 
-    /// torch returns `torch.Size`, itself a C-defined tuple subclass. The shim
-    /// does not own that type yet, so this is a plain tuple -- structurally
-    /// compatible, and the difference is recorded in docs/TORCH_C.md.
+    /// torch returns `torch.Size`, itself a tuple subclass, and so does this --
+    /// but only when a `torch` package is around to have defined it.
+    ///
+    /// `bootstrap.py` builds `Size` and hands it back through
+    /// `_set_size_class`, the same registration shape `_set_tensor_class` uses
+    /// and for the same reason: `tools/golden/loader.py` imports `_C`
+    /// standalone with no `torch` package, nothing registers, and `shape` stays
+    /// the plain tuple it has always been there. Every case in that harness
+    /// compares shapes as sequences, so the two spellings are the same input to
+    /// it -- which is why this is safe to make conditional rather than a hard
+    /// dependency on a class `_C` cannot build for itself.
+    ///
+    /// `size()` with no `dim` goes through here, so it gets the same type,
+    /// which is what upstream does. `stride()` deliberately does not: upstream
+    /// returns a **plain tuple** from `stride()`, measured, and wrapping it
+    /// would be a new divergence rather than the removal of one.
     #[getter]
-    fn shape<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
-        PyTuple::new(py, self.dims())
+    fn shape<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let dims = PyTuple::new(py, self.dims())?;
+        match SIZE_CLASS.get() {
+            Some(cls) => cls.bind(py).call1((dims,)),
+            None => Ok(dims.into_any()),
+        }
     }
 
     /// Returns *the* module-level `torch.float32` rather than an equal copy.
@@ -1875,7 +1904,7 @@ impl PyTensorBase {
     #[pyo3(signature = (dim = None))]
     fn size<'py>(&self, py: Python<'py>, dim: Option<isize>) -> PyResult<Bound<'py, PyAny>> {
         match dim {
-            None => Ok(self.shape(py)?.into_any()),
+            None => self.shape(py),
             Some(dim) => {
                 let rank = self.dims().len() as isize;
                 let index = if dim < 0 { dim + rank } else { dim };
@@ -3075,6 +3104,7 @@ pub fn mark_from_op(
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyTensorBase>()?;
     m.add_function(wrap_pyfunction!(set_tensor_class, m)?)?;
+    m.add_function(wrap_pyfunction!(set_size_class, m)?)?;
     m.add_function(wrap_pyfunction!(has_storage, m)?)?;
     m.add_function(wrap_pyfunction!(set_grad_enabled_flag, m)?)?;
     m.add_function(wrap_pyfunction!(grad_enabled_flag, m)?)?;

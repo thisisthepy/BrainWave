@@ -20467,6 +20467,14 @@ CASES = {
     "aten.constant_pad_nd.default": lambda: torch.ops.aten.constant_pad_nd.default(x, [1, 1], 0.0),
     "aten.where.self": lambda: torch.ops.aten.where.self(torch.ops.aten.gt.Scalar(x, 0.0), x, w),
     "aten.masked_fill.Scalar": lambda: torch.ops.aten.masked_fill.Scalar(x, torch.ops.aten.gt.Scalar(x, 0.0), 0.0),
+    # docs/SCALAR2.md §4. Two rows of the scalar family whose trailing digit is
+    # not 0 upstream, both reached by a Python operator (`2 - x`, `2 ** x`) and
+    # both previously named by the naive rule. They are here rather than only in
+    # the table because the table and the rule fail identically from a caller's
+    # point of view, and because these two dispatch the *same* aten key on both
+    # sides -- so a disagreement here is a naming defect and nothing else.
+    "aten.rsub.Scalar": lambda: torch.ops.aten.rsub.Scalar(x, 2.0),
+    "aten.pow.Scalar": lambda: torch.ops.aten.pow.Scalar(2.0, x),
     # The two that must answer `None` on both sides: one asks for a leaf, one
     # only reads a shape. Without them the table below would pass on a
     # `grad_fn` that is simply never `None`.
@@ -20691,6 +20699,112 @@ def test_grad_fn_names_and_the_grad_mode_gate_agree_with_upstream():
     )
 
 
+
+
+_SIZE_SCRIPT = r"""
+import json, pickle, sys
+import torch
+
+out = {"who": "shim" if hasattr(torch._C, "_aten_implemented") else "upstream"}
+t = torch.zeros(2, 3)
+shape = t.shape
+size = t.size()
+S = torch.Size((2, 3, 4))
+
+out["shape_is_size"] = isinstance(shape, torch.Size)
+out["size_is_size"] = isinstance(size, torch.Size)
+out["shape_is_tuple"] = isinstance(shape, tuple)
+out["shape_repr"] = repr(shape)
+out["shape_eq_tuple"] = shape == (2, 3)
+out["shape_unpack"] = list(shape)
+out["shape_numel"] = shape.numel()
+out["empty_repr"] = repr(torch.Size([]))
+out["empty_numel"] = torch.Size([]).numel()
+out["cls_repr"] = repr(torch.Size)
+
+# The type is closed under these four upstream. A plain `tuple` subclass is not,
+# so each one is a separate claim.
+out["slice"] = [repr(S[1:]), type(S[1:]).__name__]
+out["add"] = [repr(S + (5,)), type(S + (5,)).__name__]
+out["radd"] = [repr((5,) + S), type((5,) + S).__name__]
+out["mul"] = [repr(S * 2), type(S * 2).__name__]
+
+# `stride()` is a plain tuple upstream and must stay one -- wrapping it would be
+# a new divergence, not the removal of one.
+out["stride_type"] = type(t.stride()).__name__
+
+roundtrip = pickle.loads(pickle.dumps(shape))
+out["pickle"] = [repr(roundtrip), type(roundtrip).__name__]
+
+json.dump(out, sys.stdout)
+"""
+
+
+def _size_fixture(env_overrides):
+    env = dict(os.environ)
+    for key, value in env_overrides.items():
+        if value is None:
+            env.pop(key, None)
+        else:
+            env[key] = value
+    proc = subprocess.run(
+        [sys.executable, "-c", _SIZE_SCRIPT],
+        capture_output=True, text=True, env=env, timeout=180,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"size subprocess exited {proc.returncode}\n"
+            f"--- stdout ---\n{proc.stdout}\n--- stderr ---\n{proc.stderr}"
+        )
+    return json.loads(proc.stdout)
+
+
+def test_shape_and_size_answer_with_torch_size_and_it_behaves_like_upstreams():
+    """docs/SCALAR2.md §5. `Tensor.shape` was a plain tuple; upstream's is `torch.Size`.
+
+    The whole surface is compared field for field against upstream rather than
+    against transcribed literals, because every one of these was a measurement
+    and two of them were surprises: `repr` is `torch.Size([2, 3])` (square
+    brackets inside the call, and thirty-odd `transformers` docstrings print
+    exactly that string), and the type is **closed** under slicing, `+`,
+    reflected `+` and `*` -- none of which a `tuple` subclass gets for free.
+
+    `stride_type` is the control in the other direction. Upstream's `stride()`
+    returns a *plain* tuple, so a change that wrapped every dimension list in
+    `Size` would be a new divergence rather than the removal of one, and this
+    row fails if that happens.
+
+    `shape_is_tuple` and `shape_eq_tuple` are the compatibility controls: the
+    reason this was safe to change at all is that `Size` **is** a tuple and
+    compares equal to one, so no caller reading `x.shape` as a sequence can
+    tell. If those two ever stop holding, the change has grown teeth it was
+    argued not to have.
+
+    Emptying `SIZE_CLASS` in `tensor.rs` (or dropping the `_set_size_class`
+    call in `bootstrap.py`) fails this test and nothing else -- which is the
+    point: a new public path that nothing breaks on is a path nobody uses.
+    """
+    if not os.path.isfile(_CKPT_VENDOR_SHIM):
+        return  # vendor tree not installed -- see vendor/install_shim.sh
+    shim = _size_fixture({"PYTHONPATH": _CKPT_VENDOR_DIR, "TORCH_USE_RTLD_GLOBAL": "1"})
+    assert shim["who"] == "shim", shim["who"]
+
+    # Stated outright as well as compared, so the test still says what it wants
+    # when no upstream torch is importable in this interpreter.
+    assert shim["shape_is_size"] is True
+    assert shim["size_is_size"] is True
+    assert shim["shape_is_tuple"] is True
+    assert shim["shape_eq_tuple"] is True
+    assert shim["shape_repr"] == "torch.Size([2, 3])", shim["shape_repr"]
+    assert shim["stride_type"] == "tuple", shim["stride_type"]
+
+    if _upstream_torch is None:
+        return  # no upstream torch in this interpreter -- see docs/E2E.md
+    up = _size_fixture({"PYTHONPATH": None, "TORCH_USE_RTLD_GLOBAL": None})
+    assert up["who"] == "upstream", up["who"]
+
+    disagree = {k: (shim.get(k), v) for k, v in up.items() if k != "who" and shim.get(k) != v}
+    assert not disagree, f"torch.Size surface disagrees with upstream: {disagree}"
 
 
 # --- `float8_e4m3fn` refuses exactly what upstream refuses (docs/FLOAT8B.md) --
