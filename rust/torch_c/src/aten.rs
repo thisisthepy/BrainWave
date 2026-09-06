@@ -128,6 +128,7 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.ge.Scalar",
     "aten.ge.Tensor",
     "aten.gelu.default",
+    "aten.glu.default",
     "aten.gt.Scalar",
     "aten.gt.Tensor",
     "aten.histc.default",
@@ -1976,6 +1977,7 @@ fn aten_dispatch_inner(
         "aten.sigmoid.default" => sigmoid_default(py, args, kwargs),
         "aten.sign.default" => sign_default(py, args, kwargs),
         "aten.silu.default" => silu_default(py, args, kwargs),
+        "aten.glu.default" => glu_default(py, args, kwargs),
         "aten.relu.default" => relu_default(py, args, kwargs),
         "aten.relu_.default" => relu_inplace(py, args, kwargs),
 
@@ -7477,6 +7479,91 @@ fn silu_default(
         .tensor()?
         .fast_to(acc)
         .and_then(|t| t.silu())
+        .and_then(|t| t.fast_to(storage))
+        .map_err(|e| candle_err(OP, e))?;
+    finish(py, out, tag)
+}
+
+/// `aten::glu(Tensor self, int dim=-1) -> Tensor` -- the gated linear unit.
+///
+/// `docs/GLU.md`'s seven ASR encoders (`parakeet` x3, `lasr` x2, `cohere_asr`,
+/// `parakeet_tdt`) all stop here: `torch._C._nn.glu` is what `F.glu` binds to
+/// (measured -- `torch/nn/functional.py` spells `F.glu` as a direct call to
+/// `torch._C._nn.glu(input, dim)`, no Python-level composition in between),
+/// and this is the leaf kernel it needs, `aten.glu.default`.
+///
+/// **Splits `self` in half along `dim`** into `a` (the first half) and `b`
+/// (the second half), and returns `a * sigmoid(b)`. Measured against upstream
+/// 2.13.0 rather than assumed:
+///
+/// ```text
+/// glu(arange(12).reshape(2,6))            splits dim=-1 (the DEFAULT), not dim=0
+/// glu(arange(12).reshape(2,6), dim=0)     splits the given dim instead
+/// glu(arange(6).reshape(1,3,2), dim=1)    RAISES "Halving dimension must be
+///                                          even, but dimension 1 is size 3"
+/// glu(arange(4, dtype=int64))             RAISES "\"glu_cpu\" not implemented
+///                                          for 'Long'" -- float only, same
+///                                          refusal shape as `silu` above, not
+///                                          `sigmoid`'s promotion
+/// ```
+///
+/// So there are two traps a plausible port misses: **the default is `dim=-1`,
+/// not `dim=0`** (a gate over the *last* axis is what every one of the seven
+/// blocked encoders wants -- they gate the channel dimension after a conv or
+/// linear that puts it last), and **an odd size at `dim` must raise**, not
+/// silently floor-divide. Getting the split arithmetic right but skipping the
+/// odd-size check would pass every even-sized golden case and then diverge
+/// silently the first time a real checkpoint's projection width is odd.
+///
+/// The two halves are produced with `narrow`, the same primitive
+/// `split_with_sizes`'s kernel already uses elsewhere in this file, rather
+/// than a new one: `a = self.narrow(dim, 0, half)`, `b = self.narrow(dim,
+/// half, half)`. Dtype and precision follow `silu`'s rule exactly (float
+/// only, `float16`/`bfloat16` computed in `f32` and narrowed once at the
+/// end) because `sigmoid(b)` inside `glu_cpu` is the same fused kernel `silu`
+/// uses internally upstream, not the promoting standalone `aten::sigmoid`.
+fn glu_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.glu.default";
+    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let tag = input.tag();
+    if !tag.is_floating_point() {
+        return Err(pyo3::exceptions::PyNotImplementedError::new_err(format!(
+            "\"glu_cpu\" not implemented for '{}'",
+            scalar_type_name(tag)
+        )));
+    }
+    let self_tensor = input.tensor()?;
+    let rank = self_tensor.rank();
+    let dim = normalise_dim(OP, dim_arg(args, kwargs, 1, "dim")?.unwrap_or(-1), rank)?;
+    let extent = self_tensor.dims()[dim];
+    if extent % 2 != 0 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "Halving dimension must be even, but dimension {dim} is size {extent}"
+        )));
+    }
+    let half = extent / 2;
+    let a = self_tensor.narrow(dim, 0, half).map_err(|e| candle_err(OP, e))?;
+    let b = self_tensor.narrow(dim, half, half).map_err(|e| candle_err(OP, e))?;
+
+    let storage = PyDtype::new(tag).storage(OP)?;
+    let acc = match storage {
+        candle_core::DType::F16 | candle_core::DType::BF16 => candle_core::DType::F32,
+        other => other,
+    };
+    let out = a
+        .fast_to(acc)
+        .and_then(|a32| {
+            b.fast_to(acc)
+                .and_then(|b32| b32.neg())
+                .and_then(|t| t.exp())
+                .and_then(|t| t + 1.0)
+                .and_then(|t| t.recip())
+                .and_then(|gate| a32 * gate)
+        })
         .and_then(|t| t.fast_to(storage))
         .map_err(|e| candle_err(OP, e))?;
     finish(py, out, tag)

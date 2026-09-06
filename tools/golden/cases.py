@@ -9741,6 +9741,88 @@ def silu_cases(torch_module, c_module, torch_call) -> list[Case]:
     return cases
 
 
+def glu_cases(torch_module, c_module, torch_call) -> list[Case]:
+    """`aten.glu(Tensor self, int dim=-1)` -- the seven ASR encoders'
+
+    (`parakeet` x3, `lasr` x2, `cohere_asr`, `parakeet_tdt`) shared wall
+    (docs/GLU.md). `a, b = self.chunk(2, dim); return a * sigmoid(b)`.
+
+    Two traps a plausible port misses, both measured against upstream 2.13.0
+    rather than assumed:
+
+      * the default is `dim=-1`, not `dim=0` -- every one of the seven
+        blocked encoders gates the trailing (channel) axis after a conv or
+        linear that puts it last, so a `dim=0` default would silently split
+        the wrong axis on every real caller and still pass a golden suite
+        that only exercises 2-D inputs with the batch axis first.
+      * an ODD size at `dim` must raise, not floor-divide -- "Halving
+        dimension must be even, but dimension {d} is size {n}".
+
+    Dtype/precision rule is `silu`'s, not `sigmoid`'s: float only (no
+    integral promotion), `float16`/`bfloat16` accumulate in `float32`.
+    """
+    op = "aten.glu.default"
+    cases: list[Case] = []
+
+    for dtype_name in _TRIG_DTYPES:
+        for flat, shape, kwargs, note in [
+            (list(range(12)), (2, 6), {}, "default dim=-1, the trailing axis"),
+            (list(range(12)), (2, 6), {"dim": -1}, "explicit dim=-1 matches the default"),
+            (list(range(12)), (2, 6), {"dim": 0}, "dim=0 splits the OTHER axis"),
+            ([1.0, -1.0, 0.0, 3.5], (1, 4), {}, "assorted signs"),
+            ([-8.0, -4.0, 4.0, 8.0], (1, 4), {}, "saturating tails, where sigmoid rounds to 0/1"),
+            (list(range(2)), (2,), {}, "1-d, smallest even size"),
+        ]:
+            a_t, a_c = pair_from_flat(torch_module, c_module, flat, shape, dtype_name)
+            dim = kwargs.get("dim", -1)
+            name = f"glu(dtype={dtype_name}, shape={shape}, dim={dim}) [{note}]"
+            cases.append(
+                Case(
+                    name=name,
+                    op=op,
+                    run_torch=lambda a_t=a_t, kwargs=kwargs: torch_call(a_t, **kwargs),
+                    run_c=lambda a_c=a_c, kwargs=kwargs: c_module._aten_dispatch(op, a_c, **kwargs),
+                    note=note,
+                )
+            )
+
+    # The odd-size refusal: this is the trap, not the arithmetic.
+    for dim, shape, flat in [(1, (1, 3, 2), list(range(6))), (-1, (1, 2, 3), list(range(6)))]:
+        a_t, a_c = pair_from_flat(torch_module, c_module, [float(x) for x in flat], shape, "float32")
+        cases.append(
+            Case(
+                name=f"glu(shape={shape}, dim={dim}) [odd halving dimension must raise]",
+                op=op,
+                run_torch=lambda a_t=a_t, dim=dim: torch_call(a_t, dim=dim),
+                run_c=lambda a_c=a_c, dim=dim: c_module._aten_dispatch(op, a_c, dim=dim),
+                expect="both_error",
+                note=(
+                    "torch: RuntimeError('Halving dimension must be even, but dimension "
+                    "{dim} is size {n}'). A kernel that floor-divides instead of refusing "
+                    "would compute a wrong answer here rather than raise."
+                ),
+            )
+        )
+
+    # The dtype refusal, same shape as silu's: no integral kernel upstream.
+    for dtype_name in ["int64", "int32"]:
+        a_t, a_c = pair_from_flat(torch_module, c_module, [1, 2, 3, 4], (4,), dtype_name)
+        cases.append(
+            Case(
+                name=f"glu(dtype={dtype_name}) [no glu_cpu kernel upstream]",
+                op=op,
+                run_torch=lambda a_t=a_t: torch_call(a_t),
+                run_c=lambda a_c=a_c: c_module._aten_dispatch(op, a_c),
+                expect="both_error",
+                note=(
+                    "torch: NotImplementedError(\"glu_cpu\" not implemented for 'Long'). "
+                    "Float only, like silu -- not a promoting op like sigmoid."
+                ),
+            )
+        )
+    return cases
+
+
 def t_cases(torch_module, c_module, torch_call) -> list[Case]:
     op = "aten.t.default"
     cases: list[Case] = []
@@ -24454,6 +24536,7 @@ CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
     "aten.neg.default": neg_cases,
     "aten.rsub.Scalar": rsub_scalar_cases,
     "aten.silu.default": silu_cases,
+    "aten.glu.default": glu_cases,
     "aten.t.default": t_cases,
     "aten._scaled_dot_product_flash_attention_for_cpu.default": sdpa_flash_cpu_cases,
     # The eight docs/SAMPLING.md measured `do_sample=True` stopping on.
