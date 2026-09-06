@@ -75,4 +75,16 @@ guessing would have been worse than looking.
 2. Find a published, checksummed source for the simulator one.
 3. Only then add the job, with the fetch as its first step.
 
+> **Taken — see [`docs/IOS_CI2.md`](IOS_CI2.md).** Step 1 is done
+> (`docs/TARGET_PYTHON.md`). Step 2 stays "no" — there is no published,
+> checksummed `arm64-iphonesimulator` CPython — but the pinned source commit is
+> enough to *build* one in the job instead of fetching it, which is what
+> `docs/TARGET_PYTHON.md` sized. `.github/workflows/verify-published-wheel.yml`
+> now has an `ios-simulator-arm64` leg that does exactly that: build the
+> distribution, cache it on commit + Xcode version, download the **published**
+> simulator wheel from PyPI, and run `verify_ios_sim.py` against it — unchanged,
+> because it already reads `TARGET_PYTHON_IOS_SIM`. It has not run on a hosted
+> runner yet; `docs/IOS_CI2.md` says exactly what has and has not been
+> exercised.
+
 <!-- DOCWATCH: symbol-in-file tools/wheel/verify_ios_sim.py arm64-iphonesimulator present -->
