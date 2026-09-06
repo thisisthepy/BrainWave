@@ -7855,6 +7855,132 @@ def _install_nn(module, dispatch) -> None:
             "aten.upsample_nearest2d.default", input, osize, scale_h, scale_w,
         )
 
+    def _int_pair(value):
+        """`int[2]` the way upstream's argument parser takes it.
+
+        `F.unfold(x, kernel_size=2)` sends `_pair(2)` -- already a tuple -- but
+        `torch._C._nn.im2col(x, 2, 1, 0, 1)` with bare ints computes upstream
+        (measured on 2.13.0), because an `int[N]` schema broadcasts a scalar.
+        The Rust `pair_arg` broadcasts a length-1 list but reads its argument
+        through `shape_arg`, which wants a sequence, so the scalar case is
+        normalised here rather than there -- `aten.rs` is not this round's file
+        and the fix belongs on the side that knows it is a Python calling
+        convention.
+        """
+        if isinstance(value, (list, tuple)):
+            return [int(v) for v in value]
+        return [int(value), int(value)]
+
+    def im2col(input, kernel_size, dilation, padding, stride):
+        """`torch._C._nn.im2col` -- **`llama4`'s vision tower** (docs/VOICE3.md,
+        docs/COMPLEX2.md §8), and `F.unfold` *is* this binding.
+
+        `torch/nn/functional.py`'s `unfold` ends in
+
+            return torch._C._nn.im2col(
+                input, _pair(kernel_size), _pair(dilation),
+                _pair(padding), _pair(stride))
+
+        -- a straight forward with no reshaping and no branch, so there is no
+        `.vec`/leaf discrimination to do here and nothing this binding can get
+        wrong that the kernel does not already own. All four `int[2]` arguments
+        are **required**: `torch._C._nn.im2col(x, [2,2])` is
+        `TypeError: im2col() missing 3 required positional argument` upstream,
+        so no defaults are invented here either.
+
+        NOT an `overloads.json` or `methods.json` row: `torch.im2col` and
+        `Tensor.im2col` do not exist on 2.13.0 (checked, and `reach_allow.json`
+        staked the claim on it), so a table row would invent a door upstream
+        lacks -- `upsample_nearest2d`'s and `reflection_pad1d`'s reasoning.
+        """
+        return dispatch(
+            "aten.im2col.default", input, _int_pair(kernel_size),
+            _int_pair(dilation), _int_pair(padding), _int_pair(stride),
+        )
+
+    def col2im(input, output_size, kernel_size, dilation, padding, stride):
+        """`torch._C._nn.col2im` -- **`f5-tts`'s wall** (docs/VOICE.md rank 15),
+        and `F.fold` *is* this binding, `im2col`'s shape one argument longer.
+
+        `torch/nn/functional.py`'s `fold` forwards
+        `(input, _pair(output_size), _pair(kernel_size), _pair(dilation),
+        _pair(padding), _pair(stride))`, and the same three arguments are
+        required-with-no-default that `im2col`'s are.
+
+        **It is not `im2col`'s inverse** -- overlapping windows are *summed*
+        here -- but that is the kernel's property, restated in `aten.rs`, and
+        the round trip is a case in `test_voice3.py` for exactly that reason.
+        The binding adds nothing to it; what it adds is that `F.fold` reaches
+        it at all.
+        """
+        return dispatch(
+            "aten.col2im.default", input, _int_pair(output_size),
+            _int_pair(kernel_size), _int_pair(dilation), _int_pair(padding),
+            _int_pair(stride),
+        )
+
+    def upsample_nearest1d(input, output_size, scale_factors=None):
+        """`torch._C._nn.upsample_nearest1d` -- `bigvgan`/`voice`
+        (docs/VOICE.md rank 14), reached as `F.interpolate(x, ..., mode=
+        "nearest")` on a **3-D** input.
+
+        `torch/nn/functional.py`'s `interpolate` calls
+        `torch._C._nn.upsample_nearest1d(input, output_size, scale_factors)`,
+        the same three-argument `.vec` shape the 2-D op has one line below it.
+
+        **The discriminator is the third argument's TYPE, not the arity**, and
+        this is where the 1-D op differs from `upsample_nearest2d` above. The
+        2-D leaf schema is `(self, output_size, scales_h, scales_w)`, so a
+        *fourth* argument tells leaf from `.vec` there. The 1-D leaf schema is
+        `(self, output_size, scales)` -- **three arguments, the same count as
+        `.vec`** -- so a sentinel on a fourth parameter cannot work. Measured on
+        2.13.0, all four accepted upstream:
+
+            _nn.upsample_nearest1d(x, [7], None)    -> .default(x, [7])
+            _nn.upsample_nearest1d(x, None, [1.5])  -> .default(x, [7], 1.5)
+            _nn.upsample_nearest1d(x, [7], 1.5)     -> .default(x, [7], 1.5)
+            _nn.upsample_nearest1d(x, [7])          -> .default(x, [7])
+
+        A *sequence* third argument is `.vec`'s `scale_factors`; a float is the
+        leaf's `scales`. Taking arity as the discriminator would read the third
+        line as `.vec` and hand a bare float to `[0]`.
+
+        `output_size` and `scale_factors` are mutually exclusive in the `.vec`
+        shape and **both** wrong ways refuse with the same words upstream uses
+        -- giving both, and giving neither (measured; the second is not
+        guessable from the first).
+
+        **The scale factor is forwarded, not merely used to size the output**,
+        for `upsample_nearest2d`'s reason: `1/scale` and `in/out` coincide only
+        when the product is integral. `(1,2,5)` at `scale=1.5` gives `[7]`, and
+        `5/7 != 1/1.5`, so the two readings pick different source columns --
+        which is what the `un1d_scale_*` cases and `un1d_via_F_interpolate`
+        compare element-wise against a live upstream.
+        """
+        if isinstance(scale_factors, (list, tuple)) or scale_factors is None:
+            if (output_size is None) == (scale_factors is None):
+                raise RuntimeError(
+                    "Must specify exactly one of output_size and scale_factors"
+                )
+            if output_size is not None:
+                return dispatch(
+                    "aten.upsample_nearest1d.default", input,
+                    [int(v) for v in output_size], None,
+                )
+            factor = float(scale_factors[0])
+            osize = [int(list(input.shape)[2] * factor)]
+            return dispatch(
+                "aten.upsample_nearest1d.default", input, osize, factor,
+            )
+        if output_size is None:
+            raise RuntimeError(
+                "It is expected output_size equals to 1, but got size 0"
+            )
+        return dispatch(
+            "aten.upsample_nearest1d.default", input,
+            [int(v) for v in output_size], float(scale_factors),
+        )
+
     def leaky_relu(input, negative_slope=0.01):
         """`torch._C._nn.leaky_relu` -- `vits`' wall after the `IntTensor`
         constructor.
@@ -8012,6 +8138,9 @@ def _install_nn(module, dispatch) -> None:
         (upsample_bilinear2d, "upsample_bilinear2d"),
         (upsample_bicubic2d, "upsample_bicubic2d"),
         (upsample_nearest2d, "upsample_nearest2d"),
+        (upsample_nearest1d, "upsample_nearest1d"),
+        (im2col, "im2col"),
+        (col2im, "col2im"),
         (leaky_relu, "leaky_relu"),
         (adaptive_avg_pool2d, "adaptive_avg_pool2d"),
         (avg_pool2d, "avg_pool2d"),
@@ -8029,10 +8158,11 @@ def _install_nn(module, dispatch) -> None:
     # Readable for the same reason as `_shim_overloads`: which of `_nn`'s 70
     # names does something should be answerable by asking.
     module._shim_nn_implemented = [
-        "adaptive_avg_pool2d", "avg_pool2d", "cross_entropy_loss", "gelu", "glu", "hardtanh", "leaky_relu", "linear", "nll_loss",
+        "adaptive_avg_pool2d", "avg_pool2d", "col2im", "cross_entropy_loss",
+        "gelu", "glu", "hardtanh", "im2col", "leaky_relu", "linear", "nll_loss",
         "nll_loss_nd", "one_hot", "pad", "scaled_dot_product_attention", "silu",
         "softplus", "upsample_bicubic2d", "upsample_bilinear2d",
-        "upsample_nearest2d",
+        "upsample_nearest1d", "upsample_nearest2d",
     ]
 
 

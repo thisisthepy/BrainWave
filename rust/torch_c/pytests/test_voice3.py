@@ -1010,44 +1010,38 @@ def test_var_and_std_clamp_the_divisor_at_zero_so_an_overshoot_is_inf_not_nan():
         assert math.isnan(want["ok"][0]) and math.isnan(got["ok"][0]), (name, got, want)
 
 
-def test_the_three_nn_bindings_are_the_only_thing_still_between_these_kernels_and_F():
-    """`im2col`, `col2im` and `upsample_nearest1d` have kernels and are
-    **not reachable from `F.unfold` / `F.fold` / `F.interpolate`**, because
-    those three bind `torch._C._nn.*` and `_install_nn` in `bootstrap.py` has
-    no entry for them. That file was outside this round's territory, so the
-    gap is asserted rather than closed -- and asserted from *both* sides, so
-    it cannot be mistaken for a missing kernel:
+def test_the_three_nn_bindings_now_carry_these_kernels_all_the_way_to_F():
+    """INVERTED (docs/BIND3.md). This test used to assert that `im2col`,
+    `col2im` and `upsample_nearest1d` had kernels and were **not reachable**
+    from `F.unfold` / `F.fold` / `F.interpolate`, because `_install_nn` in
+    `bootstrap.py` had no entry for them and that file was outside the
+    round's territory.
 
-      * the aten op answers correctly (every case above goes through
-        `torch.ops.aten.*`, which is also what the golden harness uses), and
-      * the `_nn` name refuses, **naming itself**, which is this shim's
-        standing contract for a surface it has not installed.
+    The three `_install_nn` entries landed, so the absence is gone and the
+    assertion is turned around rather than removed: the same three probe
+    cases, in the same two probe processes, now have to **agree with upstream
+    element-wise** instead of refusing. Deleting it would have taken the
+    coverage with it -- these are the only cases in this file that go through
+    the `F.*` spelling rather than through `torch.ops.aten.*`.
 
-    Each needs one `_install_nn` entry shaped like `upsample_nearest2d`'s.
-    When they land, this test fails and should be deleted -- that is the
-    intended direction, and a test that could not detect the fix would be
-    worse than none.
+    `test_bind3.py` is the wider proof (every argument shape, both refusal
+    directions, and the scale-forwarding case a `2x` test cannot see). What
+    stays here is the pair of cases this file's probe already recorded, so
+    that the round that opened the gap is also the round that shows it shut.
     """
-    for name, spelling in (("im2col_via_F_unfold", "torch._C._nn.im2col"),
-                           ("col2im_via_F_fold", "torch._C._nn.col2im"),
-                           ("un1d_via_F_interpolate", "torch._C._nn.upsample_nearest1d")):
-        pair = _both(name)
-        if pair == "skip":
-            return
-        got, want = pair
-        assert "raised" not in want, (name, want)
-        assert "raised" in got, (
-            f"{name}: {spelling} now works -- delete this test and add the "
-            "case back to the agreement test above"
-        )
-        assert spelling in got["msg"], (
-            f"{name}: the refusal must name the binding, got {got['msg']!r}"
-        )
-    # And the kernels themselves are advertised, which is the other half.
+    for name in ("im2col_via_F_unfold", "col2im_via_F_fold",
+                 "un1d_via_F_interpolate"):
+        _agree(name)
+    # And the kernels themselves are advertised, which is the other half --
+    # a binding onto a missing kernel is docs/BINDINGS.md's `mish`.
     implemented = set(_C._aten_implemented())
     for op in ("aten.im2col.default", "aten.col2im.default",
                "aten.upsample_nearest1d.default"):
         assert op in implemented, op
+    # The bindings exist by name, so a future round that deletes one fails
+    # here and not only through a value comparison it might read as flaky.
+    for name in ("im2col", "col2im", "upsample_nearest1d"):
+        assert name in _C._shim_nn_implemented, name
 
 
 def test_the_new_ops_that_read_the_host_are_named_for_the_mps_list():
