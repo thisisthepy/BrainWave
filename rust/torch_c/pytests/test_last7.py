@@ -361,47 +361,72 @@ def test_a_transposed_convolution_is_not_touched_by_the_lowering():
 # --- 5. the two that were NOT kernels, pinned where they actually live ------
 
 
-def test_multinomial_with_a_tensor_num_samples_is_an_argument_form_not_a_kernel():
-    """vilt's wall, and it needs nothing in `aten.rs`.
+def test_multinomial_with_a_tensor_num_samples_now_matches_upstreams_symint_rule():
+    """The inversion this test was written to demand, landed in the same batch.
 
-    `modeling_vilt.py:155` is `torch.multinomial(torch.ones(v).float(),
-    max_image_length)` and `max_image_length` arrives as a **tensor** where the
-    schema says `SymInt num_samples`. Measured on real torch 2.13.0:
+    `docs/LAST7.md` §5 traced `vilt`'s wall to upstream's **argument parser**
+    rather than to a missing kernel -- `aten.multinomial.default` was already
+    here and already golden-compared -- and said the fix belonged in
+    `bootstrap.py`'s `_TypeChecker`, which was another round's file. It wrote
+    this test to fail the moment that landed, and named the document to update.
+    `docs/BIND5.md` landed it hours later.
 
-        multinomial(p, torch.tensor(3))      -> works, shape (3,)
-        multinomial(p, torch.tensor([3]))    -> works, shape (3,)
-        multinomial(p, torch.tensor(3.0))    -> TypeError, "must be int, not Tensor"
-        multinomial(p, torch.tensor([3, 4])) -> TypeError, same
+    What is asserted now is the **shape of the rule**, not merely that the
+    accepting case accepts. Upstream's `SymInt` coercion is: one element by
+    `numel()`, integral, and not `bool` -- and `bool` is accepted at the
+    predicate and refused at the coercion, which is why upstream raises two
+    *different* exception classes. A version that simply called `int()` on any
+    tensor would pass the first row here and silently accept the other three,
+    which is precisely the defect BIND5 found in BIND4's earlier landing of the
+    same rule one position over: `zeros(2, tensor(3.5))` returned `(2, 3)`
+    where upstream raises.
 
-    So upstream's *schema* really does take an int, and its **argument parser**
-    implicitly converts a single-element integral tensor -- the general
-    `SymInt` rule, not something specific to `multinomial`. The kernel
-    (`aten.multinomial.default`) is already here and already golden-compared.
-
-    That makes the fix `bootstrap.py`'s `_TypeChecker`, which is out of this
-    round's territory, and it makes an `overloads.json` row impossible: every
-    schema string in that file is checked against upstream by
-    `verify_schemas.py`, so a fabricated `multinomial.num_samples_tensor`
-    overload would fail that check rather than pass it. Pinned here so the next
-    round does not re-derive it, and asserting the *refusal* so the pin inverts
-    the day the type checker learns the rule.
+    So the refusals are the test. The acceptance is the easy half.
     """
-    assert "aten.multinomial.default" in _C._aten_implemented()
-    probs = _C._tensor_from_flat([1.0] * 10, [10])
-    n = _C._tensor_from_flat([3.0], [], dtype=_C.int64)
+    import json
+    import os
+    import subprocess
+    import sys
+
+    script = r"""
+import json, torch
+assert hasattr(torch._C, "_aten_implemented"), "not the shim"
+p = torch.ones(5)
+out = {}
+def go(key, fn):
     try:
-        _C._VariableFunctions.multinomial(probs, n)
-    except TypeError as e:
-        assert "no matching overload" in str(e), str(e)
-    else:
-        raise AssertionError(
-            "multinomial accepted a tensor num_samples -- if bootstrap.py's "
-            "_TypeChecker learned upstream's SymInt rule, invert this test and "
-            "update docs/LAST7.md §5"
-        )
-    # The kernel itself is fine with the int spelling; the gap is only the form.
-    out = _C._VariableFunctions.multinomial(probs, 3)
-    assert list(out.shape) == [3], list(out.shape)
+        r = fn()
+        out[key] = "ok:%d" % r.numel()
+    except Exception as e:
+        out[key] = "%s: %s" % (type(e).__name__, e)
+go("scalar_int",   lambda: torch.multinomial(p, torch.tensor(3), replacement=True))
+go("one_elem_1d",  lambda: torch.multinomial(p, torch.tensor([3]), replacement=True))
+go("scalar_float", lambda: torch.multinomial(p, torch.tensor(3.0), replacement=True))
+go("multi_elem",   lambda: torch.multinomial(p, torch.tensor([3, 4]), replacement=True))
+go("scalar_bool",  lambda: torch.multinomial(p, torch.tensor(True), replacement=True))
+print(json.dumps(out))
+"""
+    env = dict(os.environ)
+    # four levels: pytests -> torch_c -> rust -> repo root
+    _root = os.path.abspath(__file__)
+    for _ in range(4):
+        _root = os.path.dirname(_root)
+    env["PYTHONPATH"] = os.path.join(_root, "torchnative", "src", "main")
+    env["TORCH_USE_RTLD_GLOBAL"] = "1"
+    proc = subprocess.run([sys.executable, "-c", script],
+                          capture_output=True, text=True, env=env, timeout=180)
+    if proc.returncode != 0:
+        raise RuntimeError(proc.stdout + proc.stderr)
+    m = json.loads(proc.stdout.strip().splitlines()[-1])
+
+    # Accepts: one element, integral, any rank.
+    assert m["scalar_int"] == "ok:3", m
+    assert m["one_elem_1d"] == "ok:3", m
+
+    # Refuses, and upstream's two exception classes are different on purpose.
+    assert m["scalar_float"].startswith("TypeError"), m
+    assert m["multi_elem"].startswith("TypeError"), m
+    assert m["scalar_bool"].startswith("RuntimeError"), m
 
 
 def test_repeat_interleave_with_a_tensor_repeats_is_still_refused_by_name():
