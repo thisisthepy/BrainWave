@@ -2854,6 +2854,52 @@ def install(module, surface_json: str, overloads_json: str, methods_json: str) -
     # (rather than teaching the finder to special-case four names) means the
     # finder never runs for this particular submodule: Python's import system
     # checks `sys.modules` before consulting `sys.meta_path`.
+    # `torch._C._export.pt2_archive_constants` is a *module* of 27 archive
+    # path strings, with no behaviour at all -- but the generic stub makes it an
+    # `_Unimplemented`, so every attribute raises. That is why `torch.compile`
+    # died on `AOTINDUCTOR_DIR` rather than on anything about compiling
+    # (docs/COMPILE.md §2), and it stands in front of `torch.export` too.
+    #
+    # Transcribed from upstream rather than invented: these are wire-format
+    # paths inside a `.pt2` archive, so a guessed value would produce an archive
+    # nothing else can read. Closing it is only safe *after* `set_eval_frame`
+    # refuses by name -- before that, it turned a loud failure into a silent
+    # eager fallback, which COMPILE.md measured.
+    if "_export" in roots:
+        _pt2c = types.ModuleType("torch._C._export.pt2_archive_constants")
+        for _k, _v in {
+            'AOTINDUCTOR_DIR': 'data/aotinductor/',
+            'ARCHIVE_FORMAT_PATH': 'archive_format',
+            'ARCHIVE_FORMAT_VALUE': 'pt2',
+            'ARCHIVE_ROOT_NAME': 'package',
+            'ARCHIVE_VERSION_PATH': 'archive_version',
+            'ARCHIVE_VERSION_VALUE': '0',
+            'CONSTANTS_CONFIG_FILENAME_FORMAT': 'data/constants/{}_constants_config.json',
+            'CONSTANTS_DIR': 'data/constants/',
+            'CONSTANTS_PARAM_CONFIG_FORMAT': 'data/constants/{}_model_constants_config.json',
+            'CUSTOM_OBJ_FILENAME_PREFIX': 'custom_obj_',
+            'EXECUTORCH_DIR': 'data/executorch/',
+            'EXTRA_DIR': 'extra/',
+            'MODELS_DIR': 'models/',
+            'MODELS_FILENAME_FORMAT': 'models/{}.json',
+            'MODULE_INFO_PATH': 'extra/module_info.json',
+            'MTIA_DIR': 'data/mtia',
+            'OPAQUE_OBJ_FILENAME_PREFIX': 'opaque_obj_',
+            'SAMPLE_INPUTS_DIR': 'data/sample_inputs/',
+            'SAMPLE_INPUTS_FILENAME_FORMAT': 'data/sample_inputs/{}.pt',
+            'TENSOR_CONSTANT_FILENAME_PREFIX': 'tensor_',
+            'TS_SAMPLE_INPUTS_FILENAME_FORMAT': 'extra/{}.forward.sample_input.pt',
+            'WEIGHTS_CONFIG_FILENAME_FORMAT': 'data/weights/{}_weights_config.json',
+            'WEIGHTS_DIR': 'data/weights/',
+            'WEIGHTS_PARAM_CONFIG_FORMAT': 'data/weights/{}_model_param_config.json',
+            'WEIGHT_FILENAME_PREFIX': 'weight_',
+            'XL_MODEL_WEIGHTS_DIR': 'xl_model_weights/',
+            'XL_MODEL_WEIGHTS_PARAM_CONFIG_PATH': 'xl_model_weights/model_param_config',
+        }.items():
+            setattr(_pt2c, _k, _v)
+        setattr(module._export, "pt2_archive_constants", _pt2c)
+        sys.modules["torch._C._export.pt2_archive_constants"] = _pt2c
+
     if "_dynamo" in roots:
         eval_frame = types.ModuleType(f"{prefix}._dynamo.eval_frame")
         eval_frame.__path__ = []
@@ -2874,6 +2920,25 @@ def install(module, surface_json: str, overloads_json: str, methods_json: str) -
         _eval_frame_isolate_cell = [None]
 
         def set_eval_frame(callback):
+            # Refuse to *install* a hook, and say why. Without this the cell
+            # accepts the callback, never installs anything, and `torch.compile`
+            # quietly returns the eager function -- docs/COMPILE.md measured
+            # exactly that by stubbing five unrelated symbols. Today's failure
+            # is an accident of a missing data module, and closing that module
+            # would turn a loud error into a lie.
+            #
+            # `callback is None` must stay a no-op: it is the *uninstall*
+            # spelling, and `torch/_dynamo/__init__.py` takes that path on a
+            # plain `import transformers`. Refusing it would break that import.
+            if callback is not None:
+                raise NotImplementedError(
+                    "torch.compile is not available in this build. It needs "
+                    "CPython's PEP 523 frame-evaluation hook "
+                    "(_PyInterpreterState_SetEvalFrameFunc), which is outside "
+                    "the stable ABI this extension is built against "
+                    "(abi3-py313); see docs/COMPILE.md. Use torch.export or "
+                    "the capture API (docs/CAPTURE.md) for a graph."
+                )
             prior = _eval_frame_cell[0]
             _eval_frame_cell[0] = callback
             return prior

@@ -25985,5 +25985,107 @@ def test_the_eager_tape_refuses_and_releases_when_it_grows_past_its_bound():
         _C._eager_reset()
 
 
+
+# --- torch.compile refuses by name (docs/COMPILE.md) ------------------------
+
+
+_COMPILE_REFUSAL_SCRIPT = r"""
+import json
+import torch
+
+out = {"is_shim": hasattr(torch._C, "_aten_implemented")}
+
+
+def f(x):
+    return x * 2 + 1
+
+
+try:
+    torch.compile(f)(torch.ones(3))
+    out["compile"] = "RETURNED -- no exception"
+except Exception as exc:
+    out["compile"] = type(exc).__name__ + ": " + str(exc)
+
+# The guard itself, reached directly. `torch.compile` still dies earlier on
+# unrelated missing symbols, so asserting only the user-facing path would not
+# test this guard at all -- and it is the guard that stops a future stub from
+# turning compilation into a silent eager fallback.
+try:
+    torch._C._dynamo.eval_frame.set_eval_frame(lambda *a, **k: None)
+    out["install"] = "RETURNED -- no exception"
+except NotImplementedError as exc:
+    out["install"] = "NotImplementedError: " + str(exc)
+except Exception as exc:
+    out["install"] = type(exc).__name__ + ": " + str(exc)
+
+# The uninstall spelling. `torch/_dynamo/__init__.py` takes this path on a
+# plain `import transformers`, so refusing it would break that import -- which
+# is the whole reason the guard is `callback is not None` and not `always`.
+try:
+    prior = torch._C._dynamo.eval_frame.set_eval_frame(None)
+    torch._C._dynamo.eval_frame.set_eval_frame(prior)
+    out["uninstall"] = "ok"
+except Exception as exc:
+    out["uninstall"] = type(exc).__name__ + ": " + str(exc)
+
+try:
+    import transformers  # noqa: F401
+    out["transformers"] = "ok"
+except Exception as exc:
+    out["transformers"] = type(exc).__name__ + ": " + str(exc)
+
+print(json.dumps(out))
+"""
+
+
+def test_torch_compile_refuses_by_name_without_breaking_transformers():
+    """docs/COMPILE.md's §5.1 refusal, and the carve-out that keeps it usable.
+
+    Two assertions, and the second is the one that matters. `torch.compile`
+    refusing is easy; refusing *only* when something tries to install a hook is
+    the part a later tightening could silently break, because `callback is
+    None` is the uninstall spelling `torch/_dynamo/__init__.py` uses on an
+    ordinary `import transformers`. Without the import assertion, the guard
+    could be changed to always raise and nothing here would notice.
+
+    The refusal also has to be this one and not the accident it replaced.
+    Before it, `torch.compile` died on a missing `pt2_archive_constants` --
+    loud, but unrelated, and COMPILE.md showed that closing that data gap turns
+    the failure into a *silent eager fallback*. So the message is asserted, not
+    just the exception type.
+    """
+    env = dict(os.environ)
+    env["PYTHONPATH"] = _CKPT_VENDOR_DIR
+    env["TORCH_USE_RTLD_GLOBAL"] = "1"
+    proc = subprocess.run(
+        [sys.executable, "-c", _COMPILE_REFUSAL_SCRIPT],
+        capture_output=True, text=True, env=env, timeout=180,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"compile-refusal subprocess exited {proc.returncode}\n"
+            f"--- stdout ---\n{proc.stdout}\n--- stderr ---\n{proc.stderr}"
+        )
+    r = json.loads(proc.stdout.strip().splitlines()[-1])
+    assert r["is_shim"] is True, r
+
+    # The guard, asserted where it lives.
+    assert r["install"].startswith("NotImplementedError:"), r["install"]
+    assert "PEP 523" in r["install"], r["install"]
+    assert "abi3" in r["install"], r["install"]
+    assert "torch.export" in r["install"], r["install"]
+
+    # And the user-facing path, which today still stops earlier on unrelated
+    # missing symbols. Asserted only as "raises", because pinning *which*
+    # symbol would make this test a tripwire on unrelated stubbing work. What
+    # matters is that it does not silently return a compiled-looking function:
+    # docs/COMPILE.md measured that outcome with five stubs in place, and the
+    # guard above is why it can no longer happen.
+    assert r["compile"] != "RETURNED -- no exception", r["compile"]
+
+    assert r["uninstall"] == "ok", r["uninstall"]
+    assert r["transformers"] == "ok", r["transformers"]
+
+
 if __name__ == "__main__":
     raise SystemExit(_main())
