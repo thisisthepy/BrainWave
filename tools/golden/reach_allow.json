@@ -79,6 +79,16 @@
       "upstream_present": [
         "torch._C._nn.upsample_nearest1d"
       ]
+    },
+    "aten.upsample_linear1d.default": {
+      "reason": "Reached upstream as `torch._C._nn.upsample_linear1d`, and as `F.interpolate(x, size, mode='linear', align_corners=...)` on a 3-D input. Neither `torch.upsample_linear1d` nor `Tensor.upsample_linear1d` exists on 2.13.0 (checked), so this is NOT an overloads.json or methods.json row -- a row there would invent a door upstream does not have, exactly as `aten.upsample_nearest1d.default` records immediately above. The missing connection is one `_install_nn` entry shaped like `upsample_nearest2d`'s. It is NOT an alias of `aten.upsample_bilinear2d.default`, which docs/GLU.md §2 flagged as likely and this round measured rather than assumed: a different rank check (`input_size equals to 3`), a different dtype-refusal kernel name (`compute_indices_weights_linear` against `upsample_bilinear2d_channels_last`), a different dtype set (`uint8` computes for the 2-D op through a separate fixed-point kernel and RAISES here), an upper clamp on the source index that bilinear does not need, and a FUSED multiply-add in the source index that the unfused bilinear transcription gets ~3 ULP wrong (docs/RNN.md §3). `sam_vision_model` and `sam_hq_vision_model`'s wall, docs/ARCH200.md §2. bootstrap.py was another agent's file this round, so this is a work item, not a design decision, and it fails the suite the moment the entry lands -- which is when this entry should be deleted.",
+      "upstream_absent": [
+        "torch.upsample_linear1d",
+        "torch.Tensor.upsample_linear1d"
+      ],
+      "upstream_present": [
+        "torch._C._nn.upsample_linear1d"
+      ]
     }
   },
   "shape3_unexercised_spelling": {

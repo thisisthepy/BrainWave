@@ -852,6 +852,10 @@
     "aten::multiply.Tensor(Tensor self, Tensor other) -> Tensor",
     "aten::multiply.Scalar(Tensor self, Scalar other) -> Tensor"
   ],
+  "lstm": [
+    "aten::lstm.data(Tensor data, Tensor batch_sizes, Tensor[] hx, Tensor[] params, bool has_biases, int num_layers, float dropout, bool train, bool bidirectional) -> (Tensor, Tensor, Tensor)",
+    "aten::lstm.input(Tensor input, Tensor[] hx, Tensor[] params, bool has_biases, int num_layers, float dropout, bool train, bool bidirectional, bool batch_first) -> (Tensor, Tensor, Tensor)"
+  ],
   "logical_and": [
     "aten::logical_and(Tensor self, Tensor other) -> Tensor"
   ],

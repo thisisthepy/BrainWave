@@ -167,6 +167,7 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.log2.default",
     "aten.log2_.default",
     "aten.log_.default",
+    "aten.lstm.input",
     "aten.lt.Scalar",
     "aten.lt.Tensor",
     "aten.masked_fill.Scalar",
@@ -277,6 +278,7 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.unsqueeze.default",
     "aten.upsample_bicubic2d.default",
     "aten.upsample_bilinear2d.default",
+    "aten.upsample_linear1d.default",
     "aten.upsample_nearest2d.default",
     "aten.view.default",
     "aten.view_as.default",
@@ -2532,6 +2534,23 @@ fn aten_dispatch_inner(
         "aten.multiply.Tensor" => arith_tensor(py, args, kwargs, "aten.multiply.Tensor", Arith::Mul),
         "aten.multiply.Scalar" => arith_scalar(py, args, kwargs, "aten.multiply.Scalar", Arith::Mul),
         "aten.logical_and.default" => logical_and_default(py, args, kwargs),
+
+        // -- docs/RNN.md: one contiguous run, kept together for the merge ---
+        "aten.upsample_linear1d.default" => upsample_linear1d_default(py, args, kwargs),
+        "aten.lstm.input" => lstm_input(py, args, kwargs),
+        // The OTHER `aten::lstm` overload, refused by name rather than
+        // answered with `.input`'s kernel. `.data` takes a packed
+        // `(data, batch_sizes)` pair from `pack_padded_sequence`, has no
+        // `batch_first`, and iterates a ragged batch -- the same weights in a
+        // different order, so answering it here would give a right-shaped
+        // wrong tensor. Neither parakeet decoder takes this route (measured:
+        // both reach `_VF.lstm` with nine positional arguments).
+        "aten.lstm.data" => Err(not_implemented(
+            "aten.lstm.data: the packed-sequence LSTM overload is not implemented in \
+             torch._C shim -- it iterates a ragged batch described by `batch_sizes` \
+             rather than a rectangular (seq, batch, feature) tensor. \
+             `aten.lstm.input` is implemented.",
+        )),
 
         other => Err(aten_not_implemented(other)),
     }
@@ -26823,4 +26842,559 @@ fn upsample_nearest1d_default(
     }
     let tensor = write_flat(OP, out, out_dims, &device, tag)?;
     finish(py, tensor, tag)
+}
+
+// ===========================================================================
+// docs/RNN.md -- the two kernels this round added, kept in one contiguous
+// block at the end of the file (and their dispatch arms in one contiguous run)
+// so a merge that splices by category does not have to hunt for them.
+//
+// `torch.conv1d`, the third name this round was pointed at, needed NO kernel
+// and no code here at all: `bootstrap.py` has bound it to
+// `aten.convolution.default` since docs/ARCH20.md. See docs/RNN.md §1 for what
+// its two architectures actually stop on, which is not the name.
+// ===========================================================================
+
+/// `aten::upsample_linear1d(Tensor self, SymInt[1] output_size,
+///     bool align_corners, float? scales=None) -> Tensor`
+///
+/// `sam_vision_model` / `sam_hq_vision_model` (docs/ARCH200.md §2), and
+/// docs/VOICE.md rank 14's sibling: `F.interpolate(x_3d, mode="linear")`
+/// binds `torch._C._nn.upsample_linear1d`, not the 2-D op.
+///
+/// **Not an alias of `upsample_bilinear2d`, and its kinship was verified
+/// rather than assumed** -- docs/GLU.md §2 flagged that kinship as "likely but
+/// unverified" and docs/DEMAND8.md recorded three traps in the *bicubic*
+/// sibling. Measured against upstream 2.13.0 (`torch.ops.aten.
+/// upsample_linear1d.default`), one at a time:
+///
+///   * `align_corners=False` **does** clamp the source index at 0, the way
+///     bilinear does and cubic does not. `upsample_linear1d(arange(4)/1,
+///     [8], False, 2.0)` starts at exactly `0.0`, where the unclamped index
+///     is `-0.25`.
+///   * there **is** an `output_size == input_size` short circuit (bicubic has
+///     none). It is not observable by value here -- with `align_corners=False`
+///     and `scale == 1` the index arithmetic is exact anyway -- so it is kept
+///     for bilinear's reason rather than claimed as a measured difference.
+///   * the weights are at `opmath_t`, **not** at the input's dtype. A `float16`
+///     input gives `float32` lambdas narrowed only at the store; storing them
+///     at `half` is indistinguishable on the two-tap linear kernel (both taps
+///     share one lambda pair), which is exactly why bicubic's trap does not
+///     transfer -- it is a *four*-tap kernel and that is where the difference
+///     lives.
+///
+/// **The one thing that is genuinely different from `upsample_bilinear2d`'s
+/// transcription, and it is arithmetic, not structure**: the source index is
+/// one FUSED multiply-add, `fma(scale, index + 0.5, -0.5)`, not a multiply
+/// followed by a subtraction. Measured on a `float32` 4 -> 7 resample: the
+/// unfused form rounds `0.5714286 * 3.5` to exactly `2.0` and yields lambdas
+/// `(0.5, 0.5)`, where upstream yields `(0.49999988, 0.50000012)` -- recovered
+/// by feeding one-hot inputs, so it is the weights themselves and not an
+/// accumulation artefact. The two differ by ~3 ULP on every output the fusion
+/// touches, which the golden `float32` tolerance (1e-5) would NOT have caught;
+/// `pytests/test_rnn.py` compares bit patterns instead.
+///
+/// `uint8` is **refused** here, where `upsample_bilinear2d` has a separate
+/// fixed-point kernel and `upsample_nearest1d` computes: measured, upstream
+/// raises `"compute_indices_weights_linear" not implemented for 'Byte'`.
+/// That refusal name -- not bilinear's `upsample_bilinear2d_channels_last` --
+/// is the one transcribed, since naming the wrong kernel says the wrong thing
+/// about which kernel a caller failed to reach.
+fn upsample_linear1d_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.upsample_linear1d.default";
+    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let output_size = shape_arg(OP, args, kwargs, 1, "output_size")?;
+    let align_corners =
+        bool_arg(args, kwargs, 2, "align_corners")?.ok_or_else(|| missing(OP, "align_corners"))?;
+    let scales = scalar_arg(OP, args, kwargs, 3, "scales")?.map(|s| s.as_f64());
+
+    if output_size.len() != 1 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "It is expected output_size equals to 1, but got size {}",
+            output_size.len()
+        )));
+    }
+    let dims = input.tensor()?.dims().to_vec();
+    if dims.len() != 3 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "It is expected input_size equals to 3, but got size {}",
+            dims.len()
+        )));
+    }
+    let in_w = dims[2] as i64;
+    let out_w = output_size[0] as i64;
+    if in_w <= 0 || out_w <= 0 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "Input and output sizes should be greater than 0, but got input (W: \
+             {in_w}) output (W: {out_w})"
+        )));
+    }
+    // A zero *batch* is fine and gives an empty answer; a zero channel count
+    // raises. Both measured, same split as `upsample_bilinear2d`.
+    if dims[1..].iter().product::<usize>() == 0 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "Non-empty 3D data tensor expected but got a tensor with sizes {dims:?}"
+        )));
+    }
+    let tag = input.tag();
+    if !tag.is_floating_point() {
+        return Err(pyo3::exceptions::PyNotImplementedError::new_err(format!(
+            "\"compute_indices_weights_linear\" not implemented for '{}'",
+            scalar_type_name(tag)
+        )));
+    }
+
+    let out_dims = vec![dims[0], dims[1], out_w as usize];
+    let device = input.tensor()?.device().clone();
+    if dims[0] == 0 {
+        let out = Tensor::zeros(out_dims, PyDtype::new(tag).storage(OP)?, &device)
+            .map_err(|e| candle_err(OP, e))?;
+        return finish(py, out, tag);
+    }
+
+    // `opmath_t`: `float` for every float dtype but `double`. A *narrowing*
+    // for nothing and a widening for `float16`/`bfloat16`.
+    let acc32 = tag != TorchDType::Float64;
+
+    // `area_pixel_compute_scale`.
+    let scale: f64 = if align_corners {
+        if out_w > 1 {
+            if acc32 {
+                ((in_w - 1) as f32 / (out_w - 1) as f32) as f64
+            } else {
+                (in_w - 1) as f64 / (out_w - 1) as f64
+            }
+        } else {
+            0.0
+        }
+    } else {
+        match scales {
+            Some(given) if given > 0.0 => {
+                if acc32 {
+                    (1.0 / given) as f32 as f64
+                } else {
+                    1.0 / given
+                }
+            }
+            _ => {
+                if acc32 {
+                    (in_w as f32 / out_w as f32) as f64
+                } else {
+                    in_w as f64 / out_w as f64
+                }
+            }
+        }
+    };
+
+    // `compute_source_index_and_lambda`, once per output column.
+    //
+    // `i0` is clamped as well as `i1`: an explicit `scales` smaller than the
+    // size ratio pushes the index past the end (`scales=0.5` on a 4 -> 8
+    // resample reaches 14.5), and upstream answers with the last input
+    // element there rather than reading out of bounds. `upsample_bilinear2d`
+    // clamps only `i1` because nothing in its callers reaches that case;
+    // copying it unchanged would panic here.
+    let grid: Vec<(usize, usize, f64, f64)> = (0..out_w)
+        .map(|index| {
+            if out_w == in_w {
+                return (index as usize, index as usize, 1.0, 0.0);
+            }
+            let real = if align_corners {
+                if acc32 {
+                    (scale as f32 * index as f32) as f64
+                } else {
+                    scale * index as f64
+                }
+            } else if acc32 {
+                // ONE rounding, not two. See the doc comment.
+                let value = (scale as f32).mul_add(index as f32 + 0.5f32, -0.5f32);
+                if value < 0.0 {
+                    0.0
+                } else {
+                    value as f64
+                }
+            } else {
+                let value = scale.mul_add(index as f64 + 0.5, -0.5);
+                if value < 0.0 {
+                    0.0
+                } else {
+                    value
+                }
+            };
+            let i0 = real as i64;
+            let l1 = if acc32 {
+                (real as f32 - i0 as f32) as f64
+            } else {
+                real - i0 as f64
+            };
+            let l0 = if acc32 { (1.0f32 - l1 as f32) as f64 } else { 1.0 - l1 };
+            (
+                i0.min(in_w - 1).max(0) as usize,
+                (i0 + 1).min(in_w - 1).max(0) as usize,
+                l0,
+                l1,
+            )
+        })
+        .collect();
+
+    // The host readback lives HERE, in the dispatched function, not behind a
+    // helper -- `device.rs`'s `MPS_HOST_READBACK_OPS` derivation follows
+    // helpers only one level by name (docs/VOICE3.md).
+    let source = match read_flat(OP, input.tensor()?, tag)? {
+        Flat::Float(values) => values,
+        Flat::Int(values) => values.into_iter().map(|v| v as f64).collect(),
+    };
+    let lanes = dims[0] * dims[1];
+    let mut out = vec![0.0f64; lanes * out_w as usize];
+    let mut at = 0usize;
+    for lane in 0..lanes {
+        let base = lane * in_w as usize;
+        for &(w0, w1, l0, l1) in &grid {
+            let v0 = source[base + w0];
+            let v1 = source[base + w1];
+            // A second fusion, and the multiply that stays UNfused is the
+            // `l1 * v1` one: measured on the 4 -> 5 float32 resample, output
+            // column 3, `fma(l0, v0, l1 * v1)` reproduces upstream's
+            // 14.299999237060547 where the plain sum, the other fusion, and
+            // the `v0 + l1 * (v1 - v0)` lerp all give 14.300000190734863.
+            out[at] = if acc32 {
+                (l0 as f32).mul_add(v0 as f32, l1 as f32 * v1 as f32) as f64
+            } else {
+                l0.mul_add(v0, l1 * v1)
+            };
+            at += 1;
+        }
+    }
+
+    let tensor = write_flat(OP, Flat::Float(out), out_dims, &device, tag)?;
+    finish(py, tensor, tag)
+}
+
+/// `aten::lstm.input(Tensor input, Tensor[] hx, Tensor[] params,
+///     bool has_biases, int num_layers, float dropout, bool train,
+///     bool bidirectional, bool batch_first) -> (Tensor, Tensor, Tensor)`
+///
+/// `parakeet_rnnt` and `parakeet_tdt` (docs/ARCH200.md §2). Their
+/// `ParakeetRNNTDecoder` is an `nn.LSTM(..., batch_first=True)`, and
+/// `nn.LSTM.forward` calls `_VF.lstm(input, hx, self._flat_weights,
+/// self.bias, self.num_layers, self.dropout, self.training,
+/// self.bidirectional, self.batch_first)` -- nine positional arguments, which
+/// is the `.input` overload.
+///
+/// **Which overload was measured, not inferred.** `aten::lstm` has two:
+/// `.input` (above) and `.data`, which takes a packed
+/// `(data, batch_sizes)` pair from `nn.utils.rnn.pack_padded_sequence` and has
+/// no `batch_first`. Both parakeet decoders take the `.input` route; `.data`
+/// is refused **by name** in the dispatcher rather than silently handled,
+/// because a packed batch is a different iteration order over the same
+/// weights and answering it with this kernel would return a right-shaped
+/// wrong tensor.
+///
+/// Implemented: `num_layers` > 1 (layer `l`'s output is layer `l+1`'s input),
+/// `bidirectional` (the reverse direction is a second parameter set whose
+/// output is CONCATENATED on the feature axis, so layer `l+1` sees `2*H`),
+/// `batch_first` (a transpose in and a transpose out -- the hidden states are
+/// `(layers*directions, batch, H)` either way, which is the trap:
+/// `batch_first` does NOT move the batch axis of `h_0`/`c_0`), `has_biases`
+/// false as well as true, and a supplied `(h_0, c_0)`.
+///
+/// Refused by name: a non-zero `dropout` while `train` is true (that draws
+/// from the RNG between layers and this kernel has no reproducible route to
+/// upstream's draw), and `proj_size != 0` (an `LSTM` with projections carries
+/// a fifth weight `w_hr` per layer-direction, which shows up here as an extra
+/// entry in `params` and is detected by counting rather than guessed at).
+///
+/// Gate order is `i, f, g, o` along the `4*H` axis of both `w_ih` and `w_hh` --
+/// upstream's, and the single place a plausible implementation is wrong while
+/// still returning the right shape:
+///
+/// ```text
+///   i = sigmoid(W_ii x + b_ii + W_hi h + b_hi)
+///   f = sigmoid(W_if x + b_if + W_hf h + b_hf)
+///   g = tanh   (W_ig x + b_ig + W_hg h + b_hg)
+///   o = sigmoid(W_io x + b_io + W_ho h + b_ho)
+///   c' = f * c + i * g
+///   h' = o * tanh(c')
+/// ```
+///
+/// **Both biases are added, not one.** `b_ih` and `b_hh` are separately stored
+/// and separately added; folding them would be invisible in a forward whose
+/// reference is itself wrong, and is why `pytests/test_rnn.py` compares
+/// against upstream on a multi-step sequence with a non-trivial `(h_0, c_0)` --
+/// a single timestep from a zero hidden state cannot tell a correct
+/// recurrence from one that drops `h` or transposes the gates.
+///
+/// Accumulation is `f64` internally with `h`/`c` narrowed to the input dtype
+/// after every timestep, which is where upstream's CPU path stores them. The
+/// gemm itself is a plain dot product rather than BLAS, so agreement with
+/// upstream is within the dtype's tolerance and not bit-for-bit -- which is
+/// what the golden harness compares and what `test_rnn.py` asserts.
+fn lstm_input(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.lstm.input";
+    let input = tensor_arg(OP, args, kwargs, 0, "input")?;
+    let hx: Vec<PyTensorBase> = required(OP, args, kwargs, 1, "hx")?.extract()?;
+    let params: Vec<PyTensorBase> = required(OP, args, kwargs, 2, "params")?.extract()?;
+    let has_biases =
+        bool_arg(args, kwargs, 3, "has_biases")?.ok_or_else(|| missing(OP, "has_biases"))?;
+    let num_layers = required(OP, args, kwargs, 4, "num_layers")?.extract::<i64>()?;
+    let dropout = scalar_arg(OP, args, kwargs, 5, "dropout")?
+        .map(|s| s.as_f64())
+        .unwrap_or(0.0);
+    let train = bool_arg(args, kwargs, 6, "train")?.ok_or_else(|| missing(OP, "train"))?;
+    let bidirectional =
+        bool_arg(args, kwargs, 7, "bidirectional")?.ok_or_else(|| missing(OP, "bidirectional"))?;
+    let batch_first =
+        bool_arg(args, kwargs, 8, "batch_first")?.ok_or_else(|| missing(OP, "batch_first"))?;
+
+    if hx.len() != 2 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "lstm expects two hidden states (h_0, c_0), got {}",
+            hx.len()
+        )));
+    }
+    if num_layers < 1 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "lstm: Expected num_layers greater than 0",
+        ));
+    }
+    if train && dropout > 0.0 {
+        return Err(not_implemented(format!(
+            "{OP}: dropout={dropout} with train=True is not implemented in torch._C \
+             shim -- upstream draws a Bernoulli mask from the global RNG between \
+             layers, and this kernel has no route to reproduce that draw. \
+             `model.eval()` (train=False) reaches the same weights with no mask."
+        )));
+    }
+
+    let tag = input.tag();
+    if !tag.is_floating_point() {
+        return Err(pyo3::exceptions::PyNotImplementedError::new_err(format!(
+            "\"lstm_cell\" not implemented for '{}'",
+            scalar_type_name(tag)
+        )));
+    }
+
+    let dims = input.tensor()?.dims().to_vec();
+    if dims.len() != 3 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "lstm: Expected 3D tensor as input, got {}D tensor instead",
+            dims.len()
+        )));
+    }
+    let directions: usize = if bidirectional { 2 } else { 1 };
+    let num_layers = num_layers as usize;
+    let per_set: usize = if has_biases { 4 } else { 2 };
+    let expected = num_layers * directions * per_set;
+    if params.len() != expected {
+        // An `nn.LSTM(proj_size=k)` carries a fifth weight `w_hr` per
+        // layer-direction. Counted rather than guessed, so the refusal names
+        // the actual reason instead of "wrong number of parameters".
+        if params.len() == num_layers * directions * (per_set + 1) {
+            return Err(not_implemented(format!(
+                "{OP}: an LSTM with proj_size != 0 (a `w_hr` projection per \
+                 layer-direction, {} parameters rather than {expected}) is not \
+                 implemented in torch._C shim",
+                params.len()
+            )));
+        }
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "lstm: expected {expected} parameters for num_layers={num_layers}, \
+             bidirectional={bidirectional}, has_biases={has_biases}, got {}",
+            params.len()
+        )));
+    }
+
+    // `(seq, batch, feature)` internally. `batch_first` moves the batch axis
+    // of the INPUT and the OUTPUT only -- `h_0`/`c_0` are
+    // `(layers*directions, batch, H)` either way.
+    let (seq_len, batch, input_size) = if batch_first {
+        (dims[1], dims[0], dims[2])
+    } else {
+        (dims[0], dims[1], dims[2])
+    };
+
+    let h0_dims = hx[0].tensor()?.dims().to_vec();
+    let c0_dims = hx[1].tensor()?.dims().to_vec();
+    let expected_hx = vec![num_layers * directions, batch, 0usize];
+    if h0_dims.len() != 3 || h0_dims[0] != expected_hx[0] || h0_dims[1] != batch {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "Expected hidden[0] size ({}, {}, H), got {:?}",
+            expected_hx[0], batch, h0_dims
+        )));
+    }
+    if c0_dims != h0_dims {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "Expected hidden[1] size {h0_dims:?}, got {c0_dims:?}"
+        )));
+    }
+    let hidden = h0_dims[2];
+
+    let device = input.tensor()?.device().clone();
+    let narrow = float_narrower(tag);
+
+    // Every readback is in this function, not behind a helper, for
+    // `MPS_HOST_READBACK_OPS`'s one-level-by-name derivation (docs/VOICE3.md).
+    let flat_of = |t: &PyTensorBase| -> PyResult<Vec<f64>> {
+        match read_flat(OP, t.tensor()?, tag)? {
+            Flat::Float(v) => Ok(v),
+            Flat::Int(v) => Ok(v.into_iter().map(|x| x as f64).collect()),
+        }
+    };
+    let x_raw = match read_flat(OP, input.tensor()?, tag)? {
+        Flat::Float(v) => v,
+        Flat::Int(v) => v.into_iter().map(|x| x as f64).collect(),
+    };
+    let h0 = flat_of(&hx[0])?;
+    let c0 = flat_of(&hx[1])?;
+    let mut param_data: Vec<Vec<f64>> = Vec::with_capacity(params.len());
+    for p in &params {
+        param_data.push(flat_of(p)?);
+    }
+
+    // Transpose out of `batch_first` once, into `(seq, batch, feature)`.
+    let mut layer_in: Vec<f64> = if batch_first {
+        let mut v = vec![0.0f64; seq_len * batch * input_size];
+        for b in 0..batch {
+            for t in 0..seq_len {
+                let src = (b * seq_len + t) * input_size;
+                let dst = (t * batch + b) * input_size;
+                v[dst..dst + input_size].copy_from_slice(&x_raw[src..src + input_size]);
+            }
+        }
+        v
+    } else {
+        x_raw
+    };
+    let mut layer_feature = input_size;
+
+    let mut h_n = vec![0.0f64; num_layers * directions * batch * hidden];
+    let mut c_n = vec![0.0f64; num_layers * directions * batch * hidden];
+
+    let sigmoid = |v: f64| 1.0 / (1.0 + (-v).exp());
+
+    for layer in 0..num_layers {
+        let mut layer_out = vec![0.0f64; seq_len * batch * hidden * directions];
+        for dir in 0..directions {
+            let set = (layer * directions + dir) * per_set;
+            let w_ih = &param_data[set];
+            let w_hh = &param_data[set + 1];
+            let (b_ih, b_hh) = if has_biases {
+                (Some(&param_data[set + 2]), Some(&param_data[set + 3]))
+            } else {
+                (None, None)
+            };
+            if w_ih.len() != 4 * hidden * layer_feature || w_hh.len() != 4 * hidden * hidden {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "lstm: parameter {set} has {} elements, expected {} for a \
+                     (4*{hidden}, {layer_feature}) weight",
+                    w_ih.len(),
+                    4 * hidden * layer_feature
+                )));
+            }
+            let state = layer * directions + dir;
+            let mut h: Vec<f64> = h0[state * batch * hidden..(state + 1) * batch * hidden].to_vec();
+            let mut c: Vec<f64> = c0[state * batch * hidden..(state + 1) * batch * hidden].to_vec();
+
+            for step in 0..seq_len {
+                let t = if dir == 0 { step } else { seq_len - 1 - step };
+                for b in 0..batch {
+                    let x_base = (t * batch + b) * layer_feature;
+                    let h_base = b * hidden;
+                    let mut gates = [0.0f64; 4];
+                    // **`h_new`/`c_new` are staged, not written in place.**
+                    // Every unit's gates read the WHOLE previous `h` row, so
+                    // updating `h[b][unit]` before unit+1 is computed feeds a
+                    // half-stepped hidden state into the rest of the row --
+                    // which still returns the right shape, and was this
+                    // kernel's first measured disagreement with upstream.
+                    let mut h_next = vec![0.0f64; hidden];
+                    let mut c_next = vec![0.0f64; hidden];
+                    for unit in 0..hidden {
+                        for (g, gate) in gates.iter_mut().enumerate() {
+                            let row = (g * hidden + unit) * layer_feature;
+                            let mut acc = 0.0f64;
+                            for k in 0..layer_feature {
+                                acc += w_ih[row + k] * layer_in[x_base + k];
+                            }
+                            let hrow = (g * hidden + unit) * hidden;
+                            for k in 0..hidden {
+                                acc += w_hh[hrow + k] * h[h_base + k];
+                            }
+                            if let (Some(bi), Some(bh)) = (b_ih, b_hh) {
+                                acc += bi[g * hidden + unit] + bh[g * hidden + unit];
+                            }
+                            *gate = acc;
+                        }
+                        let i_gate = sigmoid(gates[0]);
+                        let f_gate = sigmoid(gates[1]);
+                        let g_gate = gates[2].tanh();
+                        let o_gate = sigmoid(gates[3]);
+                        // Upstream's CPU path stores `c` and `h` at the input
+                        // dtype between timesteps; narrowing here is what makes
+                        // a `float16` run agree over a long sequence rather
+                        // than drift.
+                        let c_new = narrow(f_gate * c[h_base + unit] + i_gate * g_gate);
+                        let h_new = narrow(o_gate * c_new.tanh());
+                        c_next[unit] = c_new;
+                        h_next[unit] = h_new;
+                    }
+                    c[h_base..h_base + hidden].copy_from_slice(&c_next);
+                    h[h_base..h_base + hidden].copy_from_slice(&h_next);
+                    // The reverse direction writes into the SECOND half of the
+                    // feature axis at the same timestep, so the concatenation
+                    // is `[forward | backward]` per step -- not a reversed
+                    // output sequence.
+                    let out_base = (t * batch + b) * hidden * directions + dir * hidden;
+                    layer_out[out_base..out_base + hidden]
+                        .copy_from_slice(&h[h_base..h_base + hidden]);
+                }
+            }
+            h_n[state * batch * hidden..(state + 1) * batch * hidden].copy_from_slice(&h);
+            c_n[state * batch * hidden..(state + 1) * batch * hidden].copy_from_slice(&c);
+        }
+        layer_in = layer_out;
+        layer_feature = hidden * directions;
+    }
+
+    let out_dims = if batch_first {
+        vec![batch, seq_len, hidden * directions]
+    } else {
+        vec![seq_len, batch, hidden * directions]
+    };
+    let out_values = if batch_first {
+        let width = hidden * directions;
+        let mut v = vec![0.0f64; seq_len * batch * width];
+        for t in 0..seq_len {
+            for b in 0..batch {
+                let src = (t * batch + b) * width;
+                let dst = (b * seq_len + t) * width;
+                v[dst..dst + width].copy_from_slice(&layer_in[src..src + width]);
+            }
+        }
+        v
+    } else {
+        layer_in
+    };
+
+    let hx_dims = vec![num_layers * directions, batch, hidden];
+    let out = write_flat(OP, Flat::Float(out_values), out_dims, &device, tag)?;
+    let h_out = write_flat(OP, Flat::Float(h_n), hx_dims.clone(), &device, tag)?;
+    let c_out = write_flat(OP, Flat::Float(c_n), hx_dims, &device, tag)?;
+
+    // Promoted element by element: `promote` at the dispatcher's exit does not
+    // look inside a tuple, the same reason `native_layer_norm` promotes its own.
+    let triple = [
+        crate::tensor::promote(py, finish(py, out, tag)?)?,
+        crate::tensor::promote(py, finish(py, h_out, tag)?)?,
+        crate::tensor::promote(py, finish(py, c_out, tag)?)?,
+    ];
+    Ok(PyTuple::new(py, triple)?.into_any().unbind())
 }
