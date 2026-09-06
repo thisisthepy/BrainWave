@@ -713,3 +713,239 @@ print("CIA:", len(torch._C._dispatch_get_registrations_for_dispatch_key(
 ```
 
 같은 것을 상류 torch 로 (벤더 트리를 `PYTHONPATH` 에서 빼고) 돌리면 §3 의 비교 열이 나옵니다.
+
+---
+
+## 12. NNAPI · CoreML — 목적지를 매개변수로 만들고, 실제 그래프에 대고 쟀다
+
+§1~§11 은 목적지가 **Core ATen** 하나였습니다. ExecuTorch 의 Edge dialect 가 그 위에 정의되어
+있으니 맞는 선택입니다. 그런데 README 의 device 열이 NNAPI 와 CoreML 을 unsupported 로 적은
+이유는 그것이 아닙니다 — **두 장치는 각자의 작고 고정된 연산 집합으로 된 그래프를 받고, 그 두
+집합 중 어느 것도 Core ATen 이 아닙니다.**
+
+이번 회차가 한 것: 목적지를 매개변수로 만든 모듈(`torchnative/export/target.py`)을 세우고,
+**이 프로젝트가 실제로 돌리는 모델에서 캡처한 그래프**에 대고 개수를 셌습니다. 추정이 아니라
+계수입니다. 재현은 `rust/torch_c/pytests/nnapi_sizing.py`.
+
+<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/target.py nnapi_ops present -->
+<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/target.py coreml_ops present -->
+<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/target.py full_decomposition_table present -->
+<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/target.py lower_to present -->
+<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/target.py survey present -->
+
+### 12.1 헤드라인 — 상류의 분해표는 이 빌드에서 **돕니다**
+
+라운드에서 가장 값진 질문이 이것이었고, 답은 **예**입니다. 그리고 그 답은 §1 이 이미 낸 것보다
+한 걸음 더 나갑니다.
+
+`decompose.py` 는 `core_aten_decompositions()` 를 씁니다. 그것이 옳습니다 — 목적지가 Core ATen
+이니까. 그런데 그 표는 상류 레지스트리의 **걸러진 뷰**입니다: Core ATen 까지 내려가는 데 쓰이는
+규칙만 남기고, **이미 Core ATen 인 op 의 규칙은 일부러 버립니다.** 목적지가 Core ATen 일 때
+그 op 들에는 할 일이 없으니까요.
+
+`aten.gelu.default` 가 정확히 그 경우입니다. gelu 는 core 이므로 **core 표에 규칙이 없습니다.**
+그런데 NNAPI 의 집합은 Core ATen 이 아니고 gelu 를 포함하지 않으므로, NNAPI 로 내리려면
+**core 표가 버린 바로 그 규칙**이 필요합니다. 그리고 그 규칙은 상류에 그대로 있습니다 —
+`torch/_decomp/decompositions.py` 가 채우는 걸러지지 않은 레지스트리
+`global_decomposition_table["post_autograd"]` 안에.
+
+| 표 | 항목 수 |
+|---|---|
+| `core_aten_decompositions()` | 417 |
+| `global_decomposition_table["post_autograd"]` | **1008** |
+| 둘의 합집합 | 1014 |
+
+**어느 쪽도 다른 쪽을 포함하지 않습니다.** core 표에는 `matmul` 규칙이 있고 post-autograd 표에는
+없습니다. post-autograd 표에는 `gelu` 가 있고 core 표에는 없습니다. 그래서 non-core 목적지가
+원하는 것은 합집합이고, `target.py` 는 목적지가 exact(Core ATen)이 아니면 합집합 쪽을 집습니다.
+
+여기서도 **분해 규칙은 한 줄도 쓰지 않았습니다.** 목적지가 달라졌으니 상류 자기 레지스트리의
+**다른 뷰**를 골랐을 뿐입니다.
+
+### 12.2 NNAPI 의 집합은 읽은 것이지 옮겨 적은 것이 아니다
+
+벤더 트리에 `torch/backends/_nnapi/serializer.py` 가 있고, 그 안의 `ADDER_MAP` 이
+**직렬화를 실제로 수행할 코드**입니다. 거기 없는 op 은 하드웨어가 무엇을 지원하든 **이 PyTorch
+를 통해서는 NNAPI 에 닿지 못합니다.** 그러므로 이것은 문서가 아니라 권위입니다.
+`target.nnapi_ops()` 가 그 파일을 파싱합니다. 29 개 이름을 우리 트리에 베껴 놓는 것은
+`decompose.py` 가 Core ATen 목록에 대해 거부하는 실수를 한 치수 작게 되풀이하는 일입니다.
+
+`aten::` 항목 **29 개**. 그리고 이 29 개가 Core ATen 과 어떻게 갈리는지가 이 모듈이
+`decompose()` 의 래퍼가 아니라 별도로 서 있는 이유입니다:
+
+| | 개수 | 이름 |
+|---|---|---|
+| Core ATen **이기도** 한 것 | 14 | `add addmm avg_pool2d cat div hardtanh mean mul relu sigmoid slice sub unsqueeze upsample_nearest2d` |
+| Core ATen **이 아닌** 것 | **15** | `_convolution adaptive_avg_pool2d conv2d dequantize detach flatten linear log_softmax max_pool2d prelu quantize_per_tensor reshape size softmax to` |
+
+아래 줄이 결정적입니다. 그 15 개는 **합성 op** 이고, Core ATen 분해는 그것들을 **분해해
+없앱니다** — `linear` 은 `addmm`/`permute` 가 되고 `softmax` 는 `_softmax` 가 됩니다. 즉
+`decompose()` 를 돌린 뒤 결과를 NNAPI 에 넘기면 **NNAPI 가 원래 그대로 받던 29 개 중 15 개를
+파괴한 채로** 넘기게 됩니다. 낮춤은 목적지 상대적이고, 목적지가 박힌 패스는 두 번째 장치를
+섬길 수 없습니다.
+
+> **주의 — 이 수는 NNAPI 에 후한 상한입니다.** `ADDER_MAP` 은 TorchScript 노드 종류(`aten::add`)로
+> 키가 잡혀 있어 오버로드를 담지 않습니다. 캡처된 `aten.add.Tensor` 를 기본 이름으로 맞추는 것은
+> 직렬화기가 특정 오버로드나 dtype 을 여전히 거절할 수 있다는 뜻입니다. 아래 모든 "이미 있음"
+> 수치는 **상한**이며, 그렇게 읽어야 합니다.
+
+### 12.3 실제 캡처된 그래프에서 센 개수
+
+모델은 docs/DEMAND7.md 가 forward 하고 상류와 일치한다고 적은 것들에서 골랐습니다. toy config
+크기인데, **모델이 닿는 op 집합은 너비·깊이가 아니라 아키텍처에만 달려 있으므로** 그것으로
+충분합니다.
+
+| 모델 | 캡처 | 노드 | distinct op |
+|---|---|---|---|
+| `smollm2_llama` (Llama 계열 decoder-only) | 됨 | 144 | 26 |
+| `vit` | 됨 | 91 | 15 |
+| `mobilenet_v2` | 됨 | 203 | 7 |
+| `resnet` | **안 됨** | — | — |
+
+`resnet` 이 캡처되지 않는 것은 분해 문제가 아닙니다. 잔차 연결이 `aten.add_.Tensor` 로 제자리
+쓰기를 하고, docs/CAPTURE.md §4 가 변이를 이름을 대고 거절합니다. **NNAPI 이전에 캡처가 먼저
+막고 있는 것**이고, 분모를 조용히 줄이지 않도록 목록에 남겨 두었습니다.
+
+**세 그래프의 합집합 distinct op = 36.**
+
+| | 개수 |
+|---|---|
+| **이미 NNAPI 집합 안** | **12** |
+| **낮춰야 하는 것** | **24** |
+
+### 12.4 그 24 개가 왜 막혀 있는가 — 그리고 이것이 라운드의 결론이다
+
+합집합 표로 낮춤을 돌리고 거절 사유를 원문 그대로 분류했습니다. **"분해를 24 개 써야 한다" 가
+아닙니다.**
+
+| 왜 거절되는가 | 개수 | op |
+|---|---|---|
+| **상류 규칙은 있는데, 실행이 셰임에 없는 `prims.*` 에 부딪힘** | **13** | `alias clone cos erf expand neg permute reciprocal rsqrt sin sqrt tanh view` |
+| 어느 상류 표에도 규칙이 없음 | 6 | `bmm contiguous convolution index.Tensor mm select.int` |
+| 그 밖의 셰임 구멍 (인자 · 오버로드) | 5 | `_scaled_dot_product_flash_attention_for_cpu` `arange` `constant_pad_nd` `native_layer_norm` `new_zeros` |
+
+첫 줄이 답입니다. **13 개는 분해가 없어서 막힌 것이 아니라, 상류의 분해가 `torch._refs`/`prims`
+로 쓰여 있는데 이 셰임이 aten 은 구현하고 prims 는 구현하지 않아서 막힙니다.** 빠진 것은
+**13 개의 `prims.*` op** 입니다:
+
+```
+prims.broadcast_in_dim  prims.clone     prims.cos        prims.erf     prims.neg
+prims.reciprocal        prims.rsqrt     prims.sin        prims.split_dim
+prims.sqrt              prims.tanh      prims.transpose  prims.view_of
+```
+
+세 번째 줄의 5 개도 대부분 작습니다 — `arange.start_step` 과 `new_zeros` 는 `layout=torch.strided`
+를 받지 않고, `constant_pad_nd` 는 `memory_format=torch.contiguous_format` 을 받지 않으며,
+`native_layer_norm` 은 `torch.var_mean` 의 오버로드 표 항목이 없습니다. **커널이 없는 것이 아니라
+인자를 안 받는 것**입니다.
+
+> 그러므로 "NNAPI 를 막는 것이 무엇인가" 의 답은 **분해 60 개** 도 **24 개** 도 아니고,
+> **`prims.*` 13 개 + 작은 인자 구멍 5 개** 입니다. 그것이 이 라운드가 사려던 정보입니다.
+
+### 12.5 세 표를 나란히 돌린 결과 — 그리고 낮춤이 **후퇴**하는 경우
+
+| 표 | LOWERED | `smollm2` 밖 | `vit` 밖 | `mobilenet` 밖 |
+|---|---|---|---|---|
+| core | 5 | 17→16 | 11→10 | 3→3 (노드 203→203) |
+| post_autograd | 9 | 17→14 | 11→10 | 3→**6** (노드 203→**1191**) |
+| union | **11** | 17→15 | 11→10 | 3→**6** (노드 203→**1191**) |
+
+`mobilenet_v2` 를 그대로 적었습니다. post-autograd 표를 쓰면 **더 나빠집니다** — `native_batch_norm`
+이 낮춰지긴 하는데 그 결과가 `sqrt`·`reciprocal`·`new_zeros` 이고 NNAPI 는 그 셋을 다 갖고 있지
+않아서, 밖에 있는 op 이 3 개에서 6 개로 늘고 노드가 6 배가 됩니다. **표를 크게 하는 것이 항상
+이득은 아닙니다.** 목적지가 다르면 어떤 규칙은 목적지에서 **멀어지는** 방향입니다.
+
+`test_lowering_a_whole_module_graph_preserves_what_it_computes` 가 같은 성질을 가장 작은 예제로
+못박아 둡니다: `Linear→GELU→Linear` 그래프에서 `t`·`gelu` 두 개가 밖에 있었고, 낮춘 뒤에도
+`permute`·`erf` 두 개가 밖에 있습니다. **개수가 줄지 않았습니다.** "9 개가 낮춰진다" 는 문장이
+NNAPI 쪽으로 9 만큼 갔다는 뜻으로 읽히기 쉬워서, 그 모듈에서는 0 이라는 것을 테스트가
+직접 들고 있게 했습니다 (§5.3 의 "테스트 수는 진척이 아니다" 와 같은 이유).
+
+### 12.6 CoreML 은 **재지 않았습니다**
+
+이 트리에 CoreML 연산 집합이 없습니다. `torch/backends/_coreml/preprocess.py` 는 `coremltools
+.convert` 를 호출하고 결과 blob 을 저장하는 **패키징 래퍼**이고, op 목록을 갖고 있지 않습니다.
+실제 레지스트리는 coremltools 안의 `coremltools.converters.mil.frontend.torch.ops` 이며
+(`@register_torch_op` 로 채워집니다), **coremltools 는 이 환경에 설치되어 있지 않습니다.**
+
+`target.coreml_ops()` 는 그럴듯한 목록을 돌려주는 대신 **거절하고 그 사실을 말합니다.**
+손으로 쓴 CoreML 집합은 "CoreML 을 위해 몇 개를 분해해야 하는가" 의 답을 **쓰는 행위로**
+정해버리고, 그 답이 측정치로 보고됩니다 — CLAUDE.md §5.4 가 이름을 붙여 둔 함정 그대로입니다.
+`test_coreml_operator_set_refuses_instead_of_inventing_one` 이 그 거절을 붙잡아 둡니다.
+
+**다음 사람이 할 일:** coremltools 를 설치하고 그 레지스트리를 읽는다. 여기에 목록을 옮겨 적지
+않는다.
+
+### 12.7 공유되는 분해가 무엇인가
+
+질문은 "두 목적지가 공유하는 분해는 무엇인가" 였습니다. CoreML 집합을 재지 못했으므로 교집합을
+셀 수는 없지만, **어느 쪽이 공유될 수 있는 종류인지는 구조로 갈립니다.**
+
+- **목적지 독립** — 원시 연산 위의 항등식. `gelu → erf` 또는 `gelu → tanh`, `silu → x·sigmoid(x)`,
+  `t/transpose → permute`, `matmul → mm`. 무엇이 받아주든 같은 함수이므로 어느 목적지에도 그대로
+  쓰입니다. **지을 값어치가 있는 것은 이 부분집합이고, 그리고 그것은 이미 상류가 갖고 있습니다.**
+- **목적지 의존** — 레이아웃, 양자화 표현, NCHW/NHWC, 어느 합성 op 을 그대로 둘 것인가.
+  §12.2 의 15 개가 여기입니다. `conv2d` 를 그대로 두는 것은 NNAPI 에 대해 옳고 Core ATen 에
+  대해 틀립니다.
+
+즉 **공유 부분집합은 새로 쓸 것이 거의 없습니다.** 상류의 규칙이 이미 목적지 독립이고, 이
+회차가 확인한 대로 그 규칙들은 여기서 **돕니다** — 막는 것은 규칙이 아니라 §12.4 의 `prims.*` 입니다.
+
+### 12.8 수치로 증명한 것
+
+"타입이 맞는다" 가 아니라 **실제 텐서 위에서 값이 같다** 입니다. 각 항목은 트레이스가 본 적 없는
+입력 3 벌에 대해 원본 함수와 낮춘 그래프를 재생해 비교한 것입니다.
+
+| 분해 | 노드 | 낮춰진 결과 | 일치 |
+|---|---|---|---|
+| `gelu` (기본) | 1→5 | `erf`, `mul.Scalar`, `mul.Tensor`, `add.Scalar` | **비트 단위 완전 일치** |
+| `gelu` (`approximate="tanh"`) | 1→9 | `tanh`, `mul`, `add` | **비트 단위 완전 일치** |
+| `silu` | 1→2 | `sigmoid`, `mul.Tensor` | 최대 절대차 1.19e-07 |
+| `t` | 1→1 | `permute` | **비트 단위** |
+| `transpose.int` | 1→1 | `permute` | **비트 단위** |
+| `matmul` | 1→1 | `mm` | **비트 단위** |
+| `native_batch_norm` (추론) | 1→20 | `sqrt` `reciprocal` `sub` `mul` `add` `unsqueeze` … | 최대 절대차 4.77e-07 |
+| `Linear→GELU→Linear` 그래프 전체 | 5→9 | — | **비트 단위** |
+| `vit` 그래프 전체 (91→99 노드) | — | — | **비트 단위** |
+| `smollm2_llama` 그래프 전체 (144→179 노드) | — | — | 최대 절대차 2.38e-07 |
+
+두 개의 `gelu` 근사가 **서로 다른 그래프**로 내려간다는 것도 함께 못박았습니다 — `approximate=`
+를 무시하는 규칙은 여전히 "비슷한" 값을 내므로, 그것만 보면 통과합니다.
+
+그래프 전체를 재생하는 항목이 따로 있는 이유: **op 하나씩의 증명은 저절로 합성되지 않습니다.**
+스플라이스는 부모 그래프의 모든 값 참조를 다시 번호 매겨야 하고, 거기서 하나가 어긋난 그래프는
+**여전히 돌면서 다른 값을 냅니다.**
+
+### 12.9 이 절이 세운 표면
+
+```python
+from torchnative.export import target as T
+
+T.NNAPI                      # <TargetSet nnapi: 29 ops>  -- 벤더 트리에서 읽음
+T.CORE_ATEN                  # <TargetSet core-aten: 193 ops>
+T.nnapi_ops()                # frozenset of base names
+T.coreml_ops()               # NotImplementedError -- 이 트리에 권위가 없다
+T.full_decomposition_table() # 상류의 걸러지지 않은 post-autograd 레지스트리
+
+T.lower_to(trace, T.NNAPI)   # 전부 낮추거나, 못 낮춘 op 을 이름으로 대고 거절
+T.survey(trace, T.NNAPI)     # 중단하지 않고 op 마다 판정 -- 계수용
+```
+
+`lower_to` 와 `survey` 가 나뉜 것이 의도입니다. `decompose()` 는 첫 거절에서 트레이스 전체를
+포기하므로 "이 그래프가 낮춰지는가" 에는 답하지만 **"이 그래프의 op 중 몇 개가 낮춰지는가" 에는
+영원히 답하지 못합니다.** 크기를 재려면 후자가 필요합니다. 반대로 델리게이트에 넘길 때는
+**부분적으로 낮춰진 그래프가 완성된 그래프와 똑같이 생겼다**는 것이 이 층에서 가장 저지르기 쉬운
+실패이므로, `lower_to` 는 전부 아니면 거절입니다.
+
+### 12.10 미완으로 남긴 것
+
+- **`prims.*` 13 개** — §12.4. 이것이 NNAPI 로 가는 가장 짧은 경로이고, 이 회차의 영역 밖입니다
+  (커널 작업이고 `aten.rs` 를 건드립니다).
+- **CoreML 계측** — coremltools 설치가 선행 조건. §12.6.
+- **`resnet` 캡처** — 제자리 잔차 add. 분해가 아니라 캡처 층의 일 (docs/CAPTURE.md §4).
+- **규칙이 아예 없는 6 개** (`bmm` `contiguous` `convolution` `index.Tensor` `mm` `select.int`) —
+  이들 중 몇은 NNAPI 하드웨어에는 대응이 있습니다. `NNAPI_OperationCode` 열거형은 **95 개**인데
+  `ADDER_MAP` 은 29 개만 닿습니다. 즉 남은 거리의 일부는 "분해가 없다" 가 아니라 **"상류
+  직렬화기가 아직 안 잇는다"** 입니다. 그 둘을 섞어 세지 않도록 여기 나눠 적습니다.
+- **실제 NNAPI 델리게이트** — 없습니다. 이 절이 세운 것은 그 델리게이트가 받을 그래프를 만드는
+  자리이지, 그것을 받는 장치가 아닙니다.
