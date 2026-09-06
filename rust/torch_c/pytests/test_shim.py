@@ -21699,6 +21699,242 @@ def test_reach_allowlist_reasons_are_answerable_by_upstream():
         # about this environment, not a green light.
         print("NOTE: reach allowlist upstream claims not verified here -- %s" % detail)
 
+# W8 and W9: the eager recorder and its lifetime. docs/BACKWARD7.md
+# ---------------------------------------------------------------------------
+
+
+def _eager_grad(loss, wrt):
+    """`_eager_backward`, projected back onto the tensors the caller named.
+
+    The tape numbers its own constants, so a caller has no way to say "the
+    gradient of `w`" except by identity -- which is what `tensors` is handed
+    back for.
+    """
+    got = _C._eager_backward(loss, None, list(wrt))
+    by_id = {id(t): g for t, g in zip(got["tensors"], got["grads"])}
+    return [by_id.get(id(t)) for t in wrt]
+
+
+def test_the_eager_recorder_records_exactly_the_ops_that_get_a_grad_fn():
+    """docs/BACKWARD7.md §2: W8's gate is `mark_from_op`'s answer and nothing
+    else.
+
+    The reason this is a test and not a comment is cost. docs/BACKWARD5.md §7
+    row 2 lists the per-dispatch cost of an always-on recorder as the number
+    nobody has, and the design that makes it near-zero is that the recorder
+    asks *no question of its own*: it runs only when the door has just given an
+    output a `grad_fn`, which is upstream's condition for a graph node
+    existing. So "records exactly the ops that get a `grad_fn`" is the
+    performance claim and the correctness claim at once, and a change that
+    broke either would break this.
+    """
+    _C._eager_reset()
+    assert _C._eager_tape_size() == 0
+
+    # No operand requires a gradient: this is every inference forward in the
+    # process, and it must leave no tape behind at all.
+    plain = _tape_f64(_tape_ramp(4), [4])
+    for _ in range(5):
+        _C._aten_dispatch("aten.mul.Tensor", plain, plain)
+    assert _C._eager_tape_size() == 0, "an inference forward built a graph"
+
+    # One operand does. Now every differentiable op is a node.
+    leaf = _tape_f64(_tape_ramp(4), [4])
+    leaf.requires_grad = True
+    a = _C._aten_dispatch("aten.mul.Tensor", leaf, leaf)
+    assert _C._eager_tape_size() == 1, _C._eager_tape_size()
+    assert a._shim_from_op == "aten.mul.Tensor", a._shim_from_op
+    b = _C._aten_dispatch("aten.tanh.default", a)
+    assert _C._eager_tape_size() == 2, _C._eager_tape_size()
+
+    # `detach` is on `NOT_DIFFERENTIABLE`, so it gets no `grad_fn` -- and
+    # therefore no node. The two answers are the same answer.
+    detached = _C._aten_dispatch("aten.detach.default", b)
+    assert detached._shim_from_op is None, detached._shim_from_op
+    assert _C._eager_tape_size() == 2, "detach was recorded, and it has no grad_fn"
+
+    # Grad mode off is upstream's other way of saying no node.
+    _C._shim_set_grad_enabled_flag(False)
+    try:
+        _C._aten_dispatch("aten.mul.Tensor", b, b)
+    finally:
+        _C._shim_set_grad_enabled_flag(True)
+    assert _C._eager_tape_size() == 2, "an op under no_grad was recorded"
+    _C._eager_reset()
+
+
+def test_the_eager_tape_and_the_capture_tape_are_the_same_derivative_rules():
+    """docs/BACKWARD3.md and docs/BACKWARD5.md §4: **reuse, not a second set of
+    rules.**
+
+    This project has said "do not write the second one" about `full`/
+    `full_like`, about `norm`/`linalg_vector_norm` and about the tape itself,
+    and this is the test that makes the saying checkable. The same program is
+    differentiated twice -- once through `_capture_begin`/`_capture_end` and
+    `CaptureTrace.backward()`, which replays the forward out of shapes, and
+    once through the eager recorder, which never replays anything -- and the
+    two must agree **element-wise**.
+
+    They can only agree by running the same 60 rules. `derivative()`,
+    `wrt_set()`, `reachable()` and `wanted()` are called by both and know about
+    neither; the difference between the two callers is entirely in how the
+    `Env` is built. If somebody adds an eager-only rule, this test is where it
+    shows up.
+    """
+    def program(x, w):
+        # Non-linear in both arguments, so a gradient cannot agree by
+        # coincidence -- docs/BACKWARD5.md §1.1's rule, met inside the test
+        # rather than asserted about it.
+        h = _C._aten_dispatch("aten.tanh.default", _C._aten_dispatch("aten.mul.Tensor", x, w))
+        return _C._aten_dispatch("aten.sum.default", _C._aten_dispatch("aten.mul.Tensor", h, h))
+
+    values, weights = _tape_ramp(4), _tape_ramp(4, 0.4, 1.9)
+
+    x = _tape_f64(values, [4])
+    w = _tape_f64(weights, [4])
+    _C._capture_begin([x])
+    trace = _C._capture_end(program(x, w))
+    replayed = trace.backward([x])
+    from_capture = [replayed["inputs"][0].tolist(), replayed["constants"][0].tolist()]
+
+    _C._eager_reset()
+    ex = _tape_f64(values, [4])
+    ew = _tape_f64(weights, [4])
+    ex.requires_grad = True
+    ew.requires_grad = True
+    grads = _eager_grad(program(ex, ew), [ex, ew])
+    from_eager = [g.tolist() for g in grads]
+
+    assert from_eager == from_capture, (from_eager, from_capture)
+    # And they are not trivially equal by both being zero or both being one.
+    flat = [v for row in from_capture for v in row]
+    assert len(set(flat)) == len(flat) > 4, flat
+
+
+def test_the_eager_graph_is_freed_by_the_backward_that_walks_it():
+    """**W9**, and it is upstream's `retain_graph=False` *default* rather than
+    a lesser refusal -- docs/BACKWARD5.md §3 is the measurement that says so
+    (18.9 MiB at S=8, 302.6 at S=128 for SmolLM2-135M, held for one iteration,
+    which is what upstream already pays).
+
+    docs/BACKWARD2.md §1.5 asked what would keep the intermediates alive. The
+    answer docs/BACKWARD5.md §4 found is that the thing already existed and was
+    being thrown away: `Recorder`'s keepalive, reshaped into an `Env`. So this
+    test is about the *other* end of that -- once it is kept, something has to
+    let go of it, and the backward is that something.
+
+    Upstream on the same program: `Trying to backward through the graph a
+    second time (or directly access saved tensors after they have already been
+    freed).`
+    """
+    _C._eager_reset()
+    leaf = _tape_f64(_tape_ramp(3), [3])
+    leaf.requires_grad = True
+    h = _C._aten_dispatch("aten.tanh.default", leaf)
+    loss = _C._aten_dispatch("aten.sum.default", _C._aten_dispatch("aten.mul.Tensor", h, h))
+    held = _C._eager_tape_size()
+    assert held >= 3, held
+
+    first = _eager_grad(loss, [leaf])[0]
+    assert first is not None
+    assert _C._eager_tape_size() == 0, "the backward did not release the graph"
+
+    try:
+        _C._eager_backward(loss)
+    except RuntimeError as exc:
+        message = str(exc)
+    else:
+        raise AssertionError(
+            "a second backward answered -- if retain_graph landed, invert this "
+            "test rather than deleting it"
+        )
+    assert "second time" in message, message
+    assert "retain_graph" in message, message
+
+    # "Freed" and "never had a graph" are told apart by the tensor's own
+    # `grad_fn`, not by a table of remembered addresses -- an earlier version
+    # of this kept freed addresses in a side set and gave the wrong message the
+    # first time an address was reused.
+    stranger = _tape_f64([1.0, 2.0], [2])
+    try:
+        _C._eager_backward(_C._aten_dispatch("aten.sum.default", stranger))
+    except RuntimeError as exc:
+        other = str(exc)
+    else:
+        raise AssertionError("a tensor with no grad_fn was differentiated")
+    assert "grad_fn" in other, other
+    assert "second time" not in other, other
+
+
+def test_the_eager_graph_refuses_a_write_through_a_view_of_a_value_it_holds():
+    """docs/BACKWARD5.md §1.1's A5 and A6 -- the **100x silently wrong
+    gradient** -- reaching a recorder for the first time.
+
+    §6 deferred W10b (storage-shared version counters, view metadata, alias
+    sets) on the grounds that it had no consumer until an eager recorder
+    existed. This round is the one that makes it exist, and the verdict is
+    unchanged for a reason §6 did not have: **a tape that refuses does not need
+    to know what aliases what.** It needs to know that a write landed on bytes
+    it depends on, and docs/BACKWARD6.md §4 already made that one lookup by
+    keying versions on the candle `Storage` rather than on the Python object.
+
+    So this is strictly less than upstream, and deliberately: upstream
+    *differentiates* this program and this refuses it. What is bought is that
+    the number below is never produced.
+    """
+    _C._eager_reset()
+    x = _tape_f64([0.3, 0.7, 1.1], [3])
+    x.requires_grad = True
+    a = _C._aten_dispatch("aten.mul.Scalar", x, 1.0)
+    view = _C._aten_dispatch("aten.view.default", a, [3])
+    _C._shim_set_grad_enabled_flag(False)
+    try:
+        _C._aten_dispatch("aten.mul_.Scalar", a, 10.0)
+    finally:
+        _C._shim_set_grad_enabled_flag(True)
+    loss = _C._aten_dispatch(
+        "aten.sum.default", _C._aten_dispatch("aten.mul.Tensor", view, view)
+    )
+    # The forward is the mutated one -- 3 * (10 * value)**2 for the ramp above.
+    assert abs(loss.item() - 179.0) < 1e-9, loss.item()
+    assert _C._eager_reason() is not None, "the write was not noticed"
+
+    try:
+        _C._eager_backward(loss)
+    except NotImplementedError as exc:
+        message = str(exc)
+    else:
+        raise AssertionError(
+            "the tape answered through an alias -- if W10b landed, this test "
+            "should assert the gradient upstream gives, not the refusal"
+        )
+    assert "in-place" in message, message
+    assert "view of the same storage" in message, message
+    _C._eager_reset()
+
+
+def test_tensor_backward_still_refuses_even_though_an_eager_graph_exists():
+    """docs/BACKWARD7.md §5. W8 and W9 landed; the **engine did not**.
+
+    The distinction this keeps is the one the round was told to keep: a graph
+    that records ops is not an engine. `_ImperativeEngine.run_backward` is
+    where `Tensor.backward()` and `torch.autograd.grad()` both land, and
+    wiring it needs `.grad` accumulation onto leaves, `allow_unused`,
+    `retain_grad`, hooks and `create_graph` -- none of which this round built
+    or checked. A refusal that names the wall is worth more than a
+    `.backward()` that half works.
+
+    Invert this test when the engine lands; do not delete it.
+    """
+    assert hasattr(_C, "_eager_backward"), "W8 did not land"
+    try:
+        _C._ImperativeEngine().run_backward()
+    except NotImplementedError as exc:
+        message = str(exc)
+    else:
+        raise AssertionError("run_backward no longer refuses -- invert this test")
+    assert "_ImperativeEngine.run_backward" in message, message
+
 
 if __name__ == "__main__":
     raise SystemExit(_main())

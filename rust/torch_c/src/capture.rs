@@ -65,11 +65,52 @@ static CAPTURING: AtomicBool = AtomicBool::new(false);
 
 thread_local! {
     static RECORDER: RefCell<Option<Recorder>> = const { RefCell::new(None) };
+    /// **W8** (docs/BACKWARD7.md): the eager tape. Same `Recorder`, no region.
+    ///
+    /// There is no `_eager_begin`. It exists from the first dispatch that
+    /// produces a `grad_fn` and lasts until `_eager_backward` frees it, which
+    /// is `docs/BACKWARD5.md` §4's "`CAPTURING` on outside a capture region"
+    /// with the gating moved to where it costs nothing -- see `EAGER_ON`.
+    static EAGER: RefCell<Option<Recorder>> = const { RefCell::new(None) };
 }
 
 #[inline(always)]
 pub fn is_active() -> bool {
     CAPTURING.load(Ordering::Relaxed)
+}
+
+/// Whether the eager tape records at all.
+///
+/// On by default, because a `.backward()` that only works after the caller
+/// asked for it is not `.backward()`. It costs nothing when nothing
+/// differentiates: the door consults it **only after `mark_from_op` has said
+/// it marked an output**, which is upstream's exact condition for a node
+/// existing at all, and which is already computed. An inference forward pays
+/// one `bool` returned in a register.
+static EAGER_ON: AtomicBool = AtomicBool::new(true);
+
+#[inline(always)]
+pub fn eager_enabled() -> bool {
+    EAGER_ON.load(Ordering::Relaxed)
+}
+
+/// Off switch, so that the recorder's own cost can be measured against a
+/// control in the same binary rather than against a second build, and so that
+/// a caller who knows they will never differentiate can decline the retention
+/// W9 is about.
+#[pyfunction]
+#[pyo3(name = "_eager_set_enabled")]
+pub fn eager_set_enabled(value: bool) {
+    EAGER_ON.store(value, Ordering::Relaxed);
+    if !value {
+        eager_free();
+    }
+}
+
+#[pyfunction]
+#[pyo3(name = "_eager_enabled")]
+pub fn eager_enabled_py() -> bool {
+    eager_enabled()
 }
 
 // ---------------------------------------------------------------------------
@@ -170,13 +211,49 @@ struct Recorder {
     inputs: Vec<TensorMeta>,
     consts: Vec<TensorMeta>,
     /// Object address -> where that value came from. Every address in here
-    /// belongs to an object `keepalive` (or `const_objects`) holds a strong
-    /// reference to, so an address can never be reused under us while the
-    /// recording is open. That is the price of identity: a trace of a long
-    /// model holds its activations until `_capture_end`. docs/CAPTURE.md §6.
+    /// belongs to an object `input_objects`, `node_objects` or `const_objects`
+    /// holds a strong reference to, so an address can never be reused under us
+    /// while the recording is open. That is the price of identity: a trace of a
+    /// long model holds its activations until `_capture_end`.
+    /// docs/CAPTURE.md §6.
     known: HashMap<usize, Ref>,
-    keepalive: Vec<Py<PyAny>>,
+    /// The declared inputs, held for the identity reason above. A region has
+    /// them; an eager tape has none, because everything it reads from outside
+    /// itself is a constant.
+    input_objects: Vec<Py<PyAny>>,
+    /// **W9** (docs/BACKWARD7.md). Every tensor result the recording produced,
+    /// indexed the way `Ref::Node` indexes it -- `node_objects[n][o]` is the
+    /// object of output `o` of node `n`, with `None` in the slots the record
+    /// calls `Slot::Other`.
+    ///
+    /// This was a flat `keepalive: Vec<Py<PyAny>>` before this round, kept
+    /// only so that an address could not be reused mid-recording, and dropped
+    /// at `_capture_end`. Reshaped, **it is an `Env`**: `docs/BACKWARD5.md` §4
+    /// found that the thing `docs/BACKWARD2.md` §1.5 asked W8 to invent -- what
+    /// keeps the intermediates alive -- already existed and was being thrown
+    /// away. A capture region still throws it away (`_capture_end` drops the
+    /// whole `Recorder`, and `CaptureTrace.backward()` replays); an eager tape
+    /// keeps it until `backward()`, which is the lifetime W9 is about.
+    node_objects: Vec<Vec<Option<Py<PyAny>>>>,
     const_objects: Vec<Py<PyAny>>,
+    /// The stamp each constant carried when it was **first seen**, in
+    /// `const_objects` order. For a region this is re-taken at `_capture_end`;
+    /// for an eager tape there is no `_capture_end`, so first sight is the
+    /// point the tape differentiates at and this is the snapshot W10a compares.
+    const_stamps: Vec<Stamp>,
+    /// The storage addresses of every value this recording holds -- constants
+    /// and node results alike.
+    ///
+    /// Exists so that `note_mutation` can ask *"is this write landing on a
+    /// value my tape depends on?"* in one lookup, and poison rather than
+    /// answer. That question is why the eager tape does not need W10b: see
+    /// `poison_on_write_to_recorded_storage`.
+    storages: HashMap<usize, ()>,
+    /// Whether this is the always-on eager tape rather than a `_capture_begin`
+    /// region. The two differ in what they refuse (`refusal_for` is a *replay*
+    /// guard and an eager tape never replays) and in what they do with
+    /// `node_objects`.
+    eager: bool,
     poisoned: Option<String>,
 }
 
@@ -184,6 +261,22 @@ impl Recorder {
     fn poison(&mut self, reason: String) {
         if self.poisoned.is_none() {
             self.poisoned = Some(reason);
+        }
+    }
+
+    fn empty(eager: bool) -> Self {
+        Self {
+            nodes: Vec::new(),
+            inputs: Vec::new(),
+            consts: Vec::new(),
+            known: HashMap::new(),
+            input_objects: Vec::new(),
+            node_objects: Vec::new(),
+            const_objects: Vec::new(),
+            const_stamps: Vec::new(),
+            storages: HashMap::new(),
+            eager,
+            poisoned: None,
         }
     }
 }
@@ -392,8 +485,64 @@ pub fn note_mutation(op: &str, args: &Bound<'_, PyTuple>, kwargs: Option<&Bound<
     if let Some(receiver) = inplace_receiver(args, kwargs) {
         if let Some(key) = storage_key(&receiver) {
             bump(key);
+            poison_on_write_to_recorded_storage(key);
         }
     }
+}
+
+/// **W8's answer to `docs/BACKWARD5.md` §1's 100×-wrong gradient, and the
+/// reason this round does not need W10b.**
+///
+/// `docs/BACKWARD5.md` §1.1 measured what a naive eager recorder does with
+/// `a = x*1; v = a.view(3); a.mul_(10); (v*v).sum()`: the recorder keys values
+/// on object identity, the view is a *second object over one storage*, the
+/// write goes to the base and the tape differentiates a program the machine
+/// never ran -- `[0.6, 1.4, 2.2]` where upstream says `[60.0, 140.0, 220.0]`,
+/// **silently**. §6 called the fix "upstream's whole aliasing layer" and
+/// deferred it on the grounds that it had no consumer until a recorder
+/// existed.
+///
+/// A recorder now exists, and the fix it needs is not that layer. **A tape
+/// that refuses does not have to know what aliases what** -- it has to know
+/// that a write landed on bytes it depends on, and `docs/BACKWARD6.md` §4
+/// already made that one lookup by keying versions on the candle `Storage`
+/// rather than on the Python object. A base and its views answer the same key,
+/// so the write above is seen without any view metadata, any alias set or any
+/// `ADInplaceOrView` key existing.
+///
+/// What is bought is a **refusal**, not a gradient: upstream *differentiates*
+/// A5/A6 and this refuses them, which is strictly less. That is the trade
+/// `docs/AUTOGRAD.md` §6 chose, and the difference between it and W10b is the
+/// difference between "no wrong answer" and "the right answer".
+///
+/// Cost: on the ordinary path, nothing -- `note_mutation` has already returned
+/// for any op that is not in-place. On an in-place op it is one hash lookup,
+/// and only if an eager tape exists at all.
+fn poison_on_write_to_recorded_storage(key: usize) {
+    if !eager_enabled() {
+        return;
+    }
+    EAGER.with(|cell| {
+        let Ok(mut slot) = cell.try_borrow_mut() else {
+            return;
+        };
+        let Some(rec) = slot.as_mut() else {
+            return;
+        };
+        if !rec.storages.contains_key(&key) {
+            return;
+        }
+        rec.poison(
+            "an in-place operation wrote into a tensor the eager graph holds. The graph \
+             records the *mathematics* of each op and reads the values back at backward() \
+             time, so a write that landed after the op ran -- including one made through a \
+             view of the same storage -- would make it differentiate a program that never \
+             ran. Upstream refuses the same shape with its version counter; this refuses it \
+             by storage. Compute the value again after the write, or do the write under \
+             torch.no_grad() on a tensor no graph depends on (docs/BACKWARD7.md)"
+                .to_string(),
+        );
+    });
 }
 
 fn bump(key: usize) {
@@ -493,17 +642,75 @@ pub fn record(
         let Some(rec) = slot.as_mut() else {
             return;
         };
+        record_into(py, rec, op, args, kwargs, out);
+    });
+}
+
+/// **W8**: the eager tape's half of the door.
+///
+/// Called only when `tensor::mark_from_op` has just given an output a
+/// `grad_fn`, which is why this function does not repeat any of that test.
+/// The consequences of that gating are the whole design and are worth stating:
+///
+/// * An op recorded here is exactly an op upstream would have built a node
+///   for -- grad mode on, a differentiable op, an operand that requires a
+///   gradient, a floating result, and a result that is a *new* tensor.
+/// * Therefore **no in-place op is ever recorded**, because an in-place op
+///   returns its receiver and fails that last clause. That is not a silent
+///   omission: `poison_on_write_to_recorded_storage` refuses the tape by name
+///   when a write lands on a value it holds.
+/// * A region wins. While `_capture_begin` is open the ops belong to that
+///   trace and this does not run, so nesting never has to be decided.
+pub fn eager_record(
+    py: Python<'_>,
+    op: &str,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+    out: &Py<PyAny>,
+) {
+    if is_active() {
+        return;
+    }
+    EAGER.with(|cell| {
+        let Ok(mut slot) = cell.try_borrow_mut() else {
+            return;
+        };
+        let rec = slot.get_or_insert_with(|| Recorder::empty(true));
+        record_into(py, rec, op, args, kwargs, out);
+    });
+}
+
+fn record_into(
+    py: Python<'_>,
+    rec: &mut Recorder,
+    op: &str,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+    out: &Py<PyAny>,
+) {
+    {
         if rec.poisoned.is_some() {
             return;
         }
-        if let Some(reason) = refusal_for(op) {
+        // `refusal_for` and the `native_batch_norm` test below are **replay**
+        // guards, and an eager tape never replays: it differentiates the
+        // values the program actually computed, in `node_objects`. So the
+        // three things they refuse mean different things on the two paths.
+        // Randomness is the clearest: docs/CAPTURE.md §9-1 records a gradient
+        // taken at a *different dropout draw* than the one reported, which is
+        // a replay defect, and an eager tape cannot have it because it holds
+        // the draw. Mutation is not exempted -- it is refused somewhere else,
+        // and more precisely, by `poison_on_write_to_recorded_storage`.
+        if !rec.eager {
+            if let Some(reason) = refusal_for(op) {
             rec.poison(reason);
             return;
+            }
         }
         // The arg-aware half of the same question, for the one op whose name
         // does not carry torch's mutation convention. See
         // `MUTATES_WITHOUT_UNDERSCORE`.
-        if MUTATES_WITHOUT_UNDERSCORE.contains(&op) && mutates_this_call(op, args, kwargs) {
+        if !rec.eager && MUTATES_WITHOUT_UNDERSCORE.contains(&op) && mutates_this_call(op, args, kwargs) {
             rec.poison(format!(
                 "{op} writes running_mean/running_var in place on this call \
                  (training=True with running statistics supplied), even though its \
@@ -543,16 +750,21 @@ pub fn record(
         };
 
         let mut outputs = Vec::with_capacity(slots.len());
+        let mut held: Vec<Option<Py<PyAny>>> = Vec::with_capacity(slots.len());
         for (position, item) in slots.iter().enumerate() {
             match item.cast::<PyTensorBase>() {
                 Ok(tensor) => {
                     outputs.push(Slot::Tensor(TensorMeta::of(tensor)));
+                    let address = item.as_ptr() as usize;
                     rec.known
-                        .insert(item.as_ptr() as usize, Ref::Node { node: node_index, output: position });
-                    rec.keepalive.push(item.clone().unbind());
+                        .insert(address, Ref::Node { node: node_index, output: position });
+                    if let Some(key) = storage_key(tensor) {
+                        rec.storages.insert(key, ());
+                    }
+                    held.push(Some(item.clone().unbind()));
                 }
                 Err(_) => {
-                    if !METADATA_ONLY.contains(&op) {
+                    if !rec.eager && !METADATA_ONLY.contains(&op) {
                         return rec.poison(format!(
                             "{op} returned a value that is not a tensor, and it is not on \
                              the metadata-only allowlist; capture cannot tell whether that \
@@ -560,9 +772,11 @@ pub fn record(
                         ));
                     }
                     outputs.push(Slot::Other);
+                    held.push(None);
                 }
             }
         }
+        rec.node_objects.push(held);
 
         rec.nodes.push(Node {
             op: op.to_string(),
@@ -571,7 +785,7 @@ pub fn record(
             outputs,
             sequence,
         });
-    });
+    }
 }
 
 fn sequence_items<'py>(value: &Bound<'py, PyAny>) -> Option<Vec<Bound<'py, PyAny>>> {
@@ -601,6 +815,15 @@ impl Recorder {
             let index = self.consts.len();
             self.consts.push(TensorMeta::of(tensor));
             self.const_objects.push(value.clone().unbind());
+            // W10a, at first sight rather than at `_capture_end`. A region
+            // re-takes these when it ends (`capture_end`), because that is the
+            // line where "it was captured" is asserted; an eager tape has no
+            // such line, so the point it differentiates at is the point it
+            // first read the value, and that is what has to be stamped.
+            self.const_stamps.push(stamp_of(tensor));
+            if let Some(key) = storage_key(tensor) {
+                self.storages.insert(key, ());
+            }
             self.known.insert(address, Ref::Const(index));
             return Ok(Arg::Value(Ref::Const(index)));
         }
@@ -1201,15 +1424,7 @@ pub fn capture_begin(py: Python<'_>, inputs: &Bound<'_, PyAny>) -> PyResult<()> 
         )
     })?;
 
-    let mut rec = Recorder {
-        nodes: Vec::new(),
-        inputs: Vec::new(),
-        consts: Vec::new(),
-        known: HashMap::new(),
-        keepalive: Vec::new(),
-        const_objects: Vec::new(),
-        poisoned: None,
-    };
+    let mut rec = Recorder::empty(false);
     for (index, value) in items.iter().enumerate() {
         let tensor = value.cast::<PyTensorBase>().map_err(|_| {
             pyo3::exceptions::PyTypeError::new_err(format!(
@@ -1226,7 +1441,7 @@ pub fn capture_begin(py: Python<'_>, inputs: &Bound<'_, PyAny>) -> PyResult<()> 
         }
         rec.inputs.push(TensorMeta::of(tensor));
         rec.known.insert(address, Ref::Input(index));
-        rec.keepalive.push(value.clone().unbind());
+        rec.input_objects.push(value.clone().unbind());
     }
     let _ = py;
 
@@ -1303,6 +1518,266 @@ pub fn capture_end(py: Python<'_>, outputs: &Bound<'_, PyAny>) -> PyResult<PyCap
     })
 }
 
+// ---------------------------------------------------------------------------
+// W8 / W9: the eager tape, its lifetime, and its backward
+// ---------------------------------------------------------------------------
+
+/// Throw the eager tape away, releasing every intermediate it held.
+///
+/// **This is W9.** `docs/BACKWARD5.md` §3 measured what is being released:
+/// 18.9 MiB at `S=8`, 75.7 at 32, 302.6 at 128 for SmolLM2-135M, distinct
+/// storages, held for one iteration -- which §3 also established is what
+/// upstream already pays for the same program. The lifetime rule is upstream's
+/// `retain_graph=False` **default** and not a lesser refusal: a graph is freed
+/// by the backward that consumes it, and a second backward over the same graph
+/// raises.
+fn eager_free() {
+    EAGER.with(|cell| {
+        let Ok(mut slot) = cell.try_borrow_mut() else {
+            return;
+        };
+        drop(slot.take());
+    });
+}
+
+#[pyfunction]
+#[pyo3(name = "_eager_reset")]
+pub fn eager_reset() {
+    eager_free();
+}
+
+/// How many nodes the eager tape is currently holding.
+///
+/// Exists so that a test can assert the *retention* W9 is about -- that the
+/// tape grows during a forward and is empty after a backward -- without
+/// inferring it from a gradient.
+#[pyfunction]
+#[pyo3(name = "_eager_tape_size")]
+pub fn eager_tape_size() -> usize {
+    EAGER.with(|cell| {
+        cell.try_borrow()
+            .ok()
+            .and_then(|slot| slot.as_ref().map(|rec| rec.nodes.len()))
+            .unwrap_or(0)
+    })
+}
+
+/// Why the eager tape has given up, if it has. The same shape as
+/// `_capture_reason`, and readable without consuming the tape.
+#[pyfunction]
+#[pyo3(name = "_eager_reason")]
+pub fn eager_reason() -> Option<String> {
+    EAGER.with(|cell| {
+        cell.try_borrow()
+            .ok()
+            .and_then(|slot| slot.as_ref().and_then(|rec| rec.poisoned.clone()))
+    })
+}
+
+/// Reverse-mode over the eager tape, from `output`.
+///
+/// **The reuse is the point.** This function builds no derivative rules. It
+/// projects the `Recorder` onto a `PyCaptureTrace` -- which is legal because
+/// `docs/BACKWARD5.md` §4 found `Recorder` already holds four of the five
+/// things `tape::backward` reads -- pairs it with the fifth, an `Env` made out
+/// of `node_objects` **without replaying anything**, and calls
+/// `tape::backward_in`. All 60 rules, `derivative()`, `wrt_set()`,
+/// `reachable()` and `wanted()` run unchanged and cannot tell which producer
+/// called them.
+///
+/// `reachable()` in particular was expected to need replacing
+/// (`docs/BACKWARD5.md` §4, last paragraph). It did not. With no trace inputs
+/// -- an eager tape has none, everything it reads from outside is a constant --
+/// its rule "a node is needed if it reads a wanted constant or a needed node"
+/// **is** the propagated `requires_grad` flag `docs/BACKWARD4.md` installed,
+/// computed from the same information one step earlier.
+///
+/// Named `_eager_backward` and not wired into `Tensor.backward()`:
+/// `_ImperativeEngine.run_backward` still refuses. See `docs/BACKWARD7.md` §5
+/// for exactly what is between the two.
+#[pyfunction]
+#[pyo3(name = "_eager_backward")]
+#[pyo3(signature = (output, grad_output = None, wrt = None))]
+pub fn eager_backward<'py>(
+    py: Python<'py>,
+    output: &Bound<'py, PyAny>,
+    grad_output: Option<&Bound<'py, PyAny>>,
+    wrt: Option<&Bound<'py, PyAny>>,
+) -> PyResult<Bound<'py, PyDict>> {
+    if is_active() {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "torch._C eager: cannot differentiate the eager graph while a capture region is \
+             recording -- the backward's own ops would be recorded into that region",
+        ));
+    }
+    let address = output.as_ptr() as usize;
+    let rec = EAGER.with(|cell| cell.borrow_mut().take());
+    let Some(rec) = rec else {
+        return Err(eager_missing(py, output, "there is no eager graph"));
+    };
+    // Taken, not borrowed: W9's free happens whether this succeeds or raises,
+    // which is `retain_graph=False`. Putting it back on the error paths would
+    // make a failed backward keep 302 MiB alive for the length of a traceback.
+    let restore = |rec: Recorder| drop(rec);
+    if let Some(reason) = &rec.poisoned {
+        let message = format!("torch._C eager: cannot differentiate this graph -- {reason}");
+        restore(rec);
+        return Err(crate::err::not_implemented(message));
+    }
+    let Some(reference) = rec.known.get(&address).copied() else {
+        restore(rec);
+        return Err(eager_missing(py, output, "this tensor is not in the eager graph"));
+    };
+    if !matches!(reference, Ref::Node { .. }) {
+        restore(rec);
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "torch._C eager: this tensor is a leaf of the eager graph -- nothing recorded \
+             here produced it, so there is nothing to differentiate through. Upstream says \
+             \"element 0 of tensors does not require grad and does not have a grad_fn\"",
+        ));
+    }
+
+    // The projection. Every field is moved, not copied: the trace lives only
+    // for this call and the `Recorder` is already gone.
+    let trace = PyCaptureTrace {
+        nodes: rec.nodes,
+        inputs: Vec::new(),
+        consts: rec.consts,
+        const_objects: rec.const_objects,
+        const_stamps: rec.const_stamps,
+        outputs: vec![reference],
+    };
+    // W10a, unchanged and now load-bearing for a second caller: a leaf that
+    // moved between the op that read it and this backward is refused by name
+    // rather than differentiated at its new value.
+    trace.check_constants_are_fresh(py)?;
+
+    // Which constants a gradient is wanted for: upstream's rule, read off the
+    // flag `docs/BACKWARD4.md` landed. `wrt_set` does the dtype half.
+    let selected: Vec<usize> = match wrt.filter(|value| !value.is_none()) {
+        Some(value) => {
+            let wanted: Vec<Bound<'py, PyAny>> = value.extract()?;
+            let mut out = Vec::new();
+            for tensor in wanted {
+                let at = tensor.as_ptr() as usize;
+                match trace
+                    .const_objects
+                    .iter()
+                    .position(|c| c.bind(py).as_ptr() as usize == at)
+                {
+                    Some(index) => out.push(index),
+                    None => {
+                        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                            "torch._C eager: a tensor named in wrt is not a leaf of this \
+                             graph -- nothing recorded here read it, so no gradient flows \
+                             to it. Upstream returns None for the same case under \
+                             allow_unused=True",
+                        ))
+                    }
+                }
+            }
+            out
+        }
+        None => {
+            let mut out = Vec::new();
+            for (index, object) in trace.const_objects.iter().enumerate() {
+                if let Ok(tensor) = object.bind(py).cast::<PyTensorBase>() {
+                    let wants = tensor
+                        .getattr("requires_grad")
+                        .and_then(|v| v.extract::<bool>())
+                        .unwrap_or(false);
+                    if wants {
+                        out.push(index);
+                    }
+                }
+            }
+            out
+        }
+    };
+
+    // The `Env`, and this is W9's payoff: no replay. `run()` re-executes the
+    // whole forward because a `CaptureTrace` kept only shapes; here the values
+    // are the ones the program computed, so the gradient is taken at the point
+    // the forward actually ran -- which is also why a random draw is safe on
+    // this path and refused on the other (docs/CAPTURE.md §9-1).
+    let env = Env {
+        inputs: Vec::new(),
+        consts: trace.const_objects.iter().map(|c| c.clone_ref(py)).collect(),
+        nodes: rec
+            .node_objects
+            .into_iter()
+            .map(|slots| {
+                slots
+                    .into_iter()
+                    .map(|slot| slot.unwrap_or_else(|| py.None()))
+                    .collect()
+            })
+            .collect(),
+    };
+
+    let seeds = grad_output.filter(|value| !value.is_none());
+    let grads = {
+        let _guard = crate::tensor::NoGradGuard::enter();
+        let indices = PyList::new(py, &selected)?;
+        crate::tape::backward_in(py, &trace, &env, seeds, Some(indices.as_any()))?
+    };
+
+    // Handed back beside the tensors they belong to, because the caller has no
+    // other way to name a constant: the tape assigned those indices, not them.
+    let constants = grads.get_item("constants")?.ok_or_else(|| {
+        pyo3::exceptions::PyRuntimeError::new_err("torch._C eager: tape returned no constants")
+    })?;
+    let out = PyDict::new(py);
+    out.set_item("tensors", PyList::new(py, trace.const_objects.iter().map(|c| c.clone_ref(py)))?)?;
+    out.set_item("grads", constants)?;
+    out.set_item("wrt", PyList::new(py, &selected)?)?;
+    out.set_item("nodes", trace.nodes.len())?;
+    Ok(out)
+}
+
+/// The two ways a tensor can fail to be differentiable here, told apart.
+///
+/// "The graph was freed" and "this never had a graph" are the same absence in
+/// `known`, and upstream distinguishes them by message -- `retain_graph` for
+/// the first, *"does not have a grad_fn"* for the second. Getting it wrong
+/// sends a reader to the wrong half of the problem.
+///
+/// The question is asked of the **tensor** and not of a table of remembered
+/// addresses. An earlier version of this kept the freed tape's addresses in a
+/// side set, and the first program that exercised both branches got the wrong
+/// message: a freed address had been reused by an unrelated tensor. The
+/// tensor's own `grad_fn` cannot be wrong that way -- it is set by the door at
+/// the moment the op ran, it is exactly upstream's condition, and a tensor
+/// carrying one whose graph is gone is precisely the `retain_graph` case.
+fn eager_missing(py: Python<'_>, output: &Bound<'_, PyAny>, generic: &str) -> PyErr {
+    let had_a_node = output
+        .cast::<PyTensorBase>()
+        .ok()
+        .and_then(|cell| cell.try_borrow().ok().map(|t| t._shim_from_op().is_some()))
+        .unwrap_or(false);
+    let _ = py;
+    // `eager_enabled()` as well as the `grad_fn`: with the recorder switched
+    // off a tensor still gets a `grad_fn` (that is `mark_from_op`, which is
+    // W5 and not W8), and calling its graph "freed" would send the reader
+    // looking for a `retain_graph` that was never the problem.
+    if had_a_node && eager_enabled() {
+        return pyo3::exceptions::PyRuntimeError::new_err(
+            "torch._C eager: Trying to backward through the graph a second time -- the \
+             saved intermediate values have already been freed. This is upstream's \
+             retain_graph=False default, and it is the whole of the lifetime rule: a \
+             backward consumes the graph it walks (docs/BACKWARD5.md §3 measured what is \
+             being released -- 302.6 MiB for SmolLM2-135M at S=128). Run the forward again, \
+             or keep a reference to what you need. retain_graph=True is not implemented",
+        );
+    }
+    pyo3::exceptions::PyRuntimeError::new_err(format!(
+        "torch._C eager: {generic}. A tensor is in the eager graph only if an op produced \
+         it under grad mode from an operand that requires one -- which is upstream's \
+         condition for grad_fn being non-None, and `.grad_fn` reports it. Upstream says \
+         \"element 0 of tensors does not require grad and does not have a grad_fn\""
+    ))
+}
+
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyCaptureValue>()?;
     m.add_class::<PyCaptureTrace>()?;
@@ -1312,6 +1787,12 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(capture_abandon, m)?)?;
     m.add_function(wrap_pyfunction!(capture_end, m)?)?;
     m.add_function(wrap_pyfunction!(capture_value, m)?)?;
+    m.add_function(wrap_pyfunction!(eager_backward, m)?)?;
+    m.add_function(wrap_pyfunction!(eager_reset, m)?)?;
+    m.add_function(wrap_pyfunction!(eager_tape_size, m)?)?;
+    m.add_function(wrap_pyfunction!(eager_reason, m)?)?;
+    m.add_function(wrap_pyfunction!(eager_set_enabled, m)?)?;
+    m.add_function(wrap_pyfunction!(eager_enabled_py, m)?)?;
     Ok(())
 }
 
