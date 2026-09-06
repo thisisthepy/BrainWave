@@ -520,6 +520,33 @@ def test_a_graph_front_end_is_not_offered_while_modes_are_not_consulted():
     )
     assert r["fx_graph_refusal"] is not None
 
+    # The hole `docs/BIND3.md` §7 found in this test, named rather than closed.
+    #
+    # Every assertion above reads False in *both* columns of the case that
+    # matters. A round that installs EXPORT.md §3's census names makes
+    # `TorchDispatchMode` **enter** -- reporting a dispatch-stack depth of 1
+    # and silently returning eager results -- without making `export` return
+    # or `fx.Graph` build. That is COMPILE.md §5's silent fallback one level
+    # below the empty graph, and it passes everything above unchanged.
+    #
+    # It is recorded here and not asserted, and the reason is worth keeping:
+    # the depth is **correct bookkeeping**. `_push_on_torch_dispatch_stack` is
+    # a state cell and a `with` block did push one. Demanding zero would force
+    # that cell to lie. What is missing is on the other side -- `_aten_dispatch`
+    # never consults the stack, and `aten.rs`'s capture hook runs *after* the
+    # kernel, so it could not replace a result even if it did.
+    #
+    # So the guard against this is EXPORT.md §6's ordering, not an assertion
+    # here: the dispatcher entrance lands first, and only then the names. A
+    # round that installs the names while `ops_seen_by_mode` is empty is doing
+    # the thing this comment exists to warn it about.
+    if r["stack_len_inside"] and not r["ops_seen_by_mode"]:
+        print(
+            "    NOTE: a TorchDispatchMode enters and reports depth "
+            f"{r['stack_len_inside']} while seeing no operators -- "
+            "docs/EXPORT.md §6, the dispatcher entrance is not landed"
+        )
+
 
 def test_capture_is_the_only_working_front_end_and_records_the_module_it_ran():
     """`capture.rs` is the oracle `docs/EXPORT.md` §5 compares against.
