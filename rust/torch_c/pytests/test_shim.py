@@ -10930,7 +10930,20 @@ def test_schema_text_survives_the_round_trip_through_the_transcribed_tables():
     # a `_VariableFunctions` member, so a row for any of them would invent a
     # door upstream lacks (the same reasoning the six pad kernels record
     # above).
-    assert len(keys) == 351, len(keys)
+    # 353 with docs/RNN.md's `lstm`. **+2**, and which table they come from is
+    # the check: both are `overloads.json`-only. `_VF.lstm` is what
+    # `nn.LSTM.forward` calls and `torch.lstm` is a real `_VariableFunctions`
+    # member, while `Tensor.lstm` does not exist on 2.13.0 -- so neither
+    # `aten::lstm|input` nor `aten::lstm|data` is a second spelling of
+    # anything in `methods.json`, and both are new identities. Getting +1
+    # would mean only one overload was transcribed; getting +4 would mean
+    # `methods.json` had grown a `lstm` row that upstream has no door for.
+    # The round's other two names contribute **zero**:
+    # `aten.upsample_linear1d.default` is `torch._C._nn`-only (a row would
+    # invent a `torch.upsample_linear1d` upstream lacks -- the six pad kernels'
+    # reasoning above), and `torch.conv1d` was already spelled, as a
+    # bootstrap.py composite over `aten::convolution`, since docs/ARCH20.md.
+    assert len(keys) == 353, len(keys)
     from_tables = sorted(
         k for k in keys
         if report["table"][f"{k[0]}|{k[1]}"]["from"] == "tables"

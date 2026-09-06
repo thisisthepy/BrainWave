@@ -49,6 +49,16 @@
         "torch.alias",
         "torch.Tensor.alias"
       ]
+    },
+    "aten.upsample_linear1d.default": {
+      "reason": "Reached upstream as `torch._C._nn.upsample_linear1d`, and as `F.interpolate(x, size, mode='linear', align_corners=...)` on a 3-D input. Neither `torch.upsample_linear1d` nor `Tensor.upsample_linear1d` exists on 2.13.0 (checked), so this is NOT an overloads.json or methods.json row -- a row there would invent a door upstream does not have, exactly as `aten.upsample_nearest1d.default` records immediately above. The missing connection is one `_install_nn` entry shaped like `upsample_nearest2d`'s. It is NOT an alias of `aten.upsample_bilinear2d.default`, which docs/GLU.md §2 flagged as likely and this round measured rather than assumed: a different rank check (`input_size equals to 3`), a different dtype-refusal kernel name (`compute_indices_weights_linear` against `upsample_bilinear2d_channels_last`), a different dtype set (`uint8` computes for the 2-D op through a separate fixed-point kernel and RAISES here), an upper clamp on the source index that bilinear does not need, and a FUSED multiply-add in the source index that the unfused bilinear transcription gets ~3 ULP wrong (docs/RNN.md §3). `sam_vision_model` and `sam_hq_vision_model`'s wall, docs/ARCH200.md §2. bootstrap.py was another agent's file this round, so this is a work item, not a design decision, and it fails the suite the moment the entry lands -- which is when this entry should be deleted.",
+      "upstream_absent": [
+        "torch.upsample_linear1d",
+        "torch.Tensor.upsample_linear1d"
+      ],
+      "upstream_present": [
+        "torch._C._nn.upsample_linear1d"
+      ]
     }
   },
   "shape3_unexercised_spelling": {
@@ -113,10 +123,10 @@
       "reason": "operator spelling. Tests exercise it as syntax (`a + b`, `a @ b`, `~a`), which this check reads as text and cannot attribute back to the dunder. A grep for `.__add__(` would be a lie in the other direction."
     },
     "_grouped_mm": {
-      "reason": "backlog: the kernel is golden-compared by dispatch key, but no test spells the name. docs/REACH.md \u00a73."
+      "reason": "backlog: the kernel is golden-compared by dispatch key, but no test spells the name. docs/REACH.md §3."
     },
     "multinomial": {
-      "reason": "backlog: the kernel is golden-compared by dispatch key, but no test spells the name. Deliberately not attempted in this round: `multinomial` is a random sample, and a test asserting a value against upstream on a random op is exactly the shallow-coverage failure mode this file warns against (a fixed seed narrows the risk but does not remove it, since the shim and upstream draw from different RNG implementations even with the same seed). docs/REACH.md \u00a73."
+      "reason": "backlog: the kernel is golden-compared by dispatch key, but no test spells the name. Deliberately not attempted in this round: `multinomial` is a random sample, and a test asserting a value against upstream on a random op is exactly the shallow-coverage failure mode this file warns against (a fixed seed narrows the risk but does not remove it, since the shim and upstream draw from different RNG implementations even with the same seed). docs/REACH.md §3."
     }
   }
 }

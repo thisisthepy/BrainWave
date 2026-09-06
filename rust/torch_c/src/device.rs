@@ -620,7 +620,7 @@ fn shim_same_device(left: PyDevice, right: PyDevice) -> bool {
 /// RMSNorm's `x.pow(2)` and the attention mask -- and none of them is a
 /// widening of this gate: the scan re-derives the list from the kernels and
 /// would put them straight back if the readback were still there.
-pub const MPS_HOST_READBACK_OPS: [&str; 84] = [
+pub const MPS_HOST_READBACK_OPS: [&str; 86] = [
     "aten._fft_c2c.default",
     "aten._fft_c2r.default",
     "aten._fft_r2c.default",
@@ -666,6 +666,7 @@ pub const MPS_HOST_READBACK_OPS: [&str; 84] = [
     "aten.linalg_qr.default",
     "aten.log2.default",
     "aten.log2_.default",
+    "aten.lstm.input",
     "aten.masked_scatter.default",
     "aten.masked_select.default",
     "aten.max.default",
@@ -699,6 +700,7 @@ pub const MPS_HOST_READBACK_OPS: [&str; 84] = [
     "aten.stft.default",
     "aten.upsample_bicubic2d.default",
     "aten.upsample_bilinear2d.default",
+    "aten.upsample_linear1d.default",
     "aten.upsample_nearest1d.default",
     "aten.upsample_nearest2d.default",
     "aten.var.correction",

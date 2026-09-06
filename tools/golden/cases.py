@@ -28801,6 +28801,405 @@ def upsample_nearest1d_cases(torch_module, c_module, torch_call) -> list[Case]:
     return cases
 
 
+# --- docs/RNN.md: aten.upsample_linear1d.default and aten.lstm.input --------
+#
+# Both builders are kept together at the end of this file, and both registered
+# in one contiguous run below, so a merge that splices by category does not
+# have to hunt for them.
+
+
+_LINEAR1D_DTYPES = ["float64", "float32", "float16", "bfloat16"]
+# 24 values that are NOT an arithmetic progression: a progression is linear, so
+# a linear resample of it is exact under almost any wrong weighting, and every
+# case below would pass with the half-pixel offset dropped.
+_LINEAR1D_INPUT = [round(math.sin(i * 1.7) * 3.0 + i / 5.0, 6) for i in range(24)]
+
+
+def upsample_linear1d_cases(torch_module, c_module, torch_call) -> list[Case]:
+    """`aten.upsample_linear1d(self, output_size, align_corners, scales=None)`.
+
+    docs/RNN.md §3. `sam_vision_model` / `sam_hq_vision_model`, and
+    docs/VOICE.md rank 14's sibling.
+
+    What separates a plausible wrong implementation here, each measured
+    against upstream 2.13.0 rather than carried over from
+    `upsample_bilinear2d`:
+
+      * **dropping the half-pixel offset** under `align_corners=False`
+        (`scale * i` instead of `scale * (i + 0.5) - 0.5`). Every
+        `align_corners=False` case on the non-progression input above
+        separates it; on an `arange` fill it is invisible.
+      * **implementing one convention for both flag values** -- each output
+        size runs through both, so the two must differ.
+      * **not clamping the source index at 0.** bicubic does not clamp
+        (docs/DEMAND8.md §2.4) and linear does; the `scales=2.0` case reaches
+        an unclamped index of -0.25.
+      * **not clamping the source index at `in - 1`.** `scales=0.5` on a
+        4 -> 8 resample reaches 14.5, past the end of the input.
+        `upsample_bilinear2d` clamps only the upper tap and would read out of
+        bounds.
+      * **ignoring `scales` and using `in/out`** -- identical whenever
+        `out == in * scale`, which is every 2x case; the disagreeing scales
+        are the ones that separate it.
+      * **computing the weights in the input dtype** rather than `opmath_t`.
+
+    NOT separated here, and deliberately: the FUSED multiply-add in the source
+    index (docs/RNN.md §3). It is ~3 ULP, which is inside this harness's
+    `float32` tolerance of 1e-5, so it is proven by bit pattern in
+    `pytests/test_rnn.py` instead. A golden case that claimed to check it
+    would be a check that cannot fail.
+    """
+    op = "aten.upsample_linear1d.default"
+    cases: list[Case] = []
+    shape = (2, 3, 4)
+    flat = _LINEAR1D_INPUT
+
+    for dtype_name in _LINEAR1D_DTYPES:
+        for align_corners in (False, True):
+            for out_w, note in (
+                (8, "2x upsample"),
+                (7, "a non-integral ratio"),
+                (5, "a non-integral ratio the other side of 4"),
+                (2, "downsample"),
+                (1, "collapse to a single sample"),
+                (4, "out == in: the axis is copied, not resampled"),
+                (16, "4x upsample"),
+            ):
+                a_t, a_c = pair_from_flat(torch_module, c_module, flat, shape, dtype_name)
+                name = (
+                    f"upsample_linear1d(dtype={dtype_name}, shape={shape}, "
+                    f"out={out_w}, align_corners={align_corners}) [{note}]"
+                )
+                cases.append(
+                    Case(
+                        name=name,
+                        op=op,
+                        run_torch=lambda t=a_t, w=out_w, ac=align_corners: torch_call(
+                            t, [w], ac, None
+                        ),
+                        run_c=lambda t=a_c, w=out_w, ac=align_corners: c_module._aten_dispatch(
+                            op, t, [w], ac, None
+                        ),
+                        note=note,
+                    )
+                )
+
+    # An explicit `scales`. The argument is INVERTED (it is a *scale factor*,
+    # and the kernel divides by it), and two of these disagree with the
+    # size-derived scale, which is the only thing that separates a kernel that
+    # ignores the argument.
+    for scale, out_w, note in (
+        (2.0, 8, "explicit scale that agrees with out/in"),
+        (0.5, 8, "explicit scale that DISAGREES -- the index runs off the end"),
+        (1.5, 6, "a non-integral explicit scale"),
+        (3.0, 12, "a larger scale"),
+        (0.25, 5, "a scale far below the size ratio"),
+        (0.0, 7, "a non-positive scale is IGNORED, not divided by"),
+        (-1.0, 7, "a negative scale is IGNORED, not divided by"),
+    ):
+        a_t, a_c = pair_from_flat(torch_module, c_module, flat, shape, "float32")
+        cases.append(
+            Case(
+                name=f"upsample_linear1d(out={out_w}, scales={scale}) [{note}]",
+                op=op,
+                run_torch=lambda t=a_t, w=out_w, s=scale: torch_call(t, [w], False, s),
+                run_c=lambda t=a_c, w=out_w, s=scale: c_module._aten_dispatch(
+                    op, t, [w], False, s
+                ),
+                note=note,
+            )
+        )
+
+    # `align_corners=True` with `out == 1`: the scale is 0, not a division by
+    # `out - 1 == 0`.
+    a_t, a_c = pair_from_flat(torch_module, c_module, flat, shape, "float32")
+    cases.append(
+        Case(
+            name="upsample_linear1d(out=1, align_corners=True) [scale is 0, not a 0-division]",
+            op=op,
+            run_torch=lambda t=a_t: torch_call(t, [1], True, None),
+            run_c=lambda t=a_c: c_module._aten_dispatch(op, t, [1], True, None),
+            note="out-1 == 0 under align_corners: upstream sets the scale to 0",
+        )
+    )
+
+    # The refusals. `uint8` is the one that does NOT transfer from the
+    # neighbouring kernels: `upsample_nearest1d` computes it and
+    # `upsample_bilinear2d` has a separate fixed-point kernel, and this op
+    # raises `"compute_indices_weights_linear" not implemented for 'Byte'`.
+    for dtype_name, note in (
+        ("uint8", "no uint8 kernel -- unlike upsample_nearest1d, which has one"),
+        ("int64", "no integral kernel"),
+        ("bool", "no bool kernel"),
+    ):
+        a_t, a_c = pair_from_flat(
+            torch_module, c_module, [float(v) for v in range(24)], shape, dtype_name
+        )
+        cases.append(
+            Case(
+                name=f"upsample_linear1d(dtype={dtype_name}) [{note}]",
+                op=op,
+                run_torch=lambda t=a_t: torch_call(t, [7], False, None),
+                run_c=lambda t=a_c: c_module._aten_dispatch(op, t, [7], False, None),
+                expect="both_error",
+                note=note,
+            )
+        )
+
+    # Rank and argument-count refusals, both of which a kernel that reshaped
+    # its way to an answer would pass silently.
+    for flat_r, shape_r, out_size, note in (
+        ([float(v) for v in range(24)], (2, 3, 4), [7, 7],
+         "output_size must be length 1"),
+        ([float(v) for v in range(24)], (1, 2, 3, 4), [7],
+         "a 4-D input is the 2-D op's, not this one's"),
+        ([float(v) for v in range(4)], (4,), [7], "a 1-D input"),
+    ):
+        a_t, a_c = pair_from_flat(torch_module, c_module, flat_r, shape_r, "float32")
+        cases.append(
+            Case(
+                name=f"upsample_linear1d(shape={shape_r}, out={out_size}) [{note}]",
+                op=op,
+                run_torch=lambda t=a_t, o=out_size: torch_call(t, o, False, None),
+                run_c=lambda t=a_c, o=out_size: c_module._aten_dispatch(op, t, o, False, None),
+                expect="both_error",
+                note=note,
+            )
+        )
+
+    return cases
+
+
+_LSTM_DTYPES = ["float64", "float32", "float16", "bfloat16"]
+
+
+def _lstm_vals(n, seed):
+    """A deterministic walk. Not `randn`: the two sides have independent RNGs
+    (the shim has no `Generator.manual_seed`), so a random fixture would not
+    be the same fixture."""
+    s = seed * 7919 + 13
+    out = []
+    for _ in range(n):
+        s = (s * 1103515245 + 12345) % 2147483648
+        out.append(round((s / 2147483648.0 - 0.5) * 2.4, 6))
+    return out
+
+
+def _lstm_case(
+    torch_module, c_module, torch_call, dtype_name, num_layers, bidirectional,
+    has_biases, batch_first, seq=4, batch=3, in_size=5, hidden=4, note="",
+) -> Case:
+    op = "aten.lstm.input"
+    dirs = 2 if bidirectional else 1
+    per = 4 if has_biases else 2
+    p_t, p_c = [], []
+    seed = 100
+    feat = in_size
+    for _ in range(num_layers):
+        for _ in range(dirs):
+            for shape in ((4 * hidden, feat), (4 * hidden, hidden)):
+                t, c = pair_from_flat(
+                    torch_module, c_module,
+                    _lstm_vals(shape[0] * shape[1], seed), shape, dtype_name,
+                )
+                p_t.append(t)
+                p_c.append(c)
+                seed += 1
+            if has_biases:
+                for _ in range(2):
+                    t, c = pair_from_flat(
+                        torch_module, c_module, _lstm_vals(4 * hidden, seed),
+                        (4 * hidden,), dtype_name,
+                    )
+                    p_t.append(t)
+                    p_c.append(c)
+                    seed += 1
+        feat = hidden * dirs
+    assert len(p_t) == num_layers * dirs * per, (len(p_t), num_layers, dirs, per)
+
+    x_shape = (batch, seq, in_size) if batch_first else (seq, batch, in_size)
+    x_t, x_c = pair_from_flat(
+        torch_module, c_module, _lstm_vals(seq * batch * in_size, 1), x_shape, dtype_name
+    )
+    hx_shape = (num_layers * dirs, batch, hidden)
+    n_hx = num_layers * dirs * batch * hidden
+    # A NON-ZERO (h_0, c_0). A zero initial state cannot tell a kernel that
+    # carries the hidden state from one that discards it.
+    h_t, h_c = pair_from_flat(torch_module, c_module, _lstm_vals(n_hx, 2), hx_shape, dtype_name)
+    c0_t, c0_c = pair_from_flat(torch_module, c_module, _lstm_vals(n_hx, 3), hx_shape, dtype_name)
+
+    return Case(
+        name=(
+            f"lstm.input(dtype={dtype_name}, num_layers={num_layers}, "
+            f"bidirectional={bidirectional}, has_biases={has_biases}, "
+            f"batch_first={batch_first}, seq={seq}, batch={batch}, "
+            f"in={in_size}, hidden={hidden}) [{note}]"
+        ),
+        op=op,
+        run_torch=lambda: torch_call(
+            x_t, [h_t, c0_t], p_t, has_biases, num_layers, 0.0, False,
+            bidirectional, batch_first,
+        ),
+        run_c=lambda: c_module._aten_dispatch(
+            op, x_c, [h_c, c0_c], p_c, has_biases, num_layers, 0.0, False,
+            bidirectional, batch_first,
+        ),
+        value_check=_triple_result_check,
+        note=note + " -- returns (output, h_n, c_n), see _triple_result_check",
+    )
+
+
+def lstm_input_cases(torch_module, c_module, torch_call) -> list[Case]:
+    """`aten.lstm.input(input, hx, params, has_biases, num_layers, dropout,
+    train, bidirectional, batch_first)` -- `parakeet_rnnt` and `parakeet_tdt`
+    (docs/RNN.md §2).
+
+    Every case is a **multi-step** sequence (`seq >= 4`) starting from a
+    **non-zero `(h_0, c_0)`**. That is not decoration: a single timestep from
+    a zero state cannot separate a correct recurrence from one that drops the
+    previous hidden state, folds `b_ih` and `b_hh` into one, or updates
+    `h[unit]` in place so later units in the same row read a half-stepped
+    hidden vector. All three return the right shape, and the third was a real
+    bug in this kernel, caught by exactly this fixture.
+
+    Gate order is `i, f, g, o`; the fixture's four gate blocks hold different
+    values, so a transposed order is a wrong number rather than a symmetry.
+
+    `bidirectional` is swept because the reverse direction's output is
+    concatenated on the FEATURE axis at the same timestep -- not emitted as a
+    reversed sequence -- and both are `(seq, batch, 2H)`.
+
+    `batch_first` is swept because it moves the batch axis of the input and
+    the output and **not** of `h_0`/`c_0`, which stay
+    `(layers * directions, batch, H)` either way.
+
+    NOT covered here, and refused by name in the kernel rather than guessed
+    at: `aten::lstm.data` (the packed-sequence overload), `proj_size != 0`,
+    and `dropout > 0` with `train=True`. See `pytests/test_rnn.py` for the
+    refusals, which need a live upstream to state what upstream does instead.
+    """
+    cases: list[Case] = []
+    for dtype_name in _LSTM_DTYPES:
+        for num_layers, bidirectional, has_biases, batch_first, note in (
+            (1, False, True, False, "the plain case"),
+            (1, False, True, True, "batch_first does NOT move h_0's batch axis"),
+            (2, False, True, False, "layer 1's input is layer 0's output"),
+            (2, False, True, True, "two layers, batch_first"),
+            (1, True, True, False, "bidirectional: [forward | backward] per step"),
+            (1, True, True, True, "bidirectional, batch_first"),
+            (2, True, True, False, "layer 1 sees 2*H features"),
+            (1, False, False, False, "has_biases=False: two params per set, not four"),
+            (2, True, False, True, "no biases, bidirectional, two layers, batch_first"),
+            (3, True, True, False, "three layers"),
+        ):
+            cases.append(
+                _lstm_case(
+                    torch_module, c_module, torch_call, dtype_name, num_layers,
+                    bidirectional, has_biases, batch_first, note=note,
+                )
+            )
+
+    # Degenerate widths, where a transposed axis is invisible, and a longer
+    # sequence, where a recurrence that fails to advance drifts furthest.
+    for seq, batch, in_size, hidden, note in (
+        (4, 1, 5, 4, "batch=1"),
+        (4, 3, 5, 1, "hidden=1"),
+        (1, 3, 5, 4, "seq=1 -- the case that CANNOT separate a wrong recurrence"),
+        (12, 2, 3, 5, "a long sequence"),
+        (6, 2, 1, 4, "input_size=1"),
+    ):
+        cases.append(
+            _lstm_case(
+                torch_module, c_module, torch_call, "float32", 2, False, True, True,
+                seq=seq, batch=batch, in_size=in_size, hidden=hidden, note=note,
+            )
+        )
+
+    # `dropout > 0` with `train=False` is the eval path every checkpoint takes
+    # and must COMPUTE -- the mask only exists in training. The refusal for
+    # `train=True` needs a live upstream and lives in pytests/test_rnn.py.
+    dirs, hidden, batch, seq, in_size = 1, 4, 3, 4, 5
+    p_t, p_c = [], []
+    seed, feat = 100, in_size
+    for _ in range(2):
+        for shape in ((4 * hidden, feat), (4 * hidden, hidden)):
+            t, c = pair_from_flat(
+                torch_module, c_module, _lstm_vals(shape[0] * shape[1], seed),
+                shape, "float32",
+            )
+            p_t.append(t)
+            p_c.append(c)
+            seed += 1
+        for _ in range(2):
+            t, c = pair_from_flat(
+                torch_module, c_module, _lstm_vals(4 * hidden, seed),
+                (4 * hidden,), "float32",
+            )
+            p_t.append(t)
+            p_c.append(c)
+            seed += 1
+        feat = hidden * dirs
+    x_t, x_c = pair_from_flat(
+        torch_module, c_module, _lstm_vals(seq * batch * in_size, 1),
+        (batch, seq, in_size), "float32",
+    )
+    n_hx = 2 * batch * hidden
+    h_t, h_c = pair_from_flat(
+        torch_module, c_module, _lstm_vals(n_hx, 2), (2, batch, hidden), "float32"
+    )
+    c0_t, c0_c = pair_from_flat(
+        torch_module, c_module, _lstm_vals(n_hx, 3), (2, batch, hidden), "float32"
+    )
+    cases.append(
+        Case(
+            name="lstm.input(dropout=0.5, train=False) [eval ignores dropout -- must compute]",
+            op="aten.lstm.input",
+            run_torch=lambda: torch_call(
+                x_t, [h_t, c0_t], p_t, True, 2, 0.5, False, False, True
+            ),
+            run_c=lambda: c_module._aten_dispatch(
+                "aten.lstm.input", x_c, [h_c, c0_c], p_c, True, 2, 0.5, False, False, True
+            ),
+            value_check=_triple_result_check,
+            note="a non-zero dropout with train=False is the checkpoint path",
+        )
+    )
+
+    # Refusals both sides make: a hidden pair that is not a pair, and a
+    # parameter list whose length does not match the option combination.
+    cases.append(
+        Case(
+            name="lstm.input(hx=[h_0]) [the hidden state is a PAIR, not one tensor]",
+            op="aten.lstm.input",
+            run_torch=lambda: torch_call(
+                x_t, [h_t], p_t, True, 2, 0.0, False, False, True
+            ),
+            run_c=lambda: c_module._aten_dispatch(
+                "aten.lstm.input", x_c, [h_c], p_c, True, 2, 0.0, False, False, True
+            ),
+            expect="both_error",
+            note="an LSTM carries (h, c); a GRU carries only h, and the two schemas differ",
+        )
+    )
+    cases.append(
+        Case(
+            name="lstm.input(params=params[:2], num_layers=2) [wrong parameter count]",
+            op="aten.lstm.input",
+            run_torch=lambda: torch_call(
+                x_t, [h_t, c0_t], p_t[:2], True, 2, 0.0, False, False, True
+            ),
+            run_c=lambda: c_module._aten_dispatch(
+                "aten.lstm.input", x_c, [h_c, c0_c], p_c[:2], True, 2, 0.0, False, False, True
+            ),
+            expect="both_error",
+            note="four parameters per layer with has_biases, so two layers needs eight",
+        )
+    )
+
+    return cases
+
+
+
 CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
     "aten.i0.default": i0_cases,
     "aten.kaiser_window.default": kaiser_window_default_cases,
@@ -28980,6 +29379,9 @@ CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
     "aten.native_group_norm.default": native_group_norm_cases,
     # docs/KERNELS26.md §20 -- zoedepth.
     "aten.upsample_bilinear2d.default": upsample_bilinear2d_cases,
+    # docs/RNN.md -- one contiguous run.
+    "aten.upsample_linear1d.default": upsample_linear1d_cases,
+    "aten.lstm.input": lstm_input_cases,
     # docs/DEMAND8.md §2 -- yolos.
     "aten.upsample_bicubic2d.default": upsample_bicubic2d_cases,
     "aten.split.Tensor": split_cases,
