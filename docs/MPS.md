@@ -219,7 +219,7 @@ $ TORCH_C_DYLD_LIBRARY_PATH=$V VK_DRIVER_FILES=$V/libkosmickrisp_icd.json \
 | `pytests/run.sh` (로더 없음) | **461 ok**, 0 FAIL, EXIT=0 |
 | 같은 스위트, `TORCH_C_DYLD_LIBRARY_PATH` 로 로더 지정 | **461 ok**, **스킵 0개**, EXIT=0 |
 | DOCWATCH | **PASS — 452/452** |
-| golden `compare.py` | **8921/8921**, ops=222 — **움직이지 않음** <!-- DOCWATCH: count golden_cases_passed ge 8921 --> <!-- DOCWATCH: count golden_ops_covered eq 222 --> |
+| golden `compare.py` | 이 회차 기준 **8921/8921**, ops=222 — 이 회차가 **움직이지 않았다**는 뜻이지 그 수가 고정이라는 뜻이 아니다. 같은 배치의 `docs/FIXES.md` 가 `fmod` 로 224 로 올렸다. `eq` 로 적었다가 그 병합에서 바로 터졌고, 다른 회차가 올릴 수 있는 수는 `ge` 로 적는다 <!-- DOCWATCH: count golden_cases_passed ge 8921 --> <!-- DOCWATCH: count golden_ops_covered ge 222 --> |
 | `aarch64-linux-android` | EXIT=0 (`scripts/device_android.sh build`) |
 | `aarch64-apple-ios-sim` | EXIT=0 (`PYO3_CONFIG_FILE` 레시피) |
 | 가드 무력화 시 | `test_an_mps_op_that_would_compute_on_the_cpu_is_refused_and_names_the_op` **FAIL**, EXIT=1 |

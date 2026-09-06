@@ -609,7 +609,7 @@ fn shim_same_device(left: PyDevice, right: PyDevice) -> bool {
 /// `aten.rs` holding a readback marker is either a kernel on this list, one of
 /// the six helpers, or on a named exemption list -- so a new readback anywhere
 /// in the file has to be classified by a human before the suite goes green.
-pub const MPS_HOST_READBACK_OPS: [&str; 54] = [
+pub const MPS_HOST_READBACK_OPS: [&str; 56] = [
     "aten._grouped_mm.default",
     "aten._log_softmax.default",
     "aten._safe_softmax.default",
@@ -630,6 +630,8 @@ pub const MPS_HOST_READBACK_OPS: [&str; 54] = [
     "aten.div.Tensor_mode",
     "aten.expm1.default",
     "aten.expm1_.default",
+    "aten.fmod.Scalar",
+    "aten.fmod.Tensor",
     "aten.gather.default",
     "aten.histc.default",
     "aten.index.Tensor",
