@@ -182,6 +182,20 @@ jobs:
         run: |
           echo "TARGET_PYTHON_IOS_SIM=${{ runner.temp }}/ios-sim-python" >> "$GITHUB_ENV"
           echo "IOS_SIM_SCRATCH=${{ runner.temp }}/ios-wheel-check" >> "$GITHUB_ENV"
+          echo "SPIKE_SITE=${{ runner.temp }}/ios-sim-deps" >> "$GITHUB_ENV"
+
+      # The harness copies the wheel's pure-Python requirements into the
+      # simulator prefix from `SPIKE_SITE`, which defaults to this project's
+      # own machine. On a runner that path does not exist, so they must be
+      # fetched. `--no-deps` is deliberate: the list staged is read from the
+      # wheel's METADATA, and letting pip resolve transitively here could pull
+      # an upstream torch on top of the one under test.
+      - name: Fetch the wheel's pure-Python requirements
+        if: matrix.label == 'ios-simulator-arm64'
+        run: |
+          python -m pip install --target "${{ runner.temp }}/ios-sim-deps" \
+            typing_extensions filelock networkx jinja2 fsspec sympy packaging pyyaml setuptools
+          ls "${{ runner.temp }}/ios-sim-deps"
 
       # The simulator wheel cannot be installed into the runner's own CPython --
       # different Mach-O platform. It is downloaded from PyPI (what a user gets,

@@ -225,8 +225,16 @@ def stage_dependencies(into: Path, wheel: Path) -> list[str]:
     for entry in dict.fromkeys(wanted):
         source = SPIKE_SITE / entry
         if not source.exists():
-            print(f"  ! no {entry} under {SPIKE_SITE}")
-            continue
+            # Loudly, and fatally. This used to warn and carry on, and the run
+            # then died much later inside `import torch` with a bare
+            # ModuleNotFoundError -- which reads like a wheel defect and is
+            # not one. The dependency list comes from the wheel's own METADATA,
+            # so a name missing here means the staging source is wrong, not
+            # that the requirement is optional.
+            raise SystemExit(
+                f"no {entry} under {SPIKE_SITE} -- it is required by the "
+                f"wheel's METADATA. Set SPIKE_SITE to a site-packages "
+                f"directory that has it.")
         target = into / entry
         if target.exists():
             # The wheel already provides this name. Overwriting it with the
