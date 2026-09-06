@@ -10264,6 +10264,14 @@ _EXPECTED_MUTABLE = (
     "aten.expm1_.default",
     "aten.fill_.Scalar",
     "aten.fill_.Tensor",
+    # docs/DEMAND8.md §2: `floor_` and `index_add_` are this round's two
+    # mutating additions, and both are `Tensor(a!) self` upstream. Two, not
+    # four: `floor.default` and `upsample_bicubic2d.default` landed in the
+    # same round and are out-of-place, so they must NOT appear here -- which
+    # is what makes this list a check on the schema parse rather than a
+    # restatement of "what changed".
+    "aten.floor_.default",
+    "aten.index_add_.default",
     "aten.index_put_.default",
     "aten.log2_.default",
     "aten.log_.default",
@@ -22429,14 +22437,6 @@ def test_lower_to_refuses_a_graph_it_could_not_finish_and_names_the_ops():
     assert "prims." in r["lower_to_refusal"], r["lower_to_refusal"]
 
 
-    # docs/DEMAND8.md §2: `floor_` and `index_add_` are this round's two
-    # mutating additions, and both are `Tensor(a!) self` upstream. Two, not
-    # four: `floor.default` and `upsample_bicubic2d.default` landed in the
-    # same round and are out-of-place, so they must NOT appear here -- which
-    # is what makes this list a check on the schema parse rather than a
-    # restatement of "what changed".
-    "aten.floor_.default",
-    "aten.index_add_.default",
 _DEMAND8_ROAD_SCRIPT = r"""
 import json, math, sys
 import torch

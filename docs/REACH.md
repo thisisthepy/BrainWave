@@ -34,7 +34,7 @@ inventory taken from another agent's build is not an inventory).
 declared names: 166, declared keys: 287, implemented keys: 208
 
 shape 1 (declared, no dispatch arm at all):            0
-shape 1 partial (one overload of a live name is dead): 109 keys
+shape 1 partial (one overload of a live name is dead): 110 keys
 shape 2 (kernel, no spelling):                         1     aten.alias.default
 shape 3 (spelling never exercised by a test):          75
 ```
@@ -81,9 +81,9 @@ The 55 backlog names are recorded, not fixed. `aten.rs` was another agent's
 territory this round, and a check whose first act is to close every gap it
 finds cannot be shown to fail. The deliverable is the failing check.
 
-## 2. The 109 partially-dead overload keys
+## 2. The 110 partially-dead overload keys
 
-A name is *live* if any of its overloads has an arm; 109 declared keys belong
+A name is *live* if any of its overloads has an arm; 110 declared keys belong
 to a live name but have no arm of their own. Overwhelmingly these are `.out`
 variants (`aten.sqrt.out`, `aten.zeros.out`, ...) plus a handful of unimplemented
 forms (`aten.scatter.value_reduce`, `aten.sort.stable`, `aten.where.Scalar`).
@@ -95,7 +95,7 @@ skip past them to the arm that exists. Declaring them is how the resolver
 reproduces upstream's refusal wording rather than a wrong match.
 
 They are still a slope, so the check holds them under a ceiling
-(`shape1_dead_overload_keys_ceiling`, currently 109): the number may fall, and
+(`shape1_dead_overload_keys_ceiling`, currently 110): the number may fall, and
 implementing one of these arms is expected to lower it, but it may not grow.
 A new declaration with nothing behind it fails here even when the name it is
 attached to happens to work.
