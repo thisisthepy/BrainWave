@@ -144,8 +144,17 @@ would otherwise count these as features.
   set of ops refused there, and every attention block passes through it.
 - **Vulkan is four ops.** Correctness is testable on this host; performance
   needs a phone and has not been measured.
-- **Nothing has run on an NPU.** CoreML executes on macOS; the NNAPI blob is
-  structurally validated and has never met an NNAPI runtime.
+- **No *hardware* NPU has been reached.** Both halves now execute
+  (`docs/NPU2.md`), and neither is on an accelerator. The CoreML models this
+  document credited above ran on the **CPU**: `MLComputePlan` reports the
+  Neural Engine as not even *supported* for a float32 program, so the
+  `float32=True` that makes the 2–3e-08 claim meaningful is the same flag that
+  puts the NPU out of reach. A wider graph at float16 does execute on the
+  Neural Engine, agreeing with replay at 2.0e-04. The NNAPI blob executes on an
+  Android emulator through `ANeuralNetworksModel` — the whole 1,156-byte model,
+  8/8 operations, ~3e-08 against replay — but every driver there is software
+  (`nnapi-reference` and the image's sample drivers). A vendor NPU driver needs
+  a physical device.
 - **`world_size >= 3` is `allreduce(op=SUM)` only**, over loopback on one
   machine. Other collectives, other reduce ops, secure aggregation and
   differential privacy refuse by name.

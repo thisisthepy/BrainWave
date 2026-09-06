@@ -12,9 +12,15 @@ Serialising is the step after that, and it has its own module per device --
 here: `coreml` needs coremltools installed and `nnapi` reaches into the
 vendored `torch.backends`, and making a bare `import torchnative.export` depend
 on either would turn a missing optional package into an import error for the
-lowering passes that do not need it. docs/NPU.md says which of the two produces
-an artefact that has been *executed* and which one has only been structurally
-validated; they are different claims.
+lowering passes that do not need it.
+
+`torchnative.export.nnapi_device` is a third, and is not imported here for the
+same reason twice over: it needs `adb`, an `ANDROID_SERIAL`, and an NDK to
+build `nnapi_runner.c` with. It is what makes the NNAPI blob *executed* rather
+than merely decoded -- docs/NPU2.md §3, which also records that the CoreML
+side's executed claim was a **CPU** claim until §2 of that document put a graph
+on the Neural Engine. Executed and structurally validated are different claims
+and every one of these modules is careful about which it is making.
 
 So a pass has to stand between the two, and `decompose` is it. The rules it
 applies are upstream's, read out of the vendored tree rather than restated

@@ -216,8 +216,11 @@ one still decodes and still passes a shape check.
 graph is required to be *refused*, by name. If it ever serialises, the fold is
 not what made this model reachable and the test says so instead of passing.
 
-> **Still structurally validated, not executed.** There is no NNAPI runtime on
-> a Mac; docs/NPU.md §2 draws that line and nothing here moves it.
+> **Structurally validated when this was written; executed since.** There is
+> no NNAPI runtime on a Mac, which is the line docs/NPU.md §2 draws and this
+> round did not move. docs/NPU2.md §3.4 moves it: the same fold, the same
+> 1,156-byte blob and the same eight opcodes, run on an Android emulator's
+> NNAPI runtime and compared element-wise against `replay`.
 
 ## 5. What is still outside, and why each one is not a refold
 

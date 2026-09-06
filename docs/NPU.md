@@ -60,6 +60,14 @@ These are different claims and this document does not merge them.
 
 There is no NNAPI runtime on a Mac. Nothing here claims a blob ran on an NPU.
 
+**Both rows were revisited in docs/NPU2.md, and both moved.** The CoreML row's
+"executed" turned out to mean *executed on the CPU* — `MLComputePlan` does not
+even list the Neural Engine as supported for a float32 program, so §6's
+`float32=True` and NPU execution exclude each other. And the NNAPI row is no
+longer structural: the blob runs on an Android emulator's NNAPI runtime through
+`ANeuralNetworksModel`. Read this table as the state of things at the time it
+was written.
+
 `parse_model` is a decoder, not a length check: it walks the operand, value,
 operation and flat-argument tables in the exact order and packing upstream
 emits them, requires every table length to match the header, every operand
