@@ -25985,5 +25985,660 @@ def test_the_eager_tape_refuses_and_releases_when_it_grows_past_its_bound():
         _C._eager_reset()
 
 
+# ---------------------------------------------------------------------------
+# docs/REFOLD.md -- prims -> aten refold, and the conv+BatchNorm fold
+# ---------------------------------------------------------------------------
+#
+# Both passes live in the vendored tree (`torchnative.export.refold` and
+# `.fuse`) and both need the shim-backed `torch`, so they run in the same
+# second-interpreter fixture `_npu_fixture` already provides. One launch buys
+# every check below.
+
+_REFOLD_SCRIPT = r"""
+import json
+import torch
+
+out = {"is_shim": hasattr(torch._C, "_aten_implemented")}
+
+from torchnative.export import fuse as FU
+from torchnative.export import nnapi as N
+from torchnative.export import refold as R
+from torchnative.export import target as T
+# `torchnative.export.__init__` exports a *function* named `decompose`, which
+# shadows the submodule of that name on the package object -- so this has to
+# go through importlib rather than `from ... import decompose as D`.
+import importlib
+
+D = importlib.import_module("torchnative.export.decompose")
+from torchnative.export.decompose import DecomposedTrace
+
+
+def capture(fn, *inputs):
+    torch._C._capture_begin(list(inputs))
+    with torch.no_grad():
+        produced = fn(*inputs)
+    produced = produced if isinstance(produced, (list, tuple)) else [produced]
+    trace = torch._C._capture_end(list(produced))
+    return DecomposedTrace(
+        trace.guards, trace.constants, trace.constant_values,
+        trace.nodes, trace.outputs,
+    )
+
+
+torch.manual_seed(0)
+
+core = D.decomposition_table()
+full = T.full_decomposition_table()
+union = dict(full)
+union.update(core)
+
+# -- 1. the asymmetry that fixes the direction of the refold ---------------
+# prims.transpose refuses a permutation aten.permute computes, so folding
+# prims -> aten is total and aten -> prims is not.
+probe = torch.randn(3, 4)
+try:
+    torch._C._aten_dispatch("prims.transpose.default", probe, [-1, 0])
+    out["prims_transpose_negative"] = "ACCEPTED"
+except Exception as error:
+    out["prims_transpose_negative"] = f"{type(error).__name__}: {error}"
+permuted = torch._C._aten_dispatch("aten.permute.default", probe, [-1, 0])
+out["aten_permute_negative"] = list(permuted.shape)
+
+# -- 2. every entry of the refold table computes the same value ------------
+# Each prims op is dispatched, then its aten replacement is dispatched with
+# the arguments the rule produces, and the two are compared elementwise. This
+# is the identity claim the whole pass rests on, so it is measured per entry
+# rather than argued once.
+x = torch.rand(2, 6) + 0.5
+per_op = {}
+for key in sorted(R.REFOLDABLE):
+    # Only tensors can be trace inputs, so the non-tensor arguments are
+    # closed over rather than passed to `capture`.
+    if key == "prims.split_dim.default":
+        extra = (1, 2)
+    elif key == "prims.transpose.default":
+        extra = ([1, 0],)
+    else:
+        extra = ()
+    trace = capture(
+        lambda a, _k=key, _e=extra: torch._C._aten_dispatch(_k, a, *_e), x
+    )
+    assert [n["op"] for n in trace.nodes] == [key], [n["op"] for n in trace.nodes]
+    refolded, folded = R.refold(trace)
+    got = refolded.replay((x,))[0]
+    want = trace.replay((x,))[0]
+    per_op[key] = {
+        "to": [n["op"] for n in refolded.nodes],
+        "folded": folded,
+        "max_abs_diff": float((got - want).abs().max()),
+    }
+out["per_op"] = per_op
+
+# -- 3. broadcast_in_dim has no aten spelling and is refused by name -------
+bcast = capture(
+    lambda a: torch._C._aten_dispatch(
+        "prims.broadcast_in_dim.default", a, [3, 2], [0]
+    ),
+    torch.ones(3),
+)
+try:
+    R.refold(bcast)
+    out["broadcast_refusal"] = "ACCEPTED"
+except R.RefoldRefused as error:
+    out["broadcast_refusal"] = str(error)
+out["broadcast_best_effort"] = [
+    n["op"] for n in R.refold(bcast, best_effort=True)[0].nodes
+]
+# ... and the control docs/PRIMS.md §1 keeps: expand cannot do it.
+try:
+    torch._C._aten_dispatch("aten.expand.default", torch.ones(3), [3, 2])
+    out["expand_control"] = "ACCEPTED"
+except Exception as error:
+    out["expand_control"] = f"{type(error).__name__}"
+
+# -- 4. the refold on the three model graphs, before/after and numerically -
+models = {}
+mlp = torch.nn.Sequential(
+    torch.nn.Linear(4, 6), torch.nn.GELU(), torch.nn.Linear(6, 3)
+).eval()
+models["mlp_gelu"] = (mlp, (torch.randn(2, 4),))
+try:
+    import transformers as tf
+
+    cfg = tf.ViTConfig(
+        hidden_size=32, num_hidden_layers=2, num_attention_heads=4,
+        intermediate_size=64, image_size=32, patch_size=16,
+    )
+    models["vit"] = (tf.ViTModel(cfg).eval(), (torch.ones(1, 3, 32, 32),))
+    cfg = tf.MobileNetV2Config(image_size=32, depth_multiplier=0.25)
+    models["mobilenet_v2"] = (
+        tf.MobileNetV2Model(cfg).eval(), (torch.ones(1, 3, 32, 32),)
+    )
+except Exception as error:
+    out["transformers"] = f"{type(error).__name__}: {error}"
+
+supported = N.supported_ops()
+per_model = {}
+for name, (module, inputs) in models.items():
+    torch._C._capture_begin(list(inputs))
+    with torch.no_grad():
+        produced = module(*inputs)
+    if not torch._C._capture_active():
+        reason = torch._C._capture_reason()
+        torch._C._capture_abandon()
+        per_model[name] = {"error": reason}
+        continue
+    if isinstance(produced, torch.Tensor):
+        candidates = [produced]
+    elif isinstance(produced, (list, tuple)):
+        candidates = list(produced)
+    else:  # a transformers ModelOutput
+        candidates = list(produced.values())
+    tensors = [v for v in candidates if isinstance(v, torch.Tensor)]
+    raw = torch._C._capture_end(tensors[:1])
+    trace = DecomposedTrace(
+        raw.guards, raw.constants, raw.constant_values, raw.nodes, raw.outputs
+    )
+    entry = {
+        "nodes": len(trace.nodes),
+        "outside_raw": len(T.NNAPI.outside(n["op"] for n in trace.nodes)),
+        "outside_raw_supported": sorted({n["op"] for n in trace.nodes} - supported),
+    }
+    for label, table in (("core", core), ("union", union)):
+        lowered = T.survey(trace, T.NNAPI, table=table)
+        both = R.lower_and_refold(trace, T.NNAPI, table=table)
+        entry[label] = {
+            "outside_lowered": len(lowered["outside_after"]),
+            "outside_refolded": len(both["outside_after"]),
+            "outside_refolded_names": sorted(both["outside_after"]),
+            "refolded": sorted(set(both["refolded"])),
+            "nodes_lowered": lowered["nodes_after"],
+            "nodes_refolded": both["nodes_after"],
+        }
+        # The refold is a re-spelling, so replaying the two graphs on inputs
+        # neither has seen must agree bit for bit -- not to a tolerance.
+        if both["refolded"]:
+            worst = 0.0
+            for _ in range(2):
+                sample = tuple(
+                    torch.randn(g["shape"]) if "float" in g["dtype"]
+                    else torch.zeros(
+                        g["shape"], dtype=getattr(torch, g["dtype"].split(".")[-1])
+                    )
+                    for g in trace.guards
+                )
+                for a, b in zip(lowered["trace"].replay(sample),
+                                both["trace"].replay(sample)):
+                    worst = max(worst, float((a - b).abs().max()))
+            entry[label]["refold_replay_max_abs_diff"] = worst
+    fused, pairs = FU.fold_conv_batch_norm(trace)
+    entry["fused_pairs"] = len(pairs)
+    entry["fused_nodes"] = len(fused.nodes)
+    entry["outside_fused_supported"] = sorted({n["op"] for n in fused.nodes} - supported)
+    if pairs:
+        worst, scale = 0.0, 0.0
+        for _ in range(3):
+            sample = tuple(torch.randn(g["shape"]) for g in trace.guards)
+            for a, b in zip(trace.replay(sample), fused.replay(sample)):
+                worst = max(worst, float((a - b).abs().max()))
+                scale = max(scale, float(a.abs().max()))
+        entry["fuse_replay_max_abs_diff"] = worst
+        entry["fuse_replay_scale"] = scale
+    per_model[name] = entry
+out["models"] = per_model
+
+# -- 5. the batch-norm affine is upstream's fused one, bit for bit ---------
+# docs/DEMAND1.md §5: the algebraically identical unfused form is *exact*
+# where upstream is not, and therefore disagrees with it. Both are measured
+# here on the same numbers; the fused one must agree exactly and the obvious
+# one must not, or `batch_norm_affine` has been quietly swapped for the wrong
+# arithmetic and nothing else in this file would notice.
+channels = 4
+xb = torch.randn(2, channels, 5, 5)
+wb = torch.rand(channels) + 0.5
+bb = torch.randn(channels)
+mb = torch.randn(channels)
+vb = torch.rand(channels) + 0.5
+eps = 1e-5
+reference = torch._C._aten_dispatch(
+    "aten.native_batch_norm.default", xb, wb, bb, mb, vb, False, 0.1, eps
+)[0]
+alpha, beta = FU.batch_norm_affine(wb, bb, mb, vb, eps)
+shape = (1, channels, 1, 1)
+fused_affine = xb * alpha.reshape(shape) + beta.reshape(shape)
+obvious = (
+    (xb - mb.reshape(shape)) * torch.rsqrt(vb + eps).reshape(shape)
+    * wb.reshape(shape) + bb.reshape(shape)
+)
+out["affine"] = {
+    "fused_max_abs_diff": float((fused_affine - reference).abs().max()),
+    "obvious_max_abs_diff": float((obvious - reference).abs().max()),
+}
+# And the cancellation case docs/DEMAND1.md §5 found it on: a constant
+# channel, where beta = bias - mean*alpha subtracts two nearly equal numbers.
+const_x = torch.full((1, 1, 2, 2), 632.0)
+const_mean = torch.tensor([632.0])
+const_var = torch.tensor([1.0])
+const_ref = torch._C._aten_dispatch(
+    "aten.native_batch_norm.default", const_x, torch.ones(1),
+    torch.tensor([0.1]), const_mean, const_var, False, 0.1, eps
+)[0]
+a2, b2 = FU.batch_norm_affine(
+    torch.ones(1), torch.tensor([0.1]), const_mean, const_var, eps
+)
+out["affine"]["constant_channel_upstream"] = float(const_ref.flatten()[0])
+out["affine"]["constant_channel_fused"] = float(
+    (const_x * a2.reshape(1, 1, 1, 1) + b2.reshape(1, 1, 1, 1)).flatten()[0]
+)
+out["affine"]["constant_channel_obvious"] = float(
+    ((const_x - const_mean) * torch.rsqrt(const_var + eps) + 0.1).flatten()[0]
+)
+
+# -- 6. what the fold refuses ---------------------------------------------
+refusals = {}
+bn_train = torch.nn.BatchNorm2d(4).train()
+conv = torch.nn.Conv2d(3, 4, 3, padding=1)
+train_net = torch.nn.Sequential(conv, bn_train)
+try:
+    t = capture(train_net, torch.randn(2, 3, 8, 8))
+    refusals["training_mode"] = len(FU.fold_conv_batch_norm(t)[1])
+except Exception as error:
+    refusals["training_mode"] = f"capture refused: {type(error).__name__}"
+
+
+class TwoUses(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.conv = torch.nn.Conv2d(3, 4, 3, padding=1)
+        self.bn = torch.nn.BatchNorm2d(4)
+
+    def forward(self, a):
+        h = self.conv(a)
+        return self.bn(h) * h
+
+
+two = TwoUses().eval()
+refusals["conv_used_twice"] = len(
+    FU.fold_conv_batch_norm(capture(two, torch.randn(1, 3, 8, 8)))[1]
+)
+
+transposed = torch.nn.Sequential(
+    torch.nn.ConvTranspose2d(3, 4, 3, padding=1), torch.nn.BatchNorm2d(4)
+).eval()
+refusals["transposed"] = len(
+    FU.fold_conv_batch_norm(capture(transposed, torch.randn(1, 3, 8, 8)))[1]
+)
+out["refusals"] = refusals
+
+# -- 7. the deliverable: a whole model inside NNAPI's set, serialised ------
+# docs/NPU.md §7 measured this network at one unmapped op before lowering
+# (native_batch_norm) and ten after. With the fold it is zero, and the blob
+# upstream's serialiser writes for it decodes.
+net = torch.nn.Sequential(
+    torch.nn.Conv2d(3, 4, 3, stride=2, padding=1),
+    torch.nn.BatchNorm2d(4),
+    torch.nn.ReLU(),
+    torch.nn.Conv2d(4, 4, 3, padding=1),
+    torch.nn.ReLU6(),
+    torch.nn.AdaptiveAvgPool2d((1, 1)),
+    torch.nn.Flatten(),
+    torch.nn.Linear(4, 5),
+    torch.nn.Softmax(dim=1),
+).eval()
+with torch.no_grad():
+    net[1].running_mean.uniform_(-1.0, 1.0)
+    net[1].running_var.uniform_(0.5, 2.0)
+    net[1].weight.uniform_(0.5, 1.5)
+    net[1].bias.uniform_(-0.5, 0.5)
+image = torch.randn(1, 3, 16, 16)
+whole = capture(net, image)
+out["whole"] = {"ops_before": sorted({n["op"] for n in whole.nodes})}
+try:
+    N.serialize(whole)
+    out["whole"]["unfused_serialises"] = "ACCEPTED"
+except N.JitFacadeRefused as error:
+    out["whole"]["unfused_serialises"] = str(error)
+
+fused_whole, pairs = FU.fold_conv_batch_norm(whole)
+out["whole"]["pairs"] = len(pairs)
+out["whole"]["outside_before_folding"] = sorted(
+    {n["op"] for n in fused_whole.nodes} - supported
+)
+# `aten.t` over a constant weight is the one docs/NPU.md §5 is about: the
+# recorded graph is unserialisable while the graph it denotes is not, and
+# constant folding is part of the serialisation path rather than an
+# optimisation on top of it.
+constant_folded, _folded_ops = N.fold_constants(fused_whole)
+out["whole"]["outside"] = sorted(
+    {n["op"] for n in constant_folded.nodes} - supported
+)
+worst = 0.0
+for _ in range(3):
+    sample = torch.randn(1, 3, 16, 16)
+    for a, b in zip(whole.replay((sample,)), fused_whole.replay((sample,))):
+        worst = max(worst, float((a - b).abs().max()))
+out["whole"]["max_abs_diff"] = worst
+model = N.serialize(fused_whole)
+decoded = N.parse_model(model)
+out["whole"]["opcodes"] = [op["opcode"] for op in decoded["operations"]]
+out["whole"]["bytes"] = len(model.as_bytes())
+out["whole"]["shapes"] = N.verify_shapes(model)
+
+print(json.dumps(out))
+"""
+
+
+def _refold_fixture():
+    return _npu_fixture(_REFOLD_SCRIPT)
+
+
+def test_the_refold_goes_prims_to_aten_because_the_other_direction_is_partial():
+    """The direction is forced by a measurement, not chosen for tidiness.
+
+    `prims.transpose` takes a full permutation, as `aten.permute` does, but it
+    validates it first: `[-1, 0]` raises where `aten.permute` computes
+    (docs/PRIMS.md §1). So every permutation prims accepts, permute accepts and
+    computes identically -- prims -> aten is total -- while aten -> prims is
+    partial and would turn a working graph into a raise on an argument real
+    graphs produce.
+
+    Checked by calling both, so if a future kernel relaxes prims' validation
+    this goes red and the direction argument is re-examined rather than
+    inherited.
+    """
+    if not os.path.isfile(_CKPT_VENDOR_SHIM):
+        print("   (skipped: vendored tree has no _C.abi3.so)")
+        return
+    r = _refold_fixture()
+    assert r["is_shim"] is True, r["is_shim"]
+    assert r["prims_transpose_negative"] != "ACCEPTED", (
+        "prims.transpose accepted [-1, 0]; the asymmetry this pass's direction "
+        "rests on is gone: " + repr(r["prims_transpose_negative"])
+    )
+    assert "invalid permutation" in r["prims_transpose_negative"], (
+        r["prims_transpose_negative"]
+    )
+    assert r["aten_permute_negative"] == [4, 3], r["aten_permute_negative"]
+
+
+def test_every_refold_table_entry_computes_the_same_value_as_the_prim():
+    """Per entry, not once for the table.
+
+    Nine of the thirteen prims are the aten kernel under another key, and it is
+    tempting to prove that by pointing at docs/PRIMS.md. The four with their own
+    kernels are the reason not to: three of them mean something *different* from
+    the aten op of the same name, so `prims.transpose` -> `aten.transpose.int`
+    would be a plausible-looking rewrite that computes something else. So each
+    entry is dispatched, refolded, and both graphs replayed, and each must agree
+    bit for bit -- a re-spelling has no tolerance to spend.
+    """
+    if not os.path.isfile(_CKPT_VENDOR_SHIM):
+        print("   (skipped: vendored tree has no _C.abi3.so)")
+        return
+    r = _refold_fixture()
+    per_op = r["per_op"]
+    assert len(per_op) == 12, sorted(per_op)
+    expected = {
+        "prims.cos.default": "aten.cos.default",
+        "prims.sin.default": "aten.sin.default",
+        "prims.erf.default": "aten.erf.default",
+        "prims.tanh.default": "aten.tanh.default",
+        "prims.sqrt.default": "aten.sqrt.default",
+        "prims.rsqrt.default": "aten.rsqrt.default",
+        "prims.reciprocal.default": "aten.reciprocal.default",
+        "prims.neg.default": "aten.neg.default",
+        "prims.clone.default": "aten.clone.default",
+        "prims.view_of.default": "aten.alias.default",
+        "prims.transpose.default": "aten.permute.default",
+        "prims.split_dim.default": "aten.view.default",
+    }
+    assert sorted(per_op) == sorted(expected), sorted(per_op)
+    for key, aten in expected.items():
+        assert per_op[key]["to"] == [aten], (key, per_op[key]["to"])
+        assert per_op[key]["folded"] == [key], (key, per_op[key]["folded"])
+        assert per_op[key]["max_abs_diff"] == 0.0, (key, per_op[key])
+
+
+def test_a_prim_with_no_aten_spelling_is_refused_by_name():
+    """`prims.broadcast_in_dim` is XLA's broadcast and `expand` cannot do it.
+
+    `broadcast_in_dim(ones(3), [3, 2], [0])` broadcasts a size-3 axis against a
+    size-2 one, which right-aligned `expand` refuses outright -- kept here as
+    the control so the refusal is grounded in a measurement rather than in a
+    recollection of one. The pass names the op it will not fold instead of
+    emitting an approximation, and `best_effort` keeps it rather than dropping
+    it, so a caller measuring the gap sees the prim still there.
+    """
+    if not os.path.isfile(_CKPT_VENDOR_SHIM):
+        print("   (skipped: vendored tree has no _C.abi3.so)")
+        return
+    r = _refold_fixture()
+    assert r["expand_control"] != "ACCEPTED", (
+        "aten.expand computed a broadcast_in_dim only prims can express, so "
+        "the reason this prim has no aten spelling no longer holds: "
+        + repr(r["expand_control"])
+    )
+    assert r["broadcast_refusal"] != "ACCEPTED", r["broadcast_refusal"]
+    assert "prims.broadcast_in_dim.default" in r["broadcast_refusal"], (
+        r["broadcast_refusal"]
+    )
+    assert "right-aligned" in r["broadcast_refusal"], r["broadcast_refusal"]
+    assert r["broadcast_best_effort"] == ["prims.broadcast_in_dim.default"], (
+        r["broadcast_best_effort"]
+    )
+
+
+def test_the_refold_recovers_vits_regression_and_claims_nothing_more():
+    """The number docs/PRIMS.md §3 reported going the wrong way, and the two
+    that do not move.
+
+    `vit` under the union table lowers to 11 ops outside NNAPI where the
+    unlowered graph had 11 and the core table gives 10 -- the prims kernels
+    landing made it *worse*, because `_refs.erf` now runs to completion. The
+    refold takes it back to 10.
+
+    `smollm2_llama` (15) and `mobilenet_v2` (6) do not move, and this test
+    asserts that they do not. Both still have prims folded out of them, so the
+    pass is doing its work; what is left outside is outside for reasons prims
+    have nothing to do with, and a test that only pinned the model that
+    improved would report the pass as more than it is (CLAUDE.md §5.3).
+    """
+    if not os.path.isfile(_CKPT_VENDOR_SHIM):
+        print("   (skipped: vendored tree has no _C.abi3.so)")
+        return
+    r = _refold_fixture()
+    models = r["models"]
+    if "vit" not in models:
+        print("   (skipped: transformers unavailable)")
+        return
+    vit = models["vit"]
+    assert vit["outside_raw"] == 11, vit["outside_raw"]
+    assert vit["union"]["outside_lowered"] == 11, vit["union"]
+    assert vit["union"]["outside_refolded"] == 10, vit["union"]
+    assert "prims.erf.default" in vit["union"]["refolded"], vit["union"]["refolded"]
+    assert "prims.transpose.default" in vit["union"]["refolded"], vit["union"]
+
+    mobile = models["mobilenet_v2"]
+    assert mobile["union"]["outside_lowered"] == 6, mobile["union"]
+    assert mobile["union"]["outside_refolded"] == 6, (
+        "mobilenet_v2 was reported as improved by the refold; docs/REFOLD.md "
+        "says it is not, and the two must not drift apart: " + repr(mobile)
+    )
+    assert mobile["union"]["refolded"], mobile["union"]
+
+
+def test_the_refold_is_a_respelling_and_replays_bit_for_bit():
+    """No tolerance. A re-spelling that needed one would not be one.
+
+    Every model whose graph had prims folded out of it is replayed twice, on
+    inputs the trace has not seen, before and after the fold. `0.0` is the only
+    passing answer; `1e-7` would mean the table had picked an op that merely
+    computes something close.
+    """
+    if not os.path.isfile(_CKPT_VENDOR_SHIM):
+        print("   (skipped: vendored tree has no _C.abi3.so)")
+        return
+    r = _refold_fixture()
+    checked = 0
+    for name, entry in r["models"].items():
+        for label in ("core", "union"):
+            if label not in entry:
+                continue
+            if "refold_replay_max_abs_diff" not in entry[label]:
+                continue
+            checked += 1
+            assert entry[label]["refold_replay_max_abs_diff"] == 0.0, (
+                name, label, entry[label]
+            )
+    assert checked >= 1, (
+        "no model graph had a prims node folded out of it, so this test "
+        "measured nothing: " + repr(sorted(r["models"]))
+    )
+
+
+def test_the_batch_norm_affine_this_fold_uses_is_upstreams():
+    """docs/DEMAND1.md §5's defect, re-armed as a check on the fold.
+
+    Upstream's inference batch norm applies a *fused* affine,
+    `alpha = invstd*w`, `beta = b - mean*alpha`, `out = x*alpha + beta`, whose
+    last line cancels two large nearly-equal numbers. The algebraically
+    identical `(x-mean)*invstd*w + b` is **exact** on a constant channel and is
+    therefore wrong -- upstream answers `0.0999755859375` there, not `0.1`.
+
+    So both forms are computed on the same numbers and compared to upstream:
+    the fused one must agree bit for bit and the obvious one must not. If they
+    ever agree, this test has stopped distinguishing them and the fold's
+    arithmetic is no longer being checked by anything.
+    """
+    if not os.path.isfile(_CKPT_VENDOR_SHIM):
+        print("   (skipped: vendored tree has no _C.abi3.so)")
+        return
+    r = _refold_fixture()
+    affine = r["affine"]
+    assert affine["fused_max_abs_diff"] == 0.0, affine
+    assert affine["obvious_max_abs_diff"] > 0.0, (
+        "the obvious unfused affine agreed with upstream exactly, so this "
+        "check can no longer tell the two apart: " + repr(affine)
+    )
+    upstream = affine["constant_channel_upstream"]
+    assert affine["constant_channel_fused"] == upstream, affine
+    assert affine["constant_channel_obvious"] != upstream, affine
+    assert upstream != 0.1, (
+        "upstream returned exactly 0.1 for the constant channel, which is what "
+        "the *unfused* form gives; the cancellation this test is about is gone: "
+        + repr(affine)
+    )
+
+
+def test_the_batch_norm_fold_refuses_where_the_algebra_does_not_hold():
+    """Three cases where folding would be wrong, each declined by name.
+
+    Not folding is always safe -- the graph still computes the right thing --
+    so the risk is entirely on the other side, and these are the three ways the
+    identity `BN(Conv(x)) = Conv(x, W*alpha, B*alpha+beta)` stops holding:
+
+    * **training mode** -- the statistics depend on `x`, so there is no
+      constant `alpha` to push anywhere;
+    * **the convolution read twice** -- its unfused value is still needed;
+    * **transposed convolution** -- its weight carries output channels on
+      axis 1, so scaling axis 0 would scale the input channels instead.
+
+    Each must fold **zero** pairs. A pass that folded any of them would produce
+    a graph that decodes, serialises and computes something else.
+    """
+    if not os.path.isfile(_CKPT_VENDOR_SHIM):
+        print("   (skipped: vendored tree has no _C.abi3.so)")
+        return
+    r = _refold_fixture()
+    refusals = r["refusals"]
+    assert refusals["conv_used_twice"] == 0, refusals
+    assert refusals["transposed"] == 0, refusals
+    # A training-mode batch norm mutates its running statistics, and
+    # docs/CAPTURE.md §4 refuses mutation, so capture may refuse before the
+    # fold is ever asked. Either outcome is a refusal; folding is not.
+    assert refusals["training_mode"] in (0,) or isinstance(
+        refusals["training_mode"], str
+    ), refusals
+
+
+def test_folding_batch_norm_into_conv_takes_mobilenet_to_one_op_outside():
+    """docs/NPU.md §7's "two ops away", now one -- and the one is named.
+
+    `mobilenet_v2` records 203 nodes with two ops NNAPI's serialiser has no
+    calling convention for: `native_batch_norm` and `constant_pad_nd`. The fold
+    removes the first by fusing **52** conv+BN pairs, taking the graph to 151
+    nodes. `constant_pad_nd` remains, and docs/REFOLD.md §5 says exactly why it
+    is not the same kind of problem.
+
+    The count is asserted rather than the direction: a fold that quietly stopped
+    matching most pairs would still "improve" the graph.
+    """
+    if not os.path.isfile(_CKPT_VENDOR_SHIM):
+        print("   (skipped: vendored tree has no _C.abi3.so)")
+        return
+    r = _refold_fixture()
+    if "mobilenet_v2" not in r["models"]:
+        print("   (skipped: transformers unavailable)")
+        return
+    mobile = r["models"]["mobilenet_v2"]
+    assert mobile["outside_raw_supported"] == [
+        "aten.constant_pad_nd.default", "aten.native_batch_norm.default"
+    ], mobile["outside_raw_supported"]
+    assert mobile["fused_pairs"] == 52, mobile["fused_pairs"]
+    assert mobile["fused_nodes"] == 151, mobile["fused_nodes"]
+    assert mobile["outside_fused_supported"] == [
+        "aten.constant_pad_nd.default"
+    ], mobile["outside_fused_supported"]
+    # The fold moves the arithmetic inside the convolution's accumulation, so
+    # this is a numerical claim and not a bit-exactness one.
+    # A *relative* bound, because this toy config's output magnitude is
+    # degenerate (~1e-26): an absolute threshold here would pass on any answer
+    # at all, which is CLAUDE.md §5.5's check-that-cannot-fail. The absolute
+    # proof of the fold is the `whole` network, whose output is O(1).
+    assert mobile["fuse_replay_max_abs_diff"] <= 1e-5 * mobile[
+        "fuse_replay_scale"
+    ], mobile
+
+
+def test_a_whole_model_now_lowers_with_nothing_outside_nnapis_set():
+    """The bar this round was set at, and the negative control beside it.
+
+    `Conv -> BatchNorm -> ReLU -> Conv -> ReLU6 -> AvgPool -> Linear -> Softmax`
+    is the network docs/NPU.md §7 measured at one unmapped op before lowering
+    and ten after. Unfused, `serialize` refuses it **by name**. Fused, nothing
+    is outside `nnapi.supported_ops()`, upstream's serialiser writes a blob, the
+    blob decodes through the layout it was written in, and every operand shape
+    agrees with what capture recorded.
+
+    The opcodes are asserted by value. A blob whose operation table is off by
+    one still decodes, and the shape check would not see it.
+    """
+    if not os.path.isfile(_CKPT_VENDOR_SHIM):
+        print("   (skipped: vendored tree has no _C.abi3.so)")
+        return
+    r = _refold_fixture()
+    whole = r["whole"]
+    assert "aten.native_batch_norm.default" in whole["ops_before"], whole
+    assert whole["unfused_serialises"] != "ACCEPTED", (
+        "the unfused graph serialised, so the fold is not what made this model "
+        "reachable and this test proves nothing: " + repr(whole)
+    )
+    assert "native_batch_norm" in whole["unfused_serialises"], whole
+    assert whole["pairs"] == 1, whole["pairs"]
+    # Before constant folding the only thing left is `aten.t` over the linear
+    # layer's weight, which docs/NPU.md §5 already established is folded rather
+    # than serialised. The batch norm is gone, and that is this round's work.
+    assert whole["outside_before_folding"] == ["aten.t.default"], whole
+    assert whole["outside"] == [], whole["outside"]
+    # CONV_2D, RELU, CONV_2D, RELU6, AVERAGE_POOL_2D, RESHAPE,
+    # FULLY_CONNECTED, SOFTMAX
+    assert whole["opcodes"] == [3, 19, 3, 21, 1, 22, 9, 25], whole["opcodes"]
+    assert whole["bytes"] > 0 and whole["bytes"] % 4 == 0, whole["bytes"]
+    assert whole["shapes"]["mismatches"] == [], whole["shapes"]
+    assert whole["shapes"]["checked"] >= 8, whole["shapes"]
+    assert whole["max_abs_diff"] < 1e-5, whole["max_abs_diff"]
+
+
+
 if __name__ == "__main__":
     raise SystemExit(_main())
