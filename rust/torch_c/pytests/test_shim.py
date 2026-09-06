@@ -1207,11 +1207,22 @@ def test_grouped_mm_resolves_from_the_torch_level_name():
     # that round added are all public names and none of them appears here,
     # which is what makes this a check on the predicate rather than a tally of
     # the round.
+    # `_unique2` joined in docs/VOICE3.md and is the fifth. It is the first
+    # one here that is private *upstream too* in the sense that matters: there
+    # is no `torch.unique2`, and `torch.unique` reaches it through
+    # `torch/functional.py::_unique_impl`, which spells `torch._unique2(...)`
+    # literally. So the widened predicate is not a convenience for it -- it is
+    # the only way `Tensor.unique()` resolves at all, and `vilt`
+    # (`modeling_vilt.py:144`) is the architecture that proved it. The other
+    # fourteen registrations that round added are public names and none
+    # appears here, which is what keeps this a check on the predicate rather
+    # than a tally of the round.
     assert admitted == [
         "_grouped_mm",
         "_is_all_true",
         "_log_softmax",
         "_safe_softmax",
+        "_unique2",
     ], admitted
     assert _C._shim_overloads["_log_softmax"] == ["aten._log_softmax.default"], (
         _C._shim_overloads["_log_softmax"]
@@ -9287,7 +9298,26 @@ def test_core_ops_and_op_tags_agree():
     # would have written 123 here and the test would still have passed the
     # day it was written, which is exactly the failure mode `min.dim` vs
     # `max.dim` above already recorded once.
-    assert r["tag_core_count"] == 125, r["tag_core_count"]
+    # 125 -> 128 with docs/VOICE3.md's fifteen registrations, and **the delta
+    # is three, not fifteen**, for the same reason. Every one was read off its
+    # own `.tags`:
+    #
+    #     col2im.default              ['core', 'pt2_compliant_tag']   <- counted
+    #     im2col.default              ['pt2_compliant_tag']           <- NOT core
+    #     var.dim                     ['core', ..., 'reduction']      <- counted
+    #     var.correction              ['core', ..., 'reduction']      <- counted
+    #     var.default                 [..., 'reduction']              <- NOT core
+    #     std.default/.dim/.correction[..., 'reduction']              <- NONE core
+    #     diag/_unique2/i0            not core
+    #     kaiser_window x3            not core
+    #     upsample_nearest1d.default  not core
+    #
+    # Two of these are the `replication_pad1d` shape again. `col2im` is core
+    # and `im2col` -- its inverse, landed in the same change -- is not. And
+    # `std.correction` is NOT core while `var.correction`, which this shim
+    # implements with the *same function*, is; inferring `std`'s three from
+    # `var`'s would have written 131 here.
+    assert r["tag_core_count"] == 128, r["tag_core_count"]
 
 
 def test_decompose_lowers_the_op_capture_md_named():
@@ -10890,7 +10920,31 @@ def test_schema_text_survives_the_round_trip_through_the_transcribed_tables():
     # spelling for them -- a row would invent a door upstream lacks. Measured
     # here rather than summed from either report, since each branch's count
     # was correct only against its own base.
-    assert len(keys) == 337, len(keys)
+    # 349 with docs/VOICE3.md. **+12**, and the split between the two tables
+    # is the check:
+    #
+    #     diag.default, i0.default                     both tables  -- 2
+    #     var.default, var.dim, var.correction         both tables  -- 3
+    #     std.default, std.dim, std.correction         both tables  -- 3
+    #     kaiser_window.default/.periodic/.beta        overloads only -- 3
+    #     _unique2.default                             overloads only -- 1
+    #
+    # The first eight are +1 each and not +2: `torch.diag`/`Tensor.diag`,
+    # `torch.var`/`Tensor.var` and `torch.std`/`Tensor.std` all exist upstream
+    # and both tables carry the *same* schema strings, so each is one identity
+    # per overload -- the `clamp_min` shape. Getting +16 would mean the two
+    # tables had transcribed them differently.
+    #
+    # The last four are `overloads.json`-only because upstream has no
+    # `Tensor.kaiser_window` and no `Tensor._unique2` (checked); a
+    # `methods.json` row would invent a method upstream lacks.
+    #
+    # `im2col`, `col2im` and `upsample_nearest1d` contribute **zero**, for
+    # docs/PAD.md's reason one paragraph up: upstream reaches all three only
+    # through `torch._C._nn.*` and has no `torch.<name>` spelling, so a row
+    # would invent a door. They are in `tools/golden/reach_allow.json`
+    # instead, as kernels awaiting an `_install_nn` entry.
+    assert len(keys) == 349, len(keys)
     from_tables = sorted(
         k for k in keys
         if report["table"][f"{k[0]}|{k[1]}"]["from"] == "tables"

@@ -97,6 +97,36 @@
         "torch._C._nn.replication_pad3d",
         "torch._C._nn.pad"
       ]
+    },
+    "aten.im2col.default": {
+      "reason": "Reached upstream as `torch._C._nn.im2col` -- and, in practice, as `F.unfold(x, kernel_size, dilation, padding, stride)`, which `torch/nn/functional.py` forwards to it directly. Neither `torch.im2col` nor `Tensor.im2col` exists on 2.13.0 (checked), so this is NOT an overloads.json or methods.json row: a row there would invent a `torch.im2col` upstream does not have -- `aten.upsample_nearest2d.default`'s and `aten.reflection_pad1d.default`'s reasoning above. The missing connection is one `_install_nn` entry shaped like `upsample_nearest2d`'s. The kernel is implemented and golden-compared, and it is `llama4`'s vision-tower wall (docs/COMPLEX2.md §8, docs/VOICE3.md). bootstrap.py was another agent's file this round, so this is a work item, not a design decision, and it fails the suite the moment the entry lands -- which is when this entry should be deleted. `pytests/test_voice3.py::test_the_three_nn_bindings_are_the_only_thing_still_between_these_kernels_and_F` asserts the same gap from the other side: the aten op answers correctly and the `_nn` name refuses, naming itself.",
+      "upstream_absent": [
+        "torch.im2col",
+        "torch.Tensor.im2col"
+      ],
+      "upstream_present": [
+        "torch._C._nn.im2col"
+      ]
+    },
+    "aten.col2im.default": {
+      "reason": "Reached upstream as `torch._C._nn.col2im`, and as `F.fold(x, output_size, kernel_size, ...)`, which forwards to it directly. Neither `torch.col2im` nor `Tensor.col2im` exists on 2.13.0 (checked). Same shape as `im2col` beside it, and the same one-entry gap. The kernel is implemented and golden-compared -- including the case that is the whole op, an OVERLAPPING stride, where `col2im` sums rather than overwrites -- and it is `f5-tts`'s wall (docs/VOICE.md rank 15, docs/VOICE3.md). bootstrap.py was another agent's file this round, so this is a work item, not a design decision, and it fails the suite the moment the entry lands -- which is when this entry should be deleted. `pytests/test_voice3.py::test_the_three_nn_bindings_are_the_only_thing_still_between_these_kernels_and_F` asserts the same gap from the other side: the aten op answers correctly and the `_nn` name refuses, naming itself.",
+      "upstream_absent": [
+        "torch.col2im",
+        "torch.Tensor.col2im"
+      ],
+      "upstream_present": [
+        "torch._C._nn.col2im"
+      ]
+    },
+    "aten.upsample_nearest1d.default": {
+      "reason": "Reached upstream as `torch._C._nn.upsample_nearest1d`, and as `F.interpolate(x, size, mode='nearest')` on a 3-D input. Neither `torch.upsample_nearest1d` nor `Tensor.upsample_nearest1d` exists on 2.13.0 (checked). It is NOT an alias of `aten.upsample_nearest2d.default`, which is the first thing that was checked: different schema, a different rank check (`input_size equals to 3`), a different dtype-refusal kernel name (`compute_indices_weights_nearest` against `upsample_nearest2d_channels_last`) and a different dtype set (`uint8` computes for both, `bool` for neither -- but the 2-D op's refusal wording differs). `bigvgan`'s forward wall, docs/VOICE.md rank 14. bootstrap.py was another agent's file this round, so this is a work item, not a design decision, and it fails the suite the moment the entry lands -- which is when this entry should be deleted. `pytests/test_voice3.py::test_the_three_nn_bindings_are_the_only_thing_still_between_these_kernels_and_F` asserts the same gap from the other side: the aten op answers correctly and the `_nn` name refuses, naming itself.",
+      "upstream_absent": [
+        "torch.upsample_nearest1d",
+        "torch.Tensor.upsample_nearest1d"
+      ],
+      "upstream_present": [
+        "torch._C._nn.upsample_nearest1d"
+      ]
     }
   },
   "shape3_unexercised_spelling": {

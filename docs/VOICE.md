@@ -47,18 +47,18 @@ composites and are named as upstream spells them.
 | 4 | `torch._C._nn.mish` | f5 | forward | kernel written, **not landed** (§4.4) |
 | 5 | `torch.cumprod` | spark | construction | **landed** (§4.2) |
 | 6 | `torch.sinc` | bigvgan | construction | **landed** (§4.1) |
-| 7 | `torch.kaiser_window` | bigvgan | construction | open (§5.1) |
+| 7 | `torch.kaiser_window` | bigvgan | construction | **landed** — docs/VOICE3.md (§5.1) |
 | 8 | `torch.polar` | vocos | forward | **candle-level** (§3) |
 | 9 | `torch.view_as_real` / `torch.view_as_complex` | vocos, bigvgan, f5 | forward | **candle-level** (§3) |
 | 10 | `complex64` storage (`zeros`/`empty`) | vocos | forward | **candle-level** (§3) |
 | 11 | `torch.fft.rfft` | vocos | forward | **candle-level** (§3) |
 | 12 | `F.pad(mode="reflect")` | bigvgan, f5, parler, vocos | forward | open (§5.2) |
 | 13 | `F.pad(mode="replicate")` | bigvgan | forward | open (§5.2) |
-| 14 | `torch._C._nn.upsample_nearest1d` | bigvgan | forward | open (§5.3) |
-| 15 | `torch._C._nn.col2im` / `im2col` (`F.fold`/`F.unfold`) | vocos | forward | open (§5.3) |
+| 14 | `torch._C._nn.upsample_nearest1d` | bigvgan | forward | kernel **landed**, `_nn` binding open — docs/VOICE3.md (§5.3) |
+| 15 | `torch._C._nn.col2im` / `im2col` (`F.fold`/`F.unfold`) | vocos | forward | kernels **landed**, `_nn` bindings open — docs/VOICE3.md (§5.3) |
 | 16 | `torch.rms_norm` (`nn.RMSNorm`) | f5 | forward | open |
 | 17 | `torch.chunk` | f5 | forward | open |
-| 18 | `torch.var` | spark | forward | open |
+| 18 | `torch.var` | spark | forward | **landed** — docs/VOICE3.md |
 | 19 | `aten.detach_.default` | parler | construction | **deliberately refused** (docs/INPLACE.md) — §5.4 |
 | 20 | `aten.floor_divide` with broadcasting | spark | construction | open (§5.5) |
 
@@ -299,12 +299,15 @@ commit that carries it.
 
 ### 5.1 `kaiser_window` — BigVGAN's whole construction
 
-The one construction wall left that is a plain missing kernel. It needs a modified Bessel
-function of the first kind (`i0`), which candle does not have and which upstream implements as a
-Cephes `chbevl` polynomial — so it is transcription work rather than composition, and getting it
-half right produces a window that looks plausible and is wrong. `periodic` follows
-`hann_window`'s rule (`kaiser_window(5)` is the six-point symmetric window with the last sample
-dropped), so that half is already understood.
+**Closed in docs/VOICE3.md.** The estimate above was right about the shape of the work and
+understated one thing: `i0` is a Cephes `chbevl` polynomial, and transcribing it is not enough,
+because upstream's is a C++ *template* instantiated at `float` as well as at `double`. The
+`float` kernel therefore runs float-rounded coefficients through float arithmetic and answers
+`i0(0.0f) == 0.9999999403953552`, not `1.0`. Computing in `f64` and narrowing once is wrong by
+up to `4.83e-07` relative over `[0, 8]` — inside the tolerance any value comparison would use.
+The second half of the transcription is that clang contracts `x * b1 - b2 + c` into an FMA by
+default; spelling that FMA is the difference between 97.8% and 100% bit-identical across an
+88,002-point sweep. `periodic` did follow `hann_window`'s rule, as predicted.
 
 ### 5.2 `reflect` / `replicate` padding — four of the five models
 
@@ -315,9 +318,16 @@ beside it). It is also the only gap on this list shared with Parler-TTS.
 
 ### 5.3 `upsample_nearest1d`, `col2im` / `im2col`
 
-`upsample_bilinear2d` and `upsample_bicubic2d` already exist, so the 1-D nearest case has
-neighbours to follow. `col2im`/`im2col` are `F.fold`/`F.unfold`, which Vocos uses for its
-overlap-add — and which it only reaches *after* `istft`, so it is behind §3 in practice.
+**Kernels landed in docs/VOICE3.md; the three `torch._C._nn.*` bindings are still open** and are
+recorded in `tools/golden/reach_allow.json` as one `_install_nn` entry each — the same shape as
+the `reflection_pad*` entries §5.2 needs.
+
+The guess above that the 1-D nearest case has neighbours to follow was half right. The index
+arithmetic *is* `upsample_nearest2d`'s, but the op is not an alias of it: different schema,
+different rank check, and a different dtype-refusal kernel name
+(`compute_indices_weights_nearest` where the 2-D op says `upsample_nearest2d_channels_last`).
+And `col2im` is not `im2col`'s inverse — it **sums** overlapping windows, which a test on a
+stride equal to the kernel cannot see at all.
 
 ### 5.4 `detach_` — Parler-TTS, and it is a refusal not a gap
 
@@ -353,7 +363,12 @@ task than it was this morning, which is the argument for having landed `cumprod`
 <!-- DOCWATCH: op-implemented aten.clip.default -->
 <!-- DOCWATCH: op-implemented aten.cumprod.default -->
 <!-- DOCWATCH: op-not-implemented aten.mish.default -->
-<!-- DOCWATCH: op-not-implemented aten.kaiser_window.beta -->
+<!-- DOCWATCH: op-implemented aten.kaiser_window.beta -->
+<!-- DOCWATCH: op-implemented aten.i0.default -->
+<!-- DOCWATCH: op-implemented aten.upsample_nearest1d.default -->
+<!-- DOCWATCH: op-implemented aten.im2col.default -->
+<!-- DOCWATCH: op-implemented aten.col2im.default -->
+<!-- DOCWATCH: op-implemented aten.var.correction -->
 <!-- DOCWATCH: op-not-implemented aten.stft.default -->
 <!-- DOCWATCH: op-not-implemented aten.polar.default -->
 <!-- DOCWATCH: op-not-implemented aten.view_as_complex.default -->
