@@ -227,10 +227,10 @@ loads on 3.13, 3.14 and later without a rebuild.
 <tr><td>Architectures — operator coverage</td><td><b>26 of 26</b> reach zero missing operators in the traced sweep</td></tr>
 <tr><td>Architectures — <b>actually forward</b></td><td><b>26 of 26</b>, matching upstream. Agreement is module-by-module through forward hooks, because two of the toy outputs are degenerate enough that their argmax is a tie — reported as a tie rather than as a match (<a href="docs/KERNELS26.md">KERNELS26.md</a>)</td></tr>
 <tr><td>Checkpoints</td><td><code>torch.load</code> and safetensors, round-tripped against upstream</td></tr>
-<tr><td>Build targets</td><td>macOS · Android · iOS · Linux · Windows — <b>five of six build a wheel</b>. WASM builds the extension and computes under Node, but a wheel needs <code>dlopen</code> (<a href="#platform-support">table</a>)</td></tr>
+<tr><td>Build targets</td><td>macOS · Android · iOS · Linux · Windows — <b>five of six build a wheel</b>. WASM builds the extension and computes under Node, and a wheel has been built by hand but not by <code>build.py</code> (<a href="#platform-support">table</a>)</td></tr>
 <tr><td>Training mode</td><td><b>26 of 26</b> forward in <code>.train()</code> as well as <code>.eval()</code>, agreeing with upstream draw for draw — <code>bernoulli_</code> draws in <code>float64</code> for every dtype, so a seeded dropout is comparable. Test-time adaptation runs on real checkpoints — <code>adapt.wrap(model, method=adapt.Tent())</code> drops GPT-2's prediction entropy 39% and transfers to held-out text — in <code>.train()</code> as well as <code>.eval()</code>, with dropout active. A training step moves all 272 SmolLM2 parameters the way upstream moves them — gradients compared element-wise over all 134,515,008 values, sign agreement 99.9987%. It is a <b>tape over a captured region</b>, not <code>Tensor.backward()</code>, which still refuses — though <code>requires_grad=True</code> is now carried rather than refused, and the refusal has moved to the engine itself and names what does work. Ten walls stand between here and an eager <code>.backward()</code> and <b>seven of them do not raise</b>, so a traceback finds one at a time (<a href="docs/BACKWARD2.md">BACKWARD2.md</a>, <a href="docs/BACKWARD3.md">BACKWARD3.md</a>) Unlike <code>torch.compile</code>, autograd <b>is reachable under abi3</b> — <code>torch/csrc/autograd</code> defines <code>Py_BUILD_CORE</code> in 0 of 129 files — and a SmolLM2 backward needs 24 ops of which 16 exist and one is a real missing kernel (<a href="docs/AUTOGRAD.md">AUTOGRAD.md</a>)</td></tr>
 <tr><td>Test-time adaptation</td><td><b>Tent runs on SmolLM2-135M.</b> Ten steps of entropy minimisation over the 61 normalisation weights: entropy <b>4.1604 → 2.9828</b> on unlabelled text, <b>3.7237 → 2.9439</b> on a held-out sentence never adapted on, adapted weights within a median relative <b>1.5e-06</b> of upstream's own autograd at 100% sign agreement. Reverting restores the base <b>bit-identically</b> across all 272 parameters, for a 137 KiB base copy against 513 MiB of model. The wrong sign sends entropy <i>up</i>, <code>lr=0</code> holds it to the last digit, and a detached objective is refused by name — because a loop that silently does nothing passes every test that only checks it completed. <code>nn.LayerNorm</code> models are refused: <code>aten.native_layer_norm.default</code> has no derivative rule (<a href="docs/ADAPT.md">ADAPT.md</a>)</td></tr>
-<tr><td>Devices run</td><td>Android arm64 — <code>import torch</code>, 119 ops, <code>nn</code> forward. <b>WASM runs under Pyodide</b> — <code>import torch</code> and a matmul, though CPython 3.14 and no wheel</td></tr>
+<tr><td>Devices run</td><td>Android arm64 — <code>import torch</code>, 119 ops, <code>nn</code> forward. <b>WASM runs under Pyodide</b> — a hand-built wheel installs, imports and computes, on CPython 3.14</td></tr>
 <tr><td>Speed vs upstream</td><td>desktop CPU, SmolLM2-135M prefill: <b>0.97x at 6 tokens, 1.13x at 128, 1.52x at 512, 2.03x at 1024</b> in <code>float32</code> — the gap grows with sequence length and what is left is attention (<a href="docs/SEQLEN.md">SEQLEN.md</a>). In <code>bfloat16</code> it is <b>2.3x faster than upstream</b> (<a href="docs/DTYPE_PERF.md">DTYPE_PERF.md</a>). Decode is the other half and it was never measured until now: <code>generate()</code> with a KV cache — the default, and what the example above runs — is <b>0.95x</b>, <b>46.6 tok/s against upstream's 44.4</b> on SmolLM2-135M <code>float32</code>, with character-identical output. The long-sequence gap is attention, and <b>not because we materialise the score matrix</b>: two independent blocked kernels were built to stop materialising it and both were slower — upstream's own, reproduced exactly, by 20x (<a href="docs/FLASH.md">FLASH.md</a>)</td></tr>
 </table>
 
@@ -302,7 +302,7 @@ only exists on a platform. Every ✅ has a run behind it.
 | candle builds | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | candle **computes** | ✅ | ✅ | ✅ | ⚠️ | ⚠️ | ⚠️ | ✅ *under Node* |
 | extension builds | ✅ | ✅ | ✅ | ✅ | ✅ *`cargo-zigbuild`* | ✅ *`cargo-xwin`* | ✅ *emscripten* |
-| wheel builds | ✅ | ✅ | ✅ | ✅ | ✅ *`manylinux_2_17`* | ✅ *`win_amd64`* | ❌ *WASI has no `dlopen`* |
+| wheel builds | ✅ | ✅ | ✅ | ✅ | ✅ *`manylinux_2_17`* | ✅ *`win_amd64`* | ⚠️ *by hand, not by `build.py`* |
 | symbols resolve | ✅ | ✅ | ✅ | ⚠️ *weaker: ELF names only versioned imports* | ✅ *PE names every one* | ✅ *stub behaviour proven against the real host* |
 | `dlopen` + `PyInit_` runs | — | — | — | — | — | — | ✅ |
 | installs | ✅ | ✅ | ✅ | ⚠️ | ✅ | ✅ | ✅ *mounted, no wheel* |
@@ -347,9 +347,12 @@ Node 24 sits in this machine's cache — `command -v node` finds nothing only be
 Pyodide the extension loads, `import torch` returns 2.13.0 from the vendored tree, and `a @ b` and
 an `nn.Linear` forward match a host build. Two things keep it short of the others: Pyodide ships
 CPython **3.14**, not 3.13, so the module is tied to one interpreter rather than to an abi3 floor
-— Emscripten voids abi3 regardless — and `torch/__init__.py` imports `torch.multiprocessing`,
+— and `torch/__init__.py` imports `torch.multiprocessing`,
 which a browser sandbox cannot supply, so that import is stubbed by the harness rather than solved.
-There is still no WASM wheel ([`docs/WASM.md`](docs/WASM.md)).
+A WASM wheel has been built by hand, installed into Pyodide 314.0.6 and imported; `build.py`
+does not build one, because `verify_cross.py` reads ELF and Mach-O symbol tables that a wasm
+module does not have, and a target this repo cannot check would ship unchecked
+([`docs/WASM.md`](docs/WASM.md) §9).
 
 ### Devices
 
@@ -421,7 +424,7 @@ there, so the dependency count falls 129 → 80.
 and 6.0.5 — three releases, three compilers — so WASM would be one binary per CPython feature
 release rather than one per platform. That is a different distribution model from the other five,
 not a variation on it. WASI is separately blocked: no `dlopen`, so `torch._C` cannot be a wheel
-there at all. And PEP 783 forbids `-pthread`, so the honest line is scalar and single-threaded —
+there at all — but WASI was never the route, and Pyodide, which is, has dynamic linking. And PEP 783 forbids `-pthread`, so the honest line is scalar and single-threaded —
 `simd128` is off because candle's own WASM SIMD backend does not compile.
 
 It is absent from the matrix on purpose: that table is a `kernels` *backend* matrix, and `kernels`
