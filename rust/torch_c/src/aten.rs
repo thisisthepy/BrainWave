@@ -46,9 +46,13 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten._to_copy.default",
     "aten._unsafe_view.default",
     "aten._weight_norm_interface.default",
+    "aten._is_all_true.default",
     "aten.abs.default",
+    "aten.acos.default",
     "aten.adaptive_avg_pool1d.default",
     "aten.adaptive_avg_pool2d.default",
+    "aten.argsort.default",
+    "aten.argsort.stable",
     "aten.greater.Scalar",
     "aten.greater.Tensor",
     "aten.roll.default",
@@ -80,6 +84,7 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.bitwise_or.Scalar",
     "aten.bitwise_or.Tensor",
     "aten.bmm.default",
+    "aten.broadcast_tensors.default",
     "aten.cat.default",
     "aten.ceil.default",
     "aten.ceil_.default",
@@ -139,7 +144,9 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.le.Scalar",
     "aten.le.Tensor",
     "aten.leaky_relu.default",
+    "aten.logical_and.default",
     "aten.lift_fresh.default",
+    "aten.linalg_qr.default",
     "aten.linalg_vector_norm.default",
     "aten.linspace.default",
     "aten.log.default",
@@ -156,6 +163,7 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.max.dim",
     "aten.max.other",
     "aten.maximum.default",
+    "aten.max_pool1d.default",
     "aten.mean.default",
     "aten.mean.dim",
     "aten.min.default",
@@ -240,6 +248,7 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.unsqueeze.default",
     "aten.upsample_bicubic2d.default",
     "aten.upsample_bilinear2d.default",
+    "aten.upsample_nearest2d.default",
     "aten.view.default",
     "aten.view.dtype",
     "aten.where.ScalarOther",
@@ -1967,6 +1976,7 @@ fn aten_dispatch_inner(
         "aten.bitwise_not.default" => bitwise_not_default(py, args, kwargs),
 
         "aten.cos.default" => unary_float(py, args, kwargs, "aten.cos.default", Unary::Cos),
+        "aten.acos.default" => acos_default(py, args, kwargs),
         "aten.sin.default" => unary_float(py, args, kwargs, "aten.sin.default", Unary::Sin),
         "aten.reciprocal.default" => {
             unary_float(py, args, kwargs, "aten.reciprocal.default", Unary::Reciprocal)
@@ -2028,6 +2038,14 @@ fn aten_dispatch_inner(
         "aten.all.dims" => {
             any_or_all_dim(py, args, kwargs, "aten.all.dims", true, BoolReduce::All)
         }
+        "aten._is_all_true.default" => is_all_true_default(py, args, kwargs),
+        "aten.argsort.default" => argsort_default(py, args, kwargs, false),
+        "aten.argsort.stable" => argsort_default(py, args, kwargs, true),
+        "aten.broadcast_tensors.default" => broadcast_tensors_default(py, args, kwargs),
+        "aten.logical_and.default" => logical_and_default(py, args, kwargs),
+        "aten.max_pool1d.default" => max_pool1d_default(py, args, kwargs),
+        "aten.upsample_nearest2d.default" => upsample_nearest2d_default(py, args, kwargs),
+        "aten.linalg_qr.default" => linalg_qr_default(py, args, kwargs),
 
         "aten.masked_fill.Scalar" => masked_fill(py, args, kwargs, "aten.masked_fill.Scalar"),
         "aten.masked_fill.Tensor" => masked_fill(py, args, kwargs, "aten.masked_fill.Tensor"),
@@ -16902,6 +16920,509 @@ fn upsample_bilinear2d_default(
     finish(py, out, tag)
 }
 
+/// `aten::acos(Tensor self) -> Tensor`
+///
+/// `yoso`'s wall (docs/ARCH100.md rank, cum=57). Not in the `unary_float`
+/// family: candle-core 0.11.0 has no `acos` unary op at all (`unary_op!` in
+/// `tensor.rs` lists `sin`/`cos`/`tanh`/`erf`/... but not `acos`, `asin` or
+/// `atan`), so this is a manual elementwise kernel over `f64::acos` -- the
+/// same `read_flat`/`write_flat` round trip `upsample_bilinear2d_default` and
+/// `max_pool2d_default` above already use for a kernel candle does not carry.
+///
+/// The dtype rule is `unary_float`'s own (measured against `torch.acos` on
+/// `int64`/`bool` inputs): non-floating input promotes to the default float
+/// dtype, each floating dtype keeps its own width. Computed in `f64` and
+/// narrowed once at the end -- there is no `opmath_t` subtlety recorded for
+/// `acos` the way there is for `upsample_bilinear2d`'s bilinear weights, so
+/// this does not special-case `float32`.
+fn acos_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.acos.default";
+    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let tag = unary_float_tag(input.tag());
+    let t = input.tensor()?;
+    let dims = t.dims().to_vec();
+    let device = t.device().clone();
+    let source = read_flat(OP, t, input.tag())?;
+    let values: Vec<f64> = match source {
+        Flat::Float(v) => v.into_iter().map(f64::acos).collect(),
+        Flat::Int(v) => v.into_iter().map(|x| (x as f64).acos()).collect(),
+    };
+    let out = write_flat(OP, Flat::Float(values), dims, &device, tag)?;
+    finish(py, out, tag)
+}
+
+/// `aten::logical_and(Tensor self, Tensor other) -> Tensor`
+///
+/// `longt5`'s wall. **Not an alias of `bitwise_and`, and the two disagree on
+/// integer input**, measured against upstream 2.13.0:
+///
+/// ```text
+/// bitwise_and(tensor([0,1,2,3]), tensor([1,1,0,2]))  ->  [0, 1, 0, 2]   (bit-AND)
+/// logical_and(tensor([0,1,2,3]), tensor([1,1,0,2]))  ->  [F, T, F, T]   (truthiness AND)
+/// ```
+///
+/// `bitwise_and` computes the bitwise AND of the two integers; `logical_and`
+/// treats any nonzero element as true, ANDs the two booleans, and always
+/// answers `bool` regardless of the input dtype. Routing this through
+/// `bitwise_binary` the way `prims.transpose` was once routed through
+/// `aten.permute` (docs/PRIMS.md) would silently accept the call and return
+/// the wrong integer answer instead of the right boolean one.
+///
+/// Implemented as `any_from(self) & any_from(other)`, broadcasting first --
+/// `any_from` is the same "nonzero" mask `any`/`all` already use, so this
+/// composes rather than duplicating the truthiness rule.
+fn logical_and_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.logical_and.default";
+    let lhs = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let rhs = tensor_arg(OP, args, kwargs, 1, "other")?;
+    let a = any_from(OP, lhs.tensor()?)?;
+    let b = any_from(OP, rhs.tensor()?)?;
+    let out = a.broadcast_mul(&b).map_err(|e| candle_err(OP, e))?;
+    finish(py, out, TorchDType::Bool)
+}
+
+/// `aten::_is_all_true(Tensor self) -> Tensor`
+///
+/// `vits`'s wall. A private, bool-only reduction -- `TensorBase._is_all_true`
+/// used by `torch/overrides.py`-adjacent code that wants to know whether every
+/// element of an already-boolean tensor is `True` without a Python-level
+/// `.item()` round trip. Upstream asserts the input is `bool` and raises an
+/// **internal** assert (not a `TypeError`) otherwise, which is transcribed
+/// here as measured:
+///
+/// ```text
+/// self.scalar_type() == at::kBool INTERNAL ASSERT FAILED at
+/// ".../ReduceOps.cpp":2144, please report a bug to PyTorch.
+/// ```
+///
+/// The reduction itself is `all`'s -- `mask.min(0)` the way
+/// `any_or_all_default` already computes `BoolReduce::All` -- so this does not
+/// restate the empty-input identity or the reduction, only the dtype guard.
+fn is_all_true_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten._is_all_true.default";
+    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    if input.tag() != TorchDType::Bool {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "self.scalar_type() == at::kBool INTERNAL ASSERT FAILED at \
+             \"aten/src/ATen/native/ReduceOps.cpp\":2144, please report a bug to PyTorch. ",
+        ));
+    }
+    any_or_all_default(py, args, kwargs, OP, BoolReduce::All)
+}
+
+/// `aten::argsort(Tensor self, int dim=-1, bool descending=False) -> Tensor`
+/// `aten::argsort.stable(Tensor self, *, bool stable, int dim=-1,
+///     bool descending=False) -> Tensor`
+///
+/// Three architectures' wall (`aria`, `aria_text`, `vit_mae`, docs/ARCH100.md
+/// rank 3, cum=43). **Ties matter**: an unstable sort and a stable sort look
+/// identical on distinct-valued input and disagree the moment two elements
+/// compare equal. Measured against upstream on `[3, 1, 3, 1, 2, 3]`:
+/// `argsort` (ascending) answers `[1, 3, 4, 0, 2, 5]`, keeping the original
+/// relative order among the two `1`s (indices 1, 3) and the three `3`s
+/// (indices 0, 2, 5) -- an unstable sort is free to answer `[3, 1, 4, 2, 0,
+/// 5]` or any other permutation that is merely sorted by value.
+///
+/// `order_along` -- the function `sort_default`/`topk_default` already
+/// share -- **is already stable** (its own doc comment records the measured
+/// upstream behaviour this reproduces), so `argsort` does not need its own
+/// sort: it calls `order_along` and keeps only the indices half of
+/// `Ordered`, discarding the values. `stable` is read and not otherwise
+/// acted on -- `order_along` is stable regardless of the flag, which is
+/// within the licence `stable=False` grants (an unstable answer is allowed,
+/// not required) and is exactly right for `stable=True`.
+fn argsort_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+    has_stable_kwarg: bool,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.argsort.default";
+    const OP_STABLE: &str = "aten.argsort.stable";
+    let op = if has_stable_kwarg { OP_STABLE } else { OP };
+    let input = tensor_arg(op, args, kwargs, 0, "self")?;
+    let rank = input.tensor()?.rank();
+    // `argsort.stable`'s schema is keyword-only past `self`/`stable`, so
+    // `dim`/`descending` sit one slot later than `argsort.default`'s -- the
+    // `stable` kwarg itself is read and discarded, same reasoning as
+    // `topk_default`'s `_sorted` above.
+    let (dim_slot, desc_slot) = if has_stable_kwarg { (2, 3) } else { (1, 2) };
+    let dim = normalise_dim(op, dim_arg(args, kwargs, dim_slot, "dim")?.unwrap_or(-1), rank)?;
+    let descending = bool_arg(args, kwargs, desc_slot, "descending")?.unwrap_or(false);
+    let ordered = order_along(op, &input, dim, descending, None)?;
+    let device = input.tensor()?.device().clone();
+    let indices = Tensor::from_vec(ordered.indices, ordered.dims, &device)
+        .map_err(|e| candle_err(op, e))?;
+    finish(py, indices, TorchDType::Int64)
+}
+
+/// `aten::broadcast_tensors(Tensor[] tensors) -> Tensor[]`
+///
+/// `gemma3n_text`'s wall (docs/ARCH100.md, one architecture) -- but the
+/// higher-value reason to land it is `nn.MSELoss`. `docs/BACKWARD9.md`
+/// recorded working around its absence by spelling the loss as
+/// `((o - t) ** 2).mean()` instead of `nn.MSELoss()(o, t)`, because
+/// `torch/functional.py`'s `broadcast_tensors` -- which `F.mse_loss`'s
+/// `expand_as`-free broadcasting path reaches through -- has no kernel here.
+///
+/// Each output keeps its **own dtype** (unlike `cat`, this does not
+/// promote): `broadcast_tensors(int64, float32)` answers one `int64` and one
+/// `float32` tensor, both at the broadcast shape. `broadcast_shape` -- the
+/// same numpy-style, right-aligned rule `bitwise_binary` and `expand_target`
+/// already share -- is folded over the whole list first, then every tensor is
+/// expanded to it with `broadcast_as`, which is a view (no copy) exactly as
+/// `expand_default` above.
+fn broadcast_tensors_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.broadcast_tensors.default";
+    let tensors: Vec<PyTensorBase> = required(OP, args, kwargs, 0, "tensors")?.extract()?;
+    if tensors.is_empty() {
+        return Ok(PyList::empty(py).into_any().unbind());
+    }
+    let mut shape: Vec<usize> = tensors[0].tensor()?.dims().to_vec();
+    for t in &tensors[1..] {
+        shape = broadcast_shape(OP, &shape, t.tensor()?.dims())?;
+    }
+    let mut outs: Vec<Py<PyAny>> = Vec::with_capacity(tensors.len());
+    for t in &tensors {
+        let out = t
+            .tensor()?
+            .broadcast_as(shape.clone())
+            .map_err(|e| candle_err(OP, e))?;
+        // Promoted here rather than at the dispatcher's exit, for the reason
+        // `unbind.int` and `finish_ordered` give: the tensors leave inside a
+        // list, which `promote` does not look into. Without this, every
+        // element of `torch.broadcast_tensors(...)` is a bare `TensorBase` and
+        // the very next thing `F.mse_loss` does to them is a `Tensor` method.
+        outs.push(crate::tensor::promote(py, finish(py, out, t.tag())?)?);
+    }
+    Ok(PyList::new(py, outs)?.into_any().unbind())
+}
+
+/// `aten::max_pool1d(Tensor self, int[1] kernel_size, int[1] stride=[],
+///     int[1] padding=[0], int[1] dilation=[1], bool ceil_mode=False)
+///     -> Tensor`
+///
+/// `canine`'s wall (docs/ARCH100.md, one architecture). The 1-D twin of
+/// `max_pool2d_default` above -- same extent formula, same `ceil_mode`
+/// correction, same `read_flat`/`write_flat` round trip -- collapsed to one
+/// spatial axis instead of two. `max_pool1d` (unlike `max_pool2d`, which has
+/// a `_with_indices` upstream twin this shim's `max_pool2d_default` also
+/// stands in for) has no indices-returning overload in `overloads.json`, so
+/// this only ever answers the values.
+fn max_pool1d_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.max_pool1d.default";
+    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let kernel = shape_arg(OP, args, kwargs, 1, "kernel_size")?;
+    let stride_raw = match optional(args, kwargs, 2, "stride")? {
+        Some(value) if !value.is_none() => shape_arg(OP, args, kwargs, 2, "stride")?,
+        _ => Vec::new(),
+    };
+    let padding = match optional(args, kwargs, 3, "padding")? {
+        Some(value) if !value.is_none() => shape_arg(OP, args, kwargs, 3, "padding")?,
+        _ => vec![0],
+    };
+    let dilation = match optional(args, kwargs, 4, "dilation")? {
+        Some(value) if !value.is_none() => shape_arg(OP, args, kwargs, 4, "dilation")?,
+        _ => vec![1],
+    };
+    let ceil_mode = bool_arg(args, kwargs, 5, "ceil_mode")?.unwrap_or(false);
+
+    let one = |name: &str, s: &[isize], default: &[isize]| -> PyResult<i64> {
+        let v = if s.is_empty() { default } else { s };
+        if v.len() == 1 {
+            Ok(v[0] as i64)
+        } else {
+            Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "max_pool1d() argument '{}' should contain one int",
+                name
+            )))
+        }
+    };
+    let k = one("kernel_size", &kernel, &[])?;
+    let s = one("stride", &stride_raw, &kernel)?;
+    let p = one("padding", &padding, &[])?;
+    let d = one("dilation", &dilation, &[])?;
+
+    if k <= 0 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "max_pool1d: kernel_size must be greater than zero",
+        ));
+    }
+    if s <= 0 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "max_pool1d: stride must be greater than zero",
+        ));
+    }
+    if d <= 0 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "max_pool1d: dilation must be greater than zero",
+        ));
+    }
+
+    let t = input.tensor()?;
+    let tag = input.tag();
+    let dims = t.dims();
+    if dims.len() != 2 && dims.len() != 3 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "max_pool1d: non-empty 2D or 3D (batch mode) tensor expected for input",
+        ));
+    }
+    let split = dims.len() - 1;
+    let planes: usize = dims[..split].iter().product();
+    let iw = dims[split] as i64;
+
+    let extent = |input_size: i64, k: i64, pad: i64, stride: i64, dilation: i64| -> i64 {
+        let numerator = input_size + 2 * pad - dilation * (k - 1) - 1;
+        let mut out = if ceil_mode {
+            numerator.div_euclid(stride) + if numerator.rem_euclid(stride) != 0 { 1 } else { 0 }
+        } else {
+            numerator.div_euclid(stride)
+        } + 1;
+        if ceil_mode && (out - 1) * stride >= input_size + pad {
+            out -= 1;
+        }
+        out
+    };
+    let ow = extent(iw, k, p, s, d);
+    if ow <= 0 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "max_pool1d: Given input size: ({}). Calculated output size: ({}). \
+             Output size is too small",
+            iw, ow
+        )));
+    }
+
+    let out_dims = if split == 0 { vec![ow as usize] } else { [&dims[..split], &[ow as usize]].concat() };
+
+    // **Not `max_pool2d_default`'s dtype rule, and this was measured rather
+    // than inherited from the neighbour.** Upstream's `max_pool1d` *computes*
+    // `float16` and `bfloat16` -- which this shim's `max_pool2d` refuses --
+    // and names a different kernel when it refuses: `"max_pool1d_impl" not
+    // implemented for 'Byte'`, not `"max_pool2d"`. Copying the 2-D branch here
+    // would have refused two dtypes upstream answers and misnamed the kernel
+    // for the three it does refuse. docs/TAIL1.md §2.
+    if !tag.is_floating_point() {
+        return Err(pyo3::exceptions::PyNotImplementedError::new_err(format!(
+            "\"max_pool1d_impl\" not implemented for '{}'",
+            scalar_type_name(tag)
+        )));
+    }
+    let source = read_flat(OP, t, tag)?;
+    // The maximum is a *selection*: every candidate is a value the input dtype
+    // already held exactly, so comparing at `f64` and writing back through
+    // `write_flat` cannot round. That is what lets one branch serve all four
+    // floating widths without a `float32`-specific accumulator, which is why
+    // there is no `acc32` split here as there is in `max_pool2d_default`.
+
+    let mut out_f = vec![0.0f64; planes * ow as usize];
+    for pl in 0..planes {
+        let base = pl * iw as usize;
+        for x in 0..ow {
+            let start_raw = x * s - p;
+            let at = pl * ow as usize + x as usize;
+            match &source {
+                Flat::Float(values) => {
+                    let mut max_val = f64::NEG_INFINITY;
+                    for idx in 0..k {
+                        let col = start_raw + idx * d;
+                        if col >= 0 && col < iw {
+                            let val = values[base + col as usize];
+                            // A `NaN` candidate wins: upstream's max
+                            // propagates it. `max_val.is_nan()` can never be
+                            // true here (the seed is `-inf` and `>` never
+                            // installs a NaN), so the `||` arm is the one that
+                            // does the work, not a redundant guard.
+                            if val > max_val || val.is_nan() {
+                                max_val = val;
+                            }
+                        }
+                    }
+                    out_f[at] = max_val;
+                }
+                Flat::Int(_) => unreachable!("refused above unless the tag is floating"),
+            }
+        }
+    }
+
+    let out_t = write_flat(OP, Flat::Float(out_f), out_dims, t.device(), tag)?;
+    finish(py, out_t, tag)
+}
+
+/// `aten::upsample_nearest2d(Tensor self, SymInt[2] output_size,
+///     float? scales_h=None, float? scales_w=None) -> Tensor`
+///
+/// `vilt`'s wall (docs/ARCH100.md, `torch._C._nn.upsample_nearest2d`). Sits
+/// beside `upsample_bilinear2d_default` for the input validation and the
+/// `read_flat`/`write_flat` scaffolding, but **the index rule is nearest's
+/// own, not bilinear's, and was measured rather than assumed** --
+/// `docs/DEMAND8.md` recorded three separate traps in `upsample_bicubic2d`
+/// that only running upstream caught, and this had its own such check:
+///
+/// ```text
+/// source = floor(dst_index * scale)     scale = area_pixel_compute_scale
+///                                        with align_corners = False always
+///                                        (upstream's nearest has no
+///                                        align_corners parameter at all --
+///                                        this schema does not carry one)
+/// ```
+///
+/// which is `nearest_neighbor_compute_source_index` in
+/// `UpSampleKernel.cpp`: no `+0.5`/`-0.5` half-pixel correction the way
+/// bilinear's non-align-corners branch has one, just a floor of the scaled
+/// index, clamped to `input_size - 1`. Verified element-by-element against
+/// upstream on `1x1x4x4 -> 1x1x8x8` (a clean 2x upsample, scale 0.5) and on
+/// the non-power-of-2 `1x1x3x5 -> 1x1x7x11`, both exact.
+///
+/// Same dtype refusals as `upsample_bilinear2d_default` -- `uint8` is a
+/// separate fixed-point kernel upstream (not re-measured here; refused by
+/// name rather than guessed), and any other non-floating dtype refuses with
+/// upstream's own kernel name for this op.
+fn upsample_nearest2d_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.upsample_nearest2d.default";
+    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let output_size = shape_arg(OP, args, kwargs, 1, "output_size")?;
+    let scales_h = scalar_arg(OP, args, kwargs, 2, "scales_h")?.map(|s| s.as_f64());
+    let scales_w = scalar_arg(OP, args, kwargs, 3, "scales_w")?.map(|s| s.as_f64());
+
+    if output_size.len() != 2 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "It is expected output_size equals to 2, but got size {}",
+            output_size.len()
+        )));
+    }
+    let dims = input.tensor()?.dims().to_vec();
+    if dims.len() != 4 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "It is expected input_size equals to 4, but got size {}",
+            dims.len()
+        )));
+    }
+    let (in_h, in_w) = (dims[2] as i64, dims[3] as i64);
+    let (out_h, out_w) = (output_size[0] as i64, output_size[1] as i64);
+    if in_h <= 0 || in_w <= 0 || out_h <= 0 || out_w <= 0 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "Input and output sizes should be greater than 0, but got input (H: {in_h}, \
+             W: {in_w}) output (H: {out_h}, W: {out_w})"
+        )));
+    }
+    if dims[1..].iter().product::<usize>() == 0 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "Non-empty 4D data tensor expected but got a tensor with sizes {dims:?}"
+        )));
+    }
+
+    let tag = input.tag();
+    // **`uint8` computes, and that is the difference between this op and its
+    // interpolating neighbours.** `upsample_bilinear2d`/`bicubic2d` have a
+    // separate fixed-point `uint8` kernel upstream, because they *average*
+    // and the rounding of that average is the kernel's whole content. Nearest
+    // neighbour never averages: every output element is one input element
+    // copied, so there is no rounding for a fixed-point kernel to do
+    // differently and the float path answers upstream's bytes exactly
+    // (measured, `4x4 -> 3x3` uint8: `[0,1,2,4,5,6,8,9,10]`, identical to the
+    // float32 gather). Refusing it here -- as this file first did, by
+    // inheriting the neighbours' reasoning -- refuses a dtype upstream
+    // answers. docs/TAIL1.md §2.
+    if !(tag.is_floating_point() || tag == TorchDType::UInt8) {
+        return Err(pyo3::exceptions::PyNotImplementedError::new_err(format!(
+            "\"upsample_nearest2d_channels_last\" not implemented for '{}'",
+            scalar_type_name(tag)
+        )));
+    }
+
+    let out_dims = vec![dims[0], dims[1], out_h as usize, out_w as usize];
+    let device = input.tensor()?.device().clone();
+    if dims[0] == 0 {
+        let out = Tensor::zeros(out_dims, PyDtype::new(tag).storage(OP)?, &device)
+            .map_err(|e| candle_err(OP, e))?;
+        return finish(py, out, tag);
+    }
+
+    let acc32 = tag != TorchDType::Float64;
+    // `area_pixel_compute_scale`, align_corners = False always (nearest has
+    // no align_corners parameter upstream).
+    let scale_of = |in_size: i64, out_size: i64, given: Option<f64>| -> f64 {
+        match given {
+            Some(scale) if scale > 0.0 => {
+                if acc32 {
+                    (1.0 / scale) as f32 as f64
+                } else {
+                    1.0 / scale
+                }
+            }
+            _ => {
+                if acc32 {
+                    (in_size as f32 / out_size as f32) as f64
+                } else {
+                    in_size as f64 / out_size as f64
+                }
+            }
+        }
+    };
+    // `nearest_neighbor_compute_source_index`: floor(dst * scale), clamped.
+    let grid = |in_size: i64, out_size: i64, scale: f64| -> Vec<usize> {
+        (0..out_size)
+            .map(|index| {
+                let src = if acc32 {
+                    (scale as f32 * index as f32).floor() as i64
+                } else {
+                    (scale * index as f64).floor() as i64
+                };
+                src.min(in_size - 1).max(0) as usize
+            })
+            .collect()
+    };
+
+    let h_grid = grid(in_h, out_h, scale_of(in_h, out_h, scales_h));
+    let w_grid = grid(in_w, out_w, scale_of(in_w, out_w, scales_w));
+
+    let source = match read_flat(OP, input.tensor()?, tag)? {
+        Flat::Float(values) => values,
+        Flat::Int(values) => values.into_iter().map(|v| v as f64).collect(),
+    };
+    let plane = (in_h * in_w) as usize;
+    let planes = dims[0] * dims[1];
+    let mut out = vec![0.0f64; planes * (out_h * out_w) as usize];
+    let mut at = 0usize;
+    for p in 0..planes {
+        let base = p * plane;
+        for &h in &h_grid {
+            let row = base + h * in_w as usize;
+            for &w in &w_grid {
+                out[at] = source[row + w];
+                at += 1;
+            }
+        }
+    }
+
+    let out = write_flat(OP, Flat::Float(out), out_dims, &device, tag)?;
+    finish(py, out, tag)
+}
+
 /// `aten::floor(Tensor self) -> Tensor`
 ///
 /// `swin`'s and `segformer`'s wall (docs/DEMAND7.md §3 rank 1). The twin of
@@ -20576,4 +21097,244 @@ fn adaptive_avg_pool2d_default(
     .map_err(|e| candle_err(OP, e))?;
 
     finish(py, out_t, tag)
+}
+
+static LINALG_QR_RESULT: std::sync::OnceLock<Py<PyAny>> = std::sync::OnceLock::new();
+
+/// `aten::linalg_qr(Tensor A, str mode="reduced") -> (Tensor Q, Tensor R)`
+///
+/// `rwkv`'s last wall, and a **construction-time** one rather than a forward
+/// one: `_init_weights` calls `nn.init.orthogonal_`, which draws a normal
+/// matrix and factorises it (docs/PRIMS.md §6, docs/DEMAND8.md). Nothing in
+/// the model runs until this answers.
+///
+/// This is a real kernel and the only one in docs/TAIL1.md's set that is; the
+/// other eight are gathers, comparisons, selections or one `libm` call. It is
+/// **LAPACK's `geqrf` + `orgqr`, transcribed**, not "any valid QR", because a
+/// QR factorisation is only unique up to the signs of `R`'s diagonal and
+/// upstream's signs are LAPACK's. Getting the decomposition right and the
+/// convention wrong would answer a `Q` with flipped columns -- still
+/// orthogonal, still `Q @ R == A`, and not upstream's answer.
+///
+/// The convention lives entirely in `dlarfg`, upstream's reflector generator,
+/// and it has one branch that is easy to miss and decides the whole
+/// **identity** case:
+///
+/// ```text
+/// xnorm = ||x[j+1..]||
+/// if xnorm == 0:   tau = 0, beta = alpha        <-- H is I; alpha keeps its sign
+/// else:            beta = -sign(alpha) * hypot(alpha, xnorm)
+///                  tau  = (beta - alpha) / beta
+///                  v    = x / (alpha - beta)
+/// ```
+///
+/// Without the `xnorm == 0` short circuit a plausible implementation writes
+/// `beta = -sign(alpha)*||x||` unconditionally and answers `R = -I` for
+/// `torch.eye(3)`, where upstream answers `+I` (measured). That is the single
+/// most likely wrong answer here and it looks perfectly reasonable.
+///
+/// **Agreement, measured against upstream at `float64` over eleven matrices**
+/// (square, tall, wide, `complete`, `1x1`, `eye`, sign-flipped): `max |dQ|` and
+/// `max |dR|` are `<= 6.4e-16` and `<= 2.9e-14` -- machine precision, i.e. the
+/// same factorisation and the same convention, not merely a compatible one.
+///
+/// **The one case where nothing agrees, and it is not a defect here.** On a
+/// rank-deficient input (`[[1,2],[2,4],[3,6]]`) the trailing columns of `Q`
+/// are determined by rounding noise -- upstream's own `R[1][1]` comes out
+/// `8.8e-07` at `float32` and `~1e-16` at `float64` -- and this
+/// implementation and LAPACK disagree by `0.104` in that column while both
+/// remain orthogonal to `1e-16`. Upstream promises nothing there. The golden
+/// cases therefore compare rank-deficient input by the *properties* that are
+/// determined (`R` upper-triangular, `Q` orthonormal, `Q @ R == A`) and keep
+/// element-wise comparison to full-rank inputs. Recording this rather than
+/// quietly choosing well-conditioned test matrices is the point: a QR that
+/// looks right on a small well-conditioned matrix and is wrong elsewhere is
+/// exactly the failure this op invites.
+///
+/// Arithmetic is at `f64` for both supported dtypes. At `float32` that makes
+/// this shim *more* accurate than upstream rather than differently accurate
+/// -- upstream's own `R[0][1]` for the classic `[[12,-51,4],...]` is
+/// `-21.000003814697266` where the exact value is `-21` -- which is a relative
+/// `1.8e-07`, inside `float32`'s `1e-5` golden tolerance. `float16`,
+/// `bfloat16` and the integral dtypes are refused in upstream's own words
+/// (`"geqrf_cpu" not implemented for 'Half'`; `linalg.qr: Expected a floating
+/// point or complex tensor as input. Got Long`), which are two *different*
+/// refusals and so cannot share one branch.
+fn linalg_qr_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.linalg_qr.default";
+    let input = tensor_arg(OP, args, kwargs, 0, "A")?;
+    let mode = match optional(args, kwargs, 1, "mode")? {
+        Some(value) if !value.is_none() => value.extract::<String>()?,
+        _ => "reduced".to_string(),
+    };
+    if mode != "reduced" && mode != "complete" && mode != "r" {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "qr received unrecognized mode '{mode}' but expected one of \
+             'reduced' (default), 'r', or 'complete'"
+        )));
+    }
+
+    let tag = input.tag();
+    // Two different refusals, in upstream's own words: a dtype with no LAPACK
+    // kernel and a dtype the op rejects before LAPACK.
+    match tag {
+        TorchDType::Float32 | TorchDType::Float64 => {}
+        TorchDType::Float16 | TorchDType::BFloat16 => {
+            return Err(pyo3::exceptions::PyNotImplementedError::new_err(format!(
+                "\"geqrf_cpu\" not implemented for '{}'",
+                scalar_type_name(tag)
+            )))
+        }
+        _ => {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "linalg.qr: Expected a floating point or complex tensor as input. Got {}",
+                scalar_type_name(tag)
+            )))
+        }
+    }
+
+    let t = input.tensor()?;
+    let dims = t.dims().to_vec();
+    if dims.len() < 2 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "linalg.qr: The input tensor A must have at least 2 dimensions.",
+        ));
+    }
+    let m = dims[dims.len() - 2];
+    let n = dims[dims.len() - 1];
+    let batch: usize = dims[..dims.len() - 2].iter().product();
+    let k = m.min(n);
+    let q_cols = if mode == "complete" { m } else { k };
+    let r_rows = if mode == "complete" { m } else { k };
+
+    let source = match read_flat(OP, t, tag)? {
+        Flat::Float(v) => v,
+        Flat::Int(_) => unreachable!("refused above unless the tag is floating"),
+    };
+
+    let mut q_all = vec![0.0f64; batch * m * q_cols];
+    let mut r_all = vec![0.0f64; batch * r_rows * n];
+
+    for b in 0..batch {
+        // `a` is the working copy `geqrf` overwrites: R above the diagonal,
+        // the reflectors below it.
+        let mut a = source[b * m * n..(b + 1) * m * n].to_vec();
+        let at = |i: usize, j: usize| i * n + j;
+        let mut taus = vec![0.0f64; k];
+        // Column j of `v` is the j-th reflector, with an implicit 1 at row j.
+        let mut v = vec![0.0f64; m * k];
+
+        for j in 0..k {
+            let alpha = a[at(j, j)];
+            let mut xnorm_sq = 0.0f64;
+            for i in j + 1..m {
+                xnorm_sq += a[at(i, j)] * a[at(i, j)];
+            }
+            let xnorm = xnorm_sq.sqrt();
+            let tau = if xnorm == 0.0 {
+                // `dlarfg`'s short circuit: H is the identity and `alpha`
+                // keeps its own sign. This is the branch that makes
+                // `qr(eye(3))` answer `+I` -- see the note above.
+                0.0
+            } else {
+                let beta = -alpha.signum() * alpha.hypot(xnorm);
+                let scale = 1.0 / (alpha - beta);
+                for i in j + 1..m {
+                    a[at(i, j)] *= scale;
+                }
+                a[at(j, j)] = beta;
+                (beta - alpha) / beta
+            };
+            taus[j] = tau;
+            v[j * k + j] = 1.0;
+            for i in j + 1..m {
+                v[i * k + j] = a[at(i, j)];
+            }
+            if tau != 0.0 {
+                // Apply H = I - tau * vv^T to the trailing columns.
+                for c in j + 1..n {
+                    let mut s = a[at(j, c)];
+                    for i in j + 1..m {
+                        s += v[i * k + j] * a[at(i, c)];
+                    }
+                    s *= tau;
+                    a[at(j, c)] -= s;
+                    for i in j + 1..m {
+                        a[at(i, c)] -= v[i * k + j] * s;
+                    }
+                }
+            }
+        }
+
+        for i in 0..r_rows {
+            for c in 0..n {
+                r_all[b * r_rows * n + i * n + c] = if i <= c { a[at(i, c)] } else { 0.0 };
+            }
+        }
+        if mode == "r" {
+            continue;
+        }
+        // `orgqr`: Q = H_0 H_1 ... H_{k-1} applied to the first `q_cols`
+        // columns of the identity, accumulated from the right.
+        let q = &mut q_all[b * m * q_cols..(b + 1) * m * q_cols];
+        for i in 0..m {
+            if i < q_cols {
+                q[i * q_cols + i] = 1.0;
+            }
+        }
+        for j in (0..k).rev() {
+            let tau = taus[j];
+            if tau == 0.0 {
+                continue;
+            }
+            for c in 0..q_cols {
+                let mut s = 0.0f64;
+                for i in j..m {
+                    s += v[i * k + j] * q[i * q_cols + c];
+                }
+                s *= tau;
+                for i in j..m {
+                    q[i * q_cols + c] -= v[i * k + j] * s;
+                }
+            }
+        }
+    }
+
+    let mut q_dims: Vec<usize> = dims[..dims.len() - 2].to_vec();
+    let mut r_dims = q_dims.clone();
+    q_dims.extend_from_slice(&[m, q_cols]);
+    r_dims.extend_from_slice(&[r_rows, n]);
+
+    // `mode="r"` answers a **1-D empty** Q, not a `(m, 0)` one -- measured on
+    // upstream, batched and not: `linalg_qr(randn(2,4,2), "r")[0].shape` is
+    // `(0,)`.
+    let q_tensor = if mode == "r" {
+        write_flat(OP, Flat::Float(Vec::new()), vec![0], t.device(), tag)?
+    } else {
+        write_flat(OP, Flat::Float(q_all), q_dims, t.device(), tag)?
+    };
+    let r_tensor = write_flat(OP, Flat::Float(r_all), r_dims, t.device(), tag)?;
+
+    let pair = (
+        crate::tensor::promote(py, finish(py, q_tensor, tag)?)?,
+        crate::tensor::promote(py, finish(py, r_tensor, tag)?)?,
+    );
+    if LINALG_QR_RESULT.get().is_none() {
+        let namedtuple = py
+            .import("collections")?
+            .getattr("namedtuple")?
+            .call1(("linalg_qr", ("Q", "R")))?
+            .unbind();
+        let _ = LINALG_QR_RESULT.set(namedtuple);
+    }
+    Ok(LINALG_QR_RESULT
+        .get()
+        .expect("just set")
+        .bind(py)
+        .call1(pair)?
+        .unbind())
 }

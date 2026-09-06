@@ -1197,7 +1197,19 @@ def test_grouped_mm_resolves_from_the_torch_level_name():
     # are the underscore-prefixed keys that reach a `torch.<name>` because of
     # it. All three have kernels; none would resolve under the old predicate.
     admitted = sorted(n for n in _C._shim_overloads if n.startswith("_"))
-    assert admitted == ["_grouped_mm", "_log_softmax", "_safe_softmax"], admitted
+    # `_is_all_true` joined in docs/TAIL1.md. It is `overloads.json`-only in
+    # the sense that matters here -- upstream has `torch._is_all_true` AND
+    # `Tensor._is_all_true`, and both tables carry it -- and it is the fourth
+    # underscore-prefixed key the widened predicate admits. The other seven ops
+    # that round added are all public names and none of them appears here,
+    # which is what makes this a check on the predicate rather than a tally of
+    # the round.
+    assert admitted == [
+        "_grouped_mm",
+        "_is_all_true",
+        "_log_softmax",
+        "_safe_softmax",
+    ], admitted
     assert _C._shim_overloads["_log_softmax"] == ["aten._log_softmax.default"], (
         _C._shim_overloads["_log_softmax"]
     )
@@ -9212,7 +9224,26 @@ def test_core_ops_and_op_tags_agree():
     # three tags `remainder`'s two overloads already carry. **+2 for one op**,
     # unlike every prior entry in this list, because both overloads landed
     # together.
-    assert r["tag_core_count"] == 110, r["tag_core_count"]
+    # 112 with docs/TAIL1.md. **+2 across nine new keys**, and the seven that
+    # do not appear are the check -- each was read off its own `.tags` on
+    # upstream 2.13.0 rather than assumed from the round:
+    #
+    #     acos.default              ['core', 'pointwise', 'pt2_compliant_tag']  <- counted
+    #     logical_and.default       ['core', 'pointwise', 'pt2_compliant_tag']  <- counted
+    #     _is_all_true.default      ['pt2_compliant_tag']
+    #     argsort.default           ['pt2_compliant_tag']
+    #     argsort.stable            ['pt2_compliant_tag']
+    #     broadcast_tensors.default ['pt2_compliant_tag']
+    #     max_pool1d.default        ['pt2_compliant_tag']
+    #     upsample_nearest2d.default['pt2_compliant_tag']
+    #     linalg_qr.default         ['pt2_compliant_tag']
+    #
+    # `max_pool1d` not being core while `max_pool2d` is not either, and
+    # `argsort` not being core while `sort` is not either, are the pairs that
+    # would tempt an inference; the five `CompositeImplicitAutograd` ops of
+    # that round carry no `core` tag at all, which is consistent but was not
+    # assumed.
+    assert r["tag_core_count"] == 112, r["tag_core_count"]
 
 
 def test_decompose_lowers_the_op_capture_md_named():
@@ -10765,7 +10796,24 @@ def test_schema_text_survives_the_round_trip_through_the_transcribed_tables():
     # left alone -- `Tensor.fmod` was not part of this round's measured gap and
     # is not asserted anywhere, so adding it here would be inventing a check
     # rather than recording one.
-    assert len(keys) == 295, len(keys)
+    # 302 with docs/TAIL1.md. **+7, not +12**, and the difference is the same
+    # `amax`/`tril`/`triu` shape as above: five of the seven schemas went into
+    # *both* tables in one change (`acos`, `logical_and`, `argsort.default`,
+    # `argsort.stable`, `_is_all_true` -- every one of which upstream exposes
+    # as a `torch.<name>` and a `Tensor.<name>`), and a pair of doors onto one
+    # schema is one identity. The two that are `overloads.json`-only are
+    # `broadcast_tensors` and `max_pool1d`: `hasattr(torch._C.TensorBase,
+    # 'broadcast_tensors')` is False on 2.13.0 and so is `max_pool1d`, checked
+    # rather than inferred from their neighbours.
+    #
+    # `upsample_nearest2d` and `linalg_qr` bring **none**, and that is the
+    # honest half of this number: upstream reaches them as
+    # `torch._C._nn.upsample_nearest2d` and `torch._C._linalg.linalg_qr`, which
+    # are submodule bindings in `bootstrap.py` and not `torch.<name>`
+    # resolution-table entries at all. Both have kernels; neither has a table
+    # row, because a table row for them would invent a `torch.<name>` upstream
+    # does not have. docs/TAIL1.md §4.
+    assert len(keys) == 302, len(keys)
     from_tables = sorted(
         k for k in keys
         if report["table"][f"{k[0]}|{k[1]}"]["from"] == "tables"

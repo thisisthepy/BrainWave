@@ -801,5 +801,24 @@
   "fmod": [
     "aten::fmod.Tensor(Tensor self, Tensor other) -> Tensor",
     "aten::fmod.Scalar(Tensor self, Scalar other) -> Tensor"
+  ],
+  "acos": [
+    "aten::acos(Tensor self) -> Tensor"
+  ],
+  "logical_and": [
+    "aten::logical_and(Tensor self, Tensor other) -> Tensor"
+  ],
+  "argsort": [
+    "aten::argsort.stable(Tensor self, *, bool stable, int dim=-1, bool descending=False) -> Tensor",
+    "aten::argsort(Tensor self, int dim=-1, bool descending=False) -> Tensor"
+  ],
+  "broadcast_tensors": [
+    "aten::broadcast_tensors(Tensor[] tensors) -> Tensor[]"
+  ],
+  "max_pool1d": [
+    "aten::max_pool1d(Tensor self, int[1] kernel_size, int[1] stride=[], int[1] padding=[0], int[1] dilation=[1], bool ceil_mode=False) -> Tensor"
+  ],
+  "_is_all_true": [
+    "aten::_is_all_true(Tensor self) -> Tensor"
   ]
 }

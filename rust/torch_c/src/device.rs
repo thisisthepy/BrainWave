@@ -609,13 +609,14 @@ fn shim_same_device(left: PyDevice, right: PyDevice) -> bool {
 /// `aten.rs` holding a readback marker is either a kernel on this list, one of
 /// the six helpers, or on a named exemption list -- so a new readback anywhere
 /// in the file has to be classified by a human before the suite goes green.
-pub const MPS_HOST_READBACK_OPS: [&str; 56] = [
+pub const MPS_HOST_READBACK_OPS: [&str; 60] = [
     "aten._grouped_mm.default",
     "aten._log_softmax.default",
     "aten._safe_softmax.default",
     "aten._softmax.default",
     "aten.abs.default",
     "aten.abs_.default",
+    "aten.acos.default",
     "aten.adaptive_avg_pool1d.default",
     "aten.adaptive_avg_pool2d.default",
     "aten.argmax.default",
@@ -638,12 +639,14 @@ pub const MPS_HOST_READBACK_OPS: [&str; 56] = [
     "aten.index_add_.default",
     "aten.index_put_.default",
     "aten.isin.Tensor_Tensor",
+    "aten.linalg_qr.default",
     "aten.log2.default",
     "aten.log2_.default",
     "aten.masked_select.default",
     "aten.max.default",
     "aten.max.dim",
     "aten.max.other",
+    "aten.max_pool1d.default",
     "aten.max_pool2d.default",
     "aten.maximum.default",
     "aten.min.default",
@@ -664,6 +667,7 @@ pub const MPS_HOST_READBACK_OPS: [&str; 56] = [
     "aten.softplus.default",
     "aten.upsample_bicubic2d.default",
     "aten.upsample_bilinear2d.default",
+    "aten.upsample_nearest2d.default",
     "aten.where.default",
     "prims.neg.default",
 ];

@@ -17,6 +17,27 @@
  "shape1_no_dispatch_arm": {},
  "shape1_dead_overload_keys_ceiling": 110,
  "shape2_kernel_without_spelling": {
+  "aten.upsample_nearest2d.default": {
+   "reason": "Reached upstream as `torch._C._nn.upsample_nearest2d` -- torch/nn/functional.py's interpolate calls it directly -- and NOT as `torch.upsample_nearest2d` or `Tensor.upsample_nearest2d`, neither of which exists on 2.13.0. So the missing connection is one `_nn` binding in bootstrap.py's `_install_nn`, beside the `upsample_bilinear2d` and `upsample_bicubic2d` it already writes; `_nn` gives every name in the stub list a *raising* stub, so the attribute is present and the kernel is still unreachable, which is why this shows up as a gap rather than as a working spelling. Not an overloads.json row: a row would invent a `torch.upsample_nearest2d` upstream does not have. A work item, not a design decision -- docs/TAIL1.md §4 -- and it fails the suite the moment the binding lands. The kernel is implemented and golden-compared (`aten.upsample_nearest2d.default`, 46 cases); `vilt`'s wall stays shut until the binding is written.",
+   "upstream_absent": [
+    "torch.upsample_nearest2d",
+    "torch.Tensor.upsample_nearest2d"
+   ],
+   "upstream_present": [
+    "torch._C._nn.upsample_nearest2d"
+   ]
+  },
+  "aten.linalg_qr.default": {
+   "reason": "Reached upstream as `torch._C._linalg.linalg_qr` -- torch/linalg/__init__.py:qr is `_add_docstr(_linalg.linalg_qr, ...)` -- and NOT as `torch.linalg_qr` or `Tensor.linalg_qr`, neither of which exists on 2.13.0. So the missing connection is a `_linalg` submodule binding in bootstrap.py, exactly the shape `_install_nn` already gives `upsample_bilinear2d`/`upsample_bicubic2d` and `bootstrap.py:2780` already gives `_linalg.linalg_vector_norm`. It is NOT an overloads.json row: a row there would invent a `torch.linalg_qr` upstream does not have. This entry is a work item, not a design decision -- docs/TAIL1.md §5 -- and it fails the suite the moment the binding lands, which is when it should be deleted. The kernel itself is implemented and golden-compared (`aten.linalg_qr.default`, 51 cases), so what is absent is one line of Python, and `rwkv`'s construction wall (nn.init.orthogonal_) stays shut until it is written.",
+   "upstream_absent": [
+    "torch.linalg_qr",
+    "torch.Tensor.linalg_qr"
+   ],
+   "upstream_present": [
+    "torch._C._linalg.linalg_qr",
+    "torch.linalg.qr"
+   ]
+  },
   "aten.alias.default": {
    "reason": "Upstream exposes no `torch.alias` and no `Tensor.alias` -- `aten::alias` is a dispatcher-internal view op that upstream's own Python surface never names. Inventing a spelling for it would be exactly what docs/SPELLINGS.md refuses (a door upstream does not have). The kernel is reached, and needs to be, through `_aten_dispatch` from traced/exported graphs and through the vendored `__getitem__`'s view path.",
    "upstream_absent": [

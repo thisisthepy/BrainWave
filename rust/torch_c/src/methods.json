@@ -633,5 +633,18 @@
   ],
   "histc": [
     "aten::histc(Tensor self, int bins=100, Scalar min=0, Scalar max=0) -> Tensor"
+  ],
+  "acos": [
+    "aten::acos(Tensor self) -> Tensor"
+  ],
+  "logical_and": [
+    "aten::logical_and(Tensor self, Tensor other) -> Tensor"
+  ],
+  "argsort": [
+    "aten::argsort.stable(Tensor self, *, bool stable, int dim=-1, bool descending=False) -> Tensor",
+    "aten::argsort(Tensor self, int dim=-1, bool descending=False) -> Tensor"
+  ],
+  "_is_all_true": [
+    "aten::_is_all_true(Tensor self) -> Tensor"
   ]
 }
