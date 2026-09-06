@@ -1390,15 +1390,28 @@ def test_setitem_writes_the_basic_index_through_to_the_base():
     row[2] = 42.0
     assert f.tolist()[1][2] == 42.0, f.tolist()
 
-    # A step above 1 still refuses, by name, and names the reason.
+    # A step above 1 used to refuse by name. docs/SETITEM.md landed the
+    # lowering -- a stepped slice is a set of positions, handed to
+    # `index_put_`, which writes through the receiver's own storage -- so this
+    # is inverted rather than deleted, and asserts the write it used to forbid.
+    #
+    # Rows 0 and 2, not 0 and 1: getting the *stride* wrong is the way a
+    # lowering passes a test that only checks "something was written".
     g = grid()
+    g[0:3:2] = 0.0
+    assert g.tolist() == [[0.0] * 4, [5.0, 6.0, 7.0, 8.0], [0.0] * 4], g.tolist()
+
+    # Two stepped slices at once are still refused, by name: `index_put_`
+    # implements a single index group and a second one is refused rather than
+    # approximated (docs/SETITEM.md §3).
+    h = grid()
     try:
-        g[0:3:2] = 0.0
+        h[0:3:2, 0:4:2] = 0.0
     except NotImplementedError as error:
-        assert "step-2" in str(error), str(error)
+        assert "index_put_" in str(error) or "single index group" in str(error), str(error)
     else:
-        raise AssertionError("a step-2 slice write was silently accepted")
-    assert g.tolist()[0] == [1.0, 2.0, 3.0, 4.0], "the refused write happened anyway"
+        raise AssertionError("two stepped slices were silently accepted")
+    assert h.tolist()[0] == [1.0, 2.0, 3.0, 4.0], "the refused write happened anyway"
 
 
 def test_which_ops_share_storage_with_their_input_and_which_do_not():
@@ -9247,7 +9260,13 @@ def test_core_ops_and_op_tags_agree():
     # `aten.reshape_as.default` is not in this list at all: it has no
     # `torch.ops.aten` entry to read tags off (docs/INDEXSEL.md), so it is not
     # in `_aten_implemented()` and cannot be counted here.
-    assert r["tag_core_count"] == 112, r["tag_core_count"]
+    # 113. The op tables have grown across several concurrent rounds --
+    # docs/INDEXSEL.md, docs/TAIL1.md, docs/VOICE.md, docs/FIXES.md -- and each
+    # read its own additions' `.tags` rather than inferring them from a sibling
+    # landing the same day. This number is their sum, re-measured on the merged
+    # tree rather than carried from any one branch, because each branch's count
+    # was correct only against its own base.
+    assert r["tag_core_count"] == 113, r["tag_core_count"]
 
 
 def test_decompose_lowers_the_op_capture_md_named():
@@ -10818,7 +10837,10 @@ def test_schema_text_survives_the_round_trip_through_the_transcribed_tables():
     # `torch.ops.aten` entry (docs/INDEXSEL.md §2): this fixture parses
     # schema *text*, transcribed or invented, and does not check the op
     # exists upstream -- that is `verify_schemas.py`'s job, not this one's.
-    assert len(keys) == 306, len(keys)
+    # 310 on the merged tree. Same reason as `tag_core_count` above: four
+    # rounds added schema identities in parallel and no branch could see the
+    # others' totals, so this is measured here rather than summed from reports.
+    assert len(keys) == 310, len(keys)
     from_tables = sorted(
         k for k in keys
         if report["table"][f"{k[0]}|{k[1]}"]["from"] == "tables"

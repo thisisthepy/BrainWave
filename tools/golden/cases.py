@@ -24547,7 +24547,6 @@ def prims_split_dim_cases(torch_module, c_module, torch_call) -> list[Case]:
         )
     return cases
 
-<<<<<<< HEAD
 # --- docs/INDEXSEL.md: index_select, argsort, where.Scalar, new_full, -------
 # unflatten, chunk (free-function), diff, multiply, logical_and ------------
 #
@@ -24790,83 +24789,11 @@ def new_full_cases(torch_module, c_module, torch_call) -> list[Case]:
             run_c=lambda: c_module._aten_dispatch(
                 op, f32_c, [2, 2], 5, dtype=c_module.int64
             ),
-=======
-
-# --- docs/TAIL1.md: the eight one-architecture ops, plus QR -------------------
-#
-# Read docs/TAIL1.md §1 for which of these were table rows over an existing
-# kernel and which were new kernels; the cases below are written so that the
-# *plausible wrong implementation* fails, which for four of them means a very
-# specific input:
-#
-#   logical_and         integers, where `bitwise_and` gives a different answer
-#                       AND a different dtype
-#   argsort             duplicates, where a stable and an unstable sort differ
-#   upsample_nearest2d  an explicit `scales_h` that disagrees with output_size,
-#                       where deriving the scale from the sizes differs
-#   linalg_qr           `eye`, where dropping LAPACK's `xnorm == 0` short
-#                       circuit answers `-I` instead of `+I`
-
-_TAIL1_TIED = [3, 1, 3, 1, 2, 3]
-
-
-def _t1(torch_module, c_module, flat, shape, dtype_name):
-    return pair_from_flat(torch_module, c_module, flat, shape, dtype_name)
-
-
-def acos_cases(torch_module, c_module, torch_call) -> list[Case]:
-    op = "aten.acos.default"
-    cases: list[Case] = []
-    # The domain, in and out of it. `1.5` and `-2.0` are the point: upstream
-    # answers NaN rather than raising, and "raises outside [-1, 1]" is the
-    # plausible wrong guess.
-    domain = [-1.0, -0.5, 0.0, 0.5, 1.0, 1.5, -2.0, float("nan"), float("inf")]
-    for dtype_name in ("float64", "float32", "float16", "bfloat16"):
-        a_t, a_c = _t1(torch_module, c_module, domain, (9,), dtype_name)
-        cases.append(
-            Case(
-                name=f"acos(dtype={dtype_name}) [domain edges, NaN and inf]",
-                op=op,
-                run_torch=lambda a_t=a_t: torch_call(a_t),
-                run_c=lambda a_c=a_c: c_module._aten_dispatch(op, a_c),
-                note="|x|>1 and +-inf answer NaN upstream, they do not raise",
-            )
-        )
-    # Promotion: every non-floating dtype answers the default float, measured.
-    for dtype_name in ("int64", "int32", "int16", "uint8", "bool"):
-        a_t, a_c = _t1(torch_module, c_module, [0, 1], (2,), dtype_name)
-        cases.append(
-            Case(
-                name=f"acos(dtype={dtype_name}) [integral promotes to float32]",
-                op=op,
-                run_torch=lambda a_t=a_t: torch_call(a_t),
-                run_c=lambda a_c=a_c: c_module._aten_dispatch(op, a_c),
-                note="unary_float promotion: an integral or bool input answers float32",
-            )
-        )
-    a_t, a_c = _t1(torch_module, c_module, [0.5], (), "float32")
-    cases.append(
-        Case(
-            name="acos(float32, 0-d)",
-            op=op,
-            run_torch=lambda: torch_call(a_t),
-            run_c=lambda: c_module._aten_dispatch(op, a_c),
-        )
-    )
-    b_t, b_c = _t1(torch_module, c_module, [], (0,), "float32")
-    cases.append(
-        Case(
-            name="acos(float32, empty)",
-            op=op,
-            run_torch=lambda: torch_call(b_t),
-            run_c=lambda: c_module._aten_dispatch(op, b_c),
->>>>>>> work/tail1
         )
     )
     return cases
 
 
-<<<<<<< HEAD
 def unflatten_int_cases(torch_module, c_module, torch_call) -> list[Case]:
     """`siglip_vision_model`'s wall, reached through
     `F.multi_head_attention_forward`'s `kv_proj.unflatten(-1, (2, E))`.
@@ -25104,7 +25031,82 @@ def logical_and_cases(torch_module, c_module, torch_call) -> list[Case]:
             run_c=lambda: c_module._aten_dispatch(op, row_c, col_c),
         ),
     ]
-=======
+
+
+
+# --- docs/TAIL1.md: the eight one-architecture ops, plus QR -------------------
+#
+# Read docs/TAIL1.md §1 for which of these were table rows over an existing
+# kernel and which were new kernels; the cases below are written so that the
+# *plausible wrong implementation* fails, which for four of them means a very
+# specific input:
+#
+#   logical_and         integers, where `bitwise_and` gives a different answer
+#                       AND a different dtype
+#   argsort             duplicates, where a stable and an unstable sort differ
+#   upsample_nearest2d  an explicit `scales_h` that disagrees with output_size,
+#                       where deriving the scale from the sizes differs
+#   linalg_qr           `eye`, where dropping LAPACK's `xnorm == 0` short
+#                       circuit answers `-I` instead of `+I`
+
+_TAIL1_TIED = [3, 1, 3, 1, 2, 3]
+
+
+def _t1(torch_module, c_module, flat, shape, dtype_name):
+    return pair_from_flat(torch_module, c_module, flat, shape, dtype_name)
+
+
+def acos_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.acos.default"
+    cases: list[Case] = []
+    # The domain, in and out of it. `1.5` and `-2.0` are the point: upstream
+    # answers NaN rather than raising, and "raises outside [-1, 1]" is the
+    # plausible wrong guess.
+    domain = [-1.0, -0.5, 0.0, 0.5, 1.0, 1.5, -2.0, float("nan"), float("inf")]
+    for dtype_name in ("float64", "float32", "float16", "bfloat16"):
+        a_t, a_c = _t1(torch_module, c_module, domain, (9,), dtype_name)
+        cases.append(
+            Case(
+                name=f"acos(dtype={dtype_name}) [domain edges, NaN and inf]",
+                op=op,
+                run_torch=lambda a_t=a_t: torch_call(a_t),
+                run_c=lambda a_c=a_c: c_module._aten_dispatch(op, a_c),
+                note="|x|>1 and +-inf answer NaN upstream, they do not raise",
+            )
+        )
+    # Promotion: every non-floating dtype answers the default float, measured.
+    for dtype_name in ("int64", "int32", "int16", "uint8", "bool"):
+        a_t, a_c = _t1(torch_module, c_module, [0, 1], (2,), dtype_name)
+        cases.append(
+            Case(
+                name=f"acos(dtype={dtype_name}) [integral promotes to float32]",
+                op=op,
+                run_torch=lambda a_t=a_t: torch_call(a_t),
+                run_c=lambda a_c=a_c: c_module._aten_dispatch(op, a_c),
+                note="unary_float promotion: an integral or bool input answers float32",
+            )
+        )
+    a_t, a_c = _t1(torch_module, c_module, [0.5], (), "float32")
+    cases.append(
+        Case(
+            name="acos(float32, 0-d)",
+            op=op,
+            run_torch=lambda: torch_call(a_t),
+            run_c=lambda: c_module._aten_dispatch(op, a_c),
+        )
+    )
+    b_t, b_c = _t1(torch_module, c_module, [], (0,), "float32")
+    cases.append(
+        Case(
+            name="acos(float32, empty)",
+            op=op,
+            run_torch=lambda: torch_call(b_t),
+            run_c=lambda: c_module._aten_dispatch(op, b_c),
+        )
+    )
+    return cases
+
+
 def logical_and_cases(torch_module, c_module, torch_call) -> list[Case]:
     op = "aten.logical_and.default"
     cases: list[Case] = []
@@ -25795,9 +25797,6 @@ def linalg_qr_cases(torch_module, c_module, torch_call) -> list[Case]:
         )
     )
     return cases
->>>>>>> work/tail1
-
-
 CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
     "aten.adaptive_avg_pool2d.default": adaptive_avg_pool2d_cases,
     "aten.where.ScalarSelf": where_scalar_self_cases,
@@ -26084,7 +26083,6 @@ CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
     "aten.nonzero.default": nonzero_default_cases,
     "aten.where.default": where_default_cases,
 
-<<<<<<< HEAD
     # docs/INDEXSEL.md
     "aten.index_select.default": index_select_cases,
     "aten.argsort.default": argsort_default_cases,
@@ -26097,7 +26095,6 @@ CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
     "aten.multiply.Tensor": multiply_tensor_cases,
     "aten.multiply.Scalar": multiply_scalar_cases,
     "aten.logical_and.default": logical_and_cases,
-=======
     # docs/TAIL1.md -- the eight one-architecture ops of docs/ARCH100.md's
     # tail, plus `linalg_qr`.
     "aten.acos.default": acos_cases,
@@ -26109,7 +26106,6 @@ CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
     "aten.max_pool1d.default": max_pool1d_cases,
     "aten.upsample_nearest2d.default": upsample_nearest2d_cases,
     "aten.linalg_qr.default": linalg_qr_cases,
->>>>>>> work/tail1
 }
 
 

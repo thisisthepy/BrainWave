@@ -240,36 +240,39 @@ def test_asymmetric_conv_padding_is_a_backend_limit_not_an_argument_form():
 
 
 def test_glu_is_advertised_and_reaches_the_kernel_key_with_the_right_default_dim():
-    # The kernel (aten.glu.default) lands on a different branch and is not
-    # in this worktree -- so this only proves the binding exists, is listed,
-    # and reaches the dispatcher under the right key with dim defaulting to
-    # -1 (measured against upstream: a bare F.glu(x) halves the *last* axis,
-    # not the first). The numeric behaviour is for the merged tree.
-    assert "glu" in _C._shim_nn_implemented
-    assert hasattr(_C._nn, "glu")
+    """The binding, now that the kernel it reaches is in the same tree.
+
+    This test was written in a worktree that had the binding and *not* the
+    kernel, so it could only assert that `_nn.glu` reached
+    `aten.glu.default` -- by catching the refusal and reading the key out of
+    it. The kernel merged, so that spelling became an assertion that the op is
+    missing, and it went red the moment both halves met.
+
+    Inverted rather than deleted, and asserting the stronger thing: the values,
+    against upstream's own definition. `glu(x, dim)` splits `x` in half along
+    `dim` and returns `a * sigmoid(b)`, so a binding that reached the right key
+    with the wrong `dim` -- the trap docs/GLU.md measured, since the default is
+    `-1` and not `0` -- gives different numbers here rather than passing.
+    """
+    import math
 
     x = _C._tensor_from_flat([1.0, 2.0, 3.0, 4.0], [2, 2])
 
-    def _unimplemented_key(call):
-        try:
-            call()
-        except NotImplementedError as e:
-            text = str(e)
-            marker = "aten op not implemented in torch._C shim: "
-            assert marker in text, text
-            return text.split(marker, 1)[1].strip()
-        raise AssertionError("expected aten.glu.default to be unimplemented here")
+    # dim=-1 (the default): halves are columns. Row 0 is [1, 2] -> 1*sig(2).
+    got = [round(float(v), 6) for v in _C._nn.glu(x).flatten()]
+    want = [round(1.0 * (1 / (1 + math.exp(-2.0))), 6),
+            round(3.0 * (1 / (1 + math.exp(-4.0))), 6)]
+    assert got == want, (got, want)
 
-    key_default = _unimplemented_key(lambda: _C._nn.glu(x))
-    assert key_default == "aten.glu.default", key_default
+    # dim=0: halves are rows. [1, 2] * sigmoid([3, 4]).
+    got0 = [round(float(v), 6) for v in _C._nn.glu(x, 0).flatten()]
+    want0 = [round(1.0 * (1 / (1 + math.exp(-3.0))), 6),
+             round(2.0 * (1 / (1 + math.exp(-4.0))), 6)]
+    assert got0 == want0, (got0, want0)
 
-    # `dim` is a real parameter, not hardcoded -- passing a different one
-    # still reaches the same key (dim is not part of the dispatch key; the
-    # kernel reads it as an argument), and the call itself must not raise
-    # anything *before* reaching the dispatcher (e.g. a signature mismatch).
-    key_explicit = _unimplemented_key(lambda: _C._nn.glu(x, dim=0))
-    assert key_explicit == "aten.glu.default", key_explicit
-
+    # And the two are different, so "the default is -1" is a claim this test
+    # can actually falsify.
+    assert got != got0, got
 
 def _main():
     failures = 0

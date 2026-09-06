@@ -24,9 +24,6 @@
         "torch.Tensor.alias"
       ]
     },
-    "aten.glu.default": {
-      "reason": "OWED, not deliberate. The kernel landed in fc202e3 and is golden-compared; the binding `F.glu` calls -- `torch._C._nn.glu`, an `_install_nn` composite -- could not be written in the same round because `bootstrap.py` belonged to a concurrent agent. docs/GLU.md §1.1 carries the exact three lines. This entry exists so the gap is recorded rather than silently allowed, and because the allowlist matches in both directions it will FAIL the moment the binding lands -- which is how it gets deleted. glu blocks seven ASR encoders."
-    },
     "aten.linalg_qr.default": {
       "reason": "Reached upstream as `torch._C._linalg.linalg_qr` -- torch/linalg/__init__.py:qr is `_add_docstr(_linalg.linalg_qr, ...)` -- and NOT as `torch.linalg_qr` or `Tensor.linalg_qr`, neither of which exists on 2.13.0. So the missing connection is a `_linalg` submodule binding in bootstrap.py, exactly the shape `_install_nn` already gives `upsample_bilinear2d`/`upsample_bicubic2d` and `bootstrap.py:2780` already gives `_linalg.linalg_vector_norm`. It is NOT an overloads.json row: a row there would invent a `torch.linalg_qr` upstream does not have. This entry is a work item, not a design decision -- docs/TAIL1.md §5 -- and it fails the suite the moment the binding lands, which is when it should be deleted. The kernel itself is implemented and golden-compared (`aten.linalg_qr.default`, 51 cases), so what is absent is one line of Python, and `rwkv`'s construction wall (nn.init.orthogonal_) stays shut until it is written.",
       "upstream_absent": [
