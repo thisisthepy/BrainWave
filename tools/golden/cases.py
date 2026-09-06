@@ -22102,6 +22102,139 @@ def _setitem_member_cases(torch_module, c_module) -> list[Case]:
                  "divergence has its own diverge case in slice_cases -- docs/VIEWS.md §6.4",
         )
     )
+
+    # --- the two stepped-write shapes the architecture sweep actually uses --
+    #
+    # docs/SETITEM.md §1: `TensorBase.__setitem__` is the single name that
+    # blocks the most architectures in docs/ARCH100.md (13 of the 82), and all
+    # 13 of them stop on **one** form -- a stepped slice on the write side.
+    # They come in exactly two shapes, and neither is the 1-D `x[0:4:2] = 0.0`
+    # pinned above:
+    #
+    #     pe[:, 0::2]    = <matrix>   fastspeech2_conformer, seamless_m4t,
+    #                                 wav2vec2-conformer  (all at CONSTRUCTION)
+    #     freqs_t[..., k::3] = <3-D>  the qwen3_5* / qwen3_vl* family,
+    #                                 cosmos3_omni, minicpmv4_6
+    #
+    # They are `expect="c_error"` for the same reason the case above is, and
+    # they are here rather than folded into it because a lowering that handles
+    # a 1-D stepped write and not a stepped write at a *later* axis would
+    # close that case and leave these two open. When docs/SETITEM.md §2's
+    # patch lands, all three flip together and compare.py says so by name.
+    pair = pair_from_flat(torch_module, c_module, [0.0] * 12, (3, 4), "float32")
+    src = pair_from_flat(
+        torch_module, c_module, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0], (3, 2), "float32")
+    cases.append(
+        _member_case(
+            torch_module, c_module, op,
+            "member x[:, 0::2] = matrix [the conformer positional-encoding write]",
+            "float32", [pair, src],
+            assigned(lambda a, s: a.__setitem__((slice(None), slice(0, None, 2)), s)),
+            expect="c_error",
+            note="upstream gives [[1,0,2,0],[3,0,4,0],[5,0,6,0]]. The stepped slice is "
+                 "at axis 1, not axis 0, so a 1-D-only lowering would not reach it "
+                 "-- docs/SETITEM.md §1",
+        )
+    )
+    pair = pair_from_flat(torch_module, c_module, [0.0] * 12, (2, 1, 6), "float32")
+    src = pair_from_flat(
+        torch_module, c_module, [1.0, 2.0, 3.0, 4.0], (2, 1, 2), "float32")
+    cases.append(
+        _member_case(
+            torch_module, c_module, op,
+            "member x[..., 1::3] = 3-D src [the interleaved-mrope write]",
+            "float32", [pair, src],
+            assigned(lambda a, s: a.__setitem__((Ellipsis, slice(1, None, 3)), s)),
+            expect="c_error",
+            note="upstream gives [[[0,1,0,0,2,0]],[[0,3,0,0,4,0]]]. The ellipsis expands "
+                 "to two full slices, so the stepped slice is at axis 2 of a rank-3 "
+                 "receiver -- docs/SETITEM.md §1",
+        )
+    )
+
+    # --- the kernel shapes that lowering rests on, which DO pass today ------
+    #
+    # docs/SETITEM.md §2 lowers a stepped write to `index_put_` with the
+    # positions the slice names as an integer index, so the two cases above
+    # can only be closed if `index_put_` already answers for these two shapes.
+    # It does, and that is worth pinning separately from the member calls:
+    # if one of these regressed, the two `c_error` cases above would keep
+    # passing (a refusal is a refusal however it is reached) and the reason
+    # the lowering is possible would have quietly gone away.
+    #
+    # (i) Two leading `None`s -- the rank-3 receiver `freqs_t[..., k::3]`
+    #     becomes. Every existing `[None, index]` case has exactly one.
+    n3_self_t, n3_self_c = pair_from_flat(
+        torch_module, c_module, [0.0] * 12, (2, 1, 6), "float32")
+    n3_idx_t, n3_idx_c = pair_from_flat(torch_module, c_module, [1, 4], (2,), "int64")
+    n3_val_t, n3_val_c = pair_from_flat(
+        torch_module, c_module, [1.0, 2.0, 3.0, 4.0], (2, 1, 2), "float32")
+    cases.append(
+        Case(
+            name="index_put_(rank-3 self, indices [None, None, index]) "
+                 "[the group sits at the LAST axis]",
+            op=op,
+            run_torch=lambda: torch_module.ops.aten.index_put_.default(
+                n3_self_t, [None, None, n3_idx_t], n3_val_t, False),
+            run_c=lambda: c_module._aten_dispatch(
+                op, n3_self_c, [None, None, n3_idx_c], n3_val_c, False),
+            note="measured [[[0,1,0,0,2,0]],[[0,3,0,0,4,0]]] -- a kernel that counted "
+                 "only the first None would write down axis 1 instead",
+        )
+    )
+    # (ii) A `(1, k)` value broadcast onto an `(n, k)` indexing result, which
+    #      is how `pe[:, 0::2] = row` arrives once the slice is an index.
+    bc_self_t, bc_self_c = pair_from_flat(
+        torch_module, c_module, [0.0] * 12, (3, 4), "float32")
+    bc_idx_t, bc_idx_c = pair_from_flat(torch_module, c_module, [0, 2], (2,), "int64")
+    bc_val_t, bc_val_c = pair_from_flat(
+        torch_module, c_module, [1.0, 2.0], (1, 2), "float32")
+    cases.append(
+        Case(
+            name="index_put_(indices [None, index], values (1,k) broadcast onto (n,k))",
+            op=op,
+            run_torch=lambda: torch_module.ops.aten.index_put_.default(
+                bc_self_t, [None, bc_idx_t], bc_val_t, False),
+            run_c=lambda: c_module._aten_dispatch(
+                op, bc_self_c, [None, bc_idx_c], bc_val_c, False),
+            note="measured [[1,0,2,0],[1,0,2,0],[1,0,2,0]] -- the value's leading 1 is "
+                 "stretched over the receiver's rows, right-aligned",
+        )
+    )
+    # (iii) The dtype rule the lowering has to bridge. `index_put_` refuses a
+    #       mismatch (its own case above pins that), while upstream's stepped
+    #       write goes through `copy_`, which CASTS: measured on 2.13.0,
+    #       `int64 x; x[0::2] = [1.7, 2.7, 3.7]` gives [1,0,2,0,3,0], not a
+    #       refusal. So the lowering must cast first, and this pins the
+    #       answer it has to reproduce rather than the refusal it must not.
+    ct_self_t, ct_self_c = pair_from_flat(torch_module, c_module, [0] * 6, (6,), "int64")
+    ct_idx_t, ct_idx_c = pair_from_flat(torch_module, c_module, [0, 2, 4], (3,), "int64")
+    ct_val_t, ct_val_c = pair_from_flat(
+        torch_module, c_module, [1.7, 2.7, 3.7], (3,), "float32")
+    _i64_t = dt.torch_dtype(torch_module, "int64")
+    _i64_c = dt.c_dtype(c_module, "int64")
+
+    def _cast_then_put_torch():
+        cast = torch_module.ops.aten._to_copy.default(ct_val_t, dtype=_i64_t)
+        return torch_module.ops.aten.index_put_.default(
+            ct_self_t, [ct_idx_t], cast, False)
+
+    def _cast_then_put_c():
+        cast = c_module._aten_dispatch("aten._to_copy.default", ct_val_c, dtype=_i64_c)
+        return c_module._aten_dispatch(op, ct_self_c, [ct_idx_c], cast, False)
+
+    cases.append(
+        Case(
+            name="index_put_(cast the values first) [what a stepped write into an "
+                 "int64 receiver has to do]",
+            op=op,
+            run_torch=_cast_then_put_torch,
+            run_c=_cast_then_put_c,
+            note="upstream's `x[0::2] = [1.7,2.7,3.7]` on an int64 receiver truncates "
+                 "toward zero to [1,0,2,0,3,0]; this is that sequence spelled out, so "
+                 "the cast direction is pinned before docs/SETITEM.md §2 relies on it",
+        )
+    )
     return cases
 
 
