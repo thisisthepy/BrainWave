@@ -15,7 +15,14 @@ on:
       version:
         description: "torchnative version to install from PyPI"
         required: false
-        default: "0.0.9a0"
+        # The default is the **latest release actually on PyPI**, not the
+        # version in `pyproject.toml`: this job installs from PyPI, so pointing
+        # it at an unpublished version turns every push into a red run that
+        # says nothing about any platform. Bump it in the release commit, after
+        # the upload -- checks written for a newer release skip themselves by
+        # name here (`tools/ci/verify_published.py`), so an older default is
+        # honest rather than broken.
+        default: "0.0.12a0"
   push:
     paths:
       - ".github/workflows/verify-published-wheel.yml"
@@ -193,8 +200,16 @@ jobs:
       - name: Fetch the wheel's pure-Python requirements
         if: matrix.label == 'ios-simulator-arm64'
         run: |
+          # `setuptools<81` is not a whim: the wheel's METADATA requires
+          # `pkg_resources`, setuptools stopped shipping it in 84.0.0, and pip
+          # resolved that latest -- so the staging step "succeeded" and the
+          # harness then refused with
+          #     no pkg_resources under .../ios-sim-deps
+          # half an hour into the job (run 34021836088). The requirement is
+          # read from METADATA, so the pin belongs here rather than in the
+          # harness.
           python -m pip install --target "${{ runner.temp }}/ios-sim-deps" \
-            typing_extensions filelock networkx jinja2 fsspec sympy packaging pyyaml setuptools
+            typing_extensions filelock networkx jinja2 fsspec sympy packaging pyyaml "setuptools<81"
           ls "${{ runner.temp }}/ios-sim-deps"
 
       # The simulator wheel cannot be installed into the runner's own CPython --
@@ -206,7 +221,7 @@ jobs:
         run: |
           python -m pip download --no-deps --only-binary :all: \
             --platform ios_14_0_arm64_iphonesimulator --python-version 3.13 --abi abi3 \
-            -d dist "torchnative==${{ inputs.version || '0.0.9a0' }}"
+            -d dist "torchnative==${{ inputs.version || '0.0.12a0' }}"
           ls -la dist
 
       - name: Verify it computes in a simulator
@@ -220,7 +235,7 @@ jobs:
         if: matrix.label != 'ios-simulator-arm64'
         run: |
           python -m pip install --upgrade pip
-          python -m pip install "torchnative==${{ inputs.version || '0.0.9a0' }}"
+          python -m pip install "torchnative==${{ inputs.version || '0.0.12a0' }}"
 
       - name: Which wheel landed
         if: matrix.label != 'ios-simulator-arm64'
