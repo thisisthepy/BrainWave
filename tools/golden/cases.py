@@ -24332,6 +24332,278 @@ def prims_split_dim_cases(torch_module, c_module, torch_call) -> list[Case]:
         )
     return cases
 
+# --- docs/VOICE.md: the speech-model round -----------------------------------
+#
+# Five voicestudio models (Vocos, BigVGAN, Parler-TTS, F5-TTS, Spark-TTS
+# BiCodec) were run from a small config against upstream and against this
+# build. These six ops are the ones that round both reached and could land;
+# `stft`/`istft`/`rfft` and the complex dtypes they return are a candle-level
+# gap, sized in docs/VOICE.md rather than half-built here.
+
+
+# --- aten.hann_window.default / aten.hann_window.periodic --------------------
+#
+# Rank 1 of docs/VOICE.md: four of the five models build this in `__init__`,
+# so it is a construction wall. Two things this suite pins:
+#
+#   * `periodic` changes the *divisor*, not the length -- `hann_window(5)` and
+#     `hann_window(5, False)` are both five long and share only element 0.
+#   * the arithmetic is upstream's four in-place ops in the *output* dtype,
+#     not a closed form in f64. The `float16`/`bfloat16`/`float64` rows are
+#     `_bit_exact` and they are what an f64 shortcut fails: at `float16`
+#     element 1 of `hann_window(5)` is `0.345703125` where the correctly
+#     rounded value of the exact answer is `0.345458984375` -- a relative
+#     7e-4, far outside any comparator here.
+#
+# `float32` cannot be held to `_bit_exact` and the reason is upstream's build,
+# not this kernel: `cos_()` on a `float32` tensor is vectorised (Sleef), which
+# is up to half an ULP off the correctly rounded cosine, and `0.5 - 0.5*c`
+# then cancels that error up into the result. Measured over lengths
+# 0/1/2/3/5/7/16/64 in both periodic modes, the worst disagreement is
+# |d| = 5.96e-08 (one ULP at 0.736, at index 21 of `hann_window(64)`) and
+# 3.10e-06 relative (at the near-zero elements the cancellation magnifies).
+# `_bounded_divergence` asserts a ceiling with headroom on exactly that, so a
+# kernel that agreed exactly still passes and one that drifted further does
+# not. It is the same device docs/SCALAR.md §8 uses for Sleef's `softplus`
+# tail.
+
+_HANN_DTYPES = ["float64", "float32", "float16", "bfloat16"]
+_HANN_LENGTHS = [0, 1, 2, 3, 5, 7, 16, 64]
+_HANN_F32_CEILING = _bounded_divergence(2e-7, 1e-5)
+
+
+def _hann_check(dtype_name):
+    """`float32` gets the Sleef ceiling, every other dtype gets bit equality."""
+    return _HANN_F32_CEILING if dtype_name == "float32" else _bit_exact
+
+
+def hann_window_default_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.hann_window.default"
+    cases: list[Case] = []
+    for length in _HANN_LENGTHS:
+        cases.append(
+            Case(
+                name=f"hann_window({length}) [default dtype, periodic implied]",
+                op=op,
+                run_torch=lambda length=length: torch_call(length),
+                run_c=lambda length=length: c_module._aten_dispatch(op, length),
+                value_check=_HANN_F32_CEILING,
+                note="length 0 answers empty and length 1 answers [1.0]; neither is an error",
+            )
+        )
+    for dtype_name in _HANN_DTYPES:
+        for length in [5, 16]:
+            cases.append(
+                Case(
+                    name=f"hann_window({length}, dtype={dtype_name})",
+                    op=op,
+                    run_torch=lambda length=length, d=dtype_name: torch_call(
+                        length, dtype=getattr(torch_module, d)
+                    ),
+                    run_c=lambda length=length, d=dtype_name: c_module._aten_dispatch(
+                        op, length, dtype=getattr(c_module, d)
+                    ),
+                    value_check=_hann_check(dtype_name),
+                    note="per-op narrowing in the output dtype, not an f64 closed form",
+                )
+            )
+    cases.append(
+        Case(
+            name="hann_window(-1, rejected)",
+            op=op,
+            run_torch=lambda: torch_call(-1),
+            run_c=lambda: c_module._aten_dispatch(op, -1),
+            expect="both_error",
+            note="upstream: 'hann_window requires non-negative window_length'",
+        )
+    )
+    cases.append(
+        Case(
+            name="hann_window(4, dtype=int64, rejected)",
+            op=op,
+            run_torch=lambda: torch_call(4, dtype=torch_module.int64),
+            run_c=lambda: c_module._aten_dispatch(op, 4, dtype=c_module.int64),
+            expect="both_error",
+            note="upstream: 'hann_window expects floating point dtypes' -- not linspace's promote",
+        )
+    )
+    return cases
+
+
+def hann_window_periodic_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.hann_window.periodic"
+    cases: list[Case] = []
+    for length in _HANN_LENGTHS:
+        for periodic in [True, False]:
+            cases.append(
+                Case(
+                    name=f"hann_window({length}, periodic={periodic})",
+                    op=op,
+                    run_torch=lambda length=length, periodic=periodic: torch_call(length, periodic),
+                    run_c=lambda length=length, periodic=periodic: c_module._aten_dispatch(
+                        op, length, periodic
+                    ),
+                    value_check=_HANN_F32_CEILING,
+                    note="periodic divides by window_length, symmetric by window_length - 1",
+                )
+            )
+    for dtype_name in _HANN_DTYPES:
+        cases.append(
+            Case(
+                name=f"hann_window(5, periodic=False, dtype={dtype_name})",
+                op=op,
+                run_torch=lambda d=dtype_name: torch_call(5, False, dtype=getattr(torch_module, d)),
+                run_c=lambda d=dtype_name: c_module._aten_dispatch(
+                    op, 5, False, dtype=getattr(c_module, d)
+                ),
+                value_check=_hann_check(dtype_name),
+                note="the symmetric branch narrows per op too",
+            )
+        )
+    return cases
+
+
+# --- aten.sinc.default -------------------------------------------------------
+#
+# BigVGAN's anti-aliased resampler (docs/VOICE.md rank 6). `x == 0` is the
+# removable singularity and answers exactly 1.0; `x == 1` does *not* answer 0
+# at `float32` but `-2.78e-08`, the residue of pi not being representable --
+# which is why the kernel computes in the output precision rather than in f64.
+
+
+def sinc_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.sinc.default"
+    cases: list[Case] = []
+    for dtype_name in ["float64", "float32", "float16", "bfloat16"]:
+        for flat, shape, note in [
+            ([0.0, 0.5, 1.0, -1.5], (2, 2), "0 is the removable singularity; 1 is the pi residue"),
+            ([0.25, 2.0, -2.0, 3.5], (2, 2), "assorted, both signs"),
+            ([0.0], (), "0-d"),
+        ]:
+            cases.append(
+                _unary_case(torch_module, c_module, op, torch_call, dtype_name, flat, shape, note)
+            )
+    for dtype_name in ["int64", "int32", "uint8", "bool"]:
+        cases.append(
+            _unary_case(
+                torch_module, c_module, op, torch_call, dtype_name, [0, 1, 2], (3,),
+                "integral and bool promote to the default float, like sin/cos",
+            )
+        )
+    return cases
+
+
+# --- aten.clip.default -------------------------------------------------------
+#
+# Vocos spells its output limiter `torch.clip` (docs/VOICE.md rank 3). It is a
+# true alias of `clamp` and that was measured, not assumed: the promotion
+# ladder, the bool-bound refusal (which names `clamp_scalar_cpu`, not a `clip_`
+# kernel) and the "both bounds absent" wording (`torch.clamp: At least one of
+# ...`) are all clamp's, so the kernel is shared rather than copied.
+
+
+def clip_default_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.clip.default"
+    cases: list[Case] = []
+    for dtype_name in ["float64", "float32", "float16", "bfloat16", "int64", "int32", "uint8"]:
+        for kwargs, note in [
+            (dict(min=-1, max=1), "both bounds"),
+            (dict(min=0), "floor only"),
+            (dict(max=2), "ceiling only"),
+        ]:
+            a_t, a_c = pair_from_flat(
+                torch_module, c_module, [0, 1, 2, 3, 4, 5], (2, 3), dtype_name
+            )
+            cases.append(
+                Case(
+                    name=f"clip(dtype={dtype_name}, {kwargs}) [{note}]",
+                    op=op,
+                    run_torch=lambda a_t=a_t, kw=kwargs: torch_call(a_t, **kw),
+                    run_c=lambda a_c=a_c, kw=kwargs: c_module._aten_dispatch(op, a_c, **kw),
+                    note=note,
+                )
+            )
+    a_t, a_c = pair_from_flat(torch_module, c_module, [0, 1, 2], (3,), "int32")
+    cases.append(
+        Case(
+            name="clip(int32, max=2.0) [a float bound promotes, clamp's rule]",
+            op=op,
+            run_torch=lambda: torch_call(a_t, max=2.0),
+            run_c=lambda: c_module._aten_dispatch(op, a_c, max=2.0),
+            note="wrapped-number promotion to the default float",
+        )
+    )
+    b_t, b_c = pair_from_flat(torch_module, c_module, [1, 0], (2,), "bool")
+    cases.append(
+        Case(
+            name="clip(bool, False, True, rejected)",
+            op=op,
+            run_torch=lambda: torch_call(b_t, False, True),
+            run_c=lambda: c_module._aten_dispatch(op, b_c, False, True),
+            expect="both_error",
+            note="upstream names clamp's kernel, not a clip one",
+        )
+    )
+    cases.append(
+        Case(
+            name="clip(bool, 0, 5) [bool + int bounds -> int64, not bool]",
+            op=op,
+            run_torch=lambda: torch_call(b_t, 0, 5),
+            run_c=lambda: c_module._aten_dispatch(op, b_c, 0, 5),
+            note="clamp's ladder: an int bound lifts bool out of the bool category",
+        )
+    )
+    return cases
+
+
+# --- aten.cumprod.default ----------------------------------------------------
+#
+# Spark-TTS BiCodec's factorised vector quantiser derives its per-level strides
+# with this during `__init__` (docs/VOICE.md rank 5). The dtype rule was
+# re-measured rather than carried over from `cumsum`: `cumprod(bool)` is
+# `int64`, not `bool`.
+
+
+def cumprod_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.cumprod.default"
+    cases: list[Case] = []
+    for dtype_name in ["float64", "float32", "float16", "bfloat16", "int64", "int32"]:
+        for dim, note in [(0, "down the rows"), (1, "along the columns"), (-1, "negative dim")]:
+            a_t, a_c = pair_from_flat(
+                torch_module, c_module, [1, 2, 3, 4, 5, 6], (2, 3), dtype_name
+            )
+            cases.append(
+                Case(
+                    name=f"cumprod(dtype={dtype_name}, dim={dim}) [{note}]",
+                    op=op,
+                    run_torch=lambda a_t=a_t, dim=dim: torch_call(a_t, dim),
+                    run_c=lambda a_c=a_c, dim=dim: c_module._aten_dispatch(op, a_c, dim),
+                    note=note,
+                )
+            )
+    b_t, b_c = pair_from_flat(torch_module, c_module, [1, 0, 1], (3,), "bool")
+    cases.append(
+        Case(
+            name="cumprod(bool, dim=0) [promotes to int64, not bool]",
+            op=op,
+            run_torch=lambda: torch_call(b_t, 0),
+            run_c=lambda: c_module._aten_dispatch(op, b_c, 0),
+            note="the integral-to-int64 rule cumsum has, re-measured for cumprod",
+        )
+    )
+    i_t, i_c = pair_from_flat(torch_module, c_module, [1, 2, 3], (3,), "int32")
+    cases.append(
+        Case(
+            name="cumprod(int32, dim=0, dtype=float32) [explicit dtype wins]",
+            op=op,
+            run_torch=lambda: torch_call(i_t, 0, dtype=torch_module.float32),
+            run_c=lambda: c_module._aten_dispatch(op, i_c, 0, dtype=c_module.float32),
+            note="an explicit dtype overrides the natural promotion",
+        )
+    )
+    return cases
+
+
 CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
     "aten.adaptive_avg_pool2d.default": adaptive_avg_pool2d_cases,
     "aten.where.ScalarSelf": where_scalar_self_cases,
@@ -24352,6 +24624,12 @@ CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
     "aten.arange.start": arange_start_cases,
     "aten.arange.start_step": arange_start_step_cases,
     "aten.linspace.default": linspace_default_cases,
+    # docs/VOICE.md -- the voicestudio speech round.
+    "aten.hann_window.default": hann_window_default_cases,
+    "aten.hann_window.periodic": hann_window_periodic_cases,
+    "aten.sinc.default": sinc_cases,
+    "aten.clip.default": clip_default_cases,
+    "aten.cumprod.default": cumprod_cases,
     "aten.argmax.default": argmax_cases,
     "aten.cat.default": cat_cases,
     "aten.embedding.default": embedding_cases,

@@ -633,5 +633,14 @@
   ],
   "histc": [
     "aten::histc(Tensor self, int bins=100, Scalar min=0, Scalar max=0) -> Tensor"
+  ],
+  "clip": [
+    "aten::clip(Tensor self, Scalar? min=None, Scalar? max=None) -> Tensor"
+  ],
+  "sinc": [
+    "aten::sinc(Tensor self) -> Tensor"
+  ],
+  "cumprod": [
+    "aten::cumprod(Tensor self, int dim, *, ScalarType? dtype=None) -> Tensor"
   ]
 }
