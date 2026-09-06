@@ -1977,7 +1977,7 @@ impl PyTensorBase {
     /// (docs/BACKWARD4.md §3.1) and belongs beside the measurement, in Python,
     /// where the test that checks it against real torch can read it.
     #[getter]
-    fn _shim_from_op(&self) -> Option<&str> {
+    pub(crate) fn _shim_from_op(&self) -> Option<&str> {
         self.from_op.as_deref()
     }
 
@@ -3006,18 +3006,26 @@ fn any_operand_requires_grad(
 /// dispatch into a raise. A tensor that could not be borrowed (because the
 /// caller is holding it mutably) simply stays a leaf, which is the answer the
 /// shim gave before this round for every tensor.
+/// Returns **whether an output was marked** -- i.e. whether upstream would
+/// have built a graph node for this call. `docs/BACKWARD7.md` §2: the eager
+/// recorder is gated on this `bool` and not on a test of its own, so that a
+/// dispatch which differentiates nothing pays one value already in a register
+/// rather than a second walk of the argument tuple. It is also the *definition*
+/// the recorder wants -- an op is on the eager tape exactly when its result has
+/// a `grad_fn`.
+#[must_use]
 pub fn mark_from_op(
     py: Python<'_>,
     op: &str,
     args: &Bound<'_, PyTuple>,
     kwargs: Option<&Bound<'_, pyo3::types::PyDict>>,
     out: &Py<PyAny>,
-) {
+) -> bool {
     if !GRAD_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
-        return;
+        return false;
     }
     if NOT_DIFFERENTIABLE.contains(&op) {
-        return;
+        return false;
     }
     // Two passes over the arguments, and the first one allocates nothing.
     //
@@ -3029,7 +3037,7 @@ pub fn mark_from_op(
     // really is on a gradient path pays for the second pass, which is the one
     // that needs the operand identities for the in-place test below.
     if !any_operand_requires_grad(args, kwargs) {
-        return;
+        return false;
     }
     let mut inputs: Vec<Bound<'_, PyAny>> = Vec::new();
     for item in args.iter() {
@@ -3042,6 +3050,7 @@ pub fn mark_from_op(
     }
     let mut outputs: Vec<Bound<'_, PyAny>> = Vec::new();
     collect_tensors(out.bind(py), &mut outputs);
+    let mut marked = false;
     for output in outputs {
         if inputs.iter().any(|input| input.is(&output)) {
             continue;
@@ -3057,8 +3066,10 @@ pub fn mark_from_op(
             if borrowed.from_op.is_none() {
                 borrowed.from_op = Some(op.into());
             }
+            marked = true;
         }
     }
+    marked
 }
 
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {

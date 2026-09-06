@@ -1756,9 +1756,31 @@ pub fn backward<'py>(
              differentiate",
         ));
     }
+    let env = trace.run(py, inputs)?;
+    backward_in(py, trace, &env, grad_outputs, wrt_constants)
+}
+
+/// The reverse walk, over a record and an `Env` that **already holds the
+/// values**.
+///
+/// Split out of `backward` for W8 (`docs/BACKWARD7.md`). `backward` is this
+/// plus `trace.run()` -- a *replay* that reconstructs the forward, which a
+/// `CaptureTrace` needs because it drops its keepalives at `_capture_end`. An
+/// eager tape does not need it: it never stopped holding the values, so its
+/// `Env` is the objects the program actually computed, and handing them
+/// straight to this function is the whole of the reuse `docs/BACKWARD3.md` §4
+/// and `docs/BACKWARD5.md` §4 argued for. Not one derivative rule below knows
+/// which of the two called it, and `derivative()`, `wrt_set()`, `reachable()`
+/// and `wanted()` are shared verbatim.
+pub(crate) fn backward_in<'py>(
+    py: Python<'py>,
+    trace: &PyCaptureTrace,
+    env: &Env,
+    grad_outputs: Option<&Bound<'py, PyAny>>,
+    wrt_constants: Option<&Bound<'py, PyAny>>,
+) -> PyResult<Bound<'py, PyDict>> {
     let wrt = wrt_set(trace, wrt_constants)?;
     let needed = reachable(trace, &wrt);
-    let env = trace.run(py, inputs)?;
 
     let mut grads: HashMap<Ref, Py<PyAny>> = HashMap::new();
     let given_seeds = grad_outputs.filter(|value| !value.is_none());
@@ -1835,7 +1857,7 @@ pub fn backward<'py>(
             .map(|slots| slots.iter().map(|s| s.bind(py).clone()).collect())
             .unwrap_or_default();
 
-        let (operands, contributions) = derivative(py, node, &env, &gouts, &outs)?;
+        let (operands, contributions) = derivative(py, node, env, &gouts, &outs)?;
         for (operand, contribution) in operands.iter().zip(contributions.into_iter()) {
             let (Some(operand), Some(contribution)) = (operand, contribution) else {
                 continue;

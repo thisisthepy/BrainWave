@@ -834,7 +834,16 @@ pub fn aten_dispatch(
     // When nothing in the process requires a gradient this is one relaxed
     // atomic load, one table scan of twelve strings, and a walk of the argument
     // tuple that stops at the first tensor and finds a `false`.
-    crate::tensor::mark_from_op(py, op, args, kwargs, &out);
+    let on_graph = crate::tensor::mark_from_op(py, op, args, kwargs, &out);
+    // W8, the eager recorder (docs/BACKWARD7.md). Gated on `mark_from_op`'s
+    // answer rather than on a test of its own: an op belongs on the eager tape
+    // exactly when upstream would have given its result a `grad_fn`, and that
+    // question has just been answered. A dispatch that differentiates nothing
+    // -- every inference forward, every golden case -- pays a `bool` already in
+    // a register and a branch that is not taken.
+    if on_graph && crate::capture::eager_enabled() {
+        crate::capture::eager_record(py, op, args, kwargs, &out);
+    }
     // W10a (docs/BACKWARD6.md). Beside `mark_from_op` and **not inside it**:
     // that function returns early when grad mode is off, and the call this
     // exists to see -- `optimizer.step()`'s `add_` -- is made under `no_grad`.
