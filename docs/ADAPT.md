@@ -521,13 +521,21 @@ not implemented in torch._C shim: torch.diff(...) -- overload resolution has no
 table entry for this op (rust/torch_c/src/overloads.json)
 ```
 
-So an adaptation step runs on the default cache path, which is what
-`docs/BACKWARD.md` §4 also did. It costs nothing here — the cache is built and
+So an adaptation step ran on the default cache path, which is what
+`docs/BACKWARD.md` §4 also did. It cost nothing here — the cache is built and
 dropped inside one traced forward, and §4's `lr=0` control shows the forward is
-identical across steps — but it is a real restriction on how the model may be
-called, and it is a table entry rather than a kernel.
+identical across steps — but it was a real restriction on how the model may be
+called, and it was a table entry rather than a kernel.
 
-<!-- DOCWATCH: json-key rust/torch_c/src/overloads.json diff absent -->
+> **Closed.** `docs/INDEXSEL.md` added the `diff` entry, and the marker below
+> is the reason this paragraph was rewritten rather than left standing: it
+> asserted `diff` was *absent*, so it failed the moment the op landed. The
+> restriction above is past tense now. The wider point the section makes — that
+> a missing **table entry** looks like a missing kernel and is not one — is what
+> `docs/ARCH100.md` later measured across the whole tail, where names outnumber
+> kernels 49 to 22.
+
+<!-- DOCWATCH: json-key rust/torch_c/src/overloads.json diff present -->
 
 ### 8.3 A delta cannot be written down — **closed, and the wall was misread**
 

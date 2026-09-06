@@ -328,6 +328,17 @@
     "aten::gather.out(Tensor self, int dim, Tensor index, *, bool sparse_grad=False, Tensor(a!) out) -> Tensor(a!)",
     "aten::gather(Tensor self, int dim, Tensor index, *, bool sparse_grad=False) -> Tensor"
   ],
+  "masked_scatter": [
+    "aten::masked_scatter(Tensor self, Tensor mask, Tensor source) -> Tensor"
+  ],
+  "bucketize": [
+    "aten::bucketize.Tensor(Tensor self, Tensor boundaries, *, bool out_int32=False, bool right=False) -> Tensor",
+    "aten::bucketize.Scalar(Scalar self, Tensor boundaries, *, bool out_int32=False, bool right=False) -> Tensor"
+  ],
+  "prod": [
+    "aten::prod(Tensor self, *, ScalarType? dtype=None) -> Tensor",
+    "aten::prod.dim_int(Tensor self, int dim, bool keepdim=False, *, ScalarType? dtype=None) -> Tensor"
+  ],
   "split": [
     "aten::split.Tensor(Tensor(a -> *) self, SymInt split_size, int dim=0) -> Tensor(a)[]"
   ],

@@ -9269,7 +9269,7 @@ def test_core_ops_and_op_tags_agree():
     # landing the same day. This number is their sum, re-measured on the merged
     # tree rather than carried from any one branch, because each branch's count
     # was correct only against its own base.
-    assert r["tag_core_count"] == 113, r["tag_core_count"]
+    assert r["tag_core_count"] == 117, r["tag_core_count"]
 
 
 def test_decompose_lowers_the_op_capture_md_named():
@@ -10376,6 +10376,16 @@ _EXPECTED_MUTABLE = (
     "aten.reciprocal_.default",
     "aten.relu_.default",
     "aten.rsqrt_.default",
+    # docs/SCATTER.md: `scatter_.src` and `scatter_.value` are this round's
+    # two mutating additions, both `Tensor(a!) self`. Two, not six: the round
+    # also landed `scatter.value`, `masked_scatter`, `bucketize` (x2) and
+    # `prod` (x2), every one of which is out-of-place and must NOT appear
+    # here. `masked_scatter` is the one worth naming -- upstream's own refusal
+    # message for a non-bool mask says `masked_scatter_`, the in-place op, even
+    # for the functional call, so a list built from error text rather than
+    # from the parsed schema would have wrongly gained an entry.
+    "aten.scatter_.src",
+    "aten.scatter_.value",
     "aten.sigmoid_.default",
     "aten.sin_.default",
     "aten.sqrt_.default",
@@ -10843,7 +10853,7 @@ def test_schema_text_survives_the_round_trip_through_the_transcribed_tables():
     # 310 on the merged tree. Same reason as `tag_core_count` above: four
     # rounds added schema identities in parallel and no branch could see the
     # others' totals, so this is measured here rather than summed from reports.
-    assert len(keys) == 310, len(keys)
+    assert len(keys) == 322, len(keys)
     from_tables = sorted(
         k for k in keys
         if report["table"][f"{k[0]}|{k[1]}"]["from"] == "tables"
@@ -27850,6 +27860,8 @@ def test_the_voice_round_spellings_reach_their_kernels_and_match_upstream():
     eq("cumprod_fn", [1.0, 2.0, 6.0, 24.0])
     eq("cumprod_member", [[1, 2, 6], [4, 20, 120]])
     eq("cumprod_int_dtype", "torch.int64")
+
+
 
 
 

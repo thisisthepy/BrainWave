@@ -74,8 +74,6 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.arange.start",
     "aten.arange.start_step",
     "aten.argmax.default",
-    "aten.argsort.default",
-    "aten.argsort.stable",
     "aten.avg_pool2d.default",
     "aten.max_pool2d.default",
     "aten.baddbmm.default",
@@ -163,7 +161,6 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.log2.default",
     "aten.log2_.default",
     "aten.log_.default",
-    "aten.logical_and.default",
     "aten.lt.Scalar",
     "aten.lt.Tensor",
     "aten.masked_fill.Scalar",
@@ -291,6 +288,14 @@ pub const IMPLEMENTED: &[&str] = &[
     "prims.tanh.default",
     "prims.transpose.default",
     "prims.view_of.default",
+    "aten.bucketize.Scalar",
+    "aten.bucketize.Tensor",
+    "aten.masked_scatter.default",
+    "aten.prod.default",
+    "aten.prod.dim_int",
+    "aten.scatter.value",
+    "aten.scatter_.src",
+    "aten.scatter_.value",
 ];
 
 /// Ops with a real kernel that `_aten_implemented()` does **not** advertise.
@@ -2154,6 +2159,14 @@ fn aten_dispatch_inner(
         // -- the eight `do_sample=True` stops on (docs/SAMPLING.md) ---------
         "aten._softmax.default" => softmax_default(py, args, kwargs),
         "aten.scatter.src" => scatter_src(py, args, kwargs),
+        "aten.scatter.value" => scatter_value(py, args, kwargs, "aten.scatter.value"),
+        "aten.scatter_.src" => scatter_inplace(py, args, kwargs, "aten.scatter_.src"),
+        "aten.scatter_.value" => scatter_inplace(py, args, kwargs, "aten.scatter_.value"),
+        "aten.masked_scatter.default" => masked_scatter_default(py, args, kwargs),
+        "aten.bucketize.Tensor" => bucketize(py, args, kwargs, "aten.bucketize.Tensor"),
+        "aten.bucketize.Scalar" => bucketize(py, args, kwargs, "aten.bucketize.Scalar"),
+        "aten.prod.default" => prod(py, args, kwargs, "aten.prod.default"),
+        "aten.prod.dim_int" => prod(py, args, kwargs, "aten.prod.dim_int"),
         "aten.sort.default" => sort_default(py, args, kwargs),
         "aten.topk.default" => topk_default(py, args, kwargs),
         "aten.multinomial.default" => multinomial_default(py, args, kwargs),
@@ -22247,3 +22260,595 @@ fn linalg_qr_default(
         .call1(pair)?
         .unbind())
 }
+/// `aten::scatter.value(Tensor self, int dim, Tensor index, Scalar value) -> Tensor`
+/// `aten::scatter_.value(Tensor(a!) self, int dim, Tensor index, Scalar value) -> Tensor(a!)`
+///
+/// `scatter.src` with the source collapsed to one number, which is the form
+/// **eleven** of the architectures in docs/ARCH100.md actually reach. Measured
+/// in `transformers` 5.15.1 rather than assumed: every one of the seven
+/// `TensorBase.scatter_` rows is the identical line
+/// `group_mask.scatter_(1, group_idx, 1)` in a DeepSeek-style MoE group router
+/// (`exaone_moe`, `glm4_moe`, `glm4_moe_lite`, `mistral4`, `nemotron_h`,
+/// `solar_open`, and `groupvit`'s `hard_softmax`, which spells it
+/// `zeros_like(logits).scatter_(dim, index, 1.0)`), and the four
+/// `aten.scatter.value` rows are `.scatter(-1, topk_indices.long(), False)`
+/// on a **bool** receiver (`axk2`, `deepseek_v32`, `glm_moe_dsa`) or
+/// `zeros.scatter(1, top_k_indices, 1)` (`jetmoe`).
+///
+/// **`reduce=` is not implemented and that is the demand-driven answer**: not
+/// one of the eleven passes it. `scatter.reduce`/`scatter.value_reduce` stay
+/// out of both tables for the same reason `maximum.out` does.
+///
+/// Four things this does **not** inherit from `scatter_src` beside it, each
+/// measured against torch 2.13.0:
+///
+///   * **A 0-d `self` is legal here.** `scatter_src` refuses rank 0 outright;
+///     `tensor(0.).scatter(0, tensor([0]), 7.)` is `7.0` upstream and
+///     `tensor(0.).scatter(0, tensor(0), 7.)` is too. The rule is upstream's
+///     `ensure_nonempty_dim`, i.e. `max(rank, 1)` on both sides -- which is
+///     also why a 0-d `self` with a **2-d** index is still refused. Same rule
+///     `gather_default` already reproduces.
+///   * **The index-dtype refusal has different wording.** `scatter.src` says
+///     `scatter(): Expected dtype int32 or int64 for index, got <name>`;
+///     the value form says `scatter(): Expected dtype int32/int64 for index`
+///     with no name. Transcribed rather than shared, the way docs/PROMOTE.md
+///     and docs/FLOAT8B.md transcribe rather than unify.
+///   * **The scalar goes through `c10::checked_convert`**, exactly as
+///     `full`/`fill_` do: `float16.scatter(..., 1e6)` and
+///     `int32.scatter(..., 2**31)` and `uint8.scatter(..., 300)` all raise
+///     `value cannot be converted to type <c10 name> without overflow`, while
+///     `int64.scatter(..., 2.5)` quietly **truncates to 2** and
+///     `uint8.scatter(..., -1)` quietly wraps to **255**. Truncation is not an
+///     overflow; only leaving the range is.
+///   * **`fill_`'s `numel == 1` hole does not exist here.** That hole is
+///     upstream's CPU `fill_` fast path, and `scatter` has no equivalent:
+///     a one-element `float16` receiver still refuses `1e6` (measured). So a
+///     constant that is not 1 is handed to `checked_convert`, because its
+///     `numel` parameter selects nothing else.
+///
+/// **Duplicate indices.** Every write puts the *same* number in, so the
+/// order-dependence `scatter.src` documents cannot be observed at all: three
+/// writes of `7.0` to column 0 leave `7.0` whichever order they happen in.
+/// This is the one place in the scatter family where "nondeterministic for
+/// duplicate indices" has no content, and the golden case says so rather than
+/// pinning a witness that could not distinguish anything.
+///
+/// **One divergence, deliberate, in the in-place form.** Upstream's kernel
+/// bounds-checks each index *as it writes*, so
+/// `zeros(1,3).scatter_(1, tensor([[0, 5]]), 7.)` raises **and leaves `7.0`
+/// in column 0** -- a half-finished write. This kernel checks every index
+/// before it writes anything, so a refusal leaves the receiver untouched.
+/// That difference is an artefact of upstream's loop rather than a documented
+/// behaviour, and docs/SCATTER.md §4 records it instead of a test pinning it.
+fn scatter_value(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+    op: &str,
+) -> PyResult<Py<PyAny>> {
+    let input = tensor_arg(op, args, kwargs, 0, "self")?;
+    let dim_raw = dim_arg(args, kwargs, 1, "dim")?.ok_or_else(|| missing(op, "dim"))?;
+    let index = tensor_arg(op, args, kwargs, 2, "index")?;
+    let raw = required(op, args, kwargs, 3, "value")?;
+    let value = scalar_arg(op, args, kwargs, 3, "value")?.ok_or_else(|| missing(op, "value"))?;
+
+    if !matches!(index.tag(), TorchDType::Int64 | TorchDType::Int32) {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "scatter(): Expected dtype int32/int64 for index",
+        ));
+    }
+
+    let tag = input.tag();
+    let rank = input.tensor()?.rank();
+    let idx_rank = index.tensor()?.rank();
+    // `ensure_nonempty_dim`: a 0-d tensor counts as one-dimensional on both
+    // sides, so (0-d self, 1-d index) and (1-d self, 0-d index) both bind.
+    if idx_rank.max(1) != rank.max(1) {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "Index tensor must have the same number of dimensions as self tensor",
+        ));
+    }
+    let dim = normalise_dim(op, dim_raw, rank)?;
+    let self_dims: Vec<usize> = if rank == 0 { vec![1] } else { input.tensor()?.dims().to_vec() };
+    let idx_dims: Vec<usize> =
+        if idx_rank == 0 { vec![1] } else { index.tensor()?.dims().to_vec() };
+    let effective_rank = self_dims.len();
+    for d in 0..effective_rank {
+        if d != dim && idx_dims[d] > self_dims[d] {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "Expected index {idx_dims:?} to be no larger than self {self_dims:?} apart \
+                 from dimension {dim}"
+            )));
+        }
+    }
+
+    // `c10::checked_convert`. A tensor value cannot reach here -- the resolver
+    // binds a 0-d tensor as a `Scalar`, and `scalar_arg` has already read it --
+    // so the raw object is what upstream's Python-to-Scalar conversion sees.
+    // `2` rather than `numel`: see the doc comment.
+    if !raw.is_instance_of::<PyTensorBase>() {
+        checked_convert(&raw, raw.is_instance_of::<pyo3::types::PyInt>(), tag, 2)?;
+    }
+
+    let mut out = read_flat(op, input.tensor()?, tag)?;
+    let positions = match read_flat(op, index.tensor()?, index.tag())? {
+        Flat::Int(v) => v,
+        Flat::Float(_) => unreachable!("the index dtype was checked above"),
+    };
+
+    let self_strides = contiguous_strides(&self_dims);
+    let idx_strides = contiguous_strides(&idx_dims);
+    let count: usize = idx_dims.iter().product();
+
+    // Every index is checked before any value is written, so a refusal leaves
+    // the receiver exactly as it was (see the doc comment's last paragraph).
+    for target in positions.iter().take(count) {
+        if *target < 0 || *target as usize >= self_dims[dim] {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "index {target} is out of bounds for dimension {dim} with size {}",
+                self_dims[dim]
+            )));
+        }
+    }
+
+    let mut coord = vec![0usize; effective_rank];
+    for _ in 0..count {
+        let idx_off: usize = coord.iter().zip(&idx_strides).map(|(c, s)| c * s).sum();
+        let target = positions[idx_off] as usize;
+        let self_off: usize = coord
+            .iter()
+            .enumerate()
+            .map(|(d, c)| if d == dim { target } else { *c } * self_strides[d])
+            .sum();
+        match &mut out {
+            Flat::Float(o) => o[self_off] = value.as_f64(),
+            // `bool` reads back as 0/1 through `Flat::Int`, and torch converts
+            // a `Scalar` to `bool` by truthiness -- `scatter(bool, ..., 1.0)`
+            // is `True` upstream, measured.
+            Flat::Int(o) => {
+                o[self_off] = if tag == TorchDType::Bool {
+                    i64::from(value.as_f64() != 0.0)
+                } else {
+                    value.as_i64()
+                }
+            }
+        }
+        for d in (0..effective_rank).rev() {
+            coord[d] += 1;
+            if coord[d] < idx_dims[d] {
+                break;
+            }
+            coord[d] = 0;
+        }
+    }
+
+    let device = input.tensor()?.device().clone();
+    let result_dims = if rank == 0 { Vec::new() } else { self_dims };
+    let tensor = write_flat(op, out, result_dims, &device, tag)?;
+    finish(py, tensor, tag)
+}
+
+/// `aten::scatter_.src`/`aten::scatter_.value`, the in-place pair.
+///
+/// docs/INPLACE.md §1's shape exactly, and nothing more: the out-of-place
+/// kernel computes a fresh replacement and `write_back` puts it through the
+/// receiver's **layout**, so a view taken before the call sees the write and
+/// `t.scatter_(...) is t` holds because the wrapper is never rebound.
+///
+/// `Overlap::Refuse` (the `write_back` default) is measured, not assumed:
+/// `zeros(1,3).expand(2,3).scatter_(1, tensor([[0]]), 5.)` raises upstream --
+/// *"more than one element of the written-to tensor refers to a single memory
+/// location"* -- unlike `masked_fill_` beside it, which upstream lets through.
+/// So `scatter_` deliberately does **not** join `write_back`'s `Allow` list.
+///
+/// Capture and the eager tape need nothing added here. The op key ends in `_`,
+/// so `capture::is_mutating` already refuses a trace and `note_mutation`
+/// already stamps the storage; `forgive_own_write` is for the ops that mutate
+/// *without* an underscore (`native_batch_norm`, docs/BACKWARD8.md §2.3) and
+/// this is not one, so widening `MUTATES_WITHOUT_UNDERSCORE` to reach it would
+/// forgive a write the guard is supposed to see.
+fn scatter_inplace(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+    op: &str,
+) -> PyResult<Py<PyAny>> {
+    let receiver = tensor_receiver(op, args, kwargs)?;
+    let result = if op == "aten.scatter_.value" {
+        scatter_value(py, args, kwargs, op)?
+    } else {
+        scatter_src(py, args, kwargs)?
+    };
+    let replacement = result.extract::<PyTensorBase>(py)?;
+    write_back(op, &receiver, replacement)?;
+    Ok(receiver.into_any().unbind())
+}
+
+/// `aten::masked_scatter(Tensor self, Tensor mask, Tensor source) -> Tensor`
+///
+/// `higgs_audio_v2`'s wall (docs/ARCH100.md), and `idefics3`/`smolvlm` reach it
+/// one line after `bucketize`: the shape is always
+/// `hidden_states.masked_scatter(token_mask.unsqueeze(-1), replacement)` --
+/// a `(B, S, 1)` mask against a `(B, S, H)` receiver, with `source` holding
+/// exactly the selected rows, flat.
+///
+/// It is **not** `masked_fill` with a tensor value and it is not
+/// `index_put_`: `source` is consumed *positionally*, one element per true
+/// position in row-major order, and its shape is ignored beyond its element
+/// count. Measured, and each of these would be got wrong by a plausible
+/// implementation:
+///
+///   * **Row-major consumption, from the source's logical order.** A
+///     transposed `source` is read in *its own* logical order, not its
+///     storage order: `zeros(2,3).masked_scatter(m, arange(6.).reshape(2,3).t())`
+///     takes `0, 3, 1`, not `0, 1, 2`.
+///   * **Extra source elements are ignored**, but too few is an error --
+///     `Number of elements of source < number of ones in mask`. An all-false
+///     mask therefore accepts an *empty* source.
+///   * **Both operands broadcast, not just the mask.** `zeros(3)` against a
+///     `(2,3)` mask returns a **`(2,3)`** result upstream, so this is the
+///     ordinary two-sided broadcast and not "expand the mask to `self`".
+///   * **The mask must be exactly `bool`.** A `uint8` mask is refused --
+///     `masked_scatter_ only supports boolean masks, but got mask with dtype
+///     Byte` -- where `masked_fill_` only warns. Note the message names the
+///     *in-place* op even for the out-of-place call; that is upstream's own
+///     text and it is kept.
+///   * **No promotion**: `masked_scatter: expected self and source to have
+///     same dtypes but gotFloat and Long`. The missing space after `got` is
+///     upstream's, transcribed rather than tidied, for the same reason
+///     docs/PROMOTE.md keeps its wording.
+fn masked_scatter_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.masked_scatter.default";
+    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let mask = tensor_arg(OP, args, kwargs, 1, "mask")?;
+    let source = tensor_arg(OP, args, kwargs, 2, "source")?;
+
+    if mask.tag() != TorchDType::Bool {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "masked_scatter_ only supports boolean masks, but got mask with dtype {}",
+            scalar_type_name(mask.tag())
+        )));
+    }
+    let tag = input.tag();
+    if source.tag() != tag {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "masked_scatter: expected self and source to have same dtypes but got{} and {}",
+            scalar_type_name(tag),
+            scalar_type_name(source.tag())
+        )));
+    }
+
+    let shape = broadcast_shape(OP, input.tensor()?.dims(), mask.tensor()?.dims())?;
+    let expanded = input
+        .tensor()?
+        .broadcast_as(shape.as_slice())
+        .and_then(|t| t.contiguous())
+        .map_err(|e| candle_err(OP, e))?;
+    let mut out = read_flat(OP, &expanded, tag)?;
+    let flags: Vec<u8> = mask
+        .tensor()?
+        .broadcast_as(shape.as_slice())
+        .and_then(|t| t.contiguous())
+        .and_then(|t| t.flatten_all())
+        .and_then(|t| t.to_dtype(candle_core::DType::U8))
+        .and_then(|t| t.to_vec1::<u8>())
+        .map_err(|e| candle_err(OP, e))?;
+
+    let wanted = flags.iter().filter(|f| **f != 0).count();
+    if source.tensor()?.elem_count() < wanted {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "Number of elements of source < number of ones in mask",
+        ));
+    }
+    // `read_flat` contiguates first, so this is the source's *logical* order.
+    let values = read_flat(OP, source.tensor()?, tag)?;
+
+    let mut taken = 0usize;
+    for (position, flag) in flags.iter().enumerate() {
+        if *flag == 0 {
+            continue;
+        }
+        match (&values, &mut out) {
+            (Flat::Float(s), Flat::Float(o)) => o[position] = s[taken],
+            (Flat::Int(s), Flat::Int(o)) => o[position] = s[taken],
+            _ => unreachable!("self and source share a dtype, checked above"),
+        }
+        taken += 1;
+    }
+
+    let device = input.tensor()?.device().clone();
+    let tensor = write_flat(OP, out, shape, &device, tag)?;
+    finish(py, tensor, tag)
+}
+
+/// One `bucketize` position, by binary search over `boundaries`.
+///
+/// The predicate is written as a **negated** comparison on purpose, and that
+/// is the whole NaN rule: IEEE makes every comparison against NaN false, so
+/// `!(b >= v)` is *true* for every boundary when `v` is NaN and the search
+/// runs off the end. Measured upstream: `bucketize(nan, [1,3,5,7])` is `4`
+/// for both `right=False` and `right=True`, `bucketize(inf, ...)` is `4`, and
+/// `bucketize(-inf, ...)` is `0`. Writing `b < v` instead would give `0` for
+/// NaN, which is the plausible wrong answer.
+fn bucketize_position(boundaries: &[f64], value: f64, right: bool) -> i64 {
+    let mut lo = 0usize;
+    let mut hi = boundaries.len();
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        let before = if right {
+            !(boundaries[mid] > value)
+        } else {
+            !(boundaries[mid] >= value)
+        };
+        if before {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    lo as i64
+}
+
+/// `aten::bucketize.Tensor(Tensor self, Tensor boundaries, *, bool
+///     out_int32=False, bool right=False) -> Tensor`
+/// `aten::bucketize.Scalar(Scalar self, Tensor boundaries, ...) -> Tensor`
+///
+/// `idefics3_vision` and `smolvlm_vision` (docs/ARCH100.md), both through the
+/// identical line `torch.bucketize(fractional_coords, boundaries, right=True)`
+/// in the patched-image position encoder.
+///
+/// **`right` does not mean what its name suggests, and the boundary values are
+/// where that shows.** Swept against upstream on `boundaries = [1,3,5,7]` with
+/// the values *on* the boundaries, the way docs/FIXES.md swept `-300..300`:
+///
+/// ```text
+/// value            0  1  2  3  5  7  8
+/// right=False      0  0  1  1  2  3  4      first index with boundary >= value
+/// right=True       0  1  1  2  3  4  4      first index with boundary >  value
+/// ```
+///
+/// So `right=False` is `lower_bound` and `right=True` is `upper_bound`, and
+/// the *only* values at which the two differ are the boundaries themselves --
+/// which is exactly why a test on interior values would pass against either
+/// one. Duplicate boundaries are the second witness: on `[1,3,3,5]`,
+/// `bucketize(3)` is `1` and `bucketize(3, right=True)` is `3`, which pins the
+/// search to the ends of the run rather than to any element inside it.
+///
+/// Three more, measured:
+///
+///   * **`boundaries` must be rank 1** -- not 0, not 2:
+///     `boundaries tensor must be 1 dimension, but got dim(N)`. An *empty*
+///     `boundaries` is fine and every answer is `0`.
+///   * **Unsorted boundaries are not refused**; upstream runs the binary
+///     search anyway and returns whatever it lands on
+///     (`bucketize(2, [5,1,3])` is `2`). Reproduced by doing the same search,
+///     rather than sorting first -- sorting would be a *better* answer and a
+///     different one.
+///   * **The dtypes need not agree.** An `int64` value against `float32`
+///     boundaries and the reverse both compare numerically, so both sides are
+///     widened to `f64` here. That is exact for every dtype this shim stores
+///     except `int64` beyond 2^53; docs/SCATTER.md §5 records the limit.
+///
+/// Output is `int64`, or `int32` when `out_int32=True`, with `self`'s shape
+/// (0-d for the `Scalar` overload).
+fn bucketize(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+    op: &str,
+) -> PyResult<Py<PyAny>> {
+    let boundaries = tensor_arg(op, args, kwargs, 1, "boundaries")?;
+    let out_int32 = bool_arg(args, kwargs, 2, "out_int32")?.unwrap_or(false);
+    let right = bool_arg(args, kwargs, 3, "right")?.unwrap_or(false);
+
+    let edge_rank = boundaries.tensor()?.rank();
+    if edge_rank != 1 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "boundaries tensor must be 1 dimension, but got dim({edge_rank})"
+        )));
+    }
+    let edges = match read_flat(op, boundaries.tensor()?, boundaries.tag())? {
+        Flat::Float(v) => v,
+        Flat::Int(v) => v.into_iter().map(|x| x as f64).collect(),
+    };
+
+    let (values, dims, device) = if op == "aten.bucketize.Scalar" {
+        let scalar = scalar_arg(op, args, kwargs, 0, "self")?.ok_or_else(|| missing(op, "self"))?;
+        (
+            vec![scalar.as_f64()],
+            Vec::new(),
+            boundaries.tensor()?.device().clone(),
+        )
+    } else {
+        let input = tensor_arg(op, args, kwargs, 0, "self")?;
+        let flat = match read_flat(op, input.tensor()?, input.tag())? {
+            Flat::Float(v) => v,
+            Flat::Int(v) => v.into_iter().map(|x| x as f64).collect(),
+        };
+        let dims = input.tensor()?.dims().to_vec();
+        let device = input.tensor()?.device().clone();
+        (flat, dims, device)
+    };
+
+    let found: Vec<i64> = values
+        .into_iter()
+        .map(|v| bucketize_position(&edges, v, right))
+        .collect();
+    let tag = if out_int32 { TorchDType::Int32 } else { TorchDType::Int64 };
+    let tensor = write_flat(op, Flat::Int(found), dims, &device, tag)?;
+    finish(py, tensor, tag)
+}
+
+/// The value this dtype would hold after one arithmetic step, as an `f64`
+/// carrier -- the integral counterpart of `float_narrower`.
+///
+/// `prod` needs it for the same reason `div` needs `float_narrower`: upstream
+/// accumulates in the **output** dtype and its wraparound is observable.
+/// Measured: `prod(tensor([70000, 70000]), dtype=torch.int32)` is
+/// `605032704`, which is `4.9e9` wrapped into `int32`, and
+/// `prod(tensor([20, 20], dtype=uint8), dtype=uint8)` is `144`.
+fn int_narrower(tag: TorchDType) -> fn(i64) -> i64 {
+    use TorchDType::*;
+    match tag {
+        Bool => |v| i64::from(v != 0),
+        UInt8 => |v| v as u8 as i64,
+        UInt32 => |v| v as u32 as i64,
+        Int8 => |v| v as i8 as i64,
+        Int16 => |v| v as i16 as i64,
+        Int32 => |v| v as i32 as i64,
+        // `int64` is the accumulator's own width, and every remaining tag is
+        // one `PyDtype::storage()` refuses.
+        _ => |v| v,
+    }
+}
+
+/// `aten::prod(Tensor self, *, ScalarType? dtype=None) -> Tensor`
+/// `aten::prod.dim_int(Tensor self, int dim, bool keepdim=False, *,
+///     ScalarType? dtype=None) -> Tensor`
+///
+/// `tapas`' wall (docs/ARCH100.md), reached as
+/// `torch.prod(torch.tensor(list(index.batch_shape())))` -- a full reduction
+/// of a small `int64` vector. The `dim_int` form is implemented beside it
+/// because it is the same loop over a different index set, and because
+/// leaving it in the table without a kernel would be a dead overload key.
+///
+/// **The empty product is 1, not 0**, in every dtype -- `prod(tensor([]))` is
+/// `1.0` and `prod(tensor([], dtype=int64))` is `1`, and with a `dim`,
+/// `prod(zeros(2,0), 1)` is `[1., 1.]`. That identity is the whole reason this
+/// is not "sum with a different operator".
+///
+/// **Two dtype rules, both measured over all nine stored dtypes:**
+///
+///   * **Every integral input, and `bool`, comes back `int64`** --
+///     `int8`, `int16`, `int32`, `uint8` and `bool` all widen, exactly as
+///     `sum` does. Floating inputs keep their own width, including `float16`
+///     and `bfloat16`.
+///   * **`dtype=` casts the *input* before reducing, it does not cast the
+///     answer**: `prod(tensor([2.5, 3.0]), dtype=int64)` is **6**, not 7.
+///     Rounding the product would give 8 and casting it would give 7; only
+///     casting first gives what upstream gives.
+///
+/// **Accumulation happens in the output dtype, step by step.** `bfloat16` is
+/// the witness and it took a discriminating input to find: on eight copies of
+/// `1.1`, upstream gives `2.15625`, which is what stepwise `bfloat16` rounding
+/// gives; accumulating in `f64` and narrowing once at the end gives
+/// `2.171875`. Same shape as `float_narrower`'s finding for `div` and the same
+/// remedy. Integer overflow is the other half of the same rule: `int64`
+/// wraps (`prod(tensor([2**32, 2**32]))` is `0`) and a narrower `dtype=`
+/// wraps at its own width, so `int_narrower` is applied after each step too.
+///
+/// **A limit, recorded rather than closed.** Above about 32 elements upstream
+/// switches to a vectorised reduction whose lane order is neither sequential
+/// nor a simple pairwise tree, and for `float16`/`bfloat16` that is visible:
+/// on 64 copies of `1.1`, upstream gives `472.0` where sequential `bfloat16`
+/// gives `482.0`. This kernel is sequential, so reduced-precision products
+/// over long axes can differ in the last places. docs/SCATTER.md §6 has the
+/// measurement; the golden cases stay inside the range where the two agree,
+/// because pinning a case to upstream's lane count would be pinning a test to
+/// an accident.
+fn prod(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+    op: &str,
+) -> PyResult<Py<PyAny>> {
+    let input = tensor_arg(op, args, kwargs, 0, "self")?;
+    let over_dim = op == "aten.prod.dim_int";
+    let (dim_raw, keepdim, requested) = if over_dim {
+        (
+            Some(dim_arg(args, kwargs, 1, "dim")?.ok_or_else(|| missing(op, "dim"))?),
+            bool_arg(args, kwargs, 2, "keepdim")?.unwrap_or(false),
+            dtype_arg(args, kwargs, 3, "dtype")?,
+        )
+    } else {
+        (None, false, dtype_arg(args, kwargs, 1, "dtype")?)
+    };
+
+    let tag = input.tag();
+    // `sum`'s rule: integral and boolean widen to `int64`, floating keeps its
+    // own width.
+    let out_tag = requested.unwrap_or(if tag.is_floating_point() { tag } else { TorchDType::Int64 });
+    let rank = input.tensor()?.rank();
+    let dims = input.tensor()?.dims().to_vec();
+    let device = input.tensor()?.device().clone();
+
+    // The cast happens before the reduction (see the doc comment), so the
+    // accumulator's identity and every step are in the output dtype.
+    let read = read_flat(op, input.tensor()?, tag)?;
+    let narrow_float = float_narrower(out_tag);
+    let narrow_int = int_narrower(out_tag);
+    let float_out = out_tag.is_floating_point();
+    let values: Vec<f64> = match &read {
+        Flat::Float(v) => v.clone(),
+        Flat::Int(v) => v.iter().map(|x| *x as f64).collect(),
+    };
+    let cast: Vec<f64> = if float_out {
+        values.iter().map(|v| narrow_float(*v)).collect()
+    } else {
+        values.iter().map(|v| narrow_int(*v as i64) as f64).collect()
+    };
+
+    let step = |acc: f64, v: f64| -> f64 {
+        if float_out {
+            narrow_float(acc * v)
+        } else {
+            narrow_int((acc as i64).wrapping_mul(v as i64)) as f64
+        }
+    };
+
+    let (out_values, out_dims) = if let Some(dim_raw) = dim_raw {
+        let dim = normalise_dim(op, dim_raw, rank)?;
+        if rank == 0 {
+            (cast.clone(), Vec::new())
+        } else {
+            let strides = contiguous_strides(&dims);
+            let extent = dims[dim];
+            let mut shape = dims.clone();
+            shape[dim] = 1;
+            let outer: usize = shape.iter().product();
+            let mut out = Vec::with_capacity(outer);
+            let mut coord = vec![0usize; rank];
+            for _ in 0..outer {
+                let base: usize = coord.iter().zip(&strides).map(|(c, s)| c * s).sum();
+                let mut acc = 1.0f64;
+                for k in 0..extent {
+                    acc = step(acc, cast[base + k * strides[dim]]);
+                }
+                out.push(acc);
+                for d in (0..rank).rev() {
+                    coord[d] += 1;
+                    if coord[d] < shape[d] {
+                        break;
+                    }
+                    coord[d] = 0;
+                }
+            }
+            let result_dims: Vec<usize> = if keepdim {
+                shape
+            } else {
+                dims.iter().enumerate().filter(|(d, _)| *d != dim).map(|(_, e)| *e).collect()
+            };
+            (out, result_dims)
+        }
+    } else {
+        let mut acc = 1.0f64;
+        for v in &cast {
+            acc = step(acc, *v);
+        }
+        (vec![acc], Vec::new())
+    };
+
+    let flat = if float_out {
+        Flat::Float(out_values)
+    } else {
+        Flat::Int(out_values.into_iter().map(|v| v as i64).collect())
+    };
+    let tensor = write_flat(op, flat, out_dims, &device, out_tag)?;
+    finish(py, tensor, out_tag)
+}
+
+
