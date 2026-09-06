@@ -221,7 +221,7 @@ loads on 3.13, 3.14 and later without a rebuild.
 <tr><th align="left">Working</th><th align="left"></th></tr>
 <tr><td>ATen operators</td><td><b>203</b>, each compared against upstream</td></tr>
 <tr><td>Golden comparison cases</td><td><b>8,476 / 8,476</b> — values, shapes, dtypes, positional <i>and</i> keyword, through the door <i>and</i> through the member</td></tr>
-<tr><td>Smoke tests</td><td><b>380</b></td></tr>
+<tr><td>Smoke tests</td><td><b>381</b></td></tr>
 <tr><td><code>from_pretrained</code></td><td>works for models whose init computes on the <b>meta</b> device — the Llama-3.2 <code>rope_scaling</code> path needed 30-odd meta kernels that were absent (<a href="docs/META.md">META.md</a>)</td></tr>
 <tr><td>Signature and schema tables</td><td><b>4479</b> entries checked against upstream</td></tr>
 <tr><td>Architectures — operator coverage</td><td><b>26 of 26</b> reach zero missing operators in the traced sweep</td></tr>

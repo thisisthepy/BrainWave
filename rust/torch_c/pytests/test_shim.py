@@ -16214,6 +16214,64 @@ def test_a_gradient_reaches_a_burned_in_constant_and_only_the_ones_asked_for():
     assert none["inputs"][0] is not None
 
 
+def test_a_traces_constants_are_read_at_backward_time_not_at_capture_time():
+    """docs/BACKWARD5.md §1.3, pinned as a **known divergence** rather than fixed.
+
+    `PyCaptureTrace` holds strong references to the caller's live parameter
+    tensors (`const_objects`) and `run()` copies those references into the
+    replay `Env`. So a trace differentiates whatever its constants hold *when
+    backward() is called* -- and in a training loop that is whatever
+    `optimizer.step()` last wrote. Upstream refuses the same program by name:
+    `one of the variables needed for gradient computation has been modified by
+    an inplace operation: ... is at version 1; expected version 0 instead.`
+
+    `torchnative.adapt` is safe from this by **ordering and nothing else** --
+    `adapt/__init__.py` calls `trace.backward()` before `self._optimizer.step()`
+    and drops the trace at the end of the call. Nothing enforces that order.
+    This test is the thing that says so out loud, so that the situation is not
+    invisible merely because it is currently unreachable by accident
+    (CLAUDE.md §5.5).
+
+    **If a round lands docs/BACKWARD5.md §6's W10a (constant freshness), invert
+    this test rather than deleting it**: the second backward should then raise
+    by name instead of returning a gradient at the new weights.
+    """
+    d = _C._aten_dispatch
+    w = _tape_f64([2.0, 2.0, 2.0], [3])
+    x = _tape_f64([0.5, 1.0, 2.0], [3])
+    _C._capture_begin([x])
+    trace = _C._capture_end(d("aten.sum.default", d("aten.mul.Tensor", x, w)))
+    assert len(trace.constant_values) == 1, len(trace.constant_values)
+    assert trace.constant_values[0] is w, "the trace burns in the live object, not a copy"
+
+    before = trace.backward([x])["inputs"][0].tolist()
+    assert before == [2.0, 2.0, 2.0], before
+
+    # An optimiser step, spelled the way one is: an in-place write on the
+    # parameter, under no_grad. Capture is closed, so nothing records it.
+    d("aten.add_.Tensor", w, _tape_f64([1.0, 1.0, 1.0], [3]))
+    assert w.tolist() == [3.0, 3.0, 3.0], w.tolist()
+
+    after = trace.backward([x])["inputs"][0].tolist()
+    assert after == [3.0, 3.0, 3.0], (
+        "the tape's constants stopped being read live at backward() time. If "
+        "that is deliberate -- docs/BACKWARD5.md §6's W10a -- this test should "
+        "now assert a refusal by name, not be deleted: got %r" % (after,))
+    assert before != after, (
+        "the two backwards agreed, so this test proved nothing about staleness; "
+        "check that w.add_ actually wrote through to the burned-in constant")
+
+    # And the forward moves first and by more, which is docs/BACKWARD5.md
+    # §1.2's reason to put any future check on the replayed output rather than
+    # on the gradient.
+    replayed = trace.replay([x])[0].tolist()
+    assert replayed == 10.5, (
+        "the replayed loss is sum(x * w) at the NEW w (3.5 * 3); the loss the "
+        "region actually produced was 7.0, at w = 2. The forward diverges by "
+        "more than the gradient does, which is why any future check belongs "
+        "here: got %r" % (replayed,))
+
+
 def test_the_tape_seeds_a_one_only_for_a_scalar_and_says_so_otherwise():
     """`backward()` with no `grad_outputs` means `d(output)/d(output) = 1`,
     which is only a definition when the output is a scalar. Guessing for a
