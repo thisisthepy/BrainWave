@@ -1879,6 +1879,19 @@ class _TypeChecker:
             return True
         if is_list:
             if isinstance(value, (list, tuple)):
+                if base in ("int", "SymInt"):
+                    # `_base`'s scalar-Tensor arm is deliberately NOT open for
+                    # list ELEMENTS: that would accept a Tensor in every
+                    # `SymInt[]` position table-wide, which is the scoping
+                    # docs/ARGFORM.md §2 forbids and which
+                    # `_coerce_symint_size_tensors` handles for the two
+                    # spellings that were measured (docs/BIND5.md §1.2).
+                    # Mirrors `predicate_for`'s `int_list_ok`, which is the
+                    # arm that actually runs.
+                    return all(
+                        isinstance(item, int) and not isinstance(item, bool)
+                        for item in value
+                    )
                 return all(self._base(base, item) for item in value)
             # torch: "if a size is specified (e.g. IntArrayRef[2]) we also
             # allow passing a single int". `x.sum(0)` is that rule.
@@ -1940,13 +1953,35 @@ class _TypeChecker:
 
             return scalar
         if base in ("int", "SymInt"):
-            # `type(value) is int` implies both halves of the test below and is
-            # true of nearly every value that reaches here, so it is tried
-            # first; the full test still decides everything else. `bool` is
-            # excluded deliberately -- see the class docstring.
-            return lambda value: type(value) is int or (
-                isinstance(value, int) and not isinstance(value, bool)
-            )
+            # `type(value) is int` implies both halves of the second test and
+            # is true of nearly every value that reaches here, so it is tried
+            # first; the rest decides everything else. `bool` is excluded
+            # deliberately -- see the class docstring.
+            #
+            # The Tensor arm is upstream's `ParameterType::INT64` check and is
+            # what `vilt` needs: `torch.multinomial(probs, num_samples)` with a
+            # Tensor `num_samples` (docs/BIND5.md §7). It is NOT multinomial-
+            # specific -- measured on `select`, `narrow`, `transpose`,
+            # `unsqueeze`, `sum(dim=)` and `repeat_interleave` as well, which
+            # is why it is here rather than in a per-op wrapper. `bool` is
+            # ACCEPTED here on purpose and refused one layer later by
+            # `_symint_from_tensor`, reproducing upstream's two classes.
+            accepted = tuple(
+                getattr(self._module, d) for d in _SIZE_LIST_TENSOR_DTYPES
+            ) + (self._module.bool,)
+
+            def int_ok(value):
+                if type(value) is int:
+                    return True
+                if isinstance(value, int):
+                    return not isinstance(value, bool)
+                return (
+                    isinstance(value, tensor)
+                    and value.numel() == 1
+                    and any(value.dtype == d for d in accepted)
+                )
+
+            return int_ok
         if base == "float":
             return lambda value: isinstance(value, (int, float)) and not isinstance(
                 value, bool
@@ -2031,10 +2066,12 @@ class _TypeChecker:
     def coerce(spelling, value):
         """The value to actually bind, once `check` has said yes.
 
-        Only one rule: a bare int that satisfied a sized int list is widened to
-        a one-element tuple, so the kernel behind the key always sees a list
-        where the schema says list. torch does the same thing one layer down
-        (`IntArrayRef` of length one).
+        Two rules. A bare int that satisfied a sized int list is widened to a
+        one-element tuple, so the kernel behind the key always sees a list
+        where the schema says list -- torch does the same thing one layer down
+        (`IntArrayRef` of length one). And a single-element Tensor that
+        satisfied a scalar `int`/`SymInt` is unpacked, which is the layer that
+        refuses `bool` (`_symint_from_tensor`).
         """
         base, is_list, _, list_size = _decompose_type(str(spelling))
         if (
@@ -2045,6 +2082,12 @@ class _TypeChecker:
             and not isinstance(value, bool)
         ):
             return (value,)
+        if (
+            not is_list
+            and base in ("int", "SymInt")
+            and not isinstance(value, int)
+        ):
+            return _symint_from_tensor(value)
         return value
 
     def _base(self, base: str, value) -> bool:
@@ -2059,7 +2102,19 @@ class _TypeChecker:
                 return True
             return isinstance(value, self._tensor) and value.dim() == 0
         if base in ("int", "SymInt"):
-            return isinstance(value, int) and not isinstance(value, bool)
+            if isinstance(value, int):
+                return not isinstance(value, bool)
+            # See `_base_predicate`'s `int_ok`: one element, any ndim, an
+            # integral dtype -- and `bool`, which `_symint_from_tensor`
+            # refuses afterwards rather than this predicate.
+            accepted = tuple(
+                getattr(self._module, d) for d in _SIZE_LIST_TENSOR_DTYPES
+            ) + (self._module.bool,)
+            return (
+                isinstance(value, self._tensor)
+                and value.numel() == 1
+                and any(value.dtype == d for d in accepted)
+            )
         if base == "float":
             return isinstance(value, (int, float)) and not isinstance(value, bool)
         if base == "bool":
@@ -2134,6 +2189,7 @@ class _ArgPlan:
         "is_list",
         "optional",
         "sized_int_list",
+        "scalar_int",
         "default_source",
         "has_default",
         "predicate",
@@ -2149,6 +2205,10 @@ class _ArgPlan:
         # `coerce`'s "widen it to a one-tuple" precondition are the same
         # predicate on the type; `list_size` is never None when `is_list`.
         self.sized_int_list = bool(is_list and list_size and base in ("int", "SymInt"))
+        # `_symint_from_tensor`'s precondition, precomputed the same way
+        # `sized_int_list` is: a SCALAR `int`/`SymInt` position, where the
+        # predicate may now have said yes to a single-element Tensor.
+        self.scalar_int = bool(not is_list and base in ("int", "SymInt"))
         # `_Argument.has_default_value()` is exactly this test.
         self.default_source = argument.default_value
         self.has_default = argument.default_value is not None
@@ -2317,13 +2377,19 @@ class _Overloads:
                 return False
             if not parameter.predicate(value):
                 return False
-            # `coerce`'s only rule, with its precondition precomputed.
+            # `coerce`'s rules, with their preconditions precomputed.
             if (
                 parameter.sized_int_list
                 and isinstance(value, int)
                 and not isinstance(value, bool)
             ):
                 value = (value,)
+            elif (
+                parameter.scalar_int
+                and type(value) is not int
+                and isinstance(value, _C_TENSORBASE[0])
+            ):
+                value = _symint_from_tensor(value)
             bound[name] = value
         return True
 
@@ -2387,13 +2453,24 @@ class _Overloads:
                 if not parameter.predicate(value):
                     bound = None
                     break
-                # `coerce`'s only rule, with its precondition precomputed.
+                # `coerce`'s rules, with their preconditions precomputed.
                 if (
                     parameter.sized_int_list
                     and isinstance(value, int)
                     and not isinstance(value, bool)
                 ):
                     value = (value,)
+                elif (
+                    parameter.scalar_int
+                    and type(value) is not int
+                    and isinstance(value, _C_TENSORBASE[0])
+                ):
+                    # The predicate let a single-element Tensor through; this
+                    # is upstream's unpack, and the one place a `bool` tensor
+                    # becomes a RuntimeError. An `int` SUBCLASS that is not
+                    # `bool` (numpy's integers) also lands here and `int()` is
+                    # the right answer for it too.
+                    value = _symint_from_tensor(value)
                 bound[parameter.name] = value
             if bound is None:
                 continue
@@ -2622,6 +2699,106 @@ def _apply_requires_grad(result, message=_FACTORY_REQUIRES_GRAD_REFUSAL):
 _C_TENSORBASE = [None]
 
 
+# The dtypes upstream's `SymInt[]` argument parser will take a Tensor element
+# in. Measured against real torch 2.13.0 in a separate process, one dtype at a
+# time (docs/BIND5.md §1), NOT inferred from `zeros` alone: every integral
+# dtype is accepted and `bool` is not, which is why `bool` is absent from a
+# list that would otherwise be spelled "integral".
+_SIZE_LIST_TENSOR_DTYPES = ("uint8", "int8", "int16", "int32", "int64")
+
+# `(accepted_integral_dtypes, bool_dtype)`, filled by `install()` beside
+# `_C_TENSORBASE`. `_TypeChecker` can read them off its own `module`, but the
+# COERCION happens in `_Overloads`, which has no module -- see
+# `_symint_from_tensor`.
+_C_SYMINT_TENSOR_DTYPES = [None]
+
+
+def _symint_from_tensor(value):
+    """Upstream's unpack for a Tensor bound to a scalar `int`/`SymInt`.
+
+    Two layers, and the split is upstream's own -- it is what makes a `bool`
+    tensor a `RuntimeError` here while a `float` one is a `TypeError` from the
+    parser. `THPUtils_checkIndex`-side accepts any single-element tensor of an
+    integral dtype **including bool**; the unpack
+    (`torch/csrc/utils/pybind.cpp`) then asserts `scalar.isIntegral(false)`,
+    which bool fails. So the predicate says yes and this says no, in that
+    order, and the two exception classes fall out of it rather than being
+    chosen. docs/BIND5.md §7 has the measurement for both.
+    """
+    dtypes = _C_SYMINT_TENSOR_DTYPES[0]
+    if dtypes is not None and value.dtype == dtypes[1]:
+        raise RuntimeError(
+            "scalar.isIntegral( false) INTERNAL ASSERT FAILED -- a bool tensor "
+            "cannot be bound to an int/SymInt argument; upstream asserts the "
+            "same thing in torch/csrc/utils/pybind.cpp"
+        )
+    return int(value)
+
+
+
+def _coerce_symint_size_tensors(module, name, size):
+    """Upstream's `SymInt[]` size-list rule, for one call's `size` argument.
+
+    A single-element integral Tensor sitting in a size list is taken for its
+    value, the way a bare Python int is. This is upstream's own argument
+    parser rule and not a `zeros` accident -- docs/BIND4.md §3 measured it for
+    `zeros`, `ones`, `empty` and `view`, and docs/BIND5.md §1 measured the
+    `new_*` family and the REFUSALS, which is the half that was missing.
+
+    The refusals are the point. Upstream draws three lines here, and the
+    first version of this rule (docs/BIND4.md §3, `int(item)` applied to
+    anything that was a Tensor) crossed two of them, making this build **more
+    permissive than the thing it replaces** -- exactly what docs/ARGFORM.md
+    forbids. Measured upstream, `torch.zeros((2, X))`:
+
+        X = tensor(3)          -> (2, 3)
+        X = tensor([3])        -> (2, 3)     one element, any ndim
+        X = tensor(3, int8)    -> (2, 3)     every integral dtype
+        X = tensor(3.0)        -> TypeError  ... "type must be tuple of ints,
+                                             but got Tensor"   -- even whole-valued
+        X = tensor(3.5)        -> TypeError  the same
+        X = tensor(True)       -> RuntimeError  Expected scalar.isIntegral(...)
+        X = tensor([3, 4])     -> TypeError  the same unpack failure
+
+    `int(item)` accepted the first three of those refusals silently
+    (`tensor(3.5)` became 3, `tensor(True)` became 1), which no test could see
+    because nothing asserted them. They raise here, with upstream's own
+    message text, and `bool` gets upstream's *different* exception TYPE
+    because upstream reaches it one layer further in -- past the unpack, at
+    the scalar conversion.
+
+    A negative size is left to the kernel below, which already refuses it
+    (`OverflowError`, where upstream says `RuntimeError: ... Dimension size
+    must be non-negative`): both refuse, and inventing a message here would
+    be a second surface claiming to know a rule the kernel owns.
+    """
+    if not isinstance(size, (list, tuple)):
+        return size
+    tensorbase = module.TensorBase
+    if not any(isinstance(item, tensorbase) for item in size):
+        return size
+    accepted = tuple(getattr(module, d) for d in _SIZE_LIST_TENSOR_DTYPES)
+    out = []
+    for pos, item in enumerate(size, start=1):
+        if not isinstance(item, tensorbase):
+            out.append(item)
+            continue
+        if item.numel() == 1 and any(item.dtype == d for d in accepted):
+            out.append(int(item))
+            continue
+        if item.numel() == 1 and item.dtype == module.bool:
+            raise RuntimeError(
+                "Expected scalar.isIntegral( false) to be true, but got false.  "
+                "(Could this error message be improved?  If so, please report an "
+                "enhancement request to PyTorch.)"
+            )
+        raise TypeError(
+            "%s(): argument 'size' failed to unpack the object at pos %d with "
+            'error "type must be tuple of ints,but got Tensor"' % (name, pos)
+        )
+    return out
+
+
 def install(module, surface_json: str, overloads_json: str, methods_json: str) -> None:
     surface = json.loads(surface_json)
     dispatch = module._aten_dispatch
@@ -2681,6 +2858,12 @@ def install(module, surface_json: str, overloads_json: str, methods_json: str) -
     # is why it is here and not beside the `TensorBase` member installation
     # further down.
     _C_TENSORBASE[0] = module.TensorBase
+    # `_symint_from_tensor`'s dtype rule, snapshotted for the same reason:
+    # the coercion runs inside `_Overloads`, which never sees `module`.
+    _C_SYMINT_TENSOR_DTYPES[0] = (
+        tuple(getattr(module, d) for d in _SIZE_LIST_TENSOR_DTYPES),
+        module.bool,
+    )
     # See `_PY_DTYPE_MODULE`'s own comment above `_strip_python_only_kwargs`:
     # filled in here so `dtype=bool`/`dtype=int`/`dtype=float` can be resolved
     # to `module.bool`/`module.int64`/`module.float64` at call time. Safe to
@@ -3317,22 +3500,13 @@ def install(module, surface_json: str, overloads_json: str, methods_json: str) -
     # without a matching measurement for each of them, which is exactly the
     # silent-divergence trap docs/ARGFORM.md §2 names.
     #
-    # A multi-element Tensor in the list is left to fail on its own `__int__`
-    # (single-element only) rather than special-cased, which is close enough
-    # to upstream's own refusal (`must be tuple of ints, but found element of
-    # type Tensor`) that inventing a nicer message here is not worth a new
-    # surface.
+    # The refusals were the half this comment used to hand-wave -- a
+    # multi-element Tensor was "left to fail on its own `__int__`", and a
+    # FLOAT or BOOL Tensor was not considered at all, so `torch.zeros((2,
+    # tensor(3.5)))` quietly gave a (2, 3) tensor where upstream raises.
+    # `_coerce_symint_size_tensors` now carries upstream's three lines and its
+    # message text; docs/BIND5.md §1 has the measurement.
     _table_zeros = varfns.zeros
-
-    def _coerce_symint_size_tensors(size):
-        if isinstance(size, (list, tuple)) and any(
-            isinstance(item, module.TensorBase) for item in size
-        ):
-            return [
-                int(item) if isinstance(item, module.TensorBase) else item
-                for item in size
-            ]
-        return size
 
     def zeros(size, *args, **kwargs):
         # `_torch_level_function`'s own guard, reproduced rather than
@@ -3350,7 +3524,9 @@ def install(module, surface_json: str, overloads_json: str, methods_json: str) -
         # first time this wrapper was written without the guard.
         if _MODE_STACK:
             return _through_torch_function_modes(zeros, (size,) + args, kwargs)
-        return _table_zeros(_coerce_symint_size_tensors(size), *args, **kwargs)
+        return _table_zeros(
+            _coerce_symint_size_tensors(module, "zeros", size), *args, **kwargs
+        )
 
     zeros.__name__ = zeros.__qualname__ = "zeros"
     varfns.zeros = zeros
@@ -4073,6 +4249,19 @@ def _install_torch_function_modes(module) -> None:
 
 
 
+def _fast_symint_coerce(value):
+    """`resolve`'s scalar `int`/`SymInt` coercion, for the generated fast path.
+
+    Anything that is not a Tensor is passed through untouched -- an `int`
+    subclass that is not `bool` reaches here only because `type(value) is int`
+    was false, and `int()` on it would be a no-op the dispatcher already does.
+    """
+    tensorbase = _C_TENSORBASE[0]
+    if tensorbase is not None and isinstance(value, tensorbase):
+        return _symint_from_tensor(value)
+    return value
+
+
 def _compile_fast_path(fn, name, entry, dispatch, is_method):
     skip = 1 if is_method else 0
     lines = [
@@ -4094,7 +4283,21 @@ def _compile_fast_path(fn, name, entry, dispatch, is_method):
         entry._armed = True
 
     import sys
-    g = {"_sys": sys, "NotImplemented": NotImplemented}
+    g = {
+        "_sys": sys,
+        "NotImplemented": NotImplemented,
+        # The fast path reproduces `resolve`'s COERCIONS as well as its
+        # predicates. It used to reproduce only `sized_int_list`'s, which was
+        # invisible while the predicates admitted nothing that needed the
+        # other one -- the moment a scalar `int`/`SymInt` started accepting a
+        # single-element Tensor, this path handed the raw Tensor to the
+        # dispatcher and the slow path did not. Two spellings of one rule is
+        # exactly the hazard `_TypeChecker`'s docstring names, and here it had
+        # teeth: the Rust side unpacked the Tensor anyway, including a `bool`
+        # one, so a divergence from upstream came back as a plausible answer
+        # rather than as an error (docs/BIND5.md §7.2).
+        "_symint_coerce": _fast_symint_coerce,
+    }
     
     for c_idx, (plan, key) in enumerate(entry._candidates):
         required_kwarg_only = any(
@@ -4148,6 +4351,11 @@ def _compile_fast_path(fn, name, entry, dispatch, is_method):
                 arg_idx = i + 1 if is_method else i
                 if plan.positional[skip + i].sized_int_list:
                     call_args.append(f"(args[{arg_idx}],) if type(args[{arg_idx}]) is int else args[{arg_idx}]")
+                elif plan.positional[skip + i].scalar_int:
+                    call_args.append(
+                        f"args[{arg_idx}] if type(args[{arg_idx}]) is int"
+                        f" else _symint_coerce(args[{arg_idx}])"
+                    )
                 else:
                     call_args.append(f"args[{arg_idx}]")
                     
@@ -4359,10 +4567,65 @@ def _install_tensor_complex_parts(tensorbase, dispatch) -> None:
     tensorbase.imag = property(lambda self: dispatch("aten.imag.default", self))
 
 
+def _install_tensor_size_list_tensor_forms(module, tensorbase) -> None:
+    """`Tensor.new_zeros((..., 0-dim int Tensor, ...))` -- `led` and
+    `longformer`'s shared wall (docs/STRIDED.md §6, docs/BIND5.md §1).
+
+    `LongformerSelfAttention._sliding_chunks_query_key_matmul`, borrowed
+    verbatim by `modeling_led.py:440` and `modeling_longformer.py:796`, writes
+
+        diagonal_chunked_attention_scores.new_zeros(
+            (batch_size * num_heads, chunks_count + 1,
+             window_overlap, window_overlap * 2 + 1)
+        )
+
+    and `chunks_count` there is a **0-dim int64 Tensor**, not a Python int --
+    confirmed by instrumenting the real call rather than read off the source
+    (`['int', 'Tensor=tensor(2)', 'int', 'int']`). It is the same argument
+    form docs/BIND4.md §3 landed for `torch.zeros`, arriving at a *method*
+    this time, and measured to be upstream's rule for the method too before
+    being written: `x.new_zeros((2, tensor(3), 4))` gives `(2, 3, 4)` on real
+    torch 2.13.0.
+
+    This wraps `new_zeros` ALONE and not the rest of the `new_*` family, for
+    the reason docs/ARGFORM.md §2 gives and docs/BIND4.md §3 followed for
+    `zeros`: upstream accepts the form for `new_ones`, `new_empty` and
+    `new_full` as well (measured, docs/BIND5.md §1), but nothing measured
+    calls them that way, and a rule installed table-wide would accept a
+    Tensor in every `SymInt[]` position with no matching measurement behind
+    each one.
+
+    Unlike `torch.zeros`, there is no `_MODE_STACK` guard to reproduce here.
+    `DeviceContext.__torch_function__` matches its 36 constructors by object
+    identity off the `torch` MODULE (`_device_constructors()`,
+    `torch/utils/_device.py`), and a bound tensor method is not among them --
+    which is why docs/BIND4.md §3.1's trap does not have a sibling on this
+    path. The wrapped method's behaviour is otherwise the table-driven one,
+    byte for byte: it forwards `*args` and `**kwargs` untouched.
+    """
+    table_new_zeros = tensorbase.new_zeros
+
+    def new_zeros(self, *args, **kwargs):
+        # `*args` rather than a named `size` parameter, so that the arity
+        # refusal for `x.new_zeros()` stays the table's own message about the
+        # aten schema instead of becoming a Python signature error about a
+        # parameter upstream does not name.
+        if args:
+            args = (
+                _coerce_symint_size_tensors(module, "new_zeros", args[0]),
+            ) + args[1:]
+        return table_new_zeros(self, *args, **kwargs)
+
+    new_zeros.__name__ = "new_zeros"
+    new_zeros.__qualname__ = "TensorBase.new_zeros"
+    tensorbase.new_zeros = new_zeros
+
+
 def _install_tensor_methods(module, tensorbase, dispatch, methods) -> None:
     for name, entry in methods.items():
         setattr(tensorbase, name, _tensor_method(name, dispatch, entry))
 
+    _install_tensor_size_list_tensor_forms(module, tensorbase)
     _install_tensor_T(tensorbase)
     _install_tensor_complex_parts(tensorbase, dispatch)
     _install_tensor_conversions(module, tensorbase, dispatch)
@@ -7071,6 +7334,233 @@ _DISCOVERED_TYPE_RETURNS = {
 }
 
 
+def _install_fx_node_base(module) -> None:
+    """`torch._C._NodeBase`, `_NodeIter`, `_fx_map_arg`, `_fx_map_aggregate`.
+
+    docs/EXPORT.md §6 **item 2**, and only item 2. Item 1 -- the dispatcher
+    entrance -- landed in `aten.rs` first (docs/DISPATCH3.md), which is the
+    precondition §6 states in the negative: with modes not consulted, filling
+    this in would let `export` run, install a proxy mode, see nothing fire and
+    return an `ExportedProgram` with no operators in it. Modes fire now, so
+    this is the next item and not a shortcut past one.
+
+    What was here before: a synthesised type carrying `_erased`, `_next` and
+    `_prev` and four raising stubs, so `torch.fx.Graph()` died on its own
+    sentinel root node (`graph.py:1369`, `Node(self, "", "root", "", (), {})`)
+    -- four lines, no export involved (docs/EXPORT.md §4.1).
+
+    Every rule below was measured against real torch 2.13.0 in a separate
+    process rather than read off `torch/csrc/fx/node.cpp`, which this tree
+    does not carry; docs/BIND5.md §2 has the transcripts.
+
+    **The sort key is the part that a plausible implementation gets wrong.**
+    Nodes carry a `_sort_key` tuple that must order them the same way the
+    linked list does, including after an insertion *between* two neighbours,
+    and it is maintained by `_prepend` rather than by the list walk. Inserting
+    `x` between `p` and `n`:
+
+        len(p) > len(n)   ->  p[:-1] + (p[-1] + 1,)
+        len(p) < len(n)   ->  n[:-1] + (n[-1] - 1,)
+        equal             ->  p + (0,)
+
+    Measured, on a graph of three placeholders `a`/`b`/`c` at `(0,)`/`(1,)`/
+    `(2,)`: inserting before `b` gives `(0, 0)`, then before *that* gives
+    `(0, -1)`, appending at the end gives `(3,)` and inserting before `a`
+    gives `(-1,)`. A monotonically increasing counter -- the obvious wrong
+    answer -- produces the right list order and the wrong `_sort_key` order
+    the moment anything is inserted in the middle, and nothing in `fx` would
+    say so until a pass sorted nodes.
+
+    **`_update_args_kwargs` converts, and the conversion is asymmetric.**
+    Measured: a top-level `args` tuple stays a plain `tuple`, a nested list
+    becomes `immutable_list`, and the top-level `kwargs` dict becomes
+    `immutable_dict`. That falls out of `map_aggregate` mapping a tuple to a
+    tuple and a list/dict to its immutable twin, applied to both. The import
+    is lazy because `torch.fx` does not exist yet when this file runs.
+
+    **`_NodeIter` skips erased nodes.** `graph.py:1619` sets `_erased = True`
+    *after* `_remove_from_list()` and says why in a comment ("iterators may
+    retain handles to erased nodes"); measured directly by setting `_erased`
+    on a still-linked node, which then vanishes from `g.nodes` without being
+    unlinked.
+
+    **`_remove_from_list` does NOT self-link.** After it, the removed node's
+    `_prev`/`_next` still point at its former neighbours (measured). A version
+    that reset them to `self` would look tidier and would break the retained-
+    handle case above.
+    """
+    node_base = module._NodeBase
+    # The synthesised type carried `_erased`/`_next`/`_prev` as CLASS-LEVEL
+    # raising getters. They have to go before anything can hold state: those
+    # three names are read on the very first `Node.__setattr__`
+    # (`torch/fx/node.py:885` calls `hasattr(self, name)`), and a getter that
+    # raises `NotImplementedError` rather than `AttributeError` makes
+    # `hasattr` propagate instead of answering `False`. So the wall was not
+    # only the four stubs docs/EXPORT.md §4.1 counted -- the three members it
+    # listed as "present and real" were raising too, which is why they are
+    # deleted rather than left alone here.
+    for _stub in (
+        "_args", "_erased", "_input_nodes", "_kwargs", "_next", "_prev",
+        "_repr_fn", "_sort_key", "graph", "meta", "name", "op", "target",
+        "type", "users",
+    ):
+        if _stub in vars(node_base):
+            delattr(node_base, _stub)
+    _immutable = []
+
+    def _immutable_collections():
+        # Lazy: `torch.fx` is not importable at bootstrap time. Upstream's
+        # node.cpp does the same lazy import for the same reason.
+        if not _immutable:
+            from torch.fx.immutable_collections import immutable_dict, immutable_list
+
+            _immutable.append((immutable_list, immutable_dict))
+        return _immutable[0]
+
+    def _fx_map_aggregate(a, fn):
+        """`fn` over every LEAF of an argument aggregate, structure preserved."""
+        if isinstance(a, tuple):
+            mapped = tuple(_fx_map_aggregate(e, fn) for e in a)
+            # namedtuples rebuild positionally, not from an iterable
+            return type(a)(*mapped) if hasattr(a, "_fields") else mapped
+        if isinstance(a, list):
+            immutable_list, _ = _immutable_collections()
+            return immutable_list(_fx_map_aggregate(e, fn) for e in a)
+        if isinstance(a, dict):
+            _, immutable_dict = _immutable_collections()
+            return immutable_dict(
+                (k, _fx_map_aggregate(v, fn)) for k, v in a.items()
+            )
+        if isinstance(a, slice):
+            return slice(
+                _fx_map_aggregate(a.start, fn),
+                _fx_map_aggregate(a.stop, fn),
+                _fx_map_aggregate(a.step, fn),
+            )
+        return fn(a)
+
+    def _fx_map_arg(a, fn):
+        """`fn` over every NODE in an argument aggregate, everything else
+        passed through. A `set` is a leaf here, not an aggregate -- measured
+        upstream, where `_fx_map_arg({a}, ...)` gives `{a}` back untouched."""
+        return _fx_map_aggregate(a, lambda x: fn(x) if isinstance(x, node_base) else x)
+
+    def __init__(self, graph, name, op, target, return_type=None):
+        self.graph = graph
+        self.name = name
+        self.op = op
+        self.target = target
+        self.type = return_type
+        self._args = ()
+        self._kwargs = {}
+        self._input_nodes = {}
+        self.users = {}
+        self.meta = {}
+        self._repr_fn = None
+        self._sort_key = ()
+        self._erased = False
+        # A fresh node is its own neighbour, so `_prepend` can unlink it
+        # unconditionally before splicing it in.
+        self._prev = self
+        self._next = self
+
+    def _update_args_kwargs(self, args, kwargs):
+        for old in self._input_nodes:
+            old.users.pop(self, None)
+        identity = lambda x: x  # noqa: E731
+        self._args = _fx_map_aggregate(args, identity)
+        self._kwargs = _fx_map_aggregate(kwargs, identity)
+        found = {}
+
+        def collect(n):
+            found.setdefault(n)
+            return n
+
+        _fx_map_arg(self._args, collect)
+        _fx_map_arg(self._kwargs, collect)
+        self._input_nodes = found
+        for n in found:
+            n.users.setdefault(self)
+
+    def _remove_from_list(self):
+        prev, nxt = self._prev, self._next
+        if prev is not None:
+            prev._next = nxt
+        if nxt is not None:
+            nxt._prev = prev
+
+    def _prepend(self, x):
+        if x is self:
+            return
+        x._remove_from_list()
+        prev = self._prev
+        prev._next = x
+        x._prev = prev
+        x._next = self
+        self._prev = x
+        psk, nsk = prev._sort_key, self._sort_key
+        if len(psk) > len(nsk):
+            x._sort_key = psk[:-1] + (psk[-1] + 1,)
+        elif len(psk) < len(nsk):
+            x._sort_key = nsk[:-1] + (nsk[-1] - 1,)
+        else:
+            x._sort_key = psk + (0,)
+
+    def _replace_input_with(self, old_input, new_input):
+        def swap(n):
+            return new_input if n is old_input else n
+
+        self._update_args_kwargs(
+            _fx_map_arg(self._args, swap), _fx_map_arg(self._kwargs, swap)
+        )
+
+    node_base.__init__ = __init__
+    node_base._update_args_kwargs = _update_args_kwargs
+    node_base._remove_from_list = _remove_from_list
+    node_base._prepend = _prepend
+    node_base._replace_input_with = _replace_input_with
+    # Ordering is by `_sort_key`, not by a walk of the list: upstream defines
+    # all four comparisons on the C type and `fx` passes nodes to `sorted()`.
+    # `__eq__`/`__hash__` are deliberately NOT touched -- `users` and
+    # `_input_nodes` are dicts KEYED BY NODE, so identity hashing is what makes
+    # two structurally identical nodes two different users.
+    node_base.__lt__ = lambda self, other: self._sort_key < other._sort_key
+    node_base.__gt__ = lambda self, other: self._sort_key > other._sort_key
+    node_base.__le__ = lambda self, other: self._sort_key <= other._sort_key
+    node_base.__ge__ = lambda self, other: self._sort_key >= other._sort_key
+
+    class _NodeIter:
+        """`torch._C._NodeIter(root, reversed)` -- `graph.py:302`'s iterator.
+
+        `reversed` picks the direction; the root sentinel terminates and is
+        never yielded, and erased nodes are skipped rather than yielded.
+        """
+
+        def __init__(self, root, reversed=False):
+            self._root = root
+            self._cur = root
+            self._reversed = bool(reversed)
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            cur = self._cur
+            while True:
+                cur = cur._prev if self._reversed else cur._next
+                self._cur = cur
+                if cur is self._root:
+                    raise StopIteration
+                if not cur._erased:
+                    return cur
+
+    _NodeIter.__module__ = "torch._C"
+    _NodeIter.__qualname__ = _NodeIter.__name__ = "_NodeIter"
+    module._NodeIter = _NodeIter
+    module._fx_map_arg = _fx_map_arg
+    module._fx_map_aggregate = _fx_map_aggregate
+
+
 def _install_dispatch_keys(module) -> None:
     """`DispatchKey` and `DispatchKeySet`, for real.
 
@@ -9085,9 +9575,11 @@ def _install_composites(module, varfns, dispatch) -> None:
             raise NotImplementedError(
                 "not implemented in torch._C shim: torch.repeat_interleave with a "
                 "tensor `repeats` -- upstream lowers it to "
-                "aten::repeat_interleave.Tensor followed by aten::index_select, and "
-                "this shim has neither kernel; the integer `repeats` spelling is "
-                "implemented"
+                "aten::repeat_interleave.Tensor followed by aten::index_select; "
+                "aten::index_select IS implemented here and "
+                "aten::repeat_interleave.Tensor is not, and building the index "
+                "without it would mean reading `repeats` back to the host -- the "
+                "integer `repeats` spelling is implemented"
             )
         repeats = int(repeats)
         if repeats < 0:
@@ -10407,6 +10899,7 @@ def _install_behaviour(module, dispatch, transcribed) -> None:
     module._set_generator_metaclass = _set_generator_metaclass
 
     _install_dispatch_keys(module)
+    _install_fx_node_base(module)
     # Seeded with the schemas that exist only in C++ upstream, or only in
     # torchgen's build-time generation -- this tree carries neither -- then
     # added to by every `define()` the tree makes; see
