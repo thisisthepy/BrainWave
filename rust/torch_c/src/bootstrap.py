@@ -10881,65 +10881,219 @@ def _install_distributed_c10d(module, spec) -> None:
     # A root rank other than 0 is refused rather than clamped -- asking rank 3
     # to be the root of a one-rank group is a bug in the caller, and answering
     # it would hide that.
-    class ProcessGroupLocal(Backend):
-        """The collectives of a group whose only member is this process.
+    # Rendezvous waits for every peer to arrive; the data sockets carry one
+    # collective's payload over loopback. They are different waits, so they are
+    # different numbers. The data timeout is kept at the 30 s
+    # docs/FEDERATED3.md §4 measured the dropout against; the rendezvous one is
+    # generous on purpose, because it is waiting for N interpreters to import
+    # torch on a loaded machine and not for bytes that are already in flight.
+    _PG_RENDEZVOUS_TIMEOUT = 300.0
+    _PG_SOCKET_TIMEOUT = 30.0
 
-        Named `Local` rather than after a transport because there is none: the
-        peer set is `{self}`. That is not a degenerate case to be tolerated --
-        it is the case federated learning starts from (DESIGN.md §11.1), where
-        one device holds one shard and aggregation happens a layer up.
+    class ProcessGroupLocal(Backend):
+        """The collectives of a group of `size` processes joined by a star of sockets.
+
+        Named `Local` rather than after a transport because there was none when
+        it was written: the peer set was `{self}`. It now spans
+        `world_size >= 1` over loopback TCP, and the name is kept because what
+        it is local to is the machine -- docs/TRANSPORT.md, docs/FEDERATED4.md.
+
+        **The topology is a star, and rank 0 is the hub.** Every other rank
+        connects to it and talks to nobody else. A ring would halve the wire
+        volume of an allreduce and is what a real backend does; it is not what
+        this is, because a star makes the reduction order a property of one
+        process rather than an emergent property of N. See `_star_exchange`.
+
+        **The ordering contract.** The hub folds contributions in **ascending
+        rank order**, `((x_0 + x_1) + x_2) + ...`, and sends *one* result back
+        to every rank -- nobody adds anything locally. Float addition is not
+        associative, so an implementation that summed in arrival order would
+        give a different answer on a different day, and a test that allowed
+        that difference would also allow a lost rank. This is the contract a
+        test can hold: the same expression written centrally, in rank order,
+        must be equal bit for bit.
         """
 
         def __init__(self, rank=0, size=1, store=None):
-            if size not in (1, 2):
-                raise NotImplementedError(
+            if not isinstance(size, int) or isinstance(size, bool) or size < 1:
+                raise ValueError(
                     "torch._C._distributed_c10d.ProcessGroupLocal: world_size "
-                    f"{size} needs a transport, and this build has none. Only "
-                    "world_size 1 and 2 are implemented"
+                    f"{size!r} is not a positive integer"
                 )
-            if size == 1 and rank != 0:
+            if not isinstance(rank, int) or isinstance(rank, bool) or not 0 <= rank < size:
                 raise ValueError(
                     "torch._C._distributed_c10d.ProcessGroupLocal: rank "
-                    f"{rank} is not in a world of size 1"
-                )
-            if size == 2 and rank not in (0, 1):
-                raise ValueError(
-                    "torch._C._distributed_c10d.ProcessGroupLocal: rank "
-                    f"{rank} is not in a world of size 2"
+                    f"{rank!r} is not in a world of size {size}"
                 )
             super().__init__(rank, size)
             self._store = store
+            #: hub only -- {peer rank: socket}. Empty on every other rank.
+            self._peers = {}
+            #: leaf only -- the socket to rank 0. `None` on the hub.
+            self._hub = None
+            if size > 1:
+                if store is None:
+                    refuse(
+                        f"ProcessGroupLocal at world_size {size} with no store",
+                        "the ranks find each other through a Store -- rank 0 "
+                        "publishes the port it bound and the others wait on "
+                        "that key -- and none was passed",
+                    )
+                self._rendezvous(rank, size, store)
 
-            self._sock = None
-            if size == 2:
-                import socket, datetime
-                self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                # Socket timeout to avoid hanging forever
-                self._sock.settimeout(30.0)
-                if rank == 0:
-                    self._sock.bind(("127.0.0.1", 0))
-                    self._sock.listen()
-                    port = self._sock.getsockname()[1]
-                    self._store.set("pg_local_port", str(port).encode('utf-8'))
-                    self._peer, _ = self._sock.accept()
-                else:
-                    self._store.wait(["pg_local_port"])
-                    port = int(self._store.get("pg_local_port").decode('utf-8'))
-                    self._sock.connect(("127.0.0.1", port))
-                    self._peer = self._sock
+        def _rendezvous(self, rank, size, store):
+            """Build the star. One store key, `size - 1` connections.
+
+            Rank 0 binds an ephemeral port, publishes it, and accepts until it
+            has heard from every other rank. Each leaf sends its own rank as
+            the first four bytes it writes, because `accept` returns them in
+            whatever order the kernel completed the handshakes and **the
+            reduction order is by rank, not by arrival**. Without that greeting
+            the hub would have to guess, and the guess would be right most of
+            the time -- which is the shape of defect this whole layer refuses.
+            """
+            import socket, struct
+
+            if rank == 0:
+                listen = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                listen.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                listen.bind(("127.0.0.1", 0))
+                listen.listen(size)
+                listen.settimeout(_PG_RENDEZVOUS_TIMEOUT)
+                store.set("pg_local_port",
+                          str(listen.getsockname()[1]).encode("utf-8"))
+                try:
+                    while len(self._peers) < size - 1:
+                        conn, _ = listen.accept()
+                        conn.settimeout(_PG_SOCKET_TIMEOUT)
+                        peer = struct.unpack("!I", self._recv_exact(conn, 4))[0]
+                        if not 1 <= peer < size or peer in self._peers:
+                            raise RuntimeError(
+                                "torch._C._distributed_c10d.ProcessGroupLocal: "
+                                f"a peer announced itself as rank {peer} in a "
+                                f"world of size {size}; "
+                                f"{sorted(self._peers)} had already arrived"
+                            )
+                        self._peers[peer] = conn
+                finally:
+                    listen.close()
+            else:
+                store.wait(["pg_local_port"])
+                port = int(store.get("pg_local_port").decode("utf-8"))
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(_PG_SOCKET_TIMEOUT)
+                sock.connect(("127.0.0.1", port))
+                sock.sendall(struct.pack("!I", rank))
+                self._hub = sock
 
         def name(self):
             return "local"
 
-        def _recv_all(self, n):
+        # -- the wire ------------------------------------------------------
+        #
+        # Length-prefixed JSON, unchanged from docs/TRANSPORT.md §2. What
+        # changed is who talks to whom.
+        @staticmethod
+        def _recv_exact(sock, n):
             data = b""
             while len(data) < n:
-                packet = self._peer.recv(n - len(data))
+                packet = sock.recv(n - len(data))
                 if not packet:
                     raise RuntimeError("connection closed")
                 data += packet
             return data
+
+        @staticmethod
+        def _frame(payload):
+            import json, struct
+            data = json.dumps(payload).encode("utf-8")
+            return struct.pack("!I", len(data)) + data
+
+        def _recv_json(self, sock):
+            import json, struct
+            (length,) = struct.unpack("!I", self._recv_exact(sock, 4))
+            return json.loads(self._recv_exact(sock, length).decode("utf-8"))
+
+        #: The three faces of a peer that is gone. `_collective` in
+        #: `torchnative.nn.federated` translates them into `RankDropped`; here
+        #: they are only caught, never interpreted.
+        _GONE = (OSError, EOFError, RuntimeError)
+
+        @classmethod
+        def _is_gone(cls, exc):
+            if isinstance(exc, RuntimeError) and not isinstance(exc, OSError):
+                return "connection closed" in str(exc)
+            return isinstance(exc, cls._GONE)
+
+        def _star_exchange(self, payload, fold, tolerate=False):
+            """One collective. Returns ``(result, missing)``.
+
+            Every leaf sends its payload to the hub and then reads one answer.
+            The hub reads from **every** leaf before it writes to any of them,
+            which is what makes this deadlock-free at any size: `sendall`
+            returns when the kernel took the bytes, not when the peer read
+            them (docs/FEDERATED.md's `_WIRE_*` note), so a leaf blocked
+            mid-send is only ever waiting for a hub that is already draining.
+
+            `fold(payloads, ranks)` runs **on the hub only**, over the ranks
+            that arrived, in ascending rank order. Its result is what every
+            survivor receives -- byte for byte the same JSON -- so no rank
+            computes a sum of its own and no two ranks can round differently.
+
+            `missing` is the hub's verdict and travels in the envelope, so the
+            survivors agree about who is gone rather than each timing out
+            separately. With `tolerate=False` a non-empty verdict is still
+            returned rather than raised; the caller decides.
+            """
+            if self._size == 1:
+                return fold([payload], [0]), ()
+            if self._rank == 0:
+                contributions = {0: payload}
+                missing = []
+                for peer in sorted(self._peers):
+                    try:
+                        contributions[peer] = self._recv_json(self._peers[peer])
+                    except Exception as exc:
+                        if not self._is_gone(exc):
+                            raise
+                        missing.append(peer)
+                present = [r for r in range(self._size) if r not in missing]
+                result = fold([contributions[r] for r in present], present)
+                frame = self._frame({"missing": missing, "result": result})
+                late = []
+                for peer in present:
+                    if peer == 0:
+                        continue
+                    try:
+                        self._peers[peer].sendall(frame)
+                    except Exception as exc:
+                        if not self._is_gone(exc):
+                            raise
+                        late.append(peer)
+                if late:
+                    # A rank that answered and then died before it could be
+                    # told the answer. The ranks it was folded with have
+                    # already been sent a result that counts it, so there is no
+                    # verdict this can report that every survivor also holds.
+                    # Refused rather than patched over -- docs/FEDERATED4.md.
+                    raise RuntimeError(
+                        "connection closed: rank(s) %s contributed to this "
+                        "collective and then went away before the result "
+                        "reached them, so the survivors do not agree about "
+                        "who was in it" % (late,)
+                    )
+                return result, tuple(missing)
+            try:
+                self._hub.sendall(self._frame(payload))
+                envelope = self._recv_json(self._hub)
+            except Exception as exc:
+                if not self._is_gone(exc):
+                    raise
+                # The hub is what every rank reaches the others through, so
+                # losing it is losing all of them at once.
+                return None, tuple(r for r in range(self._size)
+                                   if r != self._rank)
+            return envelope["result"], tuple(envelope["missing"])
 
         # -- reductions ----------------------------------------------------
         @staticmethod
@@ -10966,54 +11120,74 @@ def _install_distributed_c10d(module, spec) -> None:
                     f"rootRank {root} is not in a world of size 1"
                 )
 
-        def allreduce(self, tensors, opts=None):
-            self._check_reduce_op(opts, "allreduce")
-            if self._size == 1:
-                return Work(tensors)
-                
+        def _require_sum(self, opts, what):
             op = getattr(opts, "reduceOp", None)
             kind = getattr(op, "op", op)
             if kind is not getattr(_RedOpType, "SUM", None):
                 refuse(
-                    f"ProcessGroupLocal.allreduce with non-SUM op at world_size {self._size}",
-                    "Only SUM is implemented for world_size=2"
+                    f"ProcessGroupLocal.{what} with a non-SUM op at "
+                    f"world_size {self._size}",
+                    "Only SUM is implemented above world_size 1. AVG would be "
+                    "SUM over a divisor, which is the one number a federated "
+                    "aggregator must choose for itself",
                 )
 
-            import json, struct
-            for t in tensors:
-                data = json.dumps(t.tolist()).encode('utf-8')
-                frame = struct.pack('!I', len(data)) + data
-
-                # **Ordered by rank, because both sending first deadlocks.**
-                # `sendall` returns when the *kernel* has taken the bytes, not
-                # when the peer has read them, so it blocks once the payload
-                # exceeds the socket buffers. Both ranks sending before either
-                # receives means both block in `sendall` with nobody reading:
-                # 2.8 MB completed in 0.17 s and 4.05 MB hung for 30 s, and the
-                # wall was not even a constant -- 8.1 MB passed after a warm-up
-                # ramp had grown the buffers. A hang that depends on how much
-                # traffic came before it is the worst shape this could have.
-                #
-                # Even rank sends then receives, odd rank receives then sends.
-                # One side is always draining, so neither can fill the other's
-                # buffer with nobody home. Deterministic, and no thread.
-                if self._rank % 2 == 0:
-                    self._peer.sendall(frame)
-                    length = struct.unpack('!I', self._recv_all(4))[0]
-                    peer_data = self._recv_all(length)
-                else:
-                    length = struct.unpack('!I', self._recv_all(4))[0]
-                    peer_data = self._recv_all(length)
-                    self._peer.sendall(frame)
-
-                peer_list = json.loads(peer_data.decode('utf-8'))
-
+        @staticmethod
+        def _sum_fold(template):
+            """Fold `payloads` into their sum, in the order they are given."""
+            def fold(payloads, ranks):
                 import torch
-                peer_tensor = torch.tensor(peer_list, dtype=t.dtype, device=t.device)
-                t.add_(peer_tensor)
-                
-            return Work(tensors)
+                acc = torch.tensor(payloads[0], dtype=template.dtype,
+                                   device=template.device)
+                for payload in payloads[1:]:
+                    acc.add_(torch.tensor(payload, dtype=template.dtype,
+                                          device=template.device))
+                return acc.tolist()
+            return fold
 
+        def _allreduce(self, tensors, opts, tolerate):
+            self._check_reduce_op(opts, "allreduce")
+            if self._size == 1:
+                return Work(tensors), ()
+            self._require_sum(opts, "allreduce")
+            import torch
+            missing = ()
+            for t in tensors:
+                result, gone = self._star_exchange(
+                    t.tolist(), self._sum_fold(t), tolerate)
+                if gone and not tolerate:
+                    raise RuntimeError(
+                        "connection closed: rank(s) %s did not contribute to "
+                        "this allreduce" % (list(gone),))
+                missing = gone
+                if result is not None:
+                    # Reconstructed from the hub's JSON even on the hub, so
+                    # every rank ends holding bytes that went through the same
+                    # encoding. `repr` of a float round-trips exactly, so this
+                    # is a copy and not a second rounding.
+                    t.copy_(torch.tensor(result, dtype=t.dtype,
+                                         device=t.device))
+            return Work(tensors), missing
+
+        def allreduce(self, tensors, opts=None):
+            work, _ = self._allreduce(tensors, opts, tolerate=False)
+            return work
+
+        def allreduce_partial(self, tensors, opts=None):
+            """`allreduce` that completes over whoever arrived. Shim-only.
+
+            Returns ``(Work, missing_ranks)``. There is no upstream spelling of
+            this because upstream's allreduce either completes over the world
+            or is an error, and so is `allreduce` above. This exists so that
+            `Engine(on_missing='average_arrived')` can name a divisor: the
+            survivor set is the **hub's** verdict, carried to every survivor in
+            the same envelope as the data, so the ranks that go on divide by
+            the same number rather than by whatever each of them timed out on.
+            """
+            if self._size == 1:
+                refuse("ProcessGroupLocal.allreduce_partial at world_size 1",
+                       "a world of one has no survivor set to report")
+            return self._allreduce(tensors, opts, tolerate=True)
         def allreduce_coalesced(self, tensors, opts=None):
             if self._size != 1:
                 refuse("ProcessGroupLocal.allreduce_coalesced", "Only world_size 1 is implemented")
@@ -11034,30 +11208,104 @@ def _install_distributed_c10d(module, spec) -> None:
             self._check_root(opts, "broadcast")
             return Work(tensors)
 
+        @staticmethod
+        def _gather_fold(size):
+            """Fold into ``{str(rank): payload}`` -- who said what, not a sum.
+
+            Keyed by rank rather than positional, so that a caller reading it
+            cannot mistake "the third thing that arrived" for "rank 2".
+            """
+            def fold(payloads, ranks):
+                return {str(r): p for r, p in zip(ranks, payloads)}
+            return fold
+
+        def _allgather(self, source, tolerate):
+            """``([payload per rank], missing)``, ordered by rank."""
+            result, gone = self._star_exchange(
+                source.tolist(), self._gather_fold(self._size), tolerate)
+            if gone and not tolerate:
+                raise RuntimeError(
+                    "connection closed: rank(s) %s did not contribute to this "
+                    "allgather" % (list(gone),))
+            if result is None:
+                return None, gone
+            return [result.get(str(r)) for r in range(self._size)], gone
+
         def allgather(self, output_tensors, input_tensors, opts=None):
-            if self._size != 1:
-                refuse("ProcessGroupLocal.allgather", "Only world_size 1 is implemented")
+            """Every rank's tensor, on every rank, in rank order.
+
+            This is what makes `federated.agree` exact above two ranks. A
+            sum-and-compare (`total == value * world`) is an equality test only
+            at two; at three it accepts `(h-1, h, h+1)`, so the check that two
+            ranks disagreed would pass on three that did -- docs/FEDERATED4.md.
+            """
+            import torch
             for outputs, source in zip(output_tensors, input_tensors):
-                if len(outputs) != 1:
+                if len(outputs) != self._size:
                     raise ValueError(
-                        "torch._C._distributed_c10d.ProcessGroupLocal.allgather: "
-                        f"output list has {len(outputs)} slots for a world of size 1"
+                        "torch._C._distributed_c10d.ProcessGroupLocal.allgather"
+                        f": output list has {len(outputs)} slots for a world "
+                        f"of size {self._size}"
                     )
-                outputs[0].copy_(source)
+                if self._size == 1:
+                    outputs[0].copy_(source)
+                    continue
+                payloads, _ = self._allgather(source, tolerate=False)
+                for rank, payload in enumerate(payloads):
+                    outputs[rank].copy_(torch.tensor(
+                        payload, dtype=outputs[rank].dtype,
+                        device=outputs[rank].device))
             return Work([t for group in output_tensors for t in group])
 
+        def allgather_partial(self, output_tensors, input_tensors, opts=None):
+            """`allgather` that completes over whoever arrived. Shim-only.
+
+            Returns ``(Work, missing_ranks)``. The slots belonging to a rank
+            that did not report are **left as the caller passed them** rather
+            than zeroed: a zero is a value, and a caller that ignored the
+            returned survivor set would average it in. See `allreduce_partial`.
+            """
+            import torch
+            if self._size == 1:
+                refuse("ProcessGroupLocal.allgather_partial at world_size 1",
+                       "a world of one has no survivor set to report")
+            missing = ()
+            for outputs, source in zip(output_tensors, input_tensors):
+                if len(outputs) != self._size:
+                    raise ValueError(
+                        "torch._C._distributed_c10d.ProcessGroupLocal."
+                        f"allgather_partial: output list has {len(outputs)} "
+                        f"slots for a world of size {self._size}"
+                    )
+                payloads, missing = self._allgather(source, tolerate=True)
+                if payloads is None:
+                    continue
+                for rank, payload in enumerate(payloads):
+                    if payload is None:
+                        continue
+                    outputs[rank].copy_(torch.tensor(
+                        payload, dtype=outputs[rank].dtype,
+                        device=outputs[rank].device))
+            return Work([t for group in output_tensors for t in group]), missing
+
         def _allgather_base(self, output, input, opts=None):
-            if self._size != 1:
-                refuse("ProcessGroupLocal._allgather_base", "Only world_size 1 is implemented")
-            output.copy_(input)
+            """The flat spelling: `output` is `world_size` copies of `input`."""
+            import torch
+            if self._size == 1:
+                output.copy_(input)
+                return Work([output])
+            payloads, _ = self._allgather(input, tolerate=False)
+            flat = torch.cat([
+                torch.tensor(p, dtype=output.dtype,
+                             device=output.device).reshape(-1)
+                for p in payloads])
+            output.copy_(flat.reshape(output.shape))
             return Work([output])
 
         # 2.13's spelling of `_allgather_base`;
         # `distributed_c10d.py:4387` calls this one and `all_gather_into_tensor`
         # is the deprecated alias for it.
         def all_gather_single(self, output, input, opts=None):
-            if self._size != 1:
-                refuse("ProcessGroupLocal.all_gather_single", "Only world_size 1 is implemented")
             return self._allgather_base(output, input, opts)
 
         def all_gather_single_coalesced(self, outputs, inputs, opts=None):
@@ -11141,6 +11389,23 @@ def _install_distributed_c10d(module, spec) -> None:
                 output, input, output_split_sizes, input_split_sizes, opts)
 
         def barrier(self, opts=None):
+            """A real barrier above world_size 1, not a no-op that reports one.
+
+            At one rank it is genuinely satisfied on arrival. Above one it is
+            one trip through the star: nobody leaves until the hub has heard
+            from everybody, which is what a barrier is. Returning `Work()`
+            here would be the `filled` guard from docs/CKPT.md again -- a
+            caller that used a barrier to order two collectives would be
+            told it happened.
+            """
+            if self._size == 1:
+                return Work()
+            _, gone = self._star_exchange(0, lambda payloads, ranks: 0,
+                                          tolerate=False)
+            if gone:
+                raise RuntimeError(
+                    "connection closed: rank(s) %s never reached this barrier"
+                    % (list(gone),))
             return Work()
 
         # -- point to point ------------------------------------------------
@@ -11149,17 +11414,22 @@ def _install_distributed_c10d(module, spec) -> None:
         # any amount of local work.
         def send(self, tensors, dst_rank, tag=0):
             refuse("ProcessGroupLocal.send",
-                   f"no rank {dst_rank} exists in a world of size 1, and this "
-                   "build has no transport to reach one")
+                   f"there is no route from rank {self._rank} to rank "
+                   f"{dst_rank}. The topology is a star through rank 0 "
+                   "(docs/FEDERATED4.md), so a message between two leaves "
+                   "would have to be relayed by the hub, and a relay that "
+                   "the hub can read is not the primitive secure aggregation "
+                   "needs. Refused rather than faked")
 
         def recv(self, tensors, src_rank, tag=0):
             refuse("ProcessGroupLocal.recv",
-                   f"no rank {src_rank} exists in a world of size 1, and this "
-                   "build has no transport to reach one")
+                   f"there is no route from rank {src_rank} to rank "
+                   f"{self._rank}; the topology is a star through rank 0")
 
         def recv_anysource(self, tensors, tag=0):
             refuse("ProcessGroupLocal.recv_anysource",
-                   "no other rank exists in a world of size 1")
+                   "the star gives no way to name the sender of the next "
+                   "frame that arrives")
 
         def _start_coalescing(self, *args, **kwargs):
             return None
@@ -11201,6 +11471,11 @@ def _install_distributed_c10d(module, spec) -> None:
         "reduce_scatter_single_coalesced", "reduce_scatter_tensor_coalesced",
         "alltoall", "alltoall_base", "all_to_all_single", "barrier",
         "send", "recv", "recv_anysource",
+        # Shim-only, and not upstream spellings: they return
+        # `(Work, missing_ranks)` rather than `Work`. Forwarded so that
+        # `torchnative.nn.federated` can reach them through the group object
+        # it already holds instead of reaching into `_backends`.
+        "allreduce_partial", "allgather_partial",
     ):
         setattr(ProcessGroup, _method, _forwarded(_method))
 

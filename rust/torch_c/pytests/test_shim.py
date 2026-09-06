@@ -19689,7 +19689,10 @@ def test_federated_refuses_a_world_of_one_by_name_at_every_door():
         assert msg.startswith("NotImplementedError:"), (key, msg)
         assert "a world of one" in msg, (key, msg)
         assert "identity function" in msg, (key, msg)
-        assert "Check: torch.distributed.get_world_size() == 2" in msg, (key, msg)
+        # `>= 2`, not `== 2`: the transport carries any world now
+        # (docs/FEDERATED4.md), and the door that still refuses is the world
+        # of *one*, which is what this test is about.
+        assert "Check: torch.distributed.get_world_size() >= 2" in msg, (key, msg)
     assert "FedAvg.aggregate" in out["aggregate"], out["aggregate"]
     assert "Delta.publish" in out["publish"], out["publish"]
     assert "Engine.participate" in out["engine"], out["engine"]
@@ -19722,7 +19725,12 @@ def test_federated_refuses_the_shapes_that_would_average_incomparable_things():
         assert r["schema_mismatch"].startswith("ValueError:"), r["schema_mismatch"]
         assert "which parameters this round covers" in r["schema_mismatch"], \
             r["schema_mismatch"]
-        assert "would sum to" in r["schema_mismatch"], r["schema_mismatch"]
+        # The sum-and-compare became a rank-by-rank comparison when the
+        # world stopped being exactly two: `h0 + h1 == 2*h0` is an equality
+        # test only at two ranks. The refusal moved doors; this is the
+        # stronger message at the new one (docs/FEDERATED4.md §3).
+        assert "rank by rank rather than summed" in r["schema_mismatch"], \
+            r["schema_mismatch"]
 
         assert r["base_mismatch"].startswith("ValueError:"), r["base_mismatch"]
         assert "the base these deltas are offsets from" in r["base_mismatch"], \
@@ -19771,12 +19779,19 @@ def test_federated_refuses_the_round_shapes_it_does_not_implement():
     assert r0["engine_rounds_string"].startswith(("ValueError:", "TypeError:")), \
         r0["engine_rounds_string"]
 
+    # A proper subset of *two* ranks is a cohort of one, and that is now the
+    # door: the transport carries any world (docs/FEDERATED4.md), so the
+    # refusal stopped being "no wire for it" and became the arithmetic one --
+    # which is the stronger statement, because it holds at every world size.
+    # A subset of three ranks is *served*, and
+    # `test_a_proper_subset_cohort_aggregates_over_the_subset_and_not_the_world`
+    # is the acceptance for it.
     assert r0["engine_select"].startswith("NotImplementedError:"), r0["engine_select"]
-    assert "Participant selection over a proper subset" in r0["engine_select"], \
+    assert "cohort of 1" in r0["engine_select"], r0["engine_select"]
+    assert "identity this whole package refuses to serve" in r0["engine_select"], \
         r0["engine_select"]
-    # And it names what it would take, rather than only that it does not.
-    assert "new_group" in r0["engine_select"], r0["engine_select"]
-    assert "world_size N" in r0["engine_select"], r0["engine_select"]
+    # And it still names what a subset would take, rather than only refusing.
+    assert "a world of at least three" in r0["engine_select"], r0["engine_select"]
 
     assert r0["engine_allow_missing"].startswith("NotImplementedError:"), \
         r0["engine_allow_missing"]
@@ -21281,9 +21296,28 @@ refuses("momentum_one", lambda: federated.FedAvgM(momentum=1.0))
 refuses("momentum_negative", lambda: federated.FedAvgM(momentum=-0.1))
 refuses("server_lr_zero", lambda: federated.FedAvgM(server_lr=0.0))
 refuses("mu_zero", lambda: federated.FedProx(mu=0.0))
-refuses("on_missing_average",
+# `on_missing='average_arrived'` is implemented now, and refuses at three
+# doors instead of one. Each is probed where it is, because they say
+# different things: the first two are about a divisor nobody chose, the third
+# about a world too small for the policy to mean anything.
+refuses("on_missing_average",          # no floor at all
         lambda: federated.Engine(build(), method=adapt.Tent(),
                                  on_missing="average_arrived"))
+refuses("on_missing_floor_one",        # a floor of one is a world of one
+        lambda: federated.Engine(build(), method=adapt.Tent(),
+                                 on_missing="average_arrived",
+                                 min_participants=1))
+refuses("on_missing_floor_unused",     # a floor under 'refuse' is ignored
+        lambda: federated.Engine(build(), method=adapt.Tent(),
+                                 min_participants=2))
+# The world door. Refuses inside `participate`, before the local epochs and
+# before any collective -- so the group is still in step afterwards, which
+# `again` at the bottom of this script re-checks.
+refuses("on_missing_world_two",
+        lambda: federated.Engine(build(), method=adapt.Tent(), lr=LR,
+                                 on_missing="average_arrived",
+                                 min_participants=2).participate(
+                                     [{"input_ids": ids}], weight=WEIGHT))
 refuses("on_missing_bogus",
         lambda: federated.Engine(build(), method=adapt.Tent(),
                                  on_missing="whoever_shows_up"))
@@ -21618,11 +21652,14 @@ def test_participant_selection_is_agreed_across_the_ranks_and_a_subset_refuses()
     cohort is agreed over the same digest collective the schema and the base
     use, and a disagreement refuses by name.
 
-    A **proper subset** is refused, and the message says what it would take:
-    the collective would have to run on a sub-group (`new_group`), and the
-    transport implements only worlds of 1 and 2. At two ranks the only subsets
-    have one member, where FedAvg is the identity -- so this cannot be served
-    here even approximately.
+    A **proper subset** at *two* ranks is still refused, and the reason moved:
+    it used to be that the transport implemented only worlds of 1 and 2, and
+    it now carries any world (docs/FEDERATED4.md). What is left is the
+    arithmetic -- at two ranks every proper subset has one member, where
+    FedAvg is the identity -- so the refusal holds at every world size instead
+    of until the next round of work. The subset that *is* served is asserted
+    over three ranks, in
+    `test_a_proper_subset_cohort_aggregates_over_the_subset_and_not_the_world`.
     """
     if not _ckpt_shim_available():
         return
@@ -21634,13 +21671,24 @@ def test_participant_selection_is_agreed_across_the_ranks_and_a_subset_refuses()
         msg = r["cohort_disagree"]
         assert msg.startswith("ValueError:"), msg
         assert "which ranks this round selected" in msg, msg
-        assert "would sum to" in msg, msg
+        assert "rank by rank rather than summed" in msg, msg
 
+        # At two ranks a proper subset is a cohort of one, and that is now the
+        # door it refuses at -- the transport no longer refuses the world
+        # (docs/FEDERATED4.md), so the reason had to become the arithmetic one.
+        # It has to keep naming what a subset *would* take, or the refusal
+        # stops pointing anywhere: the previous message named `world_size N`
+        # as the next thing to build, and that thing now exists.
         sub = r["cohort_subset"]
         assert sub.startswith("NotImplementedError:"), sub
-        assert "new_group" in sub and "world but 1 and 2" in sub, sub
+        assert "cohort of 1" in sub, sub
         assert "identity" in sub, sub
-        assert "Next: ProcessGroupLocal at world_size N" in sub, sub
+        assert "a world of at least three" in sub, sub
+        assert "Check: len(select(world)) >= 2" in sub, sub
+        # And it must no longer blame the wire for it. The transport was the
+        # reason; it is not any more, and a refusal that sends the next reader
+        # to ProcessGroupLocal sends them to code that already does this.
+        assert "Next: ProcessGroupLocal at world_size N" not in sub, sub
 
         assert r["empty_cohort"].startswith("ValueError:"), r["empty_cohort"]
         assert r["cohort_out_of_range"].startswith("ValueError:"), \
@@ -21764,12 +21812,41 @@ def test_federated_refuses_secure_aggregation_and_differential_privacy_by_name()
         assert "accountant" in dp, dp
         assert "round of its own" in dp, dp
 
-        for key in ("on_missing_average", "allow_missing"):
-            msg = r[key]
-            assert msg.startswith("NotImplementedError:"), (key, msg)
-            assert "divisor nobody chose" in msg or "on_missing=" in msg, \
-                (key, msg)
-        assert "world_size N" in r["on_missing_average"], r["on_missing_average"]
+        # `allow_missing=True` is still not a policy, and still refuses by
+        # naming the one that is.
+        msg = r["allow_missing"]
+        assert msg.startswith("NotImplementedError:"), msg
+        assert "divisor nobody chose" in msg or "on_missing=" in msg, msg
+
+        # `on_missing='average_arrived'` is implemented (docs/FEDERATED4.md),
+        # so it stopped refusing *itself* and started refusing the three
+        # shapes of it that would still divide by a number nobody chose.
+        # Asserted at the doors they moved to, and asserted apart: a single
+        # `NotImplementedError` check over all of them would pass on a build
+        # that refused the policy outright again.
+        floor = r["on_missing_average"]
+        assert floor.startswith("TypeError:"), floor
+        assert "requires min_participants" in floor, floor
+        assert "divisor a number nobody chose" in floor, floor
+
+        one = r["on_missing_floor_one"]
+        assert one.startswith("ValueError:"), one
+        assert "a survivor set of one is a world of one" in one, one
+
+        unused = r["on_missing_floor_unused"]
+        assert unused.startswith("TypeError:"), unused
+        assert "accepted and ignored" in unused, unused
+
+        # And the world itself: at two ranks the policy is unshowable, and
+        # the refusal carries the measurement that says so rather than an
+        # assertion. That number is docs/FEDERATED3.md §4.1's, and
+        # `test_the_partial_average_a_dropout_would_have_produced_is_a_different_model`
+        # is what measured it.
+        small = r["on_missing_world_two"]
+        assert small.startswith("NotImplementedError:"), small
+        assert "in a world of 2" in small, small
+        assert "6e-8" in small, small
+        assert "world_size=3" in small, small
         assert r["on_missing_bogus"].startswith("ValueError:"), \
             r["on_missing_bogus"]
         for key in ("momentum_one", "momentum_negative", "server_lr_zero"):
@@ -22681,6 +22758,662 @@ def test_capture_refuses_demand8_inplace_names_and_lets_the_others_through():
     ops = [n["op"] if isinstance(n, dict) else n.op for n in trace.nodes]
     assert ops == ["aten.upsample_bicubic2d.default"], ops
 
+
+
+
+# ---------------------------------------------------------------------------
+# world_size N: the transport, and what three ranks make testable
+# (docs/FEDERATED4.md)
+#
+# docs/FEDERATED3.md §11 ended with "nothing was run at a world larger than
+# two", and named the three things that were waiting on it: a **proper subset**
+# cohort, a **survivor set of two or more**, and an `agree` that is exact above
+# two ranks. All three are here, and all three run in *three* real
+# `subprocess.Popen`s that share nothing but TCP sockets.
+#
+# The trap is unchanged and one step worse. At `world_size = 2` the identity to
+# watch for was FedAvg over one delta; at three there is a second one, and it is
+# quieter: **an allreduce that loses a rank still returns a plausible table.**
+# So the ordering test below is not decoration. Float addition is not
+# associative, and `1.0 + 1e8 - 1e8` is `0.0` in rank order and `1.0` in the
+# order `(1e8, -1e8, 1.0)`. A transport that summed in arrival order would give
+# whichever the kernel's `accept` happened to hand it first, and a test written
+# with a tolerance would accept both -- and would also accept the sum with the
+# `1.0` missing entirely, because `0.0` is what a lost rank looks like too.
+# The contract is **ascending rank order**, and it is asserted exactly.
+# ---------------------------------------------------------------------------
+
+_FED4_WEIGHTS = {0: 3.0, 1: 7.0, 2: 2.0}
+
+_FED4_WORKER_SRC = (
+    "import json, os, sys\n"
+    "import torch\n"
+    "import torch.nn as nn\n"
+    + _ADAPT_MODEL_SRC
+    + r'''
+out = {"shim": hasattr(torch._C, "_aten_implemented")}
+print("shim" if out["shim"] else "upstream", file=sys.stderr, flush=True)
+assert out["shim"], "this subprocess loaded upstream torch, not the shim"
+
+import torch.distributed as dist
+import torchnative.distributed  # noqa: F401 -- registers backend="local"
+from torchnative import adapt
+from torchnative.nn import federated
+
+rank, port, world, dest = (int(sys.argv[1]), int(sys.argv[2]),
+                           int(sys.argv[3]), sys.argv[4])
+WEIGHT = {0: 3.0, 1: 7.0, 2: 2.0}[rank]
+LOCAL_IDS = {0: [[3, 7, 1, 19, 5]],
+             1: [[11, 2, 23, 0, 14]],
+             2: [[6, 9, 13, 4, 21]]}[rank]
+
+dist.init_process_group(backend="local", init_method="tcp://127.0.0.1:%d" % port,
+                        rank=rank, world_size=world)
+out["rank"], out["world"] = dist.get_rank(), dist.get_world_size()
+out["weight"] = WEIGHT
+ids = torch.tensor(LOCAL_IDS)
+
+def tab(d):
+    return {n: t.tolist() for n, t in d.items()}
+
+def refuses(key, fn):
+    try:
+        fn()
+    except Exception as e:
+        out[key] = "%s: %s" % (type(e).__name__, str(e))
+    else:
+        out[key] = "ACCEPTED"
+
+# --- A. the ordering contract, in float32 where it is visible -------------
+# Rank order: (1.0 + 1e8) - 1e8 == 0.0. Any order that adds the two large
+# terms first gives 1.0. A lost rank 0 also gives 0.0 -- which is why the
+# gather below is here as well.
+ORDER = {0: 1.0, 1: 1e8, 2: -1e8}[rank]
+probe = torch.tensor([ORDER], dtype=torch.float32)
+dist.all_reduce(probe, op=dist.ReduceOp.SUM)
+out["order_allreduce"] = probe.tolist()
+out["order_contribution"] = ORDER
+
+holders = [torch.zeros(2, dtype=torch.float32) for _ in range(world)]
+dist.all_gather(holders, torch.tensor([float(rank), float(rank) * 10.0 + 1.0]))
+out["allgather"] = [h.tolist() for h in holders]
+
+flat = torch.zeros(world, dtype=torch.float32)
+dist.all_gather_into_tensor(flat, torch.tensor([float(rank) + 0.5]))
+out["allgather_flat"] = flat.tolist()
+
+dist.barrier()
+out["barrier"] = True
+
+# --- B. agree is exact at three: (h-1, h, h+1) sums to 3h -----------------
+# The old check was `total == value * world`, which at three ranks accepts
+# exactly this. Every rank must refuse, not just the two whose own product
+# misses.
+out["agree_all"] = federated.agree(4242, what="a probe every rank shares")
+refuses("agree_offset", lambda: federated.agree(4242 + rank - 1,
+                                                what="a probe that drifts"))
+
+# --- C. FedAvg over three ------------------------------------------------
+m = build()
+w = adapt.wrap(m, method=adapt.Tent(), lr=LR)
+w.online()
+for _ in range(3):
+    w.step(input_ids=ids)
+local = tab(w.adapted.value)
+out["local"] = local
+out["full"] = tab(federated.FedAvg().aggregate(dict(w.adapted.value),
+                                               weight=WEIGHT))
+
+# --- D. a proper subset: ranks 0 and 1, with rank 2 attending and abstaining
+SUB = [0, 1]
+out["subset"] = tab(federated.FedAvg().aggregate(
+    {n: torch.tensor(v) for n, v in local.items()},
+    weight=(WEIGHT if rank in SUB else federated.ABSTAIN)))
+out["cohort_subset"] = list(federated.cohort(lambda _w: SUB))
+
+eng = federated.Engine(build(), method=adapt.Tent(), lr=LR,
+                       aggregator=federated.FedAvg(), select=lambda _w: SUB)
+[rep] = eng.participate([{"input_ids": ids}] * 3, weight=WEIGHT)
+out["subset_round"] = {"cohort": list(rep.cohort), "rank": rep.rank,
+                       "world": rep.world, "steps": rep.steps,
+                       "weight": rep.weight, "total_weight": rep.total_weight,
+                       "participated": rep.participated,
+                       "missing": list(rep.missing)}
+out["subset_model"] = {n: p.tolist()
+                       for n, p in eng.model.named_parameters()}
+
+# A subset that does not contain the hub. `SUB` above leaves rank 2 out, and
+# an abstention contributes a *zero* -- so a reduction that silently dropped
+# rank 2's contribution would produce exactly the same answer, and the
+# assertions on `subset` above stayed green under the sabotage that did
+# precisely that (docs/FEDERATED4.md §4). Here rank 0, the hub, is the one
+# that abstains and rank 2 is a contributor, so losing it changes the number.
+SUB2 = [1, 2]
+out["subset_no_hub"] = tab(federated.FedAvg().aggregate(
+    {n: torch.tensor(v) for n, v in local.items()},
+    weight=(WEIGHT if rank in SUB2 else federated.ABSTAIN)))
+out["cohort_subset_no_hub"] = list(federated.cohort(lambda _w: SUB2))
+
+# --- E. refusals ---------------------------------------------------------
+refuses("cohort_of_one", lambda: federated.cohort([1]))
+refuses("cohort_disagree",
+        lambda: federated.cohort([0, 1, 2] if rank == 0 else [0, 1]))
+refuses("empty_cohort", lambda: federated.cohort([]))
+refuses("cohort_out_of_range", lambda: federated.cohort([0, 9]))
+refuses("floor_without_policy",
+        lambda: federated.Engine(build(), method=adapt.Tent(),
+                                 min_participants=2))
+refuses("floor_of_one",
+        lambda: federated.Engine(build(), method=adapt.Tent(),
+                                 on_missing="average_arrived",
+                                 min_participants=1))
+refuses("floor_missing",
+        lambda: federated.Engine(build(), method=adapt.Tent(),
+                                 on_missing="average_arrived"))
+refuses("secure_aggregation",
+        lambda: federated.Engine(build(), method=adapt.Tent(),
+                                 secure_aggregation=True))
+refuses("differential_privacy",
+        lambda: federated.Engine(build(), method=adapt.Tent(),
+                                 differential_privacy=(1.0, 1e-5)))
+refuses("send", lambda: dist.send(torch.zeros(2), (rank + 1) % world))
+refuses("premul",
+        lambda: dist.all_reduce(torch.zeros(2),
+                                op=dist.ReduceOp.PREMUL_SUM))
+
+# The group survived all of it.
+out["again"] = federated.agree(4242, what="a probe every rank shares")
+
+with open(dest, "w") as handle:
+    json.dump(out, handle)
+'''
+)
+
+
+_FED4_DROP_SRC = (
+    "import json, os, sys\n"
+    "import torch\n"
+    "import torch.nn as nn\n"
+    + _ADAPT_MODEL_SRC
+    + r'''
+out = {"shim": hasattr(torch._C, "_aten_implemented")}
+print("shim" if out["shim"] else "upstream", file=sys.stderr, flush=True)
+assert out["shim"], "this subprocess loaded upstream torch, not the shim"
+
+import torch.distributed as dist
+import torchnative.distributed  # noqa: F401
+from torchnative import adapt
+from torchnative.nn import federated
+
+rank, port, world, dest = (int(sys.argv[1]), int(sys.argv[2]),
+                           int(sys.argv[3]), sys.argv[4])
+WEIGHT = {0: 3.0, 1: 7.0, 2: 2.0}[rank]
+LOCAL_IDS = {0: [[3, 7, 1, 19, 5]],
+             1: [[11, 2, 23, 0, 14]],
+             2: [[6, 9, 13, 4, 21]]}[rank]
+dist.init_process_group(backend="local", init_method="tcp://127.0.0.1:%d" % port,
+                        rank=rank, world_size=world)
+out["rank"], out["weight"] = rank, WEIGHT
+
+# One collective that works, so what follows is a rank leaving a *live* group
+# rather than a rendezvous that never completed.
+live = torch.tensor([float(rank) + 1.0])
+dist.all_reduce(live, op=dist.ReduceOp.SUM)
+out["live_sum"] = float(live[0].item())
+
+if rank == 2:
+    # The dropout. `os._exit` rather than `sys.exit`: no atexit, no flush --
+    # a device that lost power, not one that said goodbye.
+    with open(dest, "w") as handle:
+        json.dump(out, handle)
+    os._exit(0)
+
+ids = torch.tensor(LOCAL_IDS)
+
+def tab(d):
+    return {n: t.tolist() for n, t in d.items()}
+
+# The local delta this rank would contribute, from a plain run on the same
+# data. Deterministic, so it is the same one the engines below produce.
+m0 = build()
+w0 = adapt.wrap(m0, method=adapt.Tent(), lr=LR)
+w0.online()
+for _ in range(3):
+    w0.step(input_ids=ids)
+out["local"] = tab(w0.adapted.value)
+
+covers = adapt.Tent().select(m0)
+
+# --- the floor refuses: two survivors, min_participants=3 -----------------
+strict = build()
+eng3 = federated.Engine(strict, method=adapt.Tent(), lr=LR,
+                        aggregator=federated.FedAvg(),
+                        on_missing="average_arrived", min_participants=3)
+out["floor3_before"] = {n: dict(strict.named_parameters())[n].tolist()
+                        for n in covers}
+try:
+    eng3.participate([{"input_ids": ids}] * 3, weight=WEIGHT)
+except Exception as e:
+    out["floor3"] = "%s: %s" % (type(e).__name__, str(e))
+    out["floor3_is_dropped"] = isinstance(e, federated.RankDropped)
+    out["floor3_missing"] = list(getattr(e, "missing", ()))
+else:
+    out["floor3"] = "ACCEPTED -- an aggregate was returned below the floor"
+    out["floor3_is_dropped"] = False
+out["floor3_after"] = {n: dict(strict.named_parameters())[n].tolist()
+                       for n in covers}
+
+# --- the floor is met: two survivors, min_participants=2 ------------------
+model = build()
+out["before"] = {n: dict(model.named_parameters())[n].tolist() for n in covers}
+eng2 = federated.Engine(model, method=adapt.Tent(), lr=LR,
+                        aggregator=federated.FedAvg(),
+                        on_missing="average_arrived", min_participants=2)
+[rep] = eng2.participate([{"input_ids": ids}] * 3, weight=WEIGHT)
+out["after"] = {n: dict(model.named_parameters())[n].tolist() for n in covers}
+# The aggregate as it came off the wire, not `after - before`: that
+# subtraction is a second float32 rounding and would disagree with the
+# central sum in the last ulp for reasons that have nothing to do with the
+# aggregation. `apply` installed exactly this on top of the base.
+out["aggregate"] = tab(eng2.adapted.adapted.value)
+out["round"] = {"missing": list(rep.missing), "cohort": list(rep.cohort),
+                "total_weight": rep.total_weight, "weight": rep.weight,
+                "world": rep.world, "participated": rep.participated}
+out["policy"] = eng2.on_missing
+
+with open(dest, "w") as handle:
+    json.dump(out, handle)
+'''
+)
+
+
+def _fed4_spawn(source, world=3, timeout=900, what="fed4"):
+    """Run `source` as `world` OS processes. Returns their JSON, rank-ordered.
+
+    The generalisation of `_fed3_spawn`, and the timeout is deliberately
+    generous rather than tuned: it is waiting for `world` interpreters to
+    import the shim and finish a round of local training on a machine that may
+    have several other builds on it. What it exists to catch is a collective
+    that *hangs*, which is unbounded, not one that is slow.
+    """
+    import socket
+    import time
+
+    tmp = tempfile.mkdtemp(prefix="%s-" % what)
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    sock.close()
+
+    env = dict(os.environ)
+    env["PYTHONPATH"] = _CKPT_VENDOR_DIR
+    env["TORCH_USE_RTLD_GLOBAL"] = "1"
+
+    procs = []
+    for rank in range(world):
+        procs.append(subprocess.Popen(
+            [sys.executable, "-c", source, str(rank), str(port), str(world),
+             os.path.join(tmp, "rank-%d.json" % rank)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env,
+        ))
+        # Rank 0 has to bind the store before the others retry against it.
+        if rank == 0:
+            time.sleep(0.4)
+
+    reports = []
+    try:
+        for rank, proc in enumerate(procs):
+            try:
+                _, err = proc.communicate(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                raise RuntimeError(
+                    "%s: rank %d never finished within %ds. A collective over "
+                    "%d ranks that hangs is what this timeout exists for -- it "
+                    "is not a performance bound." % (what, rank, timeout, world))
+            if proc.returncode != 0:
+                raise RuntimeError("%s: rank %d exited %d\n--- stderr ---\n%s"
+                                   % (what, rank, proc.returncode, err[-6000:]))
+            with open(os.path.join(tmp, "rank-%d.json" % rank)) as handle:
+                reports.append(json.load(handle))
+    finally:
+        # Every process, on every path. A multi-rank test that raises with a
+        # peer still blocked in `accept` leaves an orphan holding a port.
+        for proc in procs:
+            if proc.poll() is None:
+                proc.kill()
+                proc.communicate()
+    return reports
+
+
+@functools.cache
+def _fed4_round():
+    """The three-rank round: ordering, agreement, FedAvg, a subset cohort."""
+    return _fed4_spawn(_FED4_WORKER_SRC, world=3, what="fed4-round")
+
+
+@functools.cache
+def _fed4_dropout():
+    """Three ranks, one of which leaves a live group without saying goodbye."""
+    return _fed4_spawn(_FED4_DROP_SRC, world=3, what="fed4-drop")
+
+
+def _fed4_mean(reports, name, ranks, source="local"):
+    """`sum(w_k d_k) / sum(w_k)` over `ranks`, centrally, on upstream torch."""
+    t = _upstream_torch
+    total = 0.0
+    acc = None
+    for rank in ranks:
+        weight = _FED4_WEIGHTS[rank]
+        term = (_fed_tensor(reports[rank][source][name])
+                * t.tensor(weight, dtype=t.float32))
+        acc = term if acc is None else acc + term
+        total += weight
+    return acc / t.tensor(total, dtype=t.float32)
+
+
+def test_the_transport_reduces_three_ranks_in_rank_order_and_says_so():
+    """Three OS processes, and the allreduce's summation order is a contract.
+
+    `1.0 + 1e8 - 1e8` is `0.0` in float32 when the terms are added in rank
+    order and `1.0` when the two large ones are added first. Both are "close
+    enough" to each other on any tolerance wide enough to cover float32 at
+    1e8, and **so is the sum with the `1.0` missing entirely** -- a lost rank
+    and a reordered one are the same number here. So the contract is stated
+    (ascending rank, folded on rank 0, one result sent back to everyone) and
+    checked exactly, against the same expression written centrally on upstream
+    torch.
+
+    The `all_gather` beside it is the control the equality alone cannot be:
+    it shows every rank's contribution *arrived*, by rank, so `0.0` is the sum
+    of three terms rather than the sum of two.
+    """
+    reports = _fed4_round()
+    assert [r["rank"] for r in reports] == [0, 1, 2], reports
+    assert all(r["world"] == 3 and r["shim"] for r in reports), reports
+
+    t = _upstream_torch
+    contributions = [r["order_contribution"] for r in reports]
+    assert contributions == [1.0, 1e8, -1e8], contributions
+
+    in_rank_order = t.zeros(1, dtype=t.float32)
+    for value in contributions:
+        in_rank_order = in_rank_order + t.tensor([value], dtype=t.float32)
+    reversed_order = t.zeros(1, dtype=t.float32)
+    for value in reversed(contributions):
+        reversed_order = reversed_order + t.tensor([value], dtype=t.float32)
+
+    # The premise: the two orders really do differ, so this is a test and not
+    # a coincidence.
+    assert in_rank_order.tolist() == [0.0], in_rank_order.tolist()
+    assert reversed_order.tolist() == [1.0], reversed_order.tolist()
+
+    for report in reports:
+        assert report["order_allreduce"] == in_rank_order.tolist(), (
+            "rank %d got %r; the contract is ascending rank order, which is "
+            "%r, and arrival order would be %r"
+            % (report["rank"], report["order_allreduce"],
+               in_rank_order.tolist(), reversed_order.tolist()))
+
+    # Every rank's contribution arrived, by rank -- so the 0.0 above is three
+    # terms and not two.
+    expected = [[float(r), float(r) * 10.0 + 1.0] for r in range(3)]
+    for report in reports:
+        assert report["allgather"] == expected, report["allgather"]
+        assert report["allgather_flat"] == [0.5, 1.5, 2.5], \
+            report["allgather_flat"]
+        assert report["barrier"] is True, report
+
+
+def test_agree_is_exact_at_three_ranks_where_the_old_sum_check_was_not():
+    """`(h-1, h, h+1)` sums to `3h`. The old check accepted it; this refuses.
+
+    docs/FEDERATED3.md §5 wrote the sum-and-compare down as exact *only at two
+    ranks* and refused a larger world rather than weaken it. This is that
+    weakening made concrete: three digests that differ, whose total is exactly
+    what agreement would have totalled.
+
+    The other half is that the refusal is **symmetric**. Under the old check
+    rank 1 -- whose own value is the mean -- would have passed while ranks 0
+    and 2 failed, so a schema disagreement would have left one rank going on
+    alone. All three refuse here, and all three name which ranks differ.
+    """
+    reports = _fed4_round()
+    for report in reports:
+        assert report["agree_all"] == 4242 * 3, report["agree_all"]
+
+    offsets = [4242 + r["rank"] - 1 for r in reports]
+    assert sum(offsets) == 4242 * 3, offsets  # what the old check compared
+
+    for report in reports:
+        msg = report["agree_offset"]
+        assert msg.startswith("ValueError:"), (report["rank"], msg)
+        assert "the ranks disagree about" in msg, msg
+        assert "rank by rank rather than summed" in msg, msg
+        assert "(h-1, h, h+1)" in msg, msg
+        # Named as data: which ranks are the odd ones out, from here.
+        assert "differ from this one" in msg, msg
+
+
+def test_fedavg_over_three_processes_equals_the_weighted_mean_computed_centrally():
+    """`(3 d0 + 7 d1 + 2 d2) / 12`, against the same sum written here.
+
+    Three ranks rather than two, so the aggregate is not any pair's mean
+    either, and a transport that silently dropped the third would land on a
+    number this checks against.
+    """
+    reports = _fed4_round()
+    names = sorted(reports[0]["local"])
+    assert names, reports[0]["local"]
+
+    for name in names:
+        expected = _fed4_mean(reports, name, (0, 1, 2))
+        for report in reports:
+            got = _fed_tensor(report["full"][name])
+            assert _upstream_torch.equal(got, expected), (
+                "rank %d, %s: %r != %r" % (report["rank"], name,
+                                           got.flatten()[:4].tolist(),
+                                           expected.flatten()[:4].tolist()))
+
+        # The three deltas differ, so the mean is not any of them, and none of
+        # the three pairs' means either -- a lost rank has nowhere to hide.
+        locals_ = [_fed_tensor(r["local"][name]) for r in reports]
+        for i in range(3):
+            for j in range(i + 1, 3):
+                assert not _upstream_torch.equal(locals_[i], locals_[j]), name
+            assert not _upstream_torch.equal(locals_[i], expected), (name, i)
+        for pair in ((0, 1), (0, 2), (1, 2)):
+            assert not _upstream_torch.equal(_fed4_mean(reports, name, pair),
+                                             expected), (name, pair)
+
+    # Every rank holds the same table, byte for byte: one fold on the hub,
+    # one result sent back, nobody summing locally.
+    assert reports[0]["full"] == reports[1]["full"] == reports[2]["full"]
+
+
+def test_a_proper_subset_cohort_aggregates_over_the_subset_and_not_the_world():
+    """Ranks 0 and 1 are selected; rank 2 attends every collective and abstains.
+
+    docs/FEDERATED3.md §8 listed this as refusing because at two ranks every
+    proper subset is a world of one. At three it is not, and the acceptance is
+    the one that was impossible there: the subset's aggregate has to equal
+    `(3 d0 + 7 d1) / 10` **and differ from** `(3 d0 + 7 d1 + 2 d2) / 12`. A
+    cohort that was recorded but not honoured passes the first and fails the
+    second.
+
+    Rank 2's round reports `participated=False`, `steps=0` and `weight=0.0`:
+    an unselected client does not train, which is what selection *is*. It
+    still shows up on the wire, because the transport is a star and the ranks
+    that were selected are waiting on it.
+    """
+    reports = _fed4_round()
+    for report in reports:
+        assert report["cohort_subset"] == [0, 1], report["cohort_subset"]
+
+    for name in sorted(reports[0]["local"]):
+        subset = _fed4_mean(reports, name, (0, 1))
+        whole = _fed4_mean(reports, name, (0, 1, 2))
+        assert not _upstream_torch.equal(subset, whole), name
+        for report in reports:
+            got = _fed_tensor(report["subset"][name])
+            assert _upstream_torch.equal(got, subset), (report["rank"], name)
+            assert not _upstream_torch.equal(got, whole), (report["rank"], name)
+
+    for report in reports:
+        round_ = report["subset_round"]
+        assert round_["cohort"] == [0, 1], round_
+        assert round_["world"] == 3, round_
+        assert round_["missing"] == [], round_
+        assert round_["total_weight"] == 10.0, round_
+        if report["rank"] == 2:
+            assert round_["participated"] is False, round_
+            assert round_["steps"] == 0, round_
+            assert round_["weight"] == 0.0, round_
+        else:
+            assert round_["participated"] is True, round_
+            assert round_["steps"] == 3, round_
+            assert round_["weight"] == _FED4_WEIGHTS[report["rank"]], round_
+
+    # The point of the round: all three end holding the same model, including
+    # the one that did not train.
+    assert (reports[0]["subset_model"] == reports[1]["subset_model"]
+            == reports[2]["subset_model"])
+
+    # A cohort that excludes rank 0 -- the hub is not privileged, it is just
+    # where the fold happens. This is also the assertion the sabotage in
+    # docs/FEDERATED4.md §4 needed: with `SUB = [0, 1]` the rank whose
+    # contribution a "drop the last one" fault loses is rank 2, and rank 2 is
+    # abstaining, so its contribution is a zero and the loss is invisible.
+    # Here rank 2 carries weight 2.0 and rank 0 is the one contributing zero.
+    for report in reports:
+        assert report["cohort_subset_no_hub"] == [1, 2], report
+    for name in sorted(reports[0]["local"]):
+        no_hub = _fed4_mean(reports, name, (1, 2))
+        whole = _fed4_mean(reports, name, (0, 1, 2))
+        assert not _upstream_torch.equal(no_hub, whole), name
+        assert not _upstream_torch.equal(
+            no_hub, _fed4_mean(reports, name, (0, 1))), name
+        for report in reports:
+            got = _fed_tensor(report["subset_no_hub"][name])
+            assert _upstream_torch.equal(got, no_hub), (report["rank"], name)
+
+
+def test_average_arrived_divides_by_the_survivors_and_refuses_below_the_floor():
+    """A rank leaves; two survive; the aggregate is theirs and is not either one.
+
+    docs/FEDERATED3.md §4.1 measured what this policy returns at two ranks: the
+    survivor's own delta, to 6e-8 -- the identity, reached by a socket close
+    instead of a decision. At three ranks the survivor set is two, so the
+    partial average is a real weighted mean, and that is asserted against
+    `(3 d0 + 7 d1) / 10` computed centrally.
+
+    The divisor is still not "whoever arrived". `min_participants` is required
+    and must be at least 2, so it is the caller who says how few ranks an
+    aggregate may be built from. The control is the same round with the floor
+    at 3: it refuses, names the missing rank, and leaves the model where it
+    started.
+    """
+    reports = _fed4_dropout()
+    assert len(reports) == 3, reports
+    assert all(r["live_sum"] == 6.0 for r in reports), \
+        [r["live_sum"] for r in reports]
+
+    survivors = reports[:2]
+    for report in survivors:
+        assert report["policy"] == "average_arrived", report["policy"]
+        round_ = report["round"]
+        assert round_["missing"] == [2], round_
+        assert round_["world"] == 3, round_
+        assert round_["total_weight"] == 10.0, round_
+        assert round_["participated"] is True, round_
+
+    # The floor at 3 refuses, and undoes the round.
+    for report in survivors:
+        assert report["floor3_is_dropped"] is True, report["floor3"]
+        assert report["floor3_missing"] == [2], report["floor3_missing"]
+        assert "min_participants=3" in report["floor3"], report["floor3"]
+        assert report["floor3_before"] == report["floor3_after"], (
+            "rank %d kept a local update no other rank has" % report["rank"])
+
+    # The acceptance: the aggregate is the survivors' weighted mean, and is
+    # neither survivor's own delta -- which is exactly what it *would* have
+    # been at two ranks.
+    t = _upstream_torch
+    for name in sorted(reports[0]["local"]):
+        expected = _fed4_mean(reports, name, (0, 1))
+        for report in survivors:
+            aggregate = _fed_tensor(report["aggregate"][name])
+            assert t.equal(aggregate, expected), (
+                "rank %d, %s: %r != %r"
+                % (report["rank"], name, aggregate.flatten()[:4].tolist(),
+                   expected.flatten()[:4].tolist()))
+            for rank in (0, 1):
+                own = _fed_tensor(reports[rank]["local"][name])
+                assert not t.equal(aggregate, own), (
+                    "%s: the partial average is rank %d's own delta -- the "
+                    "identity docs/FEDERATED3.md §4.1 measured at two ranks"
+                    % (name, rank))
+
+    # Both survivors hold the same aggregate, byte for byte -- one fold on
+    # the hub, one result back. `after` differs between them only because
+    # their bases do not; `before + aggregate` is what each installed.
+    assert reports[0]["aggregate"] == reports[1]["aggregate"]
+    for report in survivors:
+        assert report["before"] != report["after"], (
+            "rank %d's round changed nothing" % report["rank"])
+
+
+def test_three_ranks_refuse_the_shapes_they_still_cannot_serve():
+    """What a bigger world did *not* unlock, each naming what it would take.
+
+    The cohort of one is the same refusal `world_size = 1` gets, moved to the
+    cohort: FedAvg over one delta is that delta at any world size. The floor
+    refusals are the divisor being chosen rather than observed. `send`/`recv`
+    and secure aggregation are the pair docs/FEDERATED3.md §6 ordered after
+    this round and that are still ordered after it: a star through rank 0 gives
+    no route between two leaves that the hub cannot read.
+    """
+    reports = _fed4_round()
+    for report in reports:
+        one = report["cohort_of_one"]
+        assert one.startswith("NotImplementedError:"), one
+        assert "cohort of 1" in one and "identity" in one, one
+
+        disagree = report["cohort_disagree"]
+        assert disagree.startswith("ValueError:"), disagree
+        assert "which ranks this round selected" in disagree, disagree
+
+        assert report["empty_cohort"].startswith("ValueError:"), report
+        assert report["cohort_out_of_range"].startswith("ValueError:"), report
+
+        floor = report["floor_without_policy"]
+        assert floor.startswith("TypeError:"), floor
+        assert "accepted and ignored" in floor, floor
+
+        one_floor = report["floor_of_one"]
+        assert one_floor.startswith("ValueError:"), one_floor
+        assert "at least 2" in one_floor, one_floor
+
+        missing_floor = report["floor_missing"]
+        assert missing_floor.startswith("TypeError:"), missing_floor
+        assert "min_participants=k" in missing_floor, missing_floor
+
+        secure = report["secure_aggregation"]
+        assert secure.startswith("NotImplementedError:"), secure
+        assert "point-to-point send/recv" in secure, secure
+
+        dp = report["differential_privacy"]
+        assert dp.startswith("NotImplementedError:"), dp
+        assert "per-example" in dp, dp
+
+        send = report["send"]
+        assert "NotImplementedError" in send, send
+        assert "star through rank 0" in send, send
+
+        premul = report["premul"]
+        assert "NotImplementedError" in premul, premul
+
+        # The group is still usable after every one of those.
+        assert report["again"] == 4242 * 3, report["again"]
 
 
 
