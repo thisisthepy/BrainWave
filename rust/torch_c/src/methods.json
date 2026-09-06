@@ -674,6 +674,9 @@
   "unflatten": [
     "aten::unflatten.int(Tensor(a) self, int dim, SymInt[] sizes) -> Tensor(a)"
   ],
+  "unfold": [
+    "aten::unfold(Tensor(a) self, int dimension, int size, int step) -> Tensor(a)"
+  ],
   "argsort": [
     "aten::argsort.stable(Tensor self, *, bool stable, int dim=-1, bool descending=False) -> Tensor",
     "aten::argsort(Tensor self, int dim=-1, bool descending=False) -> Tensor"

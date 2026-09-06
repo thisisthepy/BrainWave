@@ -535,14 +535,20 @@ def test_the_barrier_is_read_at_that_door_and_nullifying_it_is_what_STRIDED_md_m
     assert "impl Drop for StridedBarrier" in storage
 
 
-def test_as_strided_is_the_only_op_that_takes_the_barrier():
-    """One producer, so "which ops can bar a storage" is answerable by reading
-    one line rather than by trusting a convention.
+def test_as_strided_and_unfold_are_the_two_ops_that_take_the_barrier():
+    """A closed producer list, so "which ops can bar a storage" is answerable by
+    reading two lines rather than by trusting a convention.
 
-    `bar_writes_as_strided_view` is the only way to attach one, and it is
-    called from exactly one kernel. If a second op ever needs it, that is a
-    decision worth making explicitly -- an op that bars its input's storage is
-    an op that can make an unrelated later write fail.
+    **This test was `test_as_strided_is_the_only_op_that_takes_the_barrier` and
+    asserted `len(calls) == 1`.** Its own docstring said what to do when that
+    stopped being true: *"If a second op ever needs it, that is a decision worth
+    making explicitly -- an op that bars its input's storage is an op that can
+    make an unrelated later write fail."* `aten.unfold.default` is that second
+    op (docs/LAST7.md §3): upstream's `Tensor.unfold` is a two-way view for the
+    same reason `as_strided` is, candle cannot build it for the same reason, and
+    a gather without the barrier would lose a write in both directions
+    silently. So the test is inverted rather than deleted, and it still names
+    every producer -- a third one fails here until somebody writes it down.
     """
     aten = _source(_ATEN_RS)
     tensor = _source(_TENSOR_RS)
@@ -550,8 +556,9 @@ def test_as_strided_is_the_only_op_that_takes_the_barrier():
         print("   (skipped: the crate sources are not beside this file)")
         return
     calls = re.findall(r"bar_writes_as_strided_view\s*\(", aten)
-    assert len(calls) == 1, calls
+    assert len(calls) == 2, calls
     assert "fn as_strided_default(" in aten
+    assert "fn unfold_default(" in aten
     assert "pub fn bar_writes_as_strided_view(" in tensor
     # The handle is carried by `Clone`, not dropped -- a clone of the wrapper
     # points at the same storage, so dropping it would launder a barred tensor

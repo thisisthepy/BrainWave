@@ -23,11 +23,15 @@ actually does what that document claims.
 
 Two of the six are NOT touched here, and are not bugs in this file:
 
-  * the asymmetric conv padding is `aten.rs`'s candle backend refusing a
-    non-square per-axis value by name (`test_asymmetric_conv_padding_is_a_
-    backend_limit_not_an_argument_form` pins the refusal so a future round
-    does not mistake it for one of this file's gaps) -- out of this round's
-    territory (`aten.rs`) and a backend limit, not an argument-form gap.
+  * the "asymmetric" conv padding was `aten.rs`'s candle backend refusing a
+    per-axis-differing value by name -- out of that round's territory
+    (`aten.rs`) and a backend limit, not an argument-form gap. **That refusal
+    is gone**: docs/LAST7.md §4 spends the difference as explicit zero padding
+    on the input and convolves with the common remainder, so the pin here is
+    now `test_per_axis_conv_padding_now_computes_and_agrees_with_upstream`,
+    which diffs values, plus
+    `test_a_per_axis_differing_stride_is_still_refused_by_name` for the half
+    that has no such lowering.
   * the `torch.embedding` case reproduces upstream's OWN refusal (measured:
     `TypeError: embedding(): argument 'indices' ... must be Tensor, not
     NoneType`) -- not an argument-form gap at all, so there is nothing to
@@ -210,29 +214,73 @@ def test_adaptive_avg_pool2d_none_entries_keep_the_input_size():
 # --- the backend-limited one, pinned so it is not mistaken for fixed -------
 
 
-def test_asymmetric_conv_padding_is_a_backend_limit_not_an_argument_form():
-    # nystromformer's wall. Measured against upstream: a 2-D convolution with
-    # a different (but per-axis symmetric) padding on each axis,
-    # `padding=[0, 5]`, computes fine there -- it is not an asymmetric-padding
-    # case at all, just two axes with different amounts. This shim refuses it
-    # by name because candle's own conv2d takes one padding value, not one
-    # per axis (aten.rs, out of this round's territory). Pinned here so a
-    # later round auditing docs/ARGFORM.md does not read "not touched" as
-    # "forgotten".
-    inp = _C._tensor_from_flat([0.0] * 100, [1, 1, 10, 10])
-    wgt = _C._tensor_from_flat([0.0] * 6, [1, 1, 1, 6])
+def test_per_axis_conv_padding_now_computes_and_agrees_with_upstream():
+    """nystromformer's wall, inverted.
+
+    **This test was `test_asymmetric_conv_padding_is_a_backend_limit_not_an_
+    argument_form` and asserted the refusal.** docs/ARGFORM.md §1 measured that
+    `padding=[0, 5]` is not asymmetric padding at all -- it is two axes each
+    padded symmetrically by a different amount, which upstream computes fine --
+    and classified this shim's refusal as a genuine candle limitation rather
+    than an argument-form gap. That classification was right about candle and
+    wrong about the conclusion: `conv2d`'s padding really is one scalar, but the
+    difference between the axes can be spent as explicit zero padding on the
+    input, exactly as docs/RNN.md §2 spent the odd half of `padding='same'`.
+    docs/LAST7.md §4 lands that lowering, so the assertion above became an
+    assertion that a working op is missing.
+
+    Inverted into the stronger form: the values, against a reference measured on
+    real torch 2.13.0 in a separate process rather than against this shim's own
+    other spelling of the same lowering, which would be circular. The kernel is
+    `1x6` and the padding is `(0, 5)`, so a lowering that padded the wrong
+    candle axis gives `(1, 1, 20, 5)` instead of `(1, 1, 10, 15)` -- the shape
+    separates that one -- and a lowering that padded only one side gives the
+    right shape with every element shifted, which is what the element checks
+    below are for.
+    """
+    inp = _C._tensor_from_flat([i / 4 for i in range(100)], [1, 1, 10, 10])
+    wgt = _C._tensor_from_flat([i / 3 for i in range(6)], [1, 1, 1, 6])
+    out = _C._aten_dispatch(
+        "aten.convolution.default",
+        inp, wgt, None, [1, 1], [0, 5], [1, 1], False, [0, 0], 1,
+    )
+    assert list(out.shape) == [1, 1, 10, 15], list(out.shape)
+    flat = _C._aten_dispatch("aten.reshape.default", out, [-1])
+    got = [round(float(_C._aten_dispatch("aten._local_scalar_dense.default",
+                                         _C._aten_dispatch("aten.select.int", flat, 0, k))), 4)
+           for k in range(15)]
+    # Upstream, measured: the first output row. The leading zero and the
+    # trailing zero are the two ends of the width padding.
+    want = [0.0, 0.4167, 1.1667, 2.1667, 3.3333, 4.5833, 5.8333, 7.0833,
+            8.3333, 9.5833, 6.6667, 4.1667, 2.1667, 0.75, 0.0]
+    assert got == want, (got, want)
+    total = float(_C._aten_dispatch(
+        "aten._local_scalar_dense.default",
+        _C._aten_dispatch("aten.sum.default", out)))
+    assert round(total, 2) == 6187.50, total
+
+
+def test_a_per_axis_differing_stride_is_still_refused_by_name():
+    """The half of docs/ARGFORM.md §1's finding that did NOT close.
+
+    Padding has a lowering because zeros can be added to the input; a stride has
+    none -- there is nothing to add that makes an unequal stride equal. So the
+    refusal stays, and it stays *named*, which is what keeps the two halves
+    distinguishable. docs/LAST7.md §4.
+    """
+    inp = _C._tensor_from_flat([0.0] * 98, [1, 2, 7, 7])
+    wgt = _C._tensor_from_flat([0.0] * 36, [2, 2, 3, 3])
     try:
         _C._aten_dispatch(
             "aten.convolution.default",
-            inp, wgt, None, [1, 1], [0, 5], [1, 1], False, [0, 0], 1,
+            inp, wgt, None, [2, 1], [0, 0], [1, 1], False, [0, 0], 1,
         )
     except NotImplementedError as e:
-        assert "asymmetric" in str(e), str(e)
+        assert "asymmetric stride" in str(e), str(e)
     else:
         raise AssertionError(
-            "asymmetric-padding convolution resolved -- either the backend "
-            "grew this capability (update docs/ARGFORM.md) or this test is "
-            "stale"
+            "a per-axis-differing stride resolved -- if the backend grew this, "
+            "update docs/LAST7.md §4 and invert this test too"
         )
 
 
