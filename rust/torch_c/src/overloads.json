@@ -887,5 +887,8 @@
   ],
   "imag": [
     "aten::imag(Tensor(a) self) -> Tensor(a)"
+  ],
+  "rms_norm": [
+    "aten::rms_norm(Tensor input, SymInt[] normalized_shape, Tensor? weight=None, float? eps=None) -> Tensor"
   ]
 }

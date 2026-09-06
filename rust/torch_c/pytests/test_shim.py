@@ -9269,7 +9269,25 @@ def test_core_ops_and_op_tags_agree():
     # landing the same day. This number is their sum, re-measured on the merged
     # tree rather than carried from any one branch, because each branch's count
     # was correct only against its own base.
-    assert r["tag_core_count"] == 117, r["tag_core_count"]
+    # 117 -> 122 with docs/PAD.md's six padding kernels, and **the delta is
+    # five, not six**, which is the whole reason this number is pinned:
+    #
+    #     reflection_pad1d   ['core', 'pt2_compliant_tag']   <- counted
+    #     reflection_pad2d   ['core', 'pt2_compliant_tag']   <- counted
+    #     reflection_pad3d   ['core', 'pt2_compliant_tag']   <- counted
+    #     replication_pad1d  ['pt2_compliant_tag']           <- NOT core
+    #     replication_pad2d  ['core', 'pt2_compliant_tag']   <- counted
+    #     replication_pad3d  ['core', 'pt2_compliant_tag']   <- counted
+    #
+    # `replication_pad1d` is not core while `replication_pad2d` and
+    # `replication_pad3d` -- the same op one and two ranks up, implemented in
+    # this shim by the *same function* -- both are. There is no rule to derive
+    # that from; it is upstream's table, and each of the six was read off its
+    # own `.tags` rather than inferred from the five beside it. Inferring
+    # would have written 123 here and the test would still have passed the
+    # day it was written, which is exactly the failure mode `min.dim` vs
+    # `max.dim` above already recorded once.
+    assert r["tag_core_count"] == 122, r["tag_core_count"]
 
 
 def test_decompose_lowers_the_op_capture_md_named():
