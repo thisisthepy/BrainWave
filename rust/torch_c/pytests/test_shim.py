@@ -9212,7 +9212,30 @@ def test_core_ops_and_op_tags_agree():
     # three tags `remainder`'s two overloads already carry. **+2 for one op**,
     # unlike every prior entry in this list, because both overloads landed
     # together.
-    assert r["tag_core_count"] == 110, r["tag_core_count"]
+    #
+    # 114 with docs/SCATTER.md's round, and **+4 across eight new keys**,
+    # every one read off its own `.tags` on a real torch rather than inferred
+    # from the op beside it:
+    #
+    #     scatter.value          ['core', 'pt2_compliant_tag']              <- counted
+    #     masked_scatter.default ['core', 'pt2_compliant_tag']              <- counted
+    #     prod.default           ['core', 'pt2_compliant_tag', 'reduction'] <- counted
+    #     prod.dim_int           ['core', 'pt2_compliant_tag', 'reduction'] <- counted
+    #     scatter_.src           ['inplace', 'pt2_compliant_tag']
+    #     scatter_.value         ['inplace', 'pt2_compliant_tag']
+    #     bucketize.Tensor       ['pt2_compliant_tag']
+    #     bucketize.Scalar       ['pt2_compliant_tag']
+    #
+    # The two that make this a check rather than a restatement of the round:
+    # **`scatter_` is not core although `scatter` is** -- upstream tags the
+    # in-place forms `inplace` and drops `core`, the same asymmetry
+    # `min.dim`/`max.dim` had at 84 -- and **`bucketize` is not core at all**,
+    # although it is a perfectly ordinary elementwise search and the two
+    # architectures that need it (`idefics3_vision`, `smolvlm_vision`) reach
+    # it in their forward. Getting +8 here would mean the tags had been
+    # assumed from "this round implemented eight overloads"; getting +6 would
+    # mean `bucketize` had been paired off `searchsorted`.
+    assert r["tag_core_count"] == 114, r["tag_core_count"]
 
 
 def test_decompose_lowers_the_op_capture_md_named():
@@ -10322,6 +10345,16 @@ _EXPECTED_MUTABLE = (
     "aten.sigmoid_.default",
     "aten.sin_.default",
     "aten.sqrt_.default",
+    # docs/SCATTER.md: `scatter_.src` and `scatter_.value` are this round's
+    # two mutating additions, both `Tensor(a!) self`. Two, not six: the round
+    # also landed `scatter.value`, `masked_scatter`, `bucketize` (x2) and
+    # `prod` (x2), every one of which is out-of-place and must NOT appear
+    # here. `masked_scatter` is the one worth naming -- upstream's own refusal
+    # message for a non-bool mask says `masked_scatter_`, the in-place op, even
+    # for the functional call, so a list built from error text rather than
+    # from the parsed schema would have wrongly gained an entry.
+    "aten.scatter_.src",
+    "aten.scatter_.value",
     "aten.sub_.Scalar",
     "aten.sub_.Tensor",
     "aten.tanh_.default",
@@ -10765,7 +10798,42 @@ def test_schema_text_survives_the_round_trip_through_the_transcribed_tables():
     # left alone -- `Tensor.fmod` was not part of this round's measured gap and
     # is not asserted anywhere, so adding it here would be inventing a check
     # rather than recording one.
-    assert len(keys) == 295, len(keys)
+    #
+    # 302 with docs/SCATTER.md. **+7, and the split across the two tables is
+    # the check**, because the round's headline op contributes **nothing**:
+    #
+    #     scatter_        methods.json only     +2   (`.src`, `.value`)
+    #     masked_scatter  both tables           +1
+    #     bucketize       overloads.json only   +2   (`.Tensor`, `.Scalar`)
+    #     prod            both tables           +2   (default, `.dim_int`)
+    #     scatter.value   already in both       +0
+    #
+    # `aten.scatter.value` was *already* declared in both tables and only
+    # lacked a dispatch arm -- the `where.ScalarSelf` shape at 287 -- which is
+    # the measured half of docs/ARCH100.md's finding that missing bindings
+    # outnumber missing kernels 49 to 22. Four of the eleven architectures this
+    # round unblocks needed no table change at all.
+    #
+    # The three asymmetries, each read off a real torch rather than paired
+    # with a neighbour: upstream has `Tensor.scatter_` and **no**
+    # `torch.scatter_` (`hasattr(torch, "scatter_")` is False on 2.13.0), so
+    # `scatter_` is `methods.json`-only, the `new_zeros` shape at 254;
+    # upstream has `torch.bucketize` and **no** `Tensor.bucketize`, so
+    # `bucketize` is `overloads.json`-only, the `native_group_norm` shape at
+    # 268; and `masked_scatter`/`prod` have both doors, so each contributes
+    # one identity per overload and not two, the `maximum` shape at 293.
+    #
+    # Getting +11 would mean `scatter_.reduce`/`scatter_.value_reduce` and the
+    # four `.out` forms (`masked_scatter.out`, `bucketize.Tensor_out`,
+    # `bucketize.Scalar_out`, `prod.out`/`prod.int_out`) had been listed as
+    # well. They are deliberately not: no kernel stands behind any of them,
+    # and a dead overload key counts against `reach_allow.json`'s
+    # `shape1_dead_overload_keys_ceiling`, which is a ratchet -- the same
+    # reasoning that kept `maximum.out` off at 293. `reduce=` in particular is
+    # absent because **none of the eleven architectures passes it** (measured
+    # in `transformers` 5.15.1, docs/SCATTER.md §2), which is this project's
+    # demand-driven rule applied to an argument rather than to an op.
+    assert len(keys) == 302, len(keys)
     from_tables = sorted(
         k for k in keys
         if report["table"][f"{k[0]}|{k[1]}"]["from"] == "tables"

@@ -11159,6 +11159,782 @@ def scatter_src_cases(torch_module, c_module, torch_call) -> list[Case]:
     return cases
 
 
+# --- aten.scatter.value / aten.scatter_.value / aten.scatter_.src ------------
+#
+# docs/SCATTER.md. `scatter.value` is the overload eleven of docs/ARCH100.md's
+# architectures reach, and it was already declared in both transcribed tables
+# before this round -- only the dispatch arm was missing. So these cases are
+# the first thing that would have caught the gap: `scatter_src_cases` above was
+# green throughout.
+#
+# The cases are chosen for what distinguishes this overload from `.src` beside
+# it rather than for coverage of the shared loop, which `.src` already has:
+# a 0-d receiver (which `.src` refuses and this accepts), the `c10` overflow
+# refusals on the scalar, `bool` receivers, and the fact that duplicate indices
+# cannot be observed here at all.
+
+
+def _scatter_value_bool_pair(torch_module, c_module, flat, shape):
+    """A bool pair. `_tensor_from_flat` will not build `bool` directly -- the
+    same workaround `masked_fill__scalar_cases` documents."""
+    return (
+        torch_module.tensor([bool(v) for v in flat]).reshape(list(shape)),
+        c_module._tensor_from_flat([int(bool(v)) for v in flat], list(shape),
+                                   dtype=c_module.bool),
+    )
+
+
+def _scatter_value_shared(op, torch_module, c_module, torch_call) -> list[Case]:
+    cases: list[Case] = []
+
+    def case(name, self_arg, dim, idx_arg, value, note, expect="match"):
+        """Fresh tensors per side and per call -- `scatter_` mutates its
+        receiver, so a shared one would make the second run see the first."""
+        def build(side):
+            self_t = _pair(torch_module, c_module, *self_arg)[side]
+            idx_t = _pair(torch_module, c_module, *idx_arg)[side]
+            return self_t, dim, idx_t, value
+
+        cases.append(
+            Case(
+                name=name,
+                op=op,
+                run_torch=lambda: torch_call(*build(0)),
+                run_c=lambda: c_module._aten_dispatch(op, *build(1)),
+                expect=expect,
+                note=note,
+            )
+        )
+
+    # The MoE group router, in every dtype `zeros_like(scores)` can be.
+    for dtype_name in ["float64", "float32", "float16", "bfloat16", "int64", "int32"]:
+        case(
+            f"scatter(dtype={dtype_name}, value=1, the MoE group-router shape)",
+            ([0] * 8, (2, 4), dtype_name),
+            1,
+            ([1, 3, 0, 2], (2, 2), "int64"),
+            1,
+            "group_mask.scatter_(1, group_idx, 1) -- the identical line in "
+            "exaone_moe, glm4_moe, glm4_moe_lite, mistral4, nemotron_h, solar_open",
+        )
+    case(
+        "scatter(float32, value=1.0, keepdim'd index (2,1) into (2,3))",
+        ([0.0] * 6, (2, 3), "float32"), -1, ([1, 0], (2, 1), "int64"), 1.0,
+        "groupvit's hard_softmax: an argmax index with keepdim=True, and a "
+        "negative dim",
+    )
+    case(
+        "scatter(float32, duplicate indices -- every write is the same value)",
+        ([0.0] * 3, (1, 3), "float32"), 1, ([0, 0, 0], (1, 3), "int64"), 7.0,
+        "three writes to column 0. Unlike scatter.src, order cannot be "
+        "observed here: whichever write lands last, the answer is 7.0",
+    )
+    case(
+        "scatter(float32, 0-d self -- refused by scatter.src, accepted here)",
+        ([0.0], (), "float32"), 0, ([0], (1,), "int64"), 7.0,
+        "upstream's ensure_nonempty_dim: max(rank, 1) on both sides",
+    )
+    case(
+        "scatter(float32, 0-d self with a 0-d index)",
+        ([0.0], (), "float32"), 0, ([0], (), "int64"), 7.0,
+        "the other half of the same rule",
+    )
+    case(
+        "scatter(float32, 1-d self with a 0-d index)",
+        ([0.0] * 3, (3,), "float32"), 0, ([1], (), "int64"), 7.0,
+        "a 0-d index into a 1-d self is legal; a 2-d index into a 0-d self "
+        "is not (below)",
+    )
+    case(
+        "scatter(float32, 0-d self with a 2-d index rejected on both sides)",
+        ([0.0], (), "float32"), 0, ([0], (1, 1), "int64"), 7.0,
+        "max(rank,1) is 1 and 2, so this is the rank mismatch after all",
+        expect="both_error",
+    )
+    case(
+        "scatter(int64 self, value=2.5 -- truncates, does not refuse)",
+        ([0] * 3, (3,), "int64"), 0, ([0], (1,), "int64"), 2.5,
+        "c10::checked_convert truncates toward zero; only leaving the range "
+        "is an overflow",
+    )
+    case(
+        "scatter(int64 self, value=-2.7 -- truncates toward zero)",
+        ([0] * 3, (3,), "int64"), 0, ([0], (1,), "int64"), -2.7,
+        "-2, not -3",
+    )
+    case(
+        "scatter(uint8 self, value=-1 -- two's-complement wrap to 255)",
+        ([0] * 3, (3,), "uint8"), 0, ([0], (1,), "int64"), -1,
+        "a negative int is allowed into an unsigned dtype when its magnitude "
+        "fits; this is checked_convert's wrap rule, not an overflow",
+    )
+    case(
+        "scatter(uint8 self, value=300 rejected on both sides)",
+        ([0] * 3, (3,), "uint8"), 0, ([0], (1,), "int64"), 300,
+        "torch: 'value cannot be converted to type uint8_t without overflow'",
+        expect="both_error",
+    )
+    case(
+        "scatter(int32 self, value=2**31 rejected on both sides)",
+        ([0] * 3, (3,), "int32"), 0, ([0], (1,), "int64"), 2 ** 31,
+        "torch: 'value cannot be converted to type int without overflow'",
+        expect="both_error",
+    )
+    case(
+        "scatter(float16 self, value=1e6 rejected on both sides)",
+        ([0.0] * 3, (3,), "float16"), 0, ([0], (1,), "int64"), 1e6,
+        "torch: 'value cannot be converted to type c10::Half without "
+        "overflow' -- fill_'s numel==1 hole does not exist here",
+        expect="both_error",
+    )
+    case(
+        "scatter(float16 self, ONE element, value=1e6 rejected on both sides)",
+        ([0.0], (1,), "float16"), 0, ([0], (1,), "int64"), 1e6,
+        "the numel==1 case specifically: fill_ would let this through, "
+        "scatter does not (measured)",
+        expect="both_error",
+    )
+    case(
+        "scatter(float32, value=inf accepted)",
+        ([0.0] * 3, (3,), "float32"), 0, ([0], (1,), "int64"), float("inf"),
+        "infinity converts to infinity; only finite-but-too-large overflows",
+    )
+    case(
+        "scatter(int64 self, value=nan rejected on both sides)",
+        ([0] * 3, (3,), "int64"), 0, ([0], (1,), "int64"), float("nan"),
+        "an integer dtype has no NaN, so checked_convert refuses it",
+        expect="both_error",
+    )
+    case(
+        "scatter(float32, int32 index accepted)",
+        ([0.0] * 3, (3,), "float32"), 0, ([1], (1,), "int32"), 5.0,
+        "int32 and int64 both bind; every other index dtype is refused",
+    )
+    case(
+        "scatter(float32, int16 index rejected on both sides)",
+        ([0.0] * 3, (3,), "float32"), 0, ([1], (1,), "int16"), 5.0,
+        "torch: 'scatter(): Expected dtype int32/int64 for index' -- note the "
+        "wording differs from scatter.src's, which names the dtype",
+        expect="both_error",
+    )
+    case(
+        "scatter(float32, negative index rejected on both sides)",
+        ([0.0] * 3, (3,), "float32"), 0, ([-1], (1,), "int64"), 5.0,
+        "a scatter index is not a dim: -1 does not wrap",
+        expect="both_error",
+    )
+    case(
+        "scatter(float32, index out of bounds rejected on both sides)",
+        ([0.0] * 3, (3,), "float32"), 0, ([3], (1,), "int64"), 5.0,
+        "torch: 'index 3 is out of bounds for dimension 0 with size 3'",
+        expect="both_error",
+    )
+    case(
+        "scatter(float32, dim out of range rejected on both sides)",
+        ([0.0] * 3, (3,), "float32"), 2, ([0], (1,), "int64"), 5.0,
+        "IndexError on both sides",
+        expect="both_error",
+    )
+    case(
+        "scatter(float32, empty index writes nothing)",
+        ([1.0, 2.0, 3.0], (3,), "float32"), 0, ([], (0,), "int64"), 9.0,
+        "the receiver comes back unchanged, after the shape checks still ran",
+    )
+    case(
+        "scatter(float32, index longer than self along the scatter axis)",
+        ([0.0] * 6, (2, 3), "float32"), 1, ([0] * 10, (2, 5), "int64"), 4.0,
+        "'no larger than self APART FROM dimension dim' -- along the axis it "
+        "may be longer, and the repeats are simply rewritten",
+    )
+    case(
+        "scatter(float32, index larger than self off-axis rejected)",
+        ([0.0] * 6, (2, 3), "float32"), 1, ([0] * 3, (3, 1), "int64"), 4.0,
+        "the off-axis half of the same rule",
+        expect="both_error",
+    )
+
+    # bool receivers -- `axk2`/`deepseek_v32`/`glm_moe_dsa`'s exact call.
+    for value, label in [(False, "False"), (True, "True"), (1, "1"), (1.0, "1.0")]:
+        t_self, c_self = _scatter_value_bool_pair(
+            torch_module, c_module, [1, 1, 1, 1, 1, 1], (2, 3))
+        t_idx, c_idx = _pair(torch_module, c_module, [0, 2], (2, 1), "int64")
+        cases.append(
+            Case(
+                name=f"scatter(bool self, value={label})",
+                op=op,
+                run_torch=lambda t_self=t_self, t_idx=t_idx, value=value: torch_call(
+                    t_self.clone(), -1, t_idx, value),
+                run_c=lambda c_self=c_self, c_idx=c_idx, value=value: c_module._aten_dispatch(
+                    op, c_module._aten_dispatch("aten.clone.default", c_self),
+                    -1, c_idx, value),
+                note="a bool receiver takes a Scalar by truthiness and stays "
+                     "bool; index_mask.scatter(-1, topk_indices, False) is "
+                     "axk2/deepseek_v32/glm_moe_dsa's line",
+            )
+        )
+
+    # Keyword-argument coverage (docs/GOLDEN.md, docs/DISPATCH.md §4.1).
+    kw_self_t, kw_self_c = _pair(torch_module, c_module, [0.0] * 6, (2, 3), "float32")
+    kw_idx_t, kw_idx_c = _pair(torch_module, c_module, [0, 2], (2, 1), "int64")
+    cases.append(
+        Case(
+            name=f"{op}(self=/dim=/index=/value= all by keyword)",
+            op=op,
+            run_torch=lambda: torch_call(
+                self=kw_self_t.clone(), dim=1, index=kw_idx_t, value=3.0),
+            run_c=lambda: c_module._aten_dispatch(
+                op,
+                self=c_module._aten_dispatch("aten.clone.default", kw_self_c),
+                dim=1, index=kw_idx_c, value=3.0),
+        )
+    )
+    return cases
+
+
+def scatter_value_cases(torch_module, c_module, torch_call) -> list[Case]:
+    return _scatter_value_shared("aten.scatter.value", torch_module, c_module, torch_call)
+
+
+def scatter__value_cases(torch_module, c_module, torch_call) -> list[Case]:
+    """The in-place twin: the identical value/refusal matrix, plus the view
+    cases that are the only thing able to tell a write-through from a rebind.
+
+    Sharing `_scatter_value_shared` is safe because every case there builds its
+    operands **inside** the run lambda, so the mutation cannot leak between the
+    two sides or between runs -- which is exactly the property an in-place
+    builder has to have and the reason the shared helper takes `build(side)`.
+    """
+    cases = _scatter_value_shared(
+        "aten.scatter_.value", torch_module, c_module, torch_call)
+    cases.extend(
+        c for c in _view_write_cases(torch_module, c_module)
+        if c.op == "aten.scatter_.value"
+    )
+    return cases
+
+
+def scatter__src_cases(torch_module, c_module, torch_call) -> list[Case]:
+    """`scatter_.src` -- `scatter.src`'s kernel with `write_back` after it.
+
+    Deliberately thin: the arithmetic is `scatter_src_cases`' and re-running it
+    here would be the same check twice. What is *not* shared is what this
+    builder is for -- the write landing in the receiver's own storage.
+    """
+    cases: list[Case] = []
+    flat, shape = [0.0] * 6, (2, 3)
+
+    def build(side):
+        self_t = _pair(torch_module, c_module, flat, shape, "float32")[side]
+        idx_t = _pair(torch_module, c_module, [0, 2], (2, 1), "int64")[side]
+        src_t = _pair(torch_module, c_module, [8.0, 9.0], (2, 1), "float32")[side]
+        return self_t, 1, idx_t, src_t
+
+    cases.append(
+        Case(
+            name="scatter_(float32, src (2,1) into self (2,3)) [in-place]",
+            op="aten.scatter_.src",
+            run_torch=lambda: torch_call(*build(0)),
+            run_c=lambda: c_module._aten_dispatch("aten.scatter_.src", *build(1)),
+            note="the same shape scatter.src covers, through the mutating door",
+        )
+    )
+    cases.extend(
+        c for c in _view_write_cases(torch_module, c_module)
+        if c.op == "aten.scatter_.src"
+    )
+    return cases
+
+
+# --- aten.masked_scatter.default ---------------------------------------------
+#
+# docs/SCATTER.md §3. The four things a plausible implementation gets wrong are
+# each one case here: the source is consumed positionally in *its own* logical
+# order, both operands broadcast (not just the mask), the mask must be exactly
+# bool, and neither dtype promotes.
+
+
+def masked_scatter_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.masked_scatter.default"
+    cases: list[Case] = []
+
+    def case(name, self_arg, mask_flat, mask_shape, src_arg, note, expect="match"):
+        def build(side):
+            self_t = _pair(torch_module, c_module, *self_arg)[side]
+            mask_t = _scatter_value_bool_pair(
+                torch_module, c_module, mask_flat, mask_shape)[side]
+            src_t = _pair(torch_module, c_module, *src_arg)[side]
+            return self_t, mask_t, src_t
+
+        cases.append(
+            Case(
+                name=name,
+                op=op,
+                run_torch=lambda: torch_call(*build(0)),
+                run_c=lambda: c_module._aten_dispatch(op, *build(1)),
+                expect=expect,
+                note=note,
+            )
+        )
+
+    for dtype_name in ["float64", "float32", "float16", "bfloat16", "int64", "int32"]:
+        zero = 0 if dtype_name.startswith("int") else 0.0
+        one = 1 if dtype_name.startswith("int") else 1.0
+        case(
+            f"masked_scatter(dtype={dtype_name}, 3 of 6 selected)",
+            ([zero] * 6, (2, 3), dtype_name),
+            [1, 0, 1, 0, 1, 0], (2, 3),
+            ([one * v for v in (1, 2, 3)], (3,), dtype_name),
+            "one source element per true position, row-major",
+        )
+    case(
+        "masked_scatter(float32, source longer than the mask's ones)",
+        ([0.0] * 6, (2, 3), "float32"), [1, 0, 1, 0, 1, 0], (2, 3),
+        ([1.0, 2.0, 3.0, 4.0], (4,), "float32"),
+        "the extra element is simply not consumed",
+    )
+    case(
+        "masked_scatter(float32, source shorter than the mask's ones)",
+        ([0.0] * 6, (2, 3), "float32"), [1, 0, 1, 0, 1, 0], (2, 3),
+        ([1.0, 2.0], (2,), "float32"),
+        "torch: 'Number of elements of source < number of ones in mask'",
+        expect="both_error",
+    )
+    case(
+        "masked_scatter(float32, a 2-d source is read row-major)",
+        ([0.0] * 6, (2, 3), "float32"), [1, 0, 1, 0, 1, 0], (2, 3),
+        ([1.0, 2.0, 3.0, 4.0], (2, 2), "float32"),
+        "the source's shape is ignored beyond its element count",
+    )
+    case(
+        "masked_scatter(float32, higgs_audio's (B,S,1) mask into (B,S,H))",
+        ([0.0] * 24, (2, 3, 4), "float32"),
+        [1, 0, 1, 0, 1, 0], (2, 3, 1),
+        ([float(v) for v in range(12)], (3, 4), "float32"),
+        "each true token consumes a whole row of four, not one element -- "
+        "hidden_states.masked_scatter(mask.unsqueeze(-1), replacement)",
+    )
+    case(
+        "masked_scatter(float32, mask (2,1) broadcasts across the row)",
+        ([0.0] * 6, (2, 3), "float32"), [1, 0], (2, 1),
+        ([9.0, 8.0, 7.0], (3,), "float32"),
+        "a column mask selects whole rows",
+    )
+    case(
+        "masked_scatter(float32, self (3,) broadcasts UP to the mask (2,3))",
+        ([0.0] * 3, (3,), "float32"), [1, 0, 1, 0, 1, 0], (2, 3),
+        ([float(v) for v in range(9)], (9,), "float32"),
+        "upstream returns a (2,3) result: both operands broadcast, so this is "
+        "not 'expand the mask to self'",
+    )
+    case(
+        "masked_scatter(float32, an all-false mask accepts an empty source)",
+        ([1.0, 2.0, 3.0], (3,), "float32"), [0, 0, 0], (3,),
+        ([], (0,), "float32"),
+        "zero ones, zero elements needed -- the receiver comes back unchanged",
+    )
+    case(
+        "masked_scatter(float32, mask not broadcastable rejected on both sides)",
+        ([0.0] * 3, (3,), "float32"), [1, 0], (2,), ([1.0], (1,), "float32"),
+        "torch: 'The size of tensor a (2) must match the size of tensor b (3) "
+        "at non-singleton dimension 0'",
+        expect="both_error",
+    )
+
+    # A transposed source: logical order and storage order differ, and only
+    # one of the two is upstream's answer.
+    def transposed(side):
+        self_t = _pair(torch_module, c_module, [0.0] * 6, (2, 3), "float32")[side]
+        mask_t = _scatter_value_bool_pair(
+            torch_module, c_module, [1, 0, 1, 0, 1, 0], (2, 3))[side]
+        base = _pair(torch_module, c_module,
+                     [float(v) for v in range(6)], (2, 3), "float32")[side]
+        if side == 0:
+            return self_t, mask_t, base.t()
+        return self_t, mask_t, c_module._aten_dispatch("aten.t.default", base)
+
+    cases.append(
+        Case(
+            name="masked_scatter(float32, a TRANSPOSED source is read in its "
+                 "logical order)",
+            op=op,
+            run_torch=lambda: torch_call(*transposed(0)),
+            run_c=lambda: c_module._aten_dispatch(op, *transposed(1)),
+            note="[[0,3],[1,4],[2,5]] gives 0, 3, 1 -- not 0, 1, 2, which is "
+                 "what reading storage order would give",
+        )
+    )
+
+    # dtype refusals: the mask must be exactly bool, and neither operand
+    # promotes.
+    self_t, self_c = _pair(torch_module, c_module, [0.0] * 3, (3,), "float32")
+    byte_t, byte_c = _pair(torch_module, c_module, [1, 0, 1], (3,), "uint8")
+    src_t, src_c = _pair(torch_module, c_module, [1.0, 2.0], (2,), "float32")
+    cases.append(
+        Case(
+            name="masked_scatter(uint8 mask rejected on both sides)",
+            op=op,
+            run_torch=lambda: torch_call(self_t, byte_t, src_t),
+            run_c=lambda: c_module._aten_dispatch(op, self_c, byte_c, src_c),
+            expect="both_error",
+            note="torch: 'masked_scatter_ only supports boolean masks, but got "
+                 "mask with dtype Byte' -- masked_fill_ only WARNS for the same "
+                 "mask, so this is not a shared rule",
+        )
+    )
+    mask_t, mask_c = _scatter_value_bool_pair(torch_module, c_module, [1, 0, 1], (3,))
+    long_t, long_c = _pair(torch_module, c_module, [1, 2], (2,), "int64")
+    cases.append(
+        Case(
+            name="masked_scatter(self/source dtype mismatch rejected on both sides)",
+            op=op,
+            run_torch=lambda: torch_call(self_t, mask_t, long_t),
+            run_c=lambda: c_module._aten_dispatch(op, self_c, mask_c, long_c),
+            expect="both_error",
+            note="torch: 'masked_scatter: expected self and source to have same "
+                 "dtypes but gotFloat and Long' -- no promotion",
+        )
+    )
+    cases.append(
+        Case(
+            name="masked_scatter(self=/mask=/source= all by keyword)",
+            op=op,
+            run_torch=lambda: torch_call(self=self_t, mask=mask_t,
+                                         source=src_t),
+            run_c=lambda: c_module._aten_dispatch(op, self=self_c, mask=mask_c,
+                                                  source=src_c),
+        )
+    )
+    return cases
+
+
+# --- aten.bucketize.Tensor / aten.bucketize.Scalar ---------------------------
+#
+# docs/SCATTER.md §5. Every value below is **on** a boundary or non-finite,
+# because those are the only places `right=False` and `right=True` differ --
+# a sweep of interior points passes against either flag, and against a linear
+# scan too.
+
+_BUCKETIZE_EDGES = ([1.0, 3.0, 5.0, 7.0], (4,), "float32")
+_BUCKETIZE_PROBE = [0.0, 1.0, 2.0, 3.0, 5.0, 7.0, 8.0]
+
+
+def bucketize_tensor_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.bucketize.Tensor"
+    cases: list[Case] = []
+
+    def case(name, values, edges, note, right=None, out_int32=None,
+             expect="match"):
+        def build(side):
+            v = _pair(torch_module, c_module, *values)[side]
+            e = _pair(torch_module, c_module, *edges)[side]
+            kw = {}
+            if right is not None:
+                kw["right"] = right
+            if out_int32 is not None:
+                kw["out_int32"] = out_int32
+            return (v, e), kw
+
+        cases.append(
+            Case(
+                name=name,
+                op=op,
+                run_torch=lambda: (lambda a, k: torch_call(*a, **k))(*build(0)),
+                run_c=lambda: (lambda a, k: c_module._aten_dispatch(op, *a, **k))(
+                    *build(1)),
+                expect=expect,
+                note=note,
+            )
+        )
+
+    n = len(_BUCKETIZE_PROBE)
+    for right in [None, False, True]:
+        case(
+            f"bucketize(float32 on the boundaries, right={right})",
+            (_BUCKETIZE_PROBE, (n,), "float32"), _BUCKETIZE_EDGES,
+            "the four boundary values are the only ones the two flags "
+            "disagree on",
+            right=right,
+        )
+    for out_int32 in [False, True]:
+        case(
+            f"bucketize(float32, out_int32={out_int32})",
+            (_BUCKETIZE_PROBE, (n,), "float32"), _BUCKETIZE_EDGES,
+            "the flag changes the result dtype and nothing else",
+            out_int32=out_int32,
+        )
+    for right in [False, True]:
+        case(
+            f"bucketize(float32, duplicate boundaries, right={right})",
+            ([3.0], (1,), "float32"), ([1.0, 3.0, 3.0, 5.0], (4,), "float32"),
+            "1 and 3 -- the two ends of the run, which is what says this is a "
+            "lower/upper bound and not a scan",
+            right=right,
+        )
+        case(
+            f"bucketize(float32, nan/inf/-inf, right={right})",
+            ([float("nan"), float("inf"), float("-inf")], (3,), "float32"),
+            _BUCKETIZE_EDGES,
+            "NaN lands past the last boundary in BOTH flags -- the negated "
+            "comparison upstream uses, not the obvious one",
+            right=right,
+        )
+    case(
+        "bucketize(float32 2-d input keeps its shape)",
+        ([0.0, 2.0, 6.0, 9.0], (2, 2), "float32"), _BUCKETIZE_EDGES,
+        "the result has self's shape; only boundaries must be 1-d",
+    )
+    case(
+        "bucketize(int64 values against float32 boundaries)",
+        ([2, 3], (2,), "int64"), _BUCKETIZE_EDGES,
+        "the two dtypes need not agree; the comparison is numeric",
+    )
+    case(
+        "bucketize(float32 values against int64 boundaries)",
+        ([2.5], (1,), "float32"), ([1, 3, 5], (3,), "int64"),
+        "and the other way round",
+    )
+    case(
+        "bucketize(float16 values against float32 boundaries)",
+        ([2.0], (1,), "float16"), _BUCKETIZE_EDGES,
+        "a reduced-precision input widens for the comparison",
+    )
+    case(
+        "bucketize(float32, unsorted boundaries are NOT refused)",
+        ([2.0], (1,), "float32"), ([5.0, 1.0, 3.0], (3,), "float32"),
+        "upstream runs the binary search anyway and lands on 2. Sorting first "
+        "would be a better answer and a different one",
+    )
+    case(
+        "bucketize(float32, empty boundaries -- every answer is 0)",
+        (_BUCKETIZE_PROBE, (n,), "float32"), ([], (0,), "float32"),
+        "the degenerate case, which a loop written as `for i in 1..len` gets "
+        "wrong",
+    )
+    case(
+        "bucketize(float32, 0-d self)",
+        ([3.0], (), "float32"), _BUCKETIZE_EDGES,
+        "a 0-d input gives a 0-d answer",
+    )
+    case(
+        "bucketize(float32, 2-d boundaries rejected on both sides)",
+        ([2.0], (1,), "float32"), ([1.0, 3.0], (1, 2), "float32"),
+        "torch: 'boundaries tensor must be 1 dimension, but got dim(2)'",
+        expect="both_error",
+    )
+    case(
+        "bucketize(float32, 0-d boundaries rejected on both sides)",
+        ([2.0], (1,), "float32"), ([1.0], (), "float32"),
+        "not 0 either -- exactly 1",
+        expect="both_error",
+    )
+
+    # idefics3_vision / smolvlm_vision's own call, in shape.
+    v_t, v_c = _pair(torch_module, c_module,
+                     [0.0, 0.25, 0.5, 0.75], (1, 4), "float32")
+    e_t, e_c = _pair(torch_module, c_module, [0.25, 0.5, 0.75], (3,), "float32")
+    cases.append(
+        Case(
+            name="bucketize(idefics3's fractional patch coordinates, right=True)",
+            op=op,
+            run_torch=lambda: torch_call(v_t, e_t, right=True),
+            run_c=lambda: c_module._aten_dispatch(op, v_c, e_c, right=True),
+            note="modeling_idefics3.py:162 -- every probe value is exactly on "
+                 "a boundary, which is why `right=True` is load-bearing there",
+        )
+    )
+    cases.append(
+        Case(
+            name="bucketize(self=/boundaries=/right= all by keyword)",
+            op=op,
+            run_torch=lambda: torch_call(self=v_t, boundaries=e_t, right=True),
+            run_c=lambda: c_module._aten_dispatch(
+                op, self=v_c, boundaries=e_c, right=True),
+        )
+    )
+    return cases
+
+
+def bucketize_scalar_cases(torch_module, c_module, torch_call) -> list[Case]:
+    """The `Scalar` overload -- a Python number where the `Tensor` one takes a
+    tensor, answering with a 0-d result. It is not reachable by accident: the
+    resolver tries `bucketize.Tensor` first and it does not bind a float.
+    """
+    op = "aten.bucketize.Scalar"
+    cases: list[Case] = []
+    e_t, e_c = _pair(torch_module, c_module, *_BUCKETIZE_EDGES)
+
+    for value in _BUCKETIZE_PROBE + [-1.0, 3, True]:
+        for right in [False, True]:
+            cases.append(
+                Case(
+                    name=f"bucketize(scalar {value!r}, right={right})",
+                    op=op,
+                    run_torch=lambda value=value, right=right: torch_call(
+                        value, e_t, right=right),
+                    run_c=lambda value=value, right=right: c_module._aten_dispatch(
+                        op, value, e_c, right=right),
+                    note="a Python int, float and bool all bind here; the "
+                         "bool goes in as 1",
+                )
+            )
+    cases.append(
+        Case(
+            name="bucketize(scalar, out_int32=True)",
+            op=op,
+            run_torch=lambda: torch_call(3.0, e_t, out_int32=True),
+            run_c=lambda: c_module._aten_dispatch(op, 3.0, e_c, out_int32=True),
+        )
+    )
+    return cases
+
+
+# --- aten.prod.default / aten.prod.dim_int -----------------------------------
+#
+# docs/SCATTER.md §6. Three things carry the weight and none of them is the
+# arithmetic: the empty product is 1, integral inputs widen to int64, and
+# `dtype=` casts the *input*. The reduced-precision cases stay short on
+# purpose -- see the note on upstream's vectorised reduction in `prod`'s doc
+# comment in aten.rs.
+
+
+def prod_default_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.prod.default"
+    cases: list[Case] = []
+
+    def case(name, arg, note, dtype=None, expect="match"):
+        def build(side):
+            t = _pair(torch_module, c_module, *arg)[side]
+            if dtype is None:
+                return (t,), {}
+            module = torch_module if side == 0 else c_module
+            return (t,), {"dtype": dt_of(module, dtype, side)}
+
+        def dt_of(module, name, side):
+            return (dt.torch_dtype(module, name) if side == 0
+                    else dt.c_dtype(module, name))
+
+        cases.append(
+            Case(
+                name=name,
+                op=op,
+                run_torch=lambda: (lambda a, k: torch_call(*a, **k))(*build(0)),
+                run_c=lambda: (lambda a, k: c_module._aten_dispatch(op, *a, **k))(
+                    *build(1)),
+                expect=expect,
+                note=note,
+            )
+        )
+
+    for dtype_name in ["float64", "float32", "float16", "bfloat16",
+                       "int64", "int32", "int16", "uint8"]:
+        values = [2, 3, 1] if not dtype_name.startswith("float") else [2.0, 3.0, 1.0]
+        case(
+            f"prod(dtype={dtype_name})",
+            (values, (3,), dtype_name),
+            "integral inputs widen to int64; floats keep their own width",
+        )
+    case("prod(float32, empty -> 1.0)", ([], (0,), "float32"),
+         "the empty product is the identity, not zero")
+    case("prod(int64, empty -> 1)", ([], (0,), "int64"),
+         "and in the integral dtype too")
+    case("prod(float32, 0-d)", ([5.0], (), "float32"), "a 0-d input reduces to itself")
+    case("prod(float32, 2-d is a FULL reduction)", ([1.0, 2.0, 3.0, 4.0], (2, 2), "float32"),
+         "no dim means every element, whatever the rank")
+    case("prod(int64, wraps rather than saturating)",
+         ([2 ** 32, 2 ** 32], (2,), "int64"),
+         "4294967296^2 wraps to 0 in int64, measured -- a f64 accumulator "
+         "would give 1.8e19")
+    case("prod(int64, tapas' own call)", ([4, 4], (2,), "int64"),
+         "torch.prod(torch.tensor(list(index.batch_shape()))) -- "
+         "modeling_tapas.py:1380")
+    case("prod(bfloat16, eight copies of 1.1)",
+         ([1.1] * 8, (8,), "bfloat16"),
+         "2.15625 stepwise in bfloat16; 2.171875 if accumulated in f64 and "
+         "narrowed once. The one case that separates the two")
+    case("prod(float16, eight copies of 1.1)", ([1.1] * 8, (8,), "float16"),
+         "the same input in the other reduced-precision dtype")
+    case("prod(float32, dtype=int64 casts the INPUT)",
+         ([2.5, 3.0], (2,), "float32"),
+         "6, not 7 (truncating the product) and not 8 (rounding it)",
+         dtype="int64")
+    case("prod(int64, dtype=int32 wraps at int32's width)",
+         ([70000, 70000], (2,), "int64"),
+         "605032704 -- the accumulator is the OUTPUT dtype, not int64",
+         dtype="int32")
+    case("prod(uint8, dtype=uint8 wraps at 8 bits)",
+         ([20, 20], (2,), "uint8"), "400 becomes 144", dtype="uint8")
+    case("prod(int64, dtype=float32)", ([2, 3], (2,), "int64"),
+         "an integral input asked for a float answer", dtype="float32")
+
+    t_only, c_only = _pair(torch_module, c_module, [2.0, 3.0], (2,), "float32")
+    cases.append(
+        Case(
+            name="prod(self= by keyword)",
+            op=op,
+            run_torch=lambda: torch_call(self=t_only),
+            run_c=lambda: c_module._aten_dispatch(op, self=c_only),
+        )
+    )
+    return cases
+
+
+def prod_dim_int_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.prod.dim_int"
+    cases: list[Case] = []
+
+    def case(name, arg, dim, note, keepdim=None, expect="match"):
+        def build(side):
+            t = _pair(torch_module, c_module, *arg)[side]
+            return (t, dim) if keepdim is None else (t, dim, keepdim)
+
+        cases.append(
+            Case(
+                name=name,
+                op=op,
+                run_torch=lambda: torch_call(*build(0)),
+                run_c=lambda: c_module._aten_dispatch(op, *build(1)),
+                expect=expect,
+                note=note,
+            )
+        )
+
+    grid = ([1.0, 2.0, 3.0, 4.0, 5.0, 6.0], (2, 3), "float32")
+    for dim in [0, 1, -1, -2]:
+        case(f"prod(float32 (2,3), dim={dim})", grid, dim,
+             "negative dims wrap the ordinary way")
+    for keepdim in [False, True]:
+        case(f"prod(float32 (2,3), dim=1, keepdim={keepdim})", grid, 1,
+             "keepdim leaves a length-1 axis where the reduction was",
+             keepdim=keepdim)
+    case("prod(int32 (2,3), dim=1 -- widens to int64)",
+         ([1, 2, 3, 4, 5, 6], (2, 3), "int32"), 1,
+         "the same widening rule as the full reduction")
+    case("prod(float32, an EMPTY axis gives ones)",
+         ([], (2, 0), "float32"), 1,
+         "[1., 1.] -- the identity again, per output position")
+    case("prod(float32, 0-d with dim=0)", ([5.0], (), "float32"), 0,
+         "a 0-d tensor counts as one-dimensional here")
+    case("prod(float32, dim out of range rejected on both sides)",
+         ([1.0, 2.0], (2,), "float32"), 2,
+         "IndexError on both sides", expect="both_error")
+    case("prod(bfloat16 (2,4), dim=1, eight 1.1s split in two)",
+         ([1.1] * 8, (2, 4), "bfloat16"), 1,
+         "stepwise rounding again, along an axis this time")
+
+    t_g, c_g = _pair(torch_module, c_module, *grid)
+    cases.append(
+        Case(
+            name="prod(self=/dim=/keepdim= all by keyword)",
+            op=op,
+            run_torch=lambda: torch_call(self=t_g, dim=1, keepdim=True),
+            run_c=lambda: c_module._aten_dispatch(op, self=c_g, dim=1,
+                                                  keepdim=True),
+        )
+    )
+    return cases
+
+
+
 # --- aten.fill_.Tensor -------------------------------------------------------
 #
 # `fill_` with a 0-d tensor rather than a Python number. It was implemented
@@ -21650,6 +22426,84 @@ def _view_write_cases(torch_module, c_module) -> list[Case]:
         )
     )
 
+    # --- scatter_ (docs/SCATTER.md) ----------------------------------------
+    #
+    # Two views, chosen for the two branches of `tensor.rs::write_strided`:
+    # `select.int(base, 1, 1)` is stride-4 with offset 1 (the odometer branch),
+    # and `t.default(base)` is non-contiguous in both axes. A kernel that
+    # computed into a fresh buffer and returned it passes every other
+    # `scatter_` case in the suite and fails both of these.
+    t_sidx = torch_module.tensor([0, 2])
+    c_sidx = c_module._tensor_from_flat([0, 2], [2], dtype=c_module.int64)
+
+    def scatter_value_through(call, base, idx):
+        return call("aten.scatter_.value",
+                    call("aten.select.int", base, 1, 1), 0, idx, -1.0)
+
+    cases.append(
+        Case(
+            name="base after x[:,1].scatter_(0, [0,2], -1.0) [reads the BASE]",
+            op="aten.scatter_.value",
+            run_torch=lambda: (
+                lambda b: (scatter_value_through(t_call, b, t_sidx), b)[1]
+            )(torch_module.tensor(grid).reshape([3, 4])),
+            run_c=lambda: (
+                lambda b: (scatter_value_through(c_call, b, c_sidx), b)[1]
+            )(c_module._tensor_from_flat(grid, [3, 4], dtype=c_module.float32)),
+            note="a scattered write through a strided view, read back through "
+                 "the base -- the three untouched columns are half the check",
+        )
+    )
+
+    t_tidx = torch_module.tensor([[0], [2], [1]])
+    c_tidx = c_module._tensor_from_flat([0, 2, 1], [3, 1], dtype=c_module.int64)
+
+    def scatter_value_transposed(call, base, idx):
+        return call("aten.scatter_.value", call("aten.t.default", base),
+                    1, idx, -1.0)
+
+    cases.append(
+        Case(
+            name="base after x.t().scatter_(1, idx, -1.0) [reads the BASE]",
+            op="aten.scatter_.value",
+            run_torch=lambda: (
+                lambda b: (scatter_value_transposed(t_call, b, t_tidx), b)[1]
+            )(torch_module.tensor(grid).reshape([4, 3])),
+            run_c=lambda: (
+                lambda b: (scatter_value_transposed(c_call, b, c_tidx), b)[1]
+            )(c_module._tensor_from_flat(grid, [4, 3], dtype=c_module.float32)),
+            note="a destination that is non-contiguous in both axes",
+        )
+    )
+
+    def scatter_src_through(call, base, idx, src):
+        return call("aten.scatter_.src",
+                    call("aten.select.int", base, 1, 1), 0, idx, src)
+
+    cases.append(
+        Case(
+            name="base after x[:,1].scatter_(0, [0,2], src) [reads the BASE]",
+            op="aten.scatter_.src",
+            run_torch=lambda: (
+                lambda b: (
+                    scatter_src_through(t_call, b, t_sidx,
+                                        torch_module.tensor([-1.0, -2.0])),
+                    b,
+                )[1]
+            )(torch_module.tensor(grid).reshape([3, 4])),
+            run_c=lambda: (
+                lambda b: (
+                    scatter_src_through(
+                        c_call, b, c_sidx,
+                        c_module._tensor_from_flat([-1.0, -2.0], [2],
+                                                   dtype=c_module.float32)),
+                    b,
+                )[1]
+            )(c_module._tensor_from_flat(grid, [3, 4], dtype=c_module.float32)),
+            note="the src form through the same view",
+        )
+    )
+
     return cases
 
 
@@ -24462,6 +25316,14 @@ CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
     "aten.le.Scalar": le_scalar_cases,
     "aten.multinomial.default": multinomial_cases,
     "aten.scatter.src": scatter_src_cases,
+    "aten.scatter.value": scatter_value_cases,
+    "aten.scatter_.src": scatter__src_cases,
+    "aten.scatter_.value": scatter__value_cases,
+    "aten.masked_scatter.default": masked_scatter_cases,
+    "aten.bucketize.Tensor": bucketize_tensor_cases,
+    "aten.bucketize.Scalar": bucketize_scalar_cases,
+    "aten.prod.default": prod_default_cases,
+    "aten.prod.dim_int": prod_dim_int_cases,
     "aten.sort.default": sort_cases,
     "aten.squeeze.dim": squeeze_dim_cases,
     "aten.squeeze.default": squeeze_default_cases,
