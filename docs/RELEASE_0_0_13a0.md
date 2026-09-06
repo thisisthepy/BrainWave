@@ -77,6 +77,15 @@ would otherwise count these as features.
 - **`docs/ARCH100.md`** — every `transformers` architecture swept: **215 of 297
   forward**, the remaining **82** blocked behind **31 distinct operator names**.
   Nothing was implemented in that round.
+- **`docs/ARCH200.md`** — the same sweep taken again: **270 of 297 forward**, 27
+  blocked behind 16 operator names. A re-measurement, not an implementation.
+- **`docs/ARCH300.md`** — taken a third time, after two batches of operator
+  work landed: **290 of 297 forward**, the remaining **7** behind 6 walls,
+  three of them sharing one argument-form gap. **These are a snapshot, not a
+  ceiling** — three other agents were landing operator work in parallel
+  worktrees while this round was measured, and the upstream control was
+  reused from a same-day run rather than re-swept in full, checked against a
+  venv-mtime and a five-architecture spot re-run rather than assumed.
 - **`docs/COMPILE.md`** — re-diagnoses what blocks `torch.compile` (abi3 against
   PEP 523 frame evaluation, not Dynamo generally) and **recommends refusing it
   by name permanently**, spending the effort on `torch.export` instead.
@@ -90,6 +99,9 @@ would otherwise count these as features.
 - **Vulkan priced before it was wired**, and the demand model set widened,
   recording walls (`torch.floor`, `upsample_bicubic2d`, `index_add_`,
   `ndimension`) without closing them.
+
+<!-- DOCWATCH: symbol-in-file docs/ARCH300.md 290 present -->
+<!-- DOCWATCH: symbol-in-file docs/ARCH300.md 7 present -->
 
 ## 4. Documentation corrected
 
@@ -111,12 +123,14 @@ would otherwise count these as features.
 
 ## 5. What this release does not do
 
-- **82 of 297 architectures do not forward.** The denominator is not 528: of
-  the 528 model types `AutoModel` can build, 231 fail on *upstream* torch under
-  the same shrunk-config sweep and are excluded as not this project's gap.
-  *215 of 528* would be a different and wrong claim. And a forward is not a
-  match — only 26 architectures have been checked for numerical agreement
-  against upstream (`docs/ARCH100.md`).
+- **7 of 297 architectures do not forward**, down from 82 in `docs/ARCH100.md`
+  and 27 in `docs/ARCH200.md` (`docs/ARCH300.md`). The denominator is not 528:
+  of the 528 model types `AutoModel` can build, 231 fail on *upstream* torch
+  under the same shrunk-config sweep and are excluded as not this project's
+  gap. *290 of 528* would be a different and wrong claim. And a forward is
+  not a match — only 26 architectures have been checked for numerical
+  agreement against upstream; a separate, concurrent round is measuring more
+  of that right now, and its number is not anticipated here.
 - **`torch.compile` is not coming.** `docs/COMPILE.md` recommends refusing it
   by name, permanently. Nothing here has ever implemented any part of it.
   `torch.export` is the direction and it is not implemented either.
