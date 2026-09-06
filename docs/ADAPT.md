@@ -511,10 +511,10 @@ checkpoints instead of a toy, is what found the sizing wrong.
 
 <!-- DOCWATCH: op-implemented aten.native_layer_norm.default -->
 
-### 8.2 `use_cache=False` cannot be captured
+### 8.2 `use_cache=False` cannot be captured — **closed**
 
-Passing `use_cache=False` to a `transformers` forward reaches a `torch.diff`
-that has no entry in the overload table:
+Passing `use_cache=False` to a `transformers` forward used to reach a
+`torch.diff` that had no entry in the overload table:
 
 ```
 not implemented in torch._C shim: torch.diff(...) -- overload resolution has no
