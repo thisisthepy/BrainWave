@@ -16214,27 +16214,29 @@ def test_a_gradient_reaches_a_burned_in_constant_and_only_the_ones_asked_for():
     assert none["inputs"][0] is not None
 
 
-def test_a_traces_constants_are_read_at_backward_time_not_at_capture_time():
-    """docs/BACKWARD5.md §1.3, pinned as a **known divergence** rather than fixed.
+def test_a_trace_refuses_to_differentiate_at_constants_that_moved_since_capture():
+    """docs/BACKWARD6.md: W10a, **the inversion of a pinned divergence**.
 
-    `PyCaptureTrace` holds strong references to the caller's live parameter
-    tensors (`const_objects`) and `run()` copies those references into the
-    replay `Env`. So a trace differentiates whatever its constants hold *when
-    backward() is called* -- and in a training loop that is whatever
-    `optimizer.step()` last wrote. Upstream refuses the same program by name:
+    This test used to be
+    `test_a_traces_constants_are_read_at_backward_time_not_at_capture_time`
+    and asserted the defect: `PyCaptureTrace` holds strong references to the
+    caller's live parameter tensors (`const_objects`), `run()` copied those
+    references into the replay `Env`, and so a `backward()` called after
+    `optimizer.step()` silently differentiated at the **new** weights.
+    docs/BACKWARD5.md §1.3 measured it and §5 pinned it, with the instruction
+    to invert rather than delete this test when the fix landed. This is that
+    inversion.
+
+    It asserts more than the old one did. The old test only had to observe a
+    number changing; this one has to see the refusal **name the constant that
+    moved**, quote the version clause upstream quotes, and say that the trace
+    predates the movement -- and it has to see the *unmoved* case still work,
+    which is the half that catches a check firing when it should not.
+
+    Upstream refuses the same program:
     `one of the variables needed for gradient computation has been modified by
-    an inplace operation: ... is at version 1; expected version 0 instead.`
-
-    `torchnative.adapt` is safe from this by **ordering and nothing else** --
-    `adapt/__init__.py` calls `trace.backward()` before `self._optimizer.step()`
-    and drops the trace at the end of the call. Nothing enforces that order.
-    This test is the thing that says so out loud, so that the situation is not
-    invisible merely because it is currently unreachable by accident
-    (CLAUDE.md §5.5).
-
-    **If a round lands docs/BACKWARD5.md §6's W10a (constant freshness), invert
-    this test rather than deleting it**: the second backward should then raise
-    by name instead of returning a gradient at the new weights.
+    an inplace operation: [torch.FloatTensor [3]] is at version 1; expected
+    version 0 instead.`  (measured, torch 2.13.0)
     """
     d = _C._aten_dispatch
     w = _tape_f64([2.0, 2.0, 2.0], [3])
@@ -16243,33 +16245,95 @@ def test_a_traces_constants_are_read_at_backward_time_not_at_capture_time():
     trace = _C._capture_end(d("aten.sum.default", d("aten.mul.Tensor", x, w)))
     assert len(trace.constant_values) == 1, len(trace.constant_values)
     assert trace.constant_values[0] is w, "the trace burns in the live object, not a copy"
+    # The stamp is taken at `_capture_end`, over this process's history of
+    # writes to that storage -- not necessarily 0, since another test may have
+    # written to a storage the allocator has since handed back here. What is
+    # asserted is that a stamp exists to compare against at all.
+    at_capture = list(trace.constant_versions)
+    assert at_capture == [None] or isinstance(at_capture[0], int), at_capture
+    assert at_capture[0] is not None, "the constant was not stamped, so nothing can be checked"
 
+    # An unmoved tape still works, and it works repeatedly. This is the half
+    # of the test that fails if the check fires when it should not.
     before = trace.backward([x])["inputs"][0].tolist()
     assert before == [2.0, 2.0, 2.0], before
+    assert trace.backward([x])["inputs"][0].tolist() == before, "a second backward on an unmoved tape"
+    assert trace.replay([x])[0].tolist() == 7.0, trace.replay([x])[0].tolist()
 
     # An optimiser step, spelled the way one is: an in-place write on the
-    # parameter, under no_grad. Capture is closed, so nothing records it.
+    # parameter. Capture is closed, so nothing records it -- the door bumps
+    # the storage's version anyway, which is the whole of W10a.
     d("aten.add_.Tensor", w, _tape_f64([1.0, 1.0, 1.0], [3]))
     assert w.tolist() == [3.0, 3.0, 3.0], w.tolist()
+    assert list(trace.constant_versions) == at_capture, (
+        "the snapshot is a snapshot: mutating the tensor must not move the "
+        "value the trace recorded at capture time")
 
-    after = trace.backward([x])["inputs"][0].tolist()
-    assert after == [3.0, 3.0, 3.0], (
-        "the tape's constants stopped being read live at backward() time. If "
-        "that is deliberate -- docs/BACKWARD5.md §6's W10a -- this test should "
-        "now assert a refusal by name, not be deleted: got %r" % (after,))
-    assert before != after, (
-        "the two backwards agreed, so this test proved nothing about staleness; "
-        "check that w.add_ actually wrote through to the burned-in constant")
+    try:
+        trace.backward([x])
+    except RuntimeError as e:
+        message = str(e)
+    else:
+        raise AssertionError(
+            "the tape differentiated at the moved constant and said nothing -- "
+            "this is docs/BACKWARD5.md §1.3 back, and it returned %r"
+            % (trace.backward([x])["inputs"][0].tolist(),))
+    # Named, not merely raised. Each clause is a separate assertion so that a
+    # message which loses one of them fails on that one.
+    assert "constant 0 of this trace" in message, message
+    assert "torch.float64[3]" in message, message
+    assert "is at version" in message and "expected version" in message, message
+    assert "captured *before* that tensor moved" in message, message
 
-    # And the forward moves first and by more, which is docs/BACKWARD5.md
-    # §1.2's reason to put any future check on the replayed output rather than
-    # on the gradient.
-    replayed = trace.replay([x])[0].tolist()
-    assert replayed == 10.5, (
-        "the replayed loss is sum(x * w) at the NEW w (3.5 * 3); the loss the "
-        "region actually produced was 7.0, at w = 2. The forward diverges by "
-        "more than the gradient does, which is why any future check belongs "
-        "here: got %r" % (replayed,))
+    # The forward refuses too, and by the same message. docs/BACKWARD5.md §1.2
+    # measured that the replayed loss diverges before and by more than the
+    # gradient does (1.79 against 179.0), so a check that guarded only
+    # `backward()` would leave `replay()` answering 10.5 for a region that
+    # produced 7.0. Both go through `run()`, which is why there is one check.
+    try:
+        trace.replay([x])
+    except RuntimeError as e:
+        assert "constant 0 of this trace" in str(e), str(e)
+    else:
+        raise AssertionError("replay() answered at the moved constant")
+
+    # And the refusal is about *freshness*, not about the trace being spent:
+    # a trace over the moved tensor, captured now, works.
+    _C._capture_begin([x])
+    again = _C._capture_end(d("aten.sum.default", d("aten.mul.Tensor", x, w)))
+    assert again.backward([x])["inputs"][0].tolist() == [3.0, 3.0, 3.0], (
+        "recapturing after the update is the remedy the message names, and it "
+        "has to actually work")
+
+
+def test_the_constant_version_check_sees_a_write_through_a_view():
+    """docs/BACKWARD6.md §4: the counter is keyed on the **storage**, not on
+    the Python object, so a write through an alias of a burned-in constant is
+    seen. This is not W10b -- nothing here models alias *sets* or view
+    metadata; it is the one property that comes free from in-place ops going
+    through `tensor::write_into`, which writes into the buffer the wrapper
+    already points at (docs/VIEWS.md §6).
+
+    A per-object counter would pass every assertion above and fail this one,
+    which is why it is a separate test rather than a line in that one."""
+    d = _C._aten_dispatch
+    w = _tape_f64([2.0, 2.0, 2.0], [3])
+    x = _tape_f64([1.0, 1.0, 1.0], [3])
+    _C._capture_begin([x])
+    trace = _C._capture_end(d("aten.sum.default", d("aten.mul.Tensor", x, w)))
+    alias = d("aten.slice.Tensor", w, 0, 0, 2)
+    assert alias is not w
+    d("aten.add_.Tensor", alias, _tape_f64([5.0, 5.0], [2]))
+    assert w.tolist() == [7.0, 7.0, 2.0], (
+        "the alias did not write through, so this test is not testing what it "
+        "says: %r" % (w.tolist(),))
+    try:
+        trace.backward([x])
+    except RuntimeError as e:
+        assert "constant 0 of this trace" in str(e), str(e)
+    else:
+        raise AssertionError(
+            "a write through a view of a burned-in constant was not seen")
 
 
 def test_the_tape_seeds_a_one_only_for_a_scalar_and_says_so_otherwise():

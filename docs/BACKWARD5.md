@@ -30,6 +30,7 @@ Every shim reading printed `shim`; every upstream reading was taken with
 | **Q2.** How much of `VariableVersion` is needed? | **Two independent mechanisms, and a tape needs only part of one.** Upstream's leaf/view in-place refusal is structural (no counter). The counter + a per-saved-value snapshot catches three classes, and **a replay tape moots all three** — it never reads a saved value. What it does *not* moot is the constants, which are held live. §2 |
 | **Q3.** What does W9 cost? | **18.9 MiB at S=8, 302.6 MiB at S=128**, for SmolLM2-135M — 1862 nodes, 1893 tensor result slots, of which 702 are view results whose storage is already held. A naive count over result *shapes* says 538 MiB and is wrong for exactly the reason §1 is about. Lifetime is **one iteration**. §3 |
 | **Q4.** Does a shape exist that reuses the tape rather than building a second one? | **Yes, and it is smaller than BACKWARD2 §3 could see.** `tape::backward` reads five things off a trace, and `Recorder` already has four of them. The fifth is `Env`, and **`Env` already exists during capture** — it is `Recorder::keepalive`, dropped at `_capture_end`. §4 |
+| **Closed by `docs/BACKWARD6.md`** | The defect in the row below is **fixed**: one `u64` per storage, bumped at the door, snapshotted per constant at `_capture_end`, compared in `run()`. That row describes the artefact as it was, and the test that pinned it has been **inverted, not deleted** |
 | **The live defect this turned up** | The tape reads its constants **live at `backward()` time**. Mutate a parameter between `_capture_end` and `trace.backward()` and the tape silently differentiates at the new weights. No in-place op is recorded; this is today's shipped artefact. §1.3 |
 | **The recommendation** | **Pay for W10a (constant freshness) and do not pay for W10b (aliasing) yet.** W10a is one integer per tensor, closes a live defect, and is worth landing on its own merits whether or not `.backward()` is ever built. W10b is upstream's whole aliasing layer and buys nothing until a recorder exists. §6 |
 | What landed? | **The measurement, and one test that pins §1.3's defect as a known divergence.** No recorder, no engine, no version counter. §5 |
@@ -361,7 +362,10 @@ small enough to be worth having on its own.
 <!-- DOCWATCH: symbol-in-file rust/torch_c/src/capture.rs const_objects present -->
 <!-- DOCWATCH: symbol-in-file rust/torch_c/src/capture.rs keepalive present -->
 <!-- DOCWATCH: symbol-in-file rust/torch_c/src/tape.rs derivative present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_a_traces_constants_are_read_at_backward_time_not_at_capture_time present -->
+<!-- The test §5 pinned was **inverted, not deleted**, by docs/BACKWARD6.md, exactly as §5 and
+     §6 asked. It is now `test_a_trace_refuses_to_differentiate_at_constants_that_moved_since_capture`
+     and asserts the refusal by name; §1.3's defect is fixed. -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_a_trace_refuses_to_differentiate_at_constants_that_moved_since_capture present -->
 
 ---
 

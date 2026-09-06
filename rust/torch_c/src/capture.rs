@@ -257,6 +257,151 @@ fn mutates_this_call(
     training && has_stats
 }
 
+// ---------------------------------------------------------------------------
+// W10a: constant freshness (docs/BACKWARD6.md)
+// ---------------------------------------------------------------------------
+
+/// One monotonic `u64` per **storage**, bumped when an op writes into it.
+///
+/// The defect this closes is `docs/BACKWARD5.md` §1.3: `PyCaptureTrace` holds
+/// strong references to the caller's live tensors (`const_objects`) and
+/// `run()` copies those references into the replay `Env`, so a trace
+/// differentiates whatever its constants hold **at `backward()` time** -- which
+/// in a training loop is whatever `optimizer.step()` last wrote. There is no
+/// in-place op in the record; the mutation happens after `_capture_end`, and
+/// before this the tape said nothing about it.
+///
+/// This is the *snapshot* half of upstream's `c10::VariableVersion` applied to
+/// the 333 values a trace holds rather than to every saved variable
+/// (`docs/BACKWARD5.md` §2). It is deliberately **not** the general version
+/// counter: there is no `ADInplaceOrView` key, no alias set, no view metadata
+/// and no rebasing.
+///
+/// **Keyed on the storage address, not on the Python object**, and that is
+/// what makes it see a write through a view: in-place ops here go through
+/// `tensor::write_into`, which writes into the buffer the wrapper already
+/// points at (`docs/VIEWS.md` §6), so a base and its views share one candle
+/// `Storage` and therefore one entry. `replace_with` -- `set_` and
+/// `tensor.data = ...` -- rebinds instead, and that shows up as a *different*
+/// key, which the stamp comparison catches as well because a stamp is the pair
+/// `(key, version)` and not the version alone.
+///
+/// A `BTreeMap` rather than a `HashMap` only because `BTreeMap::new` is `const`
+/// and this needs no lazy initialisation. Entries are created **only** by a
+/// mutating op, so an inference forward -- which issues none -- never touches
+/// the lock and never allocates. A storage address can be reused after its
+/// tensor is dropped, which would leave a stale count attached to an unrelated
+/// buffer; that cannot produce a false refusal for a *trace constant*, because
+/// a trace holds a strong reference to every constant and its storage
+/// therefore cannot be freed while the stamp it is compared against exists.
+static STORAGE_VERSIONS: std::sync::Mutex<std::collections::BTreeMap<usize, u64>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// The identity of a tensor's bytes, as far as freshness is concerned: which
+/// storage, and how many writes had gone into it when this was taken.
+///
+/// `None` for a tensor with no storage to stamp -- `Repr::Meta` has no buffer
+/// at all and `Repr::Quantized` lives in candle's separate type system. Both
+/// compare equal to themselves by being absent, which is the right answer:
+/// nothing here can write into either of them in place.
+pub(crate) type Stamp = Option<(usize, u64)>;
+
+/// The address of the candle `Storage` behind a tensor, or `None` if it has
+/// none. Two tensors that share a buffer answer the same value; the
+/// `storage_offset` is deliberately *not* added, unlike `TensorBase.data_ptr`,
+/// because a view at a non-zero offset must share its base's version.
+fn storage_key(tensor: &Bound<'_, PyTensorBase>) -> Option<usize> {
+    let borrowed = tensor.try_borrow().ok()?;
+    match borrowed.repr() {
+        crate::tensor::Repr::Dense(inner) => {
+            let (guard, _layout) = inner.storage_and_layout();
+            let storage: &candle_core::Storage = &guard;
+            Some(storage as *const candle_core::Storage as usize)
+        }
+        _ => None,
+    }
+}
+
+/// Read a tensor's stamp. Never raises: a tensor that cannot be borrowed (a
+/// kernel is holding it mutably) stamps as `None`, which is the answer that
+/// refuses nothing.
+pub(crate) fn stamp_of(tensor: &Bound<'_, PyTensorBase>) -> Stamp {
+    let key = storage_key(tensor)?;
+    let version = STORAGE_VERSIONS.lock().ok()?.get(&key).copied().unwrap_or(0);
+    Some((key, version))
+}
+
+/// The receiver of an in-place op, found the way `aten.rs`'s `tensor_receiver`
+/// finds it -- positional 0, or the keyword `self`, because `bootstrap.py`
+/// binds every argument by keyword and a direct `torch.ops.aten` call need not.
+///
+/// Only the receiver is bumped. Bumping every tensor argument would have been
+/// one line shorter and would fire on `w.add_(x)` for `x` as well, which is a
+/// check that refuses a trace whose constant was merely *read* -- the exact
+/// shape of failure this round is not allowed to introduce.
+fn inplace_receiver<'py>(
+    args: &Bound<'py, PyTuple>,
+    kwargs: Option<&Bound<'py, PyDict>>,
+) -> Option<Bound<'py, PyTensorBase>> {
+    let value = match args.get_item(0) {
+        Ok(value) => value,
+        Err(_) => kwargs?.get_item("self").ok().flatten()?,
+    };
+    value.cast_into::<PyTensorBase>().ok()
+}
+
+/// **The bump site**, called from the door for every dispatch.
+///
+/// It is at the door and not inside `tensor::write_into` for the reason the
+/// capture hook is at the door: there is exactly one place where "an op
+/// happened" is known, and a kernel cannot forget to call it by being written
+/// later. It is beside `mark_from_op` rather than inside it because
+/// `mark_from_op` returns early when grad mode is off, and **`optimizer.step()`
+/// runs under `no_grad`** -- putting the bump behind that branch would have
+/// missed the one call this whole round exists for. `docs/BACKWARD5.md` §6
+/// sized it as "the door's existing grad-mode branch"; that sizing is wrong by
+/// one branch, and `docs/BACKWARD6.md` §3 records why.
+///
+/// The cost on the ordinary path is `is_mutating` -- one `rsplit_once` on a
+/// `&str` already in a register and an `ends_with` on one byte -- and a branch
+/// that is not taken. No lock is taken and nothing is allocated unless the op
+/// writes.
+pub fn note_mutation(op: &str, args: &Bound<'_, PyTuple>, kwargs: Option<&Bound<'_, PyDict>>) {
+    if !is_mutating(op) {
+        // The ops that mutate without saying so in their name. The list has
+        // one member and the judgement is per call, which is why this reuses
+        // `mutates_this_call` rather than the name alone.
+        if !MUTATES_WITHOUT_UNDERSCORE.contains(&op) || !mutates_this_call(op, args, kwargs) {
+            return;
+        }
+        // `native_batch_norm` writes its running statistics, which are
+        // arguments 3 and 4, and not its receiver.
+        for (index, name) in [(3usize, "running_mean"), (4, "running_var")] {
+            let value = match args.get_item(index) {
+                Ok(value) => Some(value),
+                Err(_) => kwargs.and_then(|kw| kw.get_item(name).ok().flatten()),
+            };
+            if let Some(tensor) = value.and_then(|v| v.cast_into::<PyTensorBase>().ok()) {
+                if let Some(key) = storage_key(&tensor) {
+                    bump(key);
+                }
+            }
+        }
+        return;
+    }
+    if let Some(receiver) = inplace_receiver(args, kwargs) {
+        if let Some(key) = storage_key(&receiver) {
+            bump(key);
+        }
+    }
+}
+
+fn bump(key: usize) {
+    if let Ok(mut table) = STORAGE_VERSIONS.lock() {
+        *table.entry(key).or_insert(0) += 1;
+    }
+}
+
 /// Ops that consume the generator. Recorded traces are checked by replaying
 /// them and comparing against eager, and an op that legitimately differs on
 /// every call makes that check unable to fail -- which is worse than not
@@ -573,6 +718,9 @@ pub struct PyCaptureTrace {
     pub(crate) inputs: Vec<TensorMeta>,
     pub(crate) consts: Vec<TensorMeta>,
     pub(crate) const_objects: Vec<Py<PyAny>>,
+    /// The stamp each constant carried at `_capture_end`, in `const_objects`
+    /// order. Compared in `run()`; see `STORAGE_VERSIONS`.
+    pub(crate) const_stamps: Vec<Stamp>,
     pub(crate) outputs: Vec<Ref>,
 }
 
@@ -699,6 +847,21 @@ impl PyCaptureTrace {
         PyList::new(py, self.const_objects.iter().map(|c| c.clone_ref(py)))
     }
 
+    /// The version each constant's storage was at when the trace was captured
+    /// (`None` for a constant with no storage to stamp). Exists so that a test
+    /// can say *which* stamp moved rather than inferring it from a refusal,
+    /// and so that "the counter is not moving at all" is distinguishable from
+    /// "the counter moved and the check let it through".
+    #[getter]
+    fn constant_versions<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        PyList::new(
+            py,
+            self.const_stamps
+                .iter()
+                .map(|stamp| stamp.map(|(_, version)| version)),
+        )
+    }
+
     #[getter]
     fn nodes<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
         let mut out = Vec::with_capacity(self.nodes.len());
@@ -819,6 +982,73 @@ impl PyCaptureTrace {
     /// apart -- a backward that materialised its activations its own way would
     /// be differentiating a different forward from the one `replay` proves
     /// equal to eager.
+    /// **W10a**: refuse a replay whose burned-in constants have moved since
+    /// the trace was captured (`docs/BACKWARD5.md` §1.3, `docs/BACKWARD6.md`).
+    ///
+    /// A `CaptureTrace` holds its constants *by reference*, so without this a
+    /// `backward()` called after `optimizer.step()` differentiates at the new
+    /// weights and returns a plausible number with no message -- which is the
+    /// failure `docs/CAPTURE.md` §9-1 already records one other instance of,
+    /// and the reason a refusal by name is worth more here than a recomputed
+    /// answer would be. Recomputing is not on the table anyway: the trace has
+    /// no record of how its constants were produced, because they were made
+    /// before the region began.
+    ///
+    /// The wording keeps upstream's `is at version N; expected version M`
+    /// clause, because upstream refuses this same program by that phrase and
+    /// anything matching on it should keep matching.
+    fn check_constants_are_fresh(&self, py: Python<'_>) -> PyResult<()> {
+        for (index, object) in self.const_objects.iter().enumerate() {
+            let expected = match self.const_stamps.get(index) {
+                Some(Some(stamp)) => *stamp,
+                // Not stamped at capture (meta, quantised, or unborrowable):
+                // there is nothing this could compare, so it refuses nothing.
+                _ => continue,
+            };
+            let tensor = match object.bind(py).cast::<PyTensorBase>() {
+                Ok(tensor) => tensor,
+                Err(_) => continue,
+            };
+            let seen = match stamp_of(tensor) {
+                Some(stamp) => stamp,
+                None => continue,
+            };
+            if seen == expected {
+                continue;
+            }
+            let meta = self.consts.get(index);
+            let described = meta
+                .map(|m| {
+                    format!(
+                        "torch.{}{:?} on {}",
+                        m.dtype.name(),
+                        m.shape.as_slice(),
+                        m.device
+                    )
+                })
+                .unwrap_or_else(|| "a tensor".to_string());
+            let versions = if seen.0 == expected.0 {
+                format!("it is at version {}; expected version {}", seen.1, expected.1)
+            } else {
+                // `set_` or `tensor.data = ...`: the wrapper stopped pointing
+                // at the storage that was stamped, so there is no version to
+                // compare and the identity of the buffer is the difference.
+                "it points at a different storage than the one the trace was captured over"
+                    .to_string()
+            };
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "torch._C capture: constant {index} of this trace ({described}) has been \
+                 modified by an in-place operation since the trace was captured -- \
+                 {versions}. This trace was captured *before* that tensor moved and holds \
+                 it by reference, so replaying or differentiating it now would silently \
+                 answer at the new value instead of the one the region ran on. Capture the \
+                 region again after the update -- e.g. call trace.backward() before \
+                 optimizer.step(), not after (docs/BACKWARD6.md)"
+            )));
+        }
+        Ok(())
+    }
+
     pub(crate) fn run<'py>(&self, py: Python<'py>, inputs: &Bound<'py, PyAny>) -> PyResult<Env> {
         if is_active() {
             return Err(pyo3::exceptions::PyRuntimeError::new_err(
@@ -840,6 +1070,8 @@ impl PyCaptureTrace {
                 given.len()
             )));
         }
+
+        self.check_constants_are_fresh(py)?;
 
         let mut env = Env {
             inputs: Vec::with_capacity(given.len()),
@@ -1049,13 +1281,24 @@ pub fn capture_end(py: Python<'_>, outputs: &Bound<'_, PyAny>) -> PyResult<PyCap
         })?;
         refs.push(found);
     }
-    let _ = py;
+    // W10a: the freshness snapshot, taken here because this is the line where
+    // "it was captured" is asserted, and the point the tape differentiates at
+    // is the point its constants were at when that claim was made.
+    let const_stamps: Vec<Stamp> = rec
+        .const_objects
+        .iter()
+        .map(|object| match object.bind(py).cast::<PyTensorBase>() {
+            Ok(tensor) => stamp_of(tensor),
+            Err(_) => None,
+        })
+        .collect();
 
     Ok(PyCaptureTrace {
         nodes: rec.nodes,
         inputs: rec.inputs,
         consts: rec.consts,
         const_objects: rec.const_objects,
+        const_stamps,
         outputs: refs,
     })
 }

@@ -835,6 +835,12 @@ pub fn aten_dispatch(
     // atomic load, one table scan of twelve strings, and a walk of the argument
     // tuple that stops at the first tensor and finds a `false`.
     crate::tensor::mark_from_op(py, op, args, kwargs, &out);
+    // W10a (docs/BACKWARD6.md). Beside `mark_from_op` and **not inside it**:
+    // that function returns early when grad mode is off, and the call this
+    // exists to see -- `optimizer.step()`'s `add_` -- is made under `no_grad`.
+    // On the ordinary path this is `is_mutating`: one `rsplit_once` and a
+    // branch that is not taken.
+    crate::capture::note_mutation(op, args, kwargs);
     if crate::capture::is_active() {
         crate::capture::record(py, op, args, kwargs, &out);
     }

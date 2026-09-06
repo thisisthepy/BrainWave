@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import sys
 import shutil
 import tempfile
 from types import ModuleType
@@ -28,11 +29,37 @@ def _candidate_artefacts(explicit_path: str | None) -> list[str]:
     env_path = os.environ.get("TORCH_C_ARTEFACT")
     if env_path:
         return [env_path]
-    # Default host build location documented in docs/TORCH_C.md §7.
-    return [
+    # **The default is one shared path, and several checkouts build into it.**
+    # Falling back here from a worktree grades whatever another agent most
+    # recently built, and it does not look like an error -- it looks like a
+    # result. It happened: a round reported `8470/8476` with six float8
+    # in-place cases announcing a gap "appears CLOSED", because it had picked
+    # up a concurrent round's binary. Same family as the `$TMPDIR` staging
+    # collision and the shared `CARGO_TARGET_DIR`, and the same shape every
+    # time: shared mutable build state, failing as a wrong verdict rather than
+    # as an error.
+    #
+    # So the fallback stays -- a single-checkout run should not have to set an
+    # environment variable -- but it says out loud which artefact it took, and
+    # whether that artefact belongs to the tree it was invoked from.
+    default = [
         "/Volumes/macMini/caches/cargo-target/release/lib_C.dylib",
         "/Volumes/macMini/caches/cargo-target/release/lib_C.so",
     ]
+    here = os.path.realpath(os.path.join(os.path.dirname(__file__), "..", ".."))
+    for path in default:
+        if os.path.exists(path):
+            print(
+                f"golden: TORCH_C_ARTEFACT is unset, taking the shared default\n"
+                f"        {path}\n"
+                f"        invoked from {here}\n"
+                f"        Several checkouts build into that path. If another is "
+                f"building, this grades its binary.\n"
+                f"        Set TORCH_C_ARTEFACT to the one you built.",
+                file=sys.stderr,
+            )
+            break
+    return default
 
 
 def load_shim(explicit_path: str | None = None) -> ModuleType:
