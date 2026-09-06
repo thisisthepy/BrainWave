@@ -416,10 +416,11 @@ def test_view_as_complex_copies_rather_than_aliasing():
 
 
 def test_stft_computes_and_fft_fftn_is_still_unspelled():
-    """The inversion `docs/FFT.md` earned, and the one name still missing.
+    """The inversion `docs/FFT.md` earned, and the third inversion, of the
+    other half, that `docs/BIND4.md`/`docs/COMPLEX3.md` earned together.
 
-    This test has now been inverted twice by two different rounds, and the
-    sequence is the point. It began asserting `stft` refused at
+    This test has now been inverted three times by three different rounds,
+    and the sequence is the point. It began asserting `stft` refused at
     `_nn.pad(mode='reflect')`, before any complex value existed --
     `docs/COMPLEX.md`'s reason for putting reflect pad first of three. Then
     `docs/BIND2.md` made the pad reach its kernel and the wall moved one line,
@@ -432,18 +433,41 @@ def test_stft_computes_and_fft_fftn_is_still_unspelled():
     `n_fft // 2 + 1`, which is 5 for 8 -- a full-length 8 would be
     self-consistent and wrong.
 
-    `fft_fftn` is kept in the same test on purpose. `docs/FFT.md` landed
-    `_fft_r2c`, `_fft_c2c` and `_fft_c2r` but did *not* spell
-    `aten.fft_fftn.default`, so this half still asserts an absence -- and it
-    fails, demanding its own inversion, the moment someone lands that name.
+    `fft_fftn` is kept in the same test, inverted for the reason its own
+    docstring asked for: `docs/BIND4.md` landed `torch._C._fft.fft_fftn` as a
+    real function (docs/COMPLEX3.md §6.2's verbatim two-line decomposition),
+    so the name no longer falls to the catch-all `_Unimplemented` and the old
+    assertion (`"fft_fftn" in msg`) would now be false -- the catch-all's
+    message names the attribute that was looked up, and this is not that path
+    any more.
+
+    What is asserted instead is narrower, and deliberately so: THIS worktree
+    was cut before the complex round's `_to_copy(dtype=complex64)` gate
+    merged (docs/BIND4.md's own hand-off note), so `fft_fftn` still refuses
+    here -- but now from *inside* the real decomposition, at the widen-to-
+    complex step, not from the name lookup. `test_bind4.py` holds the
+    positive half (the name resolves, is not the catch-all) without needing
+    that gate open; the full numeric claim (`FNetModel` forward agreeing with
+    upstream, max abs diff 7.15e-07) belongs to the merged tree, per
+    docs/COMPLEX3.md §6.1.
     """
     r = _raised("fft_fftn")
     if r == "skip":
         return
-    assert r is not None, "fft_fftn computed -- invert this half of the test"
+    assert r is not None, (
+        "fft_fftn computed -- the complex round's _to_copy gate has merged "
+        "here; invert this assertion to a shape/value check instead"
+    )
     exc, msg = r
     assert exc == "NotImplementedError", f"{exc}: {msg}"
-    assert "fft_fftn" in msg, msg
+    assert "fft_fftn" not in msg, (
+        f"fft_fftn is back on the catch-all path (msg={msg!r}) -- the "
+        "binding in bootstrap.py's `install` (module._fft.fft_fftn) is "
+        "missing or was not reached"
+    )
+    assert "_to_copy" in msg and "complex64" in msg, (
+        f"fft_fftn refused somewhere unexpected: {msg}"
+    )
 
     # And the half that inverted: both spellings compute now.
     for label in ("stft", "stft_real"):
