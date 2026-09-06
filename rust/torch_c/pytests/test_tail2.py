@@ -626,10 +626,30 @@ def test_only_the_expected_complex_ops_landed():
         "aten.view_as_complex.default",
         "aten.view_as_real.default",
     ]
-    # Still nothing: docs/COMPLEX.md §3.3 step 5 (`fft_fftn`, for `fnet`) and
-    # §7 (vmap) are separate decisions and neither was taken.
+    # **Inverted by docs/FFT.md**, which is what this file's docstring asks an
+    # implementing round to do rather than delete the assertion. Three
+    # `_fft_*` keys landed, all three parked for the same reason the five
+    # above are: two of them return a complex tensor and one takes one, so a
+    # golden comparison has nothing dense to read on at least one side. The
+    # list is pinned, so a fourth appearing is still a failure here.
+    assert sorted(op for op in parked if "fft_" in op) == [
+        "aten._fft_c2c.default",
+        "aten._fft_c2r.default",
+        "aten._fft_r2c.default",
+    ]
+    assert not [op for op in implemented if "fft_" in op], (
+        "an _fft_* op is advertised to golden, which cannot compare a complex "
+        "result -- see aten.rs's note on IMPLEMENTED_AWAITING_GOLDEN"
+    )
+    # `aten.stft.*` IS advertised, and deliberately: its `return_complex=False`
+    # form is real on both sides (docs/FFT.md §3).
+    assert {"aten.stft.default", "aten.stft.center"} <= implemented
+    # Still nothing: docs/COMPLEX.md §3.3 step 5 (`fft_fftn`, for `fnet`) is a
+    # separate decision -- `_fft_r2c` takes a multi-axis `dim` here, which is
+    # the arithmetic `fft_fftn` needs, but no `aten.fft_fftn.default` kernel
+    # or spelling was added. §7 (vmap) is untouched.
     assert not [op for op in implemented | parked
-                if "fft_" in op or "_vmap_" in op]
+                if "fft_fftn" in op or "_vmap_" in op]
 
 
 def _main():

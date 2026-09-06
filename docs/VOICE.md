@@ -354,7 +354,14 @@ task than it was this morning, which is the argument for having landed `cumprod`
 <!-- DOCWATCH: op-implemented aten.cumprod.default -->
 <!-- DOCWATCH: op-not-implemented aten.mish.default -->
 <!-- DOCWATCH: op-not-implemented aten.kaiser_window.beta -->
-<!-- DOCWATCH: op-not-implemented aten.stft.default -->
+<!-- docs/FFT.md landed `aten.stft.default` and `aten.stft.center`. The marker
+     above was `op-not-implemented aten.stft.default`; it is inverted rather than
+     deleted, so this section still fails if the op ever leaves again. What §3
+     says about `torch.stft` being unreachable is superseded by docs/FFT.md for
+     `center=False`; `center=True` still needs `bootstrap.py`'s `F.pad(reflect)`
+     branch (docs/PAD.md §5). -->
+<!-- DOCWATCH: op-implemented aten.stft.default -->
+<!-- DOCWATCH: op-implemented aten.stft.center -->
 <!-- DOCWATCH: op-not-implemented aten.polar.default -->
 <!-- DOCWATCH: op-not-implemented aten.view_as_complex.default -->
 <!-- DOCWATCH: json-key rust/torch_c/src/overloads.json hann_window present -->

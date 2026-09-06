@@ -609,7 +609,16 @@ fn shim_same_device(left: PyDevice, right: PyDevice) -> bool {
 /// `aten.rs` holding a readback marker is either a kernel on this list, one of
 /// the six helpers, or on a named exemption list -- so a new readback anywhere
 /// in the file has to be classified by a human before the suite goes green.
-pub const MPS_HOST_READBACK_OPS: [&str; 71] = [
+pub const MPS_HOST_READBACK_OPS: [&str; 76] = [
+    // The five FFT keys (docs/FFT.md section 7). Unlike almost everything else
+    // on this list, these do NOT read back on some dtype path and stay on the
+    // GPU on another: `candle-core` 0.11.0 has no FFT of any kind, so the
+    // transform is arithmetic this crate writes, on the host, in f64, on every
+    // path. There is nothing to allowlist -- the refusal is the honest answer
+    // until a device-side butterfly exists.
+    "aten._fft_c2c.default",
+    "aten._fft_c2r.default",
+    "aten._fft_r2c.default",
     "aten._grouped_mm.default",
     "aten._log_softmax.default",
     "aten._safe_softmax.default",
@@ -676,6 +685,8 @@ pub const MPS_HOST_READBACK_OPS: [&str; 71] = [
     "aten.scatter.value",
     "aten.scatter_reduce.two",
     "aten.softplus.default",
+    "aten.stft.center",
+    "aten.stft.default",
     "aten.upsample_bicubic2d.default",
     "aten.upsample_bilinear2d.default",
     "aten.upsample_nearest2d.default",

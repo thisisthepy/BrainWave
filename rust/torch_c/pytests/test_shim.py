@@ -727,12 +727,15 @@ def test_overload_resolution_refuses_rather_than_guessing():
     # The example keeps having to move, and that is the point rather than an
     # annoyance: it can only be a name that is *still* unreachable, so choosing
     # one is choosing a claim that gets falsified the day someone implements
-    # it. `stft` is the one this round *could not* reach and said why
-    # (docs/VOICE.md §3): it returns a complex tensor, candle 0.11.0 has no
-    # complex `DType` at all, so falsifying this line means a candle-level
-    # change has landed rather than another kernel.
+    # it. `stft` was it until docs/FFT.md, which built the transform on
+    # `Repr::Complex` and gave `torch.stft` a two-overload table entry -- so
+    # the example has moved to `istft`, its inverse. `istft` is a genuinely
+    # different problem from `stft` rather than the same one unwritten: it is
+    # an overlap-add with a window-sum normalisation, and docs/VOICE.md §3
+    # ranks it beside `stft` for the same four speech models. Falsifying this
+    # line means somebody wrote that.
     try:
-        _vf("stft")(1)
+        _vf("istft")(1)
     except NotImplementedError as e:
         assert "no table entry" in str(e)
     else:
@@ -9287,7 +9290,22 @@ def test_core_ops_and_op_tags_agree():
     # would have written 123 here and the test would still have passed the
     # day it was written, which is exactly the failure mode `min.dim` vs
     # `max.dim` above already recorded once.
-    assert r["tag_core_count"] == 125, r["tag_core_count"]
+    #
+    # 125 -> 127 with docs/FFT.md's five new keys, and **the delta is two, not
+    # five**, for the same reason:
+    #
+    #     _fft_r2c.default   ['core', 'pt2_compliant_tag']   <- counted
+    #     _fft_c2r.default   ['core', 'pt2_compliant_tag']   <- counted
+    #     _fft_c2c.default   ['pt2_compliant_tag']           <- NOT core
+    #     stft.default       ['pt2_compliant_tag']           <- NOT core
+    #     stft.center        ['pt2_compliant_tag']           <- NOT core
+    #
+    # `_fft_c2c` not being core while `_fft_r2c` and `_fft_c2r` -- its two
+    # siblings, all three implemented here by the same `dft_in_place` -- both
+    # are is upstream's table again and not derivable. Each of the five was
+    # read off its own `.tags`; inferring from the round would have written
+    # 130.
+    assert r["tag_core_count"] == 127, r["tag_core_count"]
 
 
 def test_decompose_lowers_the_op_capture_md_named():
@@ -10890,7 +10908,18 @@ def test_schema_text_survives_the_round_trip_through_the_transcribed_tables():
     # spelling for them -- a row would invent a door upstream lacks. Measured
     # here rather than summed from either report, since each branch's count
     # was correct only against its own base.
-    assert len(keys) == 337, len(keys)
+    # 339 with docs/FFT.md's `stft`. **+2, not +5**, and which of the five new
+    # kernels contribute is the check: `overloads.json` gains the two real
+    # `aten::stft` overloads (`center` and `default`) because upstream really
+    # does have `torch.stft`, and `Tensor.stft` names the same two schemas so
+    # it would add none even if `methods.json` carried it. The three
+    # `aten::_fft_*` kernels contribute **zero** -- upstream has no
+    # `torch._fft_r2c` and no `Tensor._fft_r2c`; `torch.fft.rfft` is a
+    # C++-level composite that lands on `_fft_r2c` through the dispatcher, not
+    # a `_VariableFunctions` member, so a row for any of them would invent a
+    # door upstream lacks (the same reasoning the six pad kernels record
+    # above).
+    assert len(keys) == 339, len(keys)
     from_tables = sorted(
         k for k in keys
         if report["table"][f"{k[0]}|{k[1]}"]["from"] == "tables"
