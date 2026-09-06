@@ -2317,6 +2317,60 @@ def pow_tensor_scalar_cases(torch_module, c_module, torch_call) -> list[Case]:
         )
     )
 
+    # docs/FIXES.md: `uint8_tensor ** 256` used to compute silently (the
+    # exponent narrowed into `i64` with no range check) where upstream raises
+    # `RuntimeError: value cannot be converted to type uint8_t without
+    # overflow` -- the same overflow check `fill_`/`full` already have,
+    # measured to apply to `pow.Tensor_Scalar`'s exponent too. `255` is the
+    # boundary case just inside the range (computes on both sides) and `256`
+    # is one past it.
+    u8_t, u8_c = pair_from_flat(torch_module, c_module, [2, 3, 255], (3,), "uint8")
+    cases.append(
+        Case(
+            name="pow(dtype=uint8, exponent=255) [just inside range]",
+            op=op,
+            run_torch=lambda u8_t=u8_t: torch_call(u8_t, 255),
+            run_c=lambda u8_c=u8_c: c_module._aten_dispatch(op, u8_c, 255),
+        )
+    )
+    cases.append(
+        Case(
+            name="pow(dtype=uint8, exponent=256) [one past uint8's range, refuses]",
+            op=op,
+            run_torch=lambda u8_t=u8_t: torch_call(u8_t, 256),
+            run_c=lambda u8_c=u8_c: c_module._aten_dispatch(op, u8_c, 256),
+            expect="both_error",
+            note="RuntimeError: value cannot be converted to type uint8_t "
+            "without overflow",
+        )
+    )
+
+    # docs/FIXES.md: `float32 ** 0.3` was 1 ULP off on four of the eight
+    # `_scalar_rule_cases` bases (`side_from_scalar` narrowed the exponent
+    # `0.3` to its nearest `float32` value *before* the `f64` `powf` call,
+    # which upstream measurably does not do for this overload -- narrowing
+    # first and computing in `f64` gives a different, not correctly-rounded,
+    # `float32` result). Fixed by keeping the exponent at full `f64`
+    # precision here and narrowing only the final result. Kept to **one
+    # element per case** deliberately: the comment above `float32`'s absence
+    # from `_scalar_rule_cases` records that upstream's vectorised `float32`
+    # `pow` answers different bits for the same element depending on the
+    # tensor's *length* (a SLEEF-vs-libm tail effect), so a multi-element
+    # case here would be pinned to whichever road a particular tensor length
+    # happens to take rather than to this fix.
+    for base in (7.0, 11.0, 13.0, 96.0):
+        base_t, base_c = pair_from_flat(torch_module, c_module, [base], (1,), "float32")
+        cases.append(
+            Case(
+                name=f"pow(dtype=float32, base={base}, exponent=0.3) [exponent kept at full f64 precision]",
+                op=op,
+                run_torch=lambda base_t=base_t: torch_call(base_t, 0.3),
+                run_c=lambda base_c=base_c: c_module._aten_dispatch(op, base_c, 0.3),
+                note="narrowing 0.3 to float32 before the f64 powf call was "
+                "1 ULP off from upstream's correctly-rounded answer",
+            )
+        )
+
     return cases
 
 
@@ -3773,6 +3827,279 @@ def remainder_tensor_cases(torch_module, c_module, torch_call) -> list[Case]:
     cases.append(
         Case(
             name="remainder.Tensor(int64, [3, 0]) [one zero divisor raises]",
+            op=op,
+            run_torch=lambda a_t=a_t, b_t=b_t: torch_call(a_t, b_t),
+            run_c=lambda a_c=a_c, b_c=b_c: c_module._aten_dispatch(op, a_c, b_c),
+            expect="both_error",
+            note="RuntimeError('ZeroDivisionError'), not a NaN in one lane",
+        )
+    )
+
+    return cases
+
+
+# --- aten.fmod.Scalar / aten.fmod.Tensor ------------------------------------
+#
+# docs/SCALAR2.md §6: `torch.fmod` had no row in `overloads.json` at all, so
+# `torch.fmod(...)` raised `AttributeError` rather than resolving to a
+# kernel -- unlike `remainder`, its sign-of-the-divisor sibling right above,
+# which had both overloads. `fmod`'s own kernel already existed in spirit
+# (`remainder_i64`/`remainder_f64` compute the correction on top of exactly
+# this), so this is `remainder`'s case set with the correction removed and
+# the expectations flipped on every quadrant it disagrees on.
+#
+# The same four rows `_REMAINDER_SIGNS`'s doc comment prints, from `fmod`'s
+# side of the table:
+#
+#     fmod( 7,  3) =  1     remainder =  1      (agree)
+#     fmod( 7, -3) =  1     remainder = -2      <-- disagree
+#     fmod(-7,  3) = -1     remainder =  2       <-- disagree
+#     fmod(-7, -3) = -1     remainder = -1      (agree)
+#
+# `_REMAINDER_SIGNS` is reused rather than duplicated -- same quadrants, same
+# operands, so the two case sets are checking the same inputs the two upstream
+# functions are measured to disagree on, not two different samples.
+#
+# Where `fmod` and `remainder` genuinely differ in behaviour, not just sign:
+#
+#   * **`fmod(-0.0, 3.0)` is `-0.0`, same as `remainder`'s** -- both are
+#     guarded the same way (Rust's `%` already gives `-0.0` here with no
+#     correction needed), so this is not a place the two diverge.
+#   * **float division by zero is `NaN`, integral is `ZeroDivisionError`**,
+#     identical split to `remainder`'s -- `fmod`'s zero-divisor behaviour was
+#     never the open question, only the overload table entry was.
+#   * **`i64::MIN % -1`** is the same trap `remainder_i64` already routes
+#     around with `wrapping_rem`; `fmod_i64` uses the same function for the
+#     same reason and the golden case is the same pair.
+
+_FMOD_DTYPES_FLOAT = _REMAINDER_DTYPES_FLOAT
+_FMOD_DTYPES_INT = _REMAINDER_DTYPES_INT
+_FMOD_SIGNS = _REMAINDER_SIGNS
+
+
+def fmod_scalar_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.fmod.Scalar"
+    cases: list[Case] = []
+
+    for dtype_name in _FMOD_DTYPES_FLOAT:
+        for a, b in _FMOD_SIGNS:
+            a_t, a_c = pair_from_flat(
+                torch_module, c_module, [float(a)], (1,), dtype_name
+            )
+            cases.append(
+                Case(
+                    name=f"fmod({a}.0 as {dtype_name}, {b}.0) [sign of the dividend]",
+                    op=op,
+                    run_torch=lambda a_t=a_t, b=b: torch_call(a_t, float(b)),
+                    run_c=lambda a_c=a_c, b=b: c_module._aten_dispatch(op, a_c, float(b)),
+                    note="remainder would answer the sign of the divisor",
+                )
+            )
+        a_t, a_c = pair_from_flat(
+            torch_module, c_module, [-0.0, 0.0, -0.0, 0.0], (2, 2), dtype_name
+        )
+        cases.append(
+            Case(
+                name=f"fmod(-0.0/+0.0 as {dtype_name}, 3.0) [signed zero survives]",
+                op=op,
+                run_torch=lambda a_t=a_t: torch_call(a_t, 3.0),
+                run_c=lambda a_c=a_c: c_module._aten_dispatch(op, a_c, 3.0),
+                value_check=_signed_zero_check,
+                note="Rust's `%` already gives -0.0 here, no correction needed",
+            )
+        )
+        for a, b, note in [
+            (float("inf"), 3.0, "inf dividend -> NaN"),
+            (float("-inf"), 3.0, "-inf dividend -> NaN"),
+            (float("nan"), 3.0, "NaN dividend -> NaN"),
+            (5.0, float("inf"), "+inf divisor -> the dividend, unchanged"),
+            (5.0, float("-inf"), "-inf divisor -> the dividend, unchanged (no correction)"),
+            (-5.0, float("inf"), "+inf divisor, negative dividend -> the dividend, unchanged"),
+            (5.0, 0.0, "float division by zero -> NaN, no raise"),
+            (-5.0, 0.0, "float division by zero -> NaN, no raise"),
+        ]:
+            a_t, a_c = pair_from_flat(torch_module, c_module, [a], (1,), dtype_name)
+            cases.append(
+                Case(
+                    name=f"fmod({a!r} as {dtype_name}, {b!r}) [{note}]",
+                    op=op,
+                    run_torch=lambda a_t=a_t, b=b: torch_call(a_t, b),
+                    run_c=lambda a_c=a_c, b=b: c_module._aten_dispatch(op, a_c, b),
+                    note=note,
+                )
+            )
+
+    for dtype_name in _FMOD_DTYPES_INT:
+        for a, b in _FMOD_SIGNS:
+            if dtype_name == "uint8" and a < 0:
+                continue
+            a_t, a_c = pair_from_flat(torch_module, c_module, [a], (1,), dtype_name)
+            cases.append(
+                Case(
+                    name=f"fmod({a} as {dtype_name}, {b}) [integral, sign of the dividend]",
+                    op=op,
+                    run_torch=lambda a_t=a_t, b=b: torch_call(a_t, b),
+                    run_c=lambda a_c=a_c, b=b: c_module._aten_dispatch(op, a_c, b),
+                    note="Rust's `%` on integers is already this convention",
+                )
+            )
+        a_t, a_c = pair_from_flat(torch_module, c_module, [5], (1,), dtype_name)
+        cases.append(
+            Case(
+                name=f"fmod({dtype_name}, 0) [integral division by zero raises]",
+                op=op,
+                run_torch=lambda a_t=a_t: torch_call(a_t, 0),
+                run_c=lambda a_c=a_c: c_module._aten_dispatch(op, a_c, 0),
+                expect="both_error",
+                note="upstream: RuntimeError('ZeroDivisionError'), same split as "
+                "remainder's",
+            )
+        )
+        a_t, a_c = pair_from_flat(torch_module, c_module, [5], (1,), dtype_name)
+        cases.append(
+            Case(
+                name=f"fmod({dtype_name}, 2.5) [float scalar floats the result]",
+                op=op,
+                run_torch=lambda a_t=a_t: torch_call(a_t, 2.5),
+                run_c=lambda a_c=a_c: c_module._aten_dispatch(op, a_c, 2.5),
+                note="torch's wrapped-number rule: an int scalar would not",
+            )
+        )
+
+    a_t, a_c = pair_from_flat(torch_module, c_module, [-(2**63)], (1,), "int64")
+    cases.append(
+        Case(
+            name="fmod(int64 min, -1) [the overflow pair]",
+            op=op,
+            run_torch=lambda a_t=a_t: torch_call(a_t, -1),
+            run_c=lambda a_c=a_c: c_module._aten_dispatch(op, a_c, -1),
+            note="`i64::MIN % -1` panics in Rust; upstream answers 0",
+        )
+    )
+
+    # A documented capability gap, the same shape as `remainder.Scalar`'s:
+    # measured, upstream COMPUTES for a bool tensor with a numeric scalar
+    # (int64 for an int, float32 for a float -- `fmod(bool, 2)` is
+    # `[1, 0]` int64, `fmod(bool, 2.0)` is `[1.0, 0.0]` float32) and this
+    # shim refuses, because `fmod_op` reuses `remainder_op`'s bool-scalar
+    # refusal verbatim rather than reproducing the fast-path ladder. Unlike
+    # the `Tensor,Tensor` overload just above, where the refusal really is
+    # upstream's own (`"fmod_cpu" not implemented for 'Bool'`), so the two
+    # bool cases in this file expect opposite outcomes on purpose.
+    a_t, a_c = pair_from_flat(torch_module, c_module, [True, False], (2,), "bool")
+    for scalar in (2, 2.0):
+        cases.append(
+            Case(
+                name=f"fmod(bool, {scalar!r}) [documented gap: upstream computes]",
+                op=op,
+                run_torch=lambda a_t=a_t, s=scalar: torch_call(a_t, s),
+                run_c=lambda a_c=a_c, s=scalar: c_module._aten_dispatch(op, a_c, s),
+                expect="c_error",
+                note="upstream gives int64 for an int scalar and float32 for a "
+                "float one; this shim refuses bool operands here exactly as "
+                "remainder.Scalar's own documented gap does",
+            )
+        )
+
+    # The narrowed-scalar case `remainder`'s own doc comment records --
+    # `-3` narrows to `253` in `uint8` before either kernel runs, so
+    # `fmod(uint8(200), -3)` is `200`, exactly as `remainder`'s is.
+    a_t, a_c = pair_from_flat(torch_module, c_module, [200], (1,), "uint8")
+    cases.append(
+        Case(
+            name="fmod(uint8(200), -3) [scalar narrows into uint8 first]",
+            op=op,
+            run_torch=lambda a_t=a_t: torch_call(a_t, -3),
+            run_c=lambda a_c=a_c: c_module._aten_dispatch(op, a_c, -3),
+            note="-3 narrows to 253 in uint8 before the division runs",
+        )
+    )
+
+    return cases
+
+
+def fmod_tensor_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.fmod.Tensor"
+    cases: list[Case] = []
+
+    for dtype_name in _FMOD_DTYPES_FLOAT + _FMOD_DTYPES_INT:
+        is_float = dtype_name in _FMOD_DTYPES_FLOAT
+        lhs = [a for a, _ in _FMOD_SIGNS]
+        rhs = [b for _, b in _FMOD_SIGNS]
+        if dtype_name == "uint8":
+            lhs = [abs(v) for v in lhs]
+            rhs = [abs(v) if v != 0 else 1 for v in rhs]
+        if is_float:
+            lhs = [float(v) for v in lhs]
+            rhs = [float(v) for v in rhs]
+        shape = (len(lhs),)
+        a_t, a_c = pair_from_flat(torch_module, c_module, lhs, shape, dtype_name)
+        b_t, b_c = pair_from_flat(torch_module, c_module, rhs, shape, dtype_name)
+        cases.append(
+            Case(
+                name=f"fmod.Tensor(dtype={dtype_name}) [all four sign quadrants]",
+                op=op,
+                run_torch=lambda a_t=a_t, b_t=b_t: torch_call(a_t, b_t),
+                run_c=lambda a_c=a_c, b_c=b_c: c_module._aten_dispatch(op, a_c, b_c),
+                note="elementwise, every quadrant in one call",
+            )
+        )
+
+    a_t, a_c = pair_from_flat(
+        torch_module, c_module, [7.0, 8.0], (2, 1), "float32"
+    )
+    b_t, b_c = pair_from_flat(torch_module, c_module, [3.0, -3.0], (2,), "float32")
+    cases.append(
+        Case(
+            name="fmod.Tensor((2,1) against (2,)) [broadcast]",
+            op=op,
+            run_torch=lambda a_t=a_t, b_t=b_t: torch_call(a_t, b_t),
+            run_c=lambda a_c=a_c, b_c=b_c: c_module._aten_dispatch(op, a_c, b_c),
+        )
+    )
+    cases.append(
+        Case(
+            name="fmod.Tensor((2,) against (2,1)) [broadcast, reversed]",
+            op=op,
+            run_torch=lambda a_t=b_t, b_t=a_t: torch_call(a_t, b_t),
+            run_c=lambda a_c=b_c, b_c=a_c: c_module._aten_dispatch(op, a_c, b_c),
+        )
+    )
+
+    for a_dt, b_dt in [
+        ("int64", "int32"), ("int32", "float32"), ("float32", "float64"),
+        ("float16", "float32"), ("float16", "bfloat16"), ("uint8", "int16"),
+    ]:
+        a_t, a_c = pair_from_flat(torch_module, c_module, [7], (1,), a_dt)
+        b_t, b_c = pair_from_flat(torch_module, c_module, [3], (1,), b_dt)
+        cases.append(
+            Case(
+                name=f"fmod.Tensor({a_dt} against {b_dt}) [promotion]",
+                op=op,
+                run_torch=lambda a_t=a_t, b_t=b_t: torch_call(a_t, b_t),
+                run_c=lambda a_c=a_c, b_c=b_c: c_module._aten_dispatch(op, a_c, b_c),
+                note="agrees with torch.promote_types, same table remainder uses",
+            )
+        )
+
+    a_t, a_c = pair_from_flat(torch_module, c_module, [True, False], (2,), "bool")
+    b_t, b_c = pair_from_flat(torch_module, c_module, [True, True], (2,), "bool")
+    cases.append(
+        Case(
+            name="fmod.Tensor(bool, bool) [upstream refuses too]",
+            op=op,
+            run_torch=lambda a_t=a_t, b_t=b_t: torch_call(a_t, b_t),
+            run_c=lambda a_c=a_c, b_c=b_c: c_module._aten_dispatch(op, a_c, b_c),
+            expect="both_error",
+            note='upstream: NotImplementedError \'"fmod_cpu" not implemented for \'Bool\'\'',
+        )
+    )
+
+    a_t, a_c = pair_from_flat(torch_module, c_module, [5, 6], (2,), "int64")
+    b_t, b_c = pair_from_flat(torch_module, c_module, [3, 0], (2,), "int64")
+    cases.append(
+        Case(
+            name="fmod.Tensor(int64, [3, 0]) [one zero divisor raises]",
             op=op,
             run_torch=lambda a_t=a_t, b_t=b_t: torch_call(a_t, b_t),
             run_c=lambda a_c=a_c, b_c=b_c: c_module._aten_dispatch(op, a_c, b_c),
@@ -6067,6 +6394,27 @@ def lt_scalar_cases(torch_module, c_module, torch_call) -> list[Case]:
                 [1, 2, 3, 4], (2, 2), 3, "x < 3, as reached from __lt__ with a python scalar",
             )
         )
+
+    # docs/FIXES.md / docs/SCALAR2.md §6: a negative Python int scalar against
+    # a `uint8` tensor wraps into the dtype's bit pattern before the
+    # comparison runs, the same two's-complement rule `floor_divide`'s
+    # `uint8` scalar case below uses. Measured on upstream 2.13.0 by sweeping
+    # every scalar from -300 to 300: `-1` reads as `255`, `-256` as `0`,
+    # `-300` as `212`, `300` as `44`. These four bracket that sweep --
+    # `-256`'s wrapped value of `0` is the one boundary case (every tensor
+    # element is `< 0` is false, the same answer `0` itself gives).
+    u8_a_t, u8_a_c = pair_from_flat(torch_module, c_module, [10, 20, 250], (3,), "uint8")
+    for scalar in (-1, -256, -300, 300):
+        cases.append(
+            Case(
+                name=f"lt(uint8, {scalar}) [negative/overflowing scalar wraps into uint8]",
+                op=op,
+                run_torch=lambda u8_a_t=u8_a_t, scalar=scalar: torch_call(u8_a_t, scalar),
+                run_c=lambda u8_a_c=u8_a_c, scalar=scalar: c_module._aten_dispatch(op, u8_a_c, scalar),
+                note="e.g. -1 wraps to 255 before the comparison runs",
+            )
+        )
+
     return cases
 
 
@@ -18199,6 +18547,33 @@ def floor_divide_cases(torch_module, c_module, torch_call) -> list[Case]:
         )
     )
 
+    # docs/FIXES.md / docs/SCALAR2.md §6: a negative or overflowing Python int
+    # scalar against a `uint8` tensor wraps into the dtype's bit pattern
+    # before the division runs -- the same rule `lt.Scalar`'s `uint8` cases
+    # exercise. `-256` wraps to `0`, which makes the divisor zero and raises,
+    # exactly as an explicit `// 0` does.
+    u8_t, u8_c = pair_from_flat(torch_module, c_module, [10, 20, 250], (3,), "uint8")
+    for scalar in (-1, -300, 300):
+        cases.append(
+            Case(
+                name=f"floor_divide(dtype=uint8, tensor // {scalar}) [scalar wraps into uint8 first]",
+                op=op,
+                run_torch=lambda u8_t=u8_t, scalar=scalar: torch_call(u8_t, scalar),
+                run_c=lambda u8_c=u8_c, scalar=scalar: c_module._aten_dispatch(op, u8_c, scalar),
+            )
+        )
+    cases.append(
+        Case(
+            name="floor_divide(dtype=uint8, tensor // -256) [wraps to 0, raises like // 0]",
+            op=op,
+            run_torch=lambda u8_t=u8_t: torch_call(u8_t, -256),
+            run_c=lambda u8_c=u8_c: c_module._aten_dispatch(op, u8_c, -256),
+            expect="both_error",
+            note="-256 wraps to 0 in uint8, and dividing by 0 raises "
+            "ZeroDivisionError exactly as an explicit // 0 does",
+        )
+    )
+
     # Floating dtype: division by zero is not an error (IEEE inf/-inf/nan).
     f_t, f_c = pair_from_flat(torch_module, c_module, [1.0, -1.0, 0.0], (3,), "float32")
     g_t, g_c = pair_from_flat(torch_module, c_module, [0.0, 0.0, 0.0], (3,), "float32")
@@ -23482,9 +23857,18 @@ def where_default_cases(torch_module, c_module, torch_call):
 def adaptive_avg_pool2d_cases(torch_module, c_module, torch_call):
     a_t, a_c = pair_from_flat(torch_module, c_module, [float(i) for i in range(16)], (1, 1, 4, 4), "float32")
     return [
-        Case(name="adaptive_avg_pool2d", op="aten.adaptive_avg_pool2d.default", 
-             run_torch=lambda: torch_call(a_t, [2, 2]), 
-             run_c=lambda: c_module._aten_dispatch("aten.adaptive_avg_pool2d.default", a_c, [2, 2]))
+        Case(name="adaptive_avg_pool2d", op="aten.adaptive_avg_pool2d.default",
+             run_torch=lambda: torch_call(a_t, [2, 2]),
+             run_c=lambda: c_module._aten_dispatch("aten.adaptive_avg_pool2d.default", a_c, [2, 2])),
+        # A bare int `output_size` is deliberately NOT a case here. Measured:
+        # `F.adaptive_avg_pool2d(x, 2)` does normalise to `(2, 2)` upstream,
+        # but that normalising happens in the `torch.nn.functional` wrapper,
+        # not in `torch.ops.aten.adaptive_avg_pool2d.default` -- the raw op
+        # this case dispatches directly refuses a bare int with its own
+        # pybind11 arg-parse error, measured the same way. A case here with a
+        # bare `2` would fail with a SILENT DIVERGENCE (checked), because it
+        # would be asking the aten op to be more lenient than upstream's own
+        # aten op is. See docs/FIXES.md.
     ]
 
 def where_scalar_self_cases(torch_module, c_module, torch_call):
@@ -23990,6 +24374,8 @@ CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
     "aten.repeat.default": repeat_cases,
     "aten.remainder.Scalar": remainder_scalar_cases,
     "aten.remainder.Tensor": remainder_tensor_cases,
+    "aten.fmod.Scalar": fmod_scalar_cases,
+    "aten.fmod.Tensor": fmod_tensor_cases,
     "aten.div.Scalar_mode": _div_mode_scalar_cases,
     "aten.div.Tensor_mode": _div_mode_tensor_cases,
     "aten.norm.ScalarOpt_dim": norm_scalaropt_dim_cases,

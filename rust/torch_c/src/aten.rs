@@ -119,6 +119,8 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.floor_.default",
     "aten.floor_divide.default",
     "aten.floor_divide.Scalar",
+    "aten.fmod.Scalar",
+    "aten.fmod.Tensor",
     "aten.full.default",
     "aten.full_like.default",
     "aten.gather.default",
@@ -484,6 +486,8 @@ static FLOAT8_E4M3FN_REFUSALS: &[(&str, &str)] = &[
     ("aten.flip.default", "flip_cpu"),
     ("aten.floor_divide.Scalar", "div_floor_cpu_reduced_float"),
     ("aten.floor_divide.default", "div_floor_cpu"),
+    ("aten.fmod.Scalar", "fmod_cpu"),
+    ("aten.fmod.Tensor", "fmod_cpu"),
     ("aten.gather.default", "scatter_gather_tensor_cpu"),
     ("aten.ge.Scalar", "ge_cpu"),
     ("aten.ge.Tensor", "ge_cpu"),
@@ -2138,6 +2142,8 @@ fn aten_dispatch_inner(
         "aten.floor_divide.default" => floor_divide_default(py, args, kwargs),
         "aten.floor_divide.Scalar" => floor_divide_scalar(py, args, kwargs),
         "aten.histc.default" => histc_default(py, args, kwargs),
+        "aten.fmod.Scalar" => fmod_op(py, args, kwargs, "aten.fmod.Scalar", true),
+        "aten.fmod.Tensor" => fmod_op(py, args, kwargs, "aten.fmod.Tensor", false),
         "aten.clamp_.default" => clamp_inplace_default(py, args, kwargs),
         // `mamba` clamps out of place; only the in-place sibling had a kernel.
         "aten.clamp.default" => clamp_default(py, args, kwargs),
@@ -4795,6 +4801,27 @@ fn pow_tensor_scalar(
     let exponent = scalar_arg(OP, args, kwargs, 1, "exponent")?
         .ok_or_else(|| missing(OP, "exponent"))?;
     let tag = pow_result_tag(OP, base.tag(), !exponent.is_int())?;
+    // Upstream narrows the exponent into the base's own dtype before `pow`
+    // ever runs (`side_from_scalar`'s doc comment above), and for an integer
+    // dtype that narrowing can overflow outright rather than merely lose
+    // precision. Measured on torch 2.13.0: `uint8_tensor ** 256` and
+    // `int8_tensor ** 128` both raise `RuntimeError: value cannot be
+    // converted to type <ctype> without overflow`, the same message and
+    // wording `overflow()` already produces for `fill_`/`full`. A *negative*
+    // out-of-range exponent (`int8_tensor ** -129`) instead raises the
+    // "Integers to negative integer powers are not allowed" message from
+    // `pow_from_pairs` -- measured to fire first -- so this check only
+    // applies to non-negative exponents, leaving that ordering intact.
+    if !tag.is_floating_point() && exponent.is_int() {
+        let e = exponent.as_i64();
+        if e >= 0 {
+            if let Some((min, max)) = int_range(tag) {
+                if e < min || e > max {
+                    return Err(overflow(tag));
+                }
+            }
+        }
+    }
     let shape = base.tensor()?.dims().to_vec();
     // `x ** 2` is the RMSNorm case and it is the whole linear term of the
     // model-level gap (docs/SEQLEN.md §2). Bit-identical -- see the fast path's
@@ -4803,7 +4830,25 @@ fn pow_tensor_scalar(
         return finish(py, t, tag);
     }
     let bases = side_from_tensor(OP, base.tensor()?, tag)?;
-    let exponents = side_from_scalar(&exponent, tag);
+    // `side_from_scalar` narrows a float exponent into `tag` before the `f64`
+    // `powf` call, on the theory (its own doc comment) that upstream narrows
+    // the scalar into the dispatched `scalar_t` first. That theory holds for
+    // `float64` (nothing to narrow) but not for `float32`: measured on torch
+    // 2.13.0 with a 50-digit `mpmath` oracle for the true value, `[7, 11, 13,
+    // 96].to(float32) ** 0.3` upstream's answer is the correctly-rounded
+    // `float32` result of `pow(base, 0.3)` computed with the *full-precision*
+    // `f64` exponent -- narrowing `0.3` to its nearest `float32` first
+    // (`0.30000001192092896`) and then computing in `f64` reproduces a
+    // different, NOT correctly-rounded, `float32` answer on all four, always
+    // 1 ULP high. So for `float32` the exponent is kept at full `f64`
+    // precision here, and only the final result is narrowed (`pow_from_pairs`
+    // already narrows via `fast_to(storage)`). `float64` is unaffected either
+    // way since narrowing to `float64` is a no-op.
+    let exponents = if tag == TorchDType::Float32 && !exponent.is_int() {
+        PowSide::Floats(vec![exponent.as_f64()])
+    } else {
+        side_from_scalar(&exponent, tag)
+    };
     pow_from_pairs(
         py,
         OP,
@@ -6382,6 +6427,28 @@ enum Cmp {
 /// tensors (measured, docs/OPS4.md §1). It is a separate key from `le.Scalar`
 /// -- different schema, different overload -- but the same kernel, exactly as
 /// `lt.Tensor`/`lt.Scalar` already are.
+/// Wraps a Python `int` scalar into an unsigned integer dtype's bit pattern,
+/// the way upstream's own `Scalar`-to-tensor conversion does before an
+/// unsigned tensor ever sees it. Measured by sweeping a `uint8` tensor's `//`
+/// and `<` against every scalar from -300 to 300 on torch 2.13.0: `-1` reads
+/// as `255`, `-256` as `0` (and then `// -256` raises `ZeroDivisionError`,
+/// exactly as `// 0` does), `-300` as `212`, `300` as `44` -- i.e. ordinary
+/// two's-complement truncation to the dtype's width, equivalent to `(v as
+/// u8)` widened back to `i64`. Signed integer dtypes and floats are untouched:
+/// only the unsigned family reinterprets a negative or overflowing scalar
+/// instead of refusing or saturating it.
+fn wrap_unsigned_scalar(v: i64, dtype: TorchDType) -> i64 {
+    let bits: u32 = match dtype {
+        TorchDType::UInt8 => 8,
+        TorchDType::UInt16 => 16,
+        TorchDType::UInt32 => 32,
+        // `u64`'s modulus does not fit in `i64`; not measured, left alone.
+        _ => return v,
+    };
+    let modulus = 1i64 << bits;
+    v.rem_euclid(modulus)
+}
+
 fn compare_common(op: &str, tensor: &Tensor, floating: bool, tag: TorchDType) -> PyResult<Tensor> {
     let _ = tag;
     // `float8_e4m3fn` refused here until docs/FLOAT8C.md §2. `widen_f64` routes
@@ -6461,7 +6528,7 @@ fn compare_scalar(
     let right = if floating {
         Tensor::full(other.as_f64(), (), left.device())
     } else {
-        Tensor::full(other.as_i64(), (), left.device())
+        Tensor::full(wrap_unsigned_scalar(other.as_i64(), lhs.tag()), (), left.device())
     }
     .map_err(|e| candle_err(op, e))?;
     finish(py, apply_cmp(op, kind, &left, &right)?, TorchDType::Bool)
@@ -9242,6 +9309,134 @@ fn remainder_op(
         // Unreachable: both sides are read at the same `tag`, so they are the
         // same `Flat` arm by construction. An `unreachable!()` here would be a
         // panic across the FFI boundary.
+        _ => {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "{op}: operands read at different categories -- internal error"
+            )))
+        }
+    };
+    let out = write_flat(op, values, shape, left.device(), tag)?;
+    finish(py, out, tag)
+}
+
+/// `fmod`'s correction over `remainder_f64`'s: there isn't one. `fmod` follows
+/// the sign of the *dividend* (`remainder_f64`'s doc comment above draws the
+/// contrast), which is exactly what Rust's `%` on floats already computes --
+/// no `(b < 0) != (m < 0)` adjustment, no negative-zero special case to
+/// preserve. Measured on torch 2.13.0: `fmod(-0.0, 3.0) == -0.0`,
+/// `fmod(5.0, 0.0)` and `fmod(-5.0, -0.0)` are both `NaN`, and Rust's `%`
+/// already agrees on all three -- IEEE 754 float remainder by zero is `NaN`
+/// and `-0.0 % 3.0` is `-0.0`, so this is a wrapper, not a transcription.
+fn fmod_f64(a: f64, b: f64) -> f64 {
+    a % b
+}
+
+/// The integer half. Unlike `remainder_i64`, no post-correction: `fmod`'s
+/// result already has the dividend's sign, which is what a truncating `%`
+/// gives. `wrapping_rem` for the same reason `remainder_i64` uses it --
+/// `i64::MIN % -1` panics in Rust where upstream answers `0` -- and a zero
+/// divisor raises `RuntimeError('ZeroDivisionError')`, matching upstream
+/// (measured: `torch.fmod(int64_tensor, 0)` raises, `torch.fmod(float_tensor,
+/// 0.0)` does not).
+fn fmod_i64(a: i64, b: i64) -> PyResult<i64> {
+    if b == 0 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err("ZeroDivisionError"));
+    }
+    Ok(a.wrapping_rem(b))
+}
+
+/// `aten::fmod.Scalar(Tensor self, Scalar other) -> Tensor` and
+/// `aten::fmod.Tensor(Tensor self, Tensor other) -> Tensor`.
+///
+/// `docs/SCALAR2.md` §6: no golden case exercised either overload, which is
+/// how `torch.fmod` stayed off `overloads.json` despite `remainder` -- its
+/// sign-of-the-divisor sibling -- having both overloads implemented since
+/// docs/ARCH26.md. Same dtype rules, same `uint8` scalar-narrowing behaviour
+/// (`fmod(uint8(200), -3)` is `200`, exactly as `remainder`'s doc comment
+/// records for the same pair, because `-3` narrows to `253` before either
+/// kernel sees it), same `Bool` refusal wording (`"fmod_cpu" not implemented
+/// for 'Bool'`) -- the only difference from `remainder_op` is which
+/// elementwise function computes the result, so this reuses its plumbing
+/// verbatim rather than re-deriving it.
+fn fmod_op(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+    op: &str,
+    scalar_form: bool,
+) -> PyResult<Py<PyAny>> {
+    let lhs = tensor_arg(op, args, kwargs, 0, "self")?;
+    let left = lhs.tensor()?;
+
+    let (tag, right_dims) = if scalar_form {
+        let other =
+            scalar_arg(op, args, kwargs, 1, "other")?.ok_or_else(|| missing(op, "other"))?;
+        if lhs.tag() == TorchDType::Bool {
+            return Err(not_implemented(format!(
+                "{op}: a torch.bool tensor with a numeric scalar promotes through a \
+                 fast-path ladder keyed on the scalar's Python type (int64 for an int, \
+                 float32 for a float, and upstream raises for a bool), which is not \
+                 implemented in torch._C shim"
+            )));
+        }
+        let mut tag = lhs.tag();
+        if !other.is_int() && !tag.is_floating_point() {
+            tag = default_float();
+        }
+        (tag, left.dims().to_vec())
+    } else {
+        let rhs = tensor_arg(op, args, kwargs, 1, "other")?;
+        if lhs.tag() == TorchDType::Bool || rhs.tag() == TorchDType::Bool {
+            return Err(pyo3::exceptions::PyNotImplementedError::new_err(
+                "\"fmod_cpu\" not implemented for 'Bool'",
+            ));
+        }
+        let tag = promote_operands(op, &lhs, &rhs)?;
+        (tag, rhs.tensor()?.dims().to_vec())
+    };
+
+    let storage = PyDtype::new(tag).storage(op)?;
+    let shape = if scalar_form {
+        left.dims().to_vec()
+    } else {
+        broadcast_shape(op, left.dims(), &right_dims)?
+    };
+
+    let a = left
+        .fast_to(storage)
+        .and_then(|t| t.broadcast_as(shape.clone()))
+        .map_err(|e| candle_err(op, e))?;
+    let b = if scalar_form {
+        let scalar =
+            scalar_arg(op, args, kwargs, 1, "other")?.ok_or_else(|| missing(op, "other"))?;
+        let filled = if storage.is_int() {
+            Tensor::full(scalar.as_i64(), (), left.device())
+        } else {
+            Tensor::full(scalar.as_f64(), (), left.device())
+        };
+        filled
+            .and_then(|t| t.fast_to(storage))
+            .and_then(|t| t.broadcast_as(shape.clone()))
+            .map_err(|e| candle_err(op, e))?
+    } else {
+        tensor_arg(op, args, kwargs, 1, "other")?
+            .tensor()?
+            .fast_to(storage)
+            .and_then(|t| t.broadcast_as(shape.clone()))
+            .map_err(|e| candle_err(op, e))?
+    };
+
+    let values = match (read_flat(op, &a, tag)?, read_flat(op, &b, tag)?) {
+        (Flat::Float(x), Flat::Float(y)) => {
+            Flat::Float(x.into_iter().zip(y).map(|(p, q)| fmod_f64(p, q)).collect())
+        }
+        (Flat::Int(x), Flat::Int(y)) => {
+            let mut out = Vec::with_capacity(x.len());
+            for (p, q) in x.into_iter().zip(y) {
+                out.push(fmod_i64(p, q)?);
+            }
+            Flat::Int(out)
+        }
         _ => {
             return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
                 "{op}: operands read at different categories -- internal error"
@@ -14322,7 +14517,7 @@ fn floor_divide_impl(
             let target = if scalar_at_opmath { TorchDType::Float32 } else { tag };
             Flat::Float(vec![float_narrower(target)(scalar.as_f64())])
         } else {
-            Flat::Int(vec![scalar.as_i64()])
+            Flat::Int(vec![wrap_unsigned_scalar(scalar.as_i64(), tag)])
         }
     };
 
@@ -20244,7 +20439,7 @@ fn adaptive_avg_pool2d_default(
 ) -> PyResult<Py<PyAny>> {
     const OP: &str = "aten.adaptive_avg_pool2d.default";
     let input = tensor_arg(OP, args, kwargs, 0, "self")?;
-    let output_size = shape_arg(OP, args, kwargs, 1, "output_size")?;
+    let raw_output_size = shape_arg(OP, args, kwargs, 1, "output_size")?;
 
     let t = input.tensor()?;
     let tag = input.tag();
@@ -20256,11 +20451,32 @@ fn adaptive_avg_pool2d_default(
         ));
     }
 
-    if output_size.len() != 2 {
+    // **Not fixed here.** `F.adaptive_avg_pool2d(x, 2)` -- a bare int -- does
+    // silently normalise to `(2, 2)` upstream (measured, element-for-element
+    // identical to the tuple form), but the normalising happens in
+    // `torch.nn.functional.adaptive_avg_pool2d`, the Python wrapper, before
+    // it ever calls `torch.ops.aten.adaptive_avg_pool2d.default`. The raw
+    // aten op itself does NOT accept a bare int -- measured directly,
+    // `torch.ops.aten.adaptive_avg_pool2d.default(x, 2)` raises
+    // `RuntimeError` from pybind11's own arg parser ("Expected a value of
+    // type 'List[int]' ... instead found type 'int'") before the kernel body
+    // ever runs. So loosening this check here would make `aten.rs`'s own
+    // op -- the thing `tools/golden/compare.py` calls directly -- accept an
+    // input shape upstream's *op* refuses, which is the wrong layer to widen
+    // the type at (confirmed: doing so passed `F.adaptive_avg_pool2d(x, 2)`
+    // but failed golden's own direct-dispatch case with a SILENT DIVERGENCE).
+    // The composite that would normalise the int before this function ever
+    // sees it is `bootstrap.py`'s `adaptive_avg_pool2d` at line ~6974, which
+    // forwards `output_size` to `dispatch(...)` completely unnormalised --
+    // that is outside this round's territory (`bootstrap.py` is off limits),
+    // so this item is left exactly as it stood, same shape as docs/PRIMS.md
+    // §5's `bootstrap.py`-only gap.
+    if raw_output_size.len() != 2 {
         return Err(pyo3::exceptions::PyRuntimeError::new_err(
             "adaptive_avg_pool2d: output_size must be 2",
         ));
     }
+    let output_size = raw_output_size;
 
     let osize_h = output_size[0] as i64;
     let osize_w = output_size[1] as i64;

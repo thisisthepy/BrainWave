@@ -797,5 +797,9 @@
   ],
   "roll": [
     "aten::roll(Tensor self, SymInt[1] shifts, int[1] dims=[]) -> Tensor"
+  ],
+  "fmod": [
+    "aten::fmod.Tensor(Tensor self, Tensor other) -> Tensor",
+    "aten::fmod.Scalar(Tensor self, Scalar other) -> Tensor"
   ]
 }
