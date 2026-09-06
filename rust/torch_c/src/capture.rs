@@ -36,7 +36,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyModule, PySet, PyTuple};
@@ -111,6 +111,88 @@ pub fn eager_set_enabled(value: bool) {
 #[pyo3(name = "_eager_enabled")]
 pub fn eager_enabled_py() -> bool {
     eager_enabled()
+}
+
+/// **W11** (docs/BACKWARD8.md): the largest number of nodes the eager tape
+/// will hold before it refuses.
+///
+/// `docs/BACKWARD7.md` §10 row 2 recorded that the tape *"cannot grow without
+/// bound"* was not established, and it was not, because it could not: the tape
+/// is freed by `backward()` and by nothing else, so a program that runs
+/// forwards under grad mode and never differentiates retains every
+/// intermediate for the life of the interpreter. Upstream is bounded here for
+/// free -- its graph hangs off the output tensors and refcounting collects it
+/// when the caller drops them -- and this is not, because the tape is a
+/// thread-local the outputs do not own.
+///
+/// **Measured, docs/BACKWARD8.md §4**, a hand-written greedy decode loop on
+/// real SmolLM2-135M with `use_cache=True`, parameters left exactly as
+/// `from_pretrained` hands them over (every one `requires_grad=True`, which is
+/// why the tape records at all), sizes read with `_eager_tape_bytes`:
+///
+/// | | nodes | tape |
+/// |---|---:|---:|
+/// | prefill, `S=6` | 1 721 | 13.19 MiB |
+/// | + 8 decode steps | 15 489 | 33.93 MiB |
+///
+/// 1 721 nodes and about 2.6 MiB per decode step, growing without limit, and
+/// the same loop under `torch.no_grad()` records **0 nodes and 0 bytes**. RSS
+/// is not the instrument here for the reason `_eager_tape_bytes` documents;
+/// what RSS could be got to say -- about 3.7 MiB a step before the machine
+/// corrupted the reading -- agrees in order with the tape's own count.
+///
+/// Upstream in this same program is *not* flat, and that correction matters
+/// more than the number: `DynamicCache` holds every step's key and value, each
+/// with a `grad_fn`, so upstream's graph is retained too. The difference is
+/// **ownership, not bookkeeping.** Upstream's graph hangs off tensors, so
+/// dropping the cache frees it and `no_grad` never builds it; this tape is a
+/// thread-local that outlives every output, and `_eager_reset()` was the only
+/// thing that could free it. **A silent unbounded leak is the wrong default in
+/// a library that exists for on-device inference**, so the choice here is a
+/// bound with a named refusal rather than a documented requirement: a program
+/// that trips it is told what it did and what to do about it, at a point where
+/// the process is still alive to be told.
+///
+/// The default is `100_000` nodes, chosen against the measurement above rather
+/// than picked. The largest single forward this project runs -- a full
+/// SmolLM2-135M prefill -- is 1 721 nodes, so the bound is **58x** the biggest
+/// graph a `backward()` here has ever had to hold, and no
+/// forward-and-backward can reach it by accident. What it does reach is the
+/// runaway: about 58 decode steps and 170 MiB, which is where a leak stops
+/// being a rounding error on a phone. Reaching it at all means the caller
+/// meant `torch.no_grad()`, because a loop that intended to differentiate
+/// would have called `backward()` and freed the tape.
+///
+/// Tripping it is a **refusal, and a release.** A tape over the bound can
+/// never answer again, so it drops every value it holds rather than keeping
+/// them alive until `_eager_reset()`: the memory the bound exists to protect
+/// is given back at the moment the bound is hit, not at the moment the caller
+/// notices. That is safe because `eager_backward` tests `poisoned` before it
+/// reads `known`, and `record_into` returns at `poisoned` before it reads
+/// anything -- so no path can observe the emptied tables.
+static EAGER_MAX_NODES: AtomicUsize = AtomicUsize::new(100_000);
+
+pub fn eager_max_nodes() -> usize {
+    EAGER_MAX_NODES.load(Ordering::Relaxed)
+}
+
+/// Read the bound. Exists so that a test can assert the default rather than
+/// restate it, and so that the refusal can be provoked without recording
+/// 100 000 nodes to do it.
+#[pyfunction]
+#[pyo3(name = "_eager_max_nodes")]
+pub fn eager_max_nodes_py() -> usize {
+    eager_max_nodes()
+}
+
+/// Set the bound. `0` means unbounded, which restores exactly the behaviour
+/// `docs/BACKWARD7.md` §10 row 2 described -- kept so that the bound can be
+/// **nullified** and the tests that assert it seen to go red (`CLAUDE.md`
+/// §5.5), not because unbounded is an option anyone should choose.
+#[pyfunction]
+#[pyo3(name = "_eager_set_max_nodes")]
+pub fn eager_set_max_nodes(value: usize) {
+    EAGER_MAX_NODES.store(value, Ordering::Relaxed);
 }
 
 // ---------------------------------------------------------------------------
@@ -261,6 +343,65 @@ impl Recorder {
     fn poison(&mut self, reason: String) {
         if self.poisoned.is_none() {
             self.poisoned = Some(reason);
+        }
+    }
+
+    /// Drop every value this recording holds, keeping only the reason it can
+    /// never answer again.
+    ///
+    /// **W11.** A poisoned tape is unusable by construction -- `record_into`
+    /// returns at `poisoned` before it reads any table, and `eager_backward`
+    /// tests `poisoned` before it reads `known` -- so the objects it is still
+    /// holding are pure retention. For the bound in `EAGER_MAX_NODES` that
+    /// retention *is* the thing being bounded, so the refusal releases rather
+    /// than waiting for `_eager_reset()`.
+    ///
+    /// Only called after `poison`. Calling it on a live recording would
+    /// destroy the graph without saying so, which is why it is not public and
+    /// why `poisoned` is asserted rather than assumed.
+    fn release_values(&mut self) {
+        debug_assert!(self.poisoned.is_some(), "released a tape that can still answer");
+        self.nodes = Vec::new();
+        self.inputs = Vec::new();
+        self.consts = Vec::new();
+        self.known = HashMap::new();
+        self.input_objects = Vec::new();
+        self.node_objects = Vec::new();
+        self.const_objects = Vec::new();
+        self.const_stamps = Vec::new();
+        self.storages = HashMap::new();
+    }
+
+    /// Advance the recorded stamp of `running_mean`/`running_var` by one, to
+    /// account for the write the op being recorded has already made and that
+    /// `note_mutation` is about to count.
+    ///
+    /// **W11**, and see the call site for why this is not a loosening. Two
+    /// details matter here:
+    ///
+    /// * It looks the arguments up in `known` rather than re-stamping from the
+    ///   tensor, so it works on the second and later calls too -- by then
+    ///   `arg_of` has returned the existing `Ref::Const` without touching
+    ///   `const_stamps`, and re-stamping would have swallowed every past write
+    ///   rather than this one.
+    /// * It adds one rather than reading the storage's current version, for
+    ///   the same reason: reading would forgive whatever else had happened.
+    fn forgive_own_write(&mut self, args: &Bound<'_, PyTuple>, kwargs: Option<&Bound<'_, PyDict>>) {
+        for (index, name) in [(3usize, "running_mean"), (4, "running_var")] {
+            let value = match args.get_item(index) {
+                Ok(value) => Some(value),
+                Err(_) => kwargs.and_then(|kw| kw.get_item(name).ok().flatten()),
+            };
+            let Some(value) = value else { continue };
+            if value.is_none() {
+                continue;
+            }
+            let Some(Ref::Const(slot)) = self.known.get(&(value.as_ptr() as usize)).copied() else {
+                continue;
+            };
+            if let Some(Some((_, version))) = self.const_stamps.get_mut(slot) {
+                *version += 1;
+            }
         }
     }
 
@@ -692,6 +833,30 @@ fn record_into(
         if rec.poisoned.is_some() {
             return;
         }
+        // **W11** (docs/BACKWARD8.md §4): the bound. Tested before the node is
+        // built rather than after, so the tape never exceeds the number it
+        // reports, and only for the eager tape -- a capture region is bounded
+        // by its own `_capture_end` and by the caller who wrote it.
+        //
+        // One relaxed load and a comparison, on a path that has already
+        // decided to allocate a `Node`. `0` disables it, which is what
+        // nullifying the bound means.
+        let limit = eager_max_nodes();
+        if rec.eager && limit != 0 && rec.nodes.len() >= limit {
+            rec.poison(format!(
+                "the eager graph grew past {limit} nodes without ever being differentiated. \
+                 The tape is freed by backward() and by nothing else, so a loop that runs \
+                 forwards under grad mode and never calls it retains every intermediate -- \
+                 measured at 1721 nodes and ~2.6 MiB per decode step of SmolLM2-135M, with \
+                 no limit, where upstream's graph hangs off the output tensors and this \
+                 one does not. The values held so far have been released. Run the loop \
+                 under torch.no_grad(), which records nothing at all, or call \
+                 torch._C._eager_reset() each iteration, or raise the bound with \
+                 torch._C._eager_set_max_nodes(n) (docs/BACKWARD8.md §4)"
+            ));
+            rec.release_values();
+            return;
+        }
         // `refusal_for` and the `native_batch_norm` test below are **replay**
         // guards, and an eager tape never replays: it differentiates the
         // values the program actually computed, in `node_objects`. So the
@@ -740,6 +905,42 @@ fn record_into(
                     Err(reason) => return rec.poison(format!("{op}: {reason}")),
                 }
             }
+        }
+
+        // **W11** (docs/BACKWARD8.md §2): forgive this op its *own* write.
+        //
+        // Measured on a real `nn.Sequential(Conv2d, BatchNorm2d, ReLU)` in
+        // `train()` mode: before this, the tape refused its own forward. The
+        // mechanism is an ordering, not a policy. `aten.rs` calls
+        // `eager_record` -- which stamps a constant the first time it sees it
+        // -- and then calls `note_mutation`, which bumps
+        // `running_mean`/`running_var` for the write the kernel had *already*
+        // made before either ran. So the stamp is taken at version N over a
+        // buffer that is at version N, and one line later the same, single,
+        // already-completed write moves it to N+1. `backward()` then finds a
+        // constant one version stale and refuses, on a program upstream
+        // answers, with nothing in between having written anything.
+        //
+        // Anticipating the bump here is exactly as narrow as the defect: it
+        // moves the stamp by one, for the two arguments `note_mutation` is
+        // about to bump, only when `mutates_this_call` says this call writes
+        // them. A *second* write -- a real `optimizer.step()`, a
+        // `running_mean.zero_()`, a second BatchNorm call reading the same
+        // buffer -- lands at N+2 against an expected N+1 and is still refused
+        // by name. The guard is not loosened; it stops counting the op's own
+        // write twice.
+        //
+        // Safe because the value is not read back. The training-mode
+        // derivative of `native_batch_norm` is a function of the input, the
+        // weight and `save_mean`/`save_invstd`, which the op *returns*; the
+        // running statistics are an output of the forward and an input to
+        // nothing. Eval mode does read them and writes nothing, so
+        // `mutates_this_call` is `false` there and this does not run.
+        if rec.eager
+            && MUTATES_WITHOUT_UNDERSCORE.contains(&op)
+            && mutates_this_call(op, args, kwargs)
+        {
+            rec.forgive_own_write(args, kwargs);
         }
 
         let node_index = rec.nodes.len();
@@ -1562,6 +1763,90 @@ pub fn eager_tape_size() -> usize {
     })
 }
 
+/// **W11** (docs/BACKWARD8.md §4): how many bytes of tensor the eager tape is
+/// keeping alive that nothing else would.
+///
+/// Exists because RSS is not an instrument on this machine. The decode-loop
+/// measurement in §4 was first taken with `ru_maxrss`, which is a *peak* and
+/// therefore reported `+0.0 MiB` for a tape that had grown by fourteen
+/// thousand nodes; retaken with `ps -o rss=` it reported a growth that then
+/// went **negative by 599 MiB** between two consecutive steps, because eight
+/// other agents were on the machine and pages were reclaimed underneath it.
+/// `docs/BACKWARD7.md` §8 already recorded this machine corrupting a
+/// measurement. A number the tape computes about itself cannot be corrupted
+/// that way, and it is the number the bound in `EAGER_MAX_NODES` is about.
+///
+/// **Two corrections make it a size and not a fiction**, and both were found
+/// by measuring without them. Summing `shape.product() * itemsize` over every
+/// recorded result reported **529 MiB for a single SmolLM2-135M prefill** and
+/// 516 MiB per decode step, against an RSS that moved by about 4 MiB a step.
+/// The excess is entirely aliasing and ownership:
+///
+/// * **Deduplicated by storage.** Every `Linear` records a `t()` of its
+///   weight, and that result is a *view*: a distinct tensor over storage the
+///   tape is already counting. The `lm_head` transpose alone is a `[49152,
+///   576]` view, 108 MiB counted for a buffer that costs nothing. Each
+///   storage is therefore counted once, at the largest view of it the tape
+///   holds.
+/// * **Constant storages excluded.** That transpose does not merely duplicate
+///   a count, it counts *the model's parameters* as tape. The tape holds them
+///   by reference and `from_pretrained` owns them; freeing the tape returns
+///   none of it. So a storage that any constant also points at contributes
+///   nothing.
+///
+/// What is left is an **upper bound on what dropping the tape would return**:
+/// a result the caller is still holding anyway is counted here too, which
+/// errs high, which is the direction a bound wants. It is not free -- it binds
+/// and borrows every held tensor -- so it is a diagnostic to be called between
+/// steps, not on the dispatch path.
+#[pyfunction]
+#[pyo3(name = "_eager_tape_bytes")]
+pub fn eager_tape_bytes(py: Python<'_>) -> usize {
+    EAGER.with(|cell| {
+        let Ok(slot) = cell.try_borrow() else {
+            return 0;
+        };
+        let Some(rec) = slot.as_ref() else {
+            return 0;
+        };
+        let mut owned_by_the_model: std::collections::HashSet<usize> = Default::default();
+        for object in &rec.const_objects {
+            if let Ok(tensor) = object.bind(py).cast::<PyTensorBase>() {
+                if let Some(key) = storage_key(tensor) {
+                    owned_by_the_model.insert(key);
+                }
+            }
+        }
+        let mut largest: HashMap<usize, usize> = HashMap::new();
+        for held in &rec.node_objects {
+            for item in held.iter().flatten() {
+                let Ok(tensor) = item.bind(py).cast::<PyTensorBase>() else {
+                    continue;
+                };
+                let Some(key) = storage_key(tensor) else {
+                    continue;
+                };
+                if owned_by_the_model.contains(&key) {
+                    continue;
+                }
+                let Ok(borrowed) = tensor.try_borrow() else {
+                    continue;
+                };
+                let bytes = borrowed
+                    .dims()
+                    .iter()
+                    .product::<usize>()
+                    .saturating_mul(borrowed.tag().itemsize());
+                let entry = largest.entry(key).or_insert(0);
+                if bytes > *entry {
+                    *entry = bytes;
+                }
+            }
+        }
+        largest.values().sum()
+    })
+}
+
 /// Why the eager tape has given up, if it has. The same shape as
 /// `_capture_reason`, and readable without consuming the tape.
 #[pyfunction]
@@ -1650,7 +1935,42 @@ pub fn eager_backward<'py>(
     // W10a, unchanged and now load-bearing for a second caller: a leaf that
     // moved between the op that read it and this backward is refused by name
     // rather than differentiated at its new value.
-    trace.check_constants_are_fresh(py)?;
+    //
+    // **W10a's freshness check, and what a real model did to it**
+    // (docs/BACKWARD8.md §2). `docs/BACKWARD7.md` §10 row 3 predicted that a
+    // mid-forward buffer write would be refused here where upstream answers,
+    // and named two: a KV cache and a batch-norm running statistic. Measured,
+    // both, on real models:
+    //
+    // * **The KV cache does not reach this at all.** transformers'
+    //   `DynamicCache` grows by `torch.cat`, which allocates; there is no
+    //   in-place write for a storage guard to see. SmolLM2-135M with
+    //   `use_cache=True`, prefilled and decoded and differentiated, answers,
+    //   and the gradient agrees with 2.13.0.
+    // * **The batch-norm statistic did reach it, and it was this guard's own
+    //   fault.** `aten.rs` calls `eager_record` -- which stamps the constant
+    //   -- before `note_mutation`, which then bumped the same storage for the
+    //   write the kernel had already made, so the tape refused *its own
+    //   forward*. `Recorder::forgive_own_write` counts that write once, and a
+    //   training-mode BatchNorm now differentiates.
+    //
+    // What is left refusing here is a genuinely second write: an
+    // `optimizer.step()` before the `backward()`, a `zero_()` on a recorded
+    // buffer. The wording is widened rather than replaced, because the message
+    // is `PyCaptureTrace`'s and a capture region still raises it verbatim. On
+    // the eager path its advice -- *"capture the region again"* -- names a call
+    // the caller never made, and a refusal that tells you to do something
+    // impossible is a worse refusal than one that admits it.
+    if let Err(stale) = trace.check_constants_are_fresh(py) {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "{}\n\nThere is no region to capture again: this is the eager tape, and the \
+             write happened between the op that read this tensor and backward() \
+             (docs/BACKWARD8.md §2). Take the gradient before the write -- backward() \
+             before optimizer.step(), not after -- or run the write under torch.no_grad() \
+             on a tensor no graph depends on",
+            stale.value(py).str().map(|s| s.to_string()).unwrap_or_default()
+        )));
+    }
 
     // Which constants a gradient is wanted for: upstream's rule, read off the
     // flag `docs/BACKWARD4.md` landed. `wrt_set` does the dtype half.
@@ -1793,6 +2113,9 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(eager_reason, m)?)?;
     m.add_function(wrap_pyfunction!(eager_set_enabled, m)?)?;
     m.add_function(wrap_pyfunction!(eager_enabled_py, m)?)?;
+    m.add_function(wrap_pyfunction!(eager_tape_bytes, m)?)?;
+    m.add_function(wrap_pyfunction!(eager_max_nodes_py, m)?)?;
+    m.add_function(wrap_pyfunction!(eager_set_max_nodes, m)?)?;
     Ok(())
 }
 
