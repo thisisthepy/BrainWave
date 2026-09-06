@@ -82,12 +82,14 @@ against.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
+import threading
 
 import torch
 
 __all__ = ["FedAvg", "FedAvgM", "FedProx", "Engine", "Round", "digest",
-           "agree", "cohort", "RankDropped"]
+           "agree", "cohort", "RankDropped", "ABSTAIN", "tolerate_missing"]
 
 
 # The wire is JSON over a socket (docs/TRANSPORT.md §2). This guard existed
@@ -152,8 +154,8 @@ def _group(group):
     return dist.get_world_size(group), dist.get_rank(group)
 
 
-def _require_two(group, who):
-    """``(world_size, rank)``, refusing a world that is not exactly two.
+def _require_world(group, who, minimum=2):
+    """``(world_size, rank)``, refusing a world too small to prove anything.
 
     One place, because the *interesting* refusal -- a world of one -- has to
     read the same wherever a caller hits it. It was written twice first, and
@@ -161,6 +163,11 @@ def _require_two(group, who):
     ``Delta.publish`` reached the base-agreement check before the aggregator
     and reported "written for a world of exactly two", which is true and is
     not the point.
+
+    ``minimum`` is 2 for aggregation itself and larger for the things that
+    two ranks cannot show: a **proper subset** cohort and a **survivor set**
+    of two or more both need three (docs/FEDERATED4.md), because at two ranks
+    each of them is a world of one and FedAvg over one delta is that delta.
     """
     world, rank = _group(group)
     if world == 1:
@@ -172,20 +179,165 @@ def _require_two(group, who):
             "whether the weights are honoured, ignored, or never read. "
             "FedAvg is not defined here as 'the average of one'; the "
             "degenerate case is named instead of served.\n"
-            "Check: torch.distributed.get_world_size() == 2, reached through "
+            "Check: torch.distributed.get_world_size() >= 2, reached through "
             "init_process_group(backend='local', init_method='tcp://...', "
             "world_size=2) -- docs/TRANSPORT.md" % (who,)
         )
-    if world != 2:
+    if world < minimum:
         raise NotImplementedError(
-            "torchnative.nn.federated: world_size %d, reached through %s. The "
-            "transport under this implements 2 (docs/TRANSPORT.md §3), and the "
-            "agreement check in agree() is exact only for 2 -- at three it "
-            "would accept (h-1, h, h+1). An all_gather settles it for any "
-            "world, and allgather refuses above world_size 1."
-            % (world, who)
+            "torchnative.nn.federated: world_size %d, reached through %s, "
+            "which needs at least %d. The transport carries any world "
+            "(docs/FEDERATED4.md), but %d ranks are not enough to show what "
+            "this does: whatever it selects or whatever survives is a world "
+            "of one, and FedAvg over one delta is that delta -- so a test of "
+            "it would pass with no aggregation at all.\n"
+            "Check: init_process_group(..., world_size=%d)"
+            % (world, who, minimum, world, minimum)
         )
     return world, rank
+
+
+#: The spelling ``Delta.publish`` calls. It no longer means "exactly two" --
+#: it means "at least two", which is what it always checked for.
+_require_two = _require_world
+
+
+class _Arrival:
+    """Who reported, across the collectives of one round.
+
+    ``Engine(on_missing='average_arrived')`` divides by the weights of the
+    ranks that arrived, and that is only a number if **every** collective in
+    the round agreed about which ranks those were. The survivor set is the
+    hub's verdict and travels with the data
+    (``ProcessGroupLocal.allreduce_partial``), so the survivors hold the same
+    one -- but a rank that leaves *between* two collectives of the same round
+    changes it, and a divisor that changed halfway is not the divisor of any
+    average. So it is recorded once and compared after that.
+    """
+
+    def __init__(self, world):
+        self.world = world
+        self.missing = None
+
+    @property
+    def survivors(self):
+        if self.missing is None:
+            return tuple(range(self.world))
+        return tuple(r for r in range(self.world) if r not in self.missing)
+
+    def record(self, missing, what):
+        missing = tuple(sorted(int(r) for r in missing))
+        if self.missing is None:
+            self.missing = missing
+            return
+        if missing != self.missing:
+            raise RankDropped(
+                "torchnative.nn.federated: the survivor set changed inside "
+                "one round -- %s were missing, and %s are missing during %s. "
+                "A weighted mean whose divisor changed halfway is not the "
+                "mean of anything, so this refuses rather than reporting the "
+                "last one."
+                % (list(self.missing), list(missing), what),
+                missing=missing, during=what,
+            )
+
+
+_ARRIVAL = threading.local()
+
+
+@contextlib.contextmanager
+def tolerate_missing(group=None):
+    """Let the collectives inside complete over whoever arrived.
+
+    Yields an :class:`_Arrival`. Outside this block every collective in this
+    module is all-or-nothing and a lost rank raises :class:`RankDropped`;
+    inside it, the collectives use the shim's ``*_partial`` spellings, which
+    return the hub's survivor set alongside the data.
+
+    This is a *mechanism*. The policy -- and the minimum number of survivors
+    the caller is willing to divide by -- is ``Engine(on_missing=...,
+    min_participants=...)``, because "however many arrived" is exactly the
+    divisor nobody chose that :class:`RankDropped` exists to refuse.
+    """
+    world, _ = _group(group)
+    previous = getattr(_ARRIVAL, "current", None)
+    arrival = _Arrival(world)
+    _ARRIVAL.current = arrival
+    try:
+        yield arrival
+    finally:
+        _ARRIVAL.current = previous
+
+
+def _arrival():
+    return getattr(_ARRIVAL, "current", None)
+
+
+def _backend(group, what):
+    """The shim's backend object for ``group``, or a refusal naming why.
+
+    ``allreduce_partial`` has no upstream spelling: upstream's allreduce either
+    completes over the world or is an error. So this reaches past
+    ``torch.distributed``'s API to the backend the shim registered, and says so
+    when that backend is not there.
+    """
+    dist = _dist()
+    pg = group if group is not None else dist.distributed_c10d._get_default_group()
+    sole = getattr(pg, "_sole_backend", None)
+    if sole is None:
+        raise NotImplementedError(
+            "torchnative.nn.federated: %r is not this shim's process group, "
+            "and %s has no upstream spelling -- a collective that completes "
+            "over whoever arrived is not an allreduce, so no backend but this "
+            "one offers it (docs/FEDERATED4.md)" % (pg, what)
+        )
+    return sole(what)
+
+
+def _sum_opts():
+    dist = _dist()
+
+    class _Opts:
+        pass
+
+    opts = _Opts()
+    opts.reduceOp = dist.ReduceOp.SUM
+    return opts
+
+
+def _all_reduce(tensor, group, what):
+    """``all_reduce(SUM)``, tolerant or not depending on the context."""
+    dist = _dist()
+    arrival = _arrival()
+    if arrival is None:
+        return _collective(
+            lambda: dist.all_reduce(tensor, op=dist.ReduceOp.SUM, group=group),
+            group, what)
+
+    def run():
+        work, missing = _backend(group, "allreduce_partial").allreduce_partial(
+            [tensor], _sum_opts())
+        arrival.record(missing, what)
+        return work
+
+    return _collective(run, group, what)
+
+
+def _all_gather(holders, tensor, group, what):
+    """``all_gather``, tolerant or not depending on the context."""
+    dist = _dist()
+    arrival = _arrival()
+    if arrival is None:
+        return _collective(
+            lambda: dist.all_gather(holders, tensor, group=group), group, what)
+
+    def run():
+        work, missing = _backend(group, "allgather_partial").allgather_partial(
+            [holders], [tensor])
+        arrival.record(missing, what)
+        return work
+
+    return _collective(run, group, what)
 
 
 class RankDropped(RuntimeError):
@@ -249,10 +401,10 @@ def _collective(fn, group, what):
         "whichever ranks arrived would divide by a number nobody chose and "
         "would report success (docs/DESIGN.md §6).\n"
         "Policy: Engine(on_missing='refuse') is the default and is this. "
-        "on_missing='average_arrived' refuses by name -- it needs a divisor "
-        "the caller chose and a world larger than the two this transport "
-        "carries, because at two ranks the survivors are a world of one and "
-        "FedAvg over one delta is that delta."
+        "Engine(on_missing='average_arrived', min_participants=k) divides by "
+        "the survivors instead, and needs k >= 2 and a world of at least "
+        "three -- at two ranks the survivor set is one and FedAvg over one "
+        "delta is that delta (docs/FEDERATED4.md)."
         % (",".join(str(r) for r in missing) or "?", what, world),
         rank=rank, missing=missing, during=what,
     )
@@ -296,33 +448,50 @@ def digest(table, values=True):
 def agree(value, group=None, what="this value"):
     """Refuse unless every rank passed the same integer. Returns the sum.
 
-    One ``int64`` ``all_reduce``. The test is ``total == value * world_size``,
-    an *equality* test only because the world has exactly two members:
-    ``h0 + h1 == 2 * h0`` iff ``h0 == h1``. At three or more it would accept
-    ``(h-1, h, h+1)``, so this refuses a larger world rather than quietly
-    weakening -- and the transport refuses one first.
+    One ``int64`` ``all_gather``, and the comparison is **element by element
+    against every rank's digest**, not against a total.
 
-    ``SUM`` because it is the one reduction the transport implements
-    (docs/TRANSPORT.md §3), which is also why this is a sum-and-compare rather
-    than a ``MIN``/``MAX`` bracket.
+    It used to be one ``all_reduce(SUM)`` and the test ``total == value *
+    world``, which is an equality test only because the world had exactly two
+    members: ``h0 + h1 == 2 * h0`` iff ``h0 == h1``.  At three it accepts
+    ``(h - 1, h, h + 1)`` -- three ranks that disagree about the schema, the
+    base or the cohort, summing to exactly what agreement would have summed
+    to.  docs/FEDERATED3.md §5 named that and refused the larger world rather
+    than weaken here; ``ProcessGroupLocal.allgather`` at ``world_size N``
+    (docs/FEDERATED4.md) is what settles it, so the refusal is gone and the
+    check is stronger rather than wider.
+
+    Inside :func:`tolerate_missing` the gather is the partial spelling and the
+    ranks that did not report are not compared -- there is nothing of theirs
+    to compare.
     """
-    dist = _dist()
-    world, rank = _require_two(group, "federated.agree")
+    world, rank = _require_world(group, "federated.agree")
     probe = torch.tensor([int(value)], dtype=torch.int64)
-    _collective(lambda: dist.all_reduce(probe, op=dist.ReduceOp.SUM,
-                                        group=group),
-                group, "federated.agree(%s)" % (what,))
-    total = int(probe[0].item())
-    if total != int(value) * world:
+    # Filled with a value no digest can take, so a slot the transport never
+    # wrote is visible as one rather than read as a zero that agrees.
+    holders = [torch.full((1,), -1, dtype=torch.int64) for _ in range(world)]
+    _all_gather(holders, probe, group,
+                "federated.agree(%s)" % (what,))
+    arrival = _arrival()
+    missing = set(arrival.missing or ()) if arrival is not None else set()
+    seen = {r: int(holders[r][0].item())
+            for r in range(world) if r not in missing}
+    seen[rank] = int(value)
+    odd = sorted(r for r, v in seen.items() if v != int(value))
+    if odd:
         raise ValueError(
             "torchnative.nn.federated: the ranks disagree about %s. Rank %d "
-            "holds digest %d; the %d ranks sum to %d, and would sum to %d if "
-            "they agreed.\n"
-            "An all_reduce would have averaged them anyway and returned a "
-            "number, which is why this is checked instead of assumed."
-            % (what, rank, int(value), world, total, int(value) * world)
+            "holds digest %d; the %d ranks that reported hold %s, and rank(s) "
+            "%s differ from this one.\n"
+            "Gathered rank by rank rather than summed: a sum-and-compare is "
+            "an equality test only at two ranks, and at three it accepts "
+            "(h-1, h, h+1). An all_reduce would have averaged them anyway and "
+            "returned a number, which is why this is checked instead of "
+            "assumed."
+            % (what, rank, int(value), len(seen),
+               [seen[r] for r in sorted(seen)], odd)
         )
-    return total
+    return int(value) * len(seen)
 
 
 def _check_wire(tensor, name):
@@ -358,10 +527,37 @@ def _total_weight(weight, group=None):
     """``sum(weight)`` over the group, as a float. One 1-element collective."""
     dist = _dist()
     total = torch.tensor([float(weight)], dtype=torch.float64)
-    _collective(lambda: dist.all_reduce(total, op=dist.ReduceOp.SUM,
-                                        group=group),
-                group, "the sum of the ranks' weights")
+    _all_reduce(total, group, "the sum of the ranks' weights")
     return float(total[0].item())
+
+
+class _Abstain:
+    """The weight of a rank that is in the world but not in this round's cohort.
+
+    Not ``0.0``, which every aggregator here refuses: a rank weighted zero
+    contributes nothing while still counting as having participated, and that
+    is a caller mistake worth refusing. This is the same arithmetic said on
+    purpose -- ``ABSTAIN`` contributes a zero table at weight zero, so the
+    divisor is the cohort's weight and the aggregate is the cohort's mean.
+
+    It exists because a proper subset of the ranks still has to *attend* every
+    collective: the transport is a star and a rank that skipped one would hang
+    the ones that did not. Attending without contributing is what selection
+    means here, and this is the value that says so.
+    """
+
+    __slots__ = ()
+
+    def __repr__(self):
+        return "federated.ABSTAIN"
+
+    def __bool__(self):
+        return False
+
+
+#: See :class:`_Abstain`. Passed as ``weight=`` by :class:`Engine` for a rank
+#: outside the round's cohort.
+ABSTAIN = _Abstain()
 
 
 class FedAvg:
@@ -392,6 +588,10 @@ class FedAvg:
         Split out so that :class:`Engine` reports the same number the average
         was computed with, rather than a second guess at it.
         """
+        if weight is ABSTAIN:
+            # A rank outside the cohort. It attends the collectives -- it has
+            # to, the others are waiting on it -- and contributes nothing.
+            return 0.0
         if self.weighted:
             if weight is None:
                 raise TypeError(
@@ -434,8 +634,7 @@ class FedAvg:
         A federated aggregator that cannot fail is not evidence of anything, so
         the degenerate case is named instead of served.
         """
-        dist = _dist()
-        world, rank = _require_two(group, "FedAvg.aggregate")
+        world, rank = _require_world(group, "FedAvg.aggregate")
         if not table:
             raise ValueError(
                 "torchnative.nn.federated.FedAvg: an empty table. A round that "
@@ -465,6 +664,14 @@ class FedAvg:
               "which parameters this round covers")
 
         total = _total_weight(w, group)
+        if not total > 0.0:
+            raise ValueError(
+                "torchnative.nn.federated.FedAvg: the ranks' weights sum to "
+                "%r, so there is no average. Every rank that reported either "
+                "abstained (federated.ABSTAIN) or weighed nothing -- a round "
+                "over an empty cohort would otherwise divide by zero and "
+                "return a table of the right names full of nan" % (total,)
+            )
 
         out = {}
         for name in sorted(table):
@@ -477,9 +684,8 @@ class FedAvg:
             # writing the same expression, and this is the spelling that is.
             scaled = (t.detach() * torch.tensor(w, dtype=t.dtype)).clone()
             _check_wire(scaled, name)
-            _collective(lambda: dist.all_reduce(scaled, op=dist.ReduceOp.SUM,
-                                                group=group),
-                        group, "the sum of the ranks' deltas for %r" % (name,))
+            _all_reduce(scaled, group,
+                        "the sum of the ranks' deltas for %r" % (name,))
             out[name] = scaled / torch.tensor(total, dtype=t.dtype)
         return out
 
@@ -702,15 +908,21 @@ def cohort(select, group=None, who="federated.cohort"):
     "sample half the clients at random" disagrees whenever the ranks seed
     differently, which is the default.
 
-    What is *not* implemented is a proper subset.  A round over some of the
-    world needs the collective to run over a sub-group -- ``new_group`` --
-    and the transport refuses any world but 1 and 2 (docs/TRANSPORT.md §3).
-    At two ranks the only proper subsets have one member, and FedAvg over one
-    delta is that delta: the identity this whole package refuses to serve.  So
-    the agreement half is built and tested, and the subset half refuses and
-    names the transport as the next thing.
+    **A proper subset is now served, and not with ``new_group``.**  Every rank
+    still attends every collective -- the transport is a star and a rank that
+    walked away would hang the ones that did not -- and the ranks outside the
+    cohort contribute ``ABSTAIN``: a zero table at weight zero.  The divisor is
+    then the cohort's weight and the result is the cohort's weighted mean,
+    exactly.  What ``torch.distributed.new_group`` would add on top is that the
+    unselected ranks are not *reached* at all, which is a property of the wire
+    and not of the arithmetic; it is named in docs/FEDERATED4.md as still
+    missing, because a client that is asleep cannot attend a barrier.
+
+    A cohort of **one** still refuses, at any world size, and so does any
+    proper subset in a world of two: FedAvg over one delta is that delta, and
+    a test of it would pass with no aggregation at all.
     """
-    world, rank = _require_two(group, who)
+    world, rank = _require_world(group, who)
     proposal = select(world) if callable(select) else select
     try:
         ranks = tuple(sorted({int(r) for r in proposal}))
@@ -739,27 +951,31 @@ def cohort(select, group=None, who="federated.cohort"):
           "which ranks this round selected (rank %d proposed %s)"
           % (rank, list(ranks)))
 
-    if len(ranks) != world:
+    # One refusal, not two. There was a second here -- "a proper subset needs
+    # a world of at least three" -- and it was **unreachable**: in a world of
+    # two the only proper subsets have one member, so the check above had
+    # already refused every input that could reach it. A refusal that cannot
+    # fire is not a refusal, so its reason was folded into the one that does
+    # (docs/FEDERATED4.md §5).
+    if len(ranks) < 2:
         raise NotImplementedError(
-            "torchnative.nn.federated.cohort: %s of a world of %d. Participant "
-            "selection over a proper subset is not implemented: the collective "
-            "would have to run over a sub-group built with "
-            "torch.distributed.new_group, and ProcessGroupLocal refuses any "
-            "world but 1 and 2 (docs/TRANSPORT.md §3).\n"
-            "At two ranks every subset that is not both leaves one, and FedAvg "
-            "over a world of one is the identity -- so this cannot be served "
-            "here even approximately. What is built and tested is the half "
-            "that does not need a bigger world: the ranks must *agree* on the "
-            "cohort, which they do not automatically and which nothing "
-            "downstream would notice.\n"
-            "Next: ProcessGroupLocal at world_size N, then new_group over a "
-            "subset of it." % (list(ranks), world)
+            "torchnative.nn.federated.cohort: %s of a world of %d is a cohort "
+            "of %d. FedAvg over one delta is that delta -- the identity this "
+            "whole package refuses to serve -- so a round over it would "
+            "return the selected rank's own weights and report success, and a "
+            "test of it would pass with no aggregation at all.\n"
+            "In a world of two this is the only shape a proper subset can "
+            "have, which is why a proper subset needs a world of at least "
+            "three. The transport carries one now (docs/FEDERATED4.md), so "
+            "what refuses here is the arithmetic and no longer the wire: a "
+            "subset of a world of three is served, and aggregates over the "
+            "subset.\n"
+            "Check: len(select(world)) >= 2, in a world of at least three if "
+            "the cohort is not the whole world."
+            % (list(ranks), world, len(ranks))
         )
-    if rank not in ranks:
-        raise ValueError(
-            "torchnative.nn.federated.cohort: this rank (%d) is not in the "
-            "cohort %s it agreed to" % (rank, list(ranks))
-        )
+    # A rank outside the cohort is neither an error nor excused from the
+    # collectives: it attends and abstains. See `_Abstain`.
     return ranks
 
 
@@ -773,7 +989,16 @@ class Round:
     """
 
     def __init__(self, rank, world, weight, total_weight, steps, history,
-                 covers, local_norm, aggregate_norm, cohort=None):
+                 covers, local_norm, aggregate_norm, cohort=None, missing=(),
+                 participated=True):
+        #: The ranks that did not report. Empty under the default
+        #: `on_missing='refuse'`, where a drop raises instead of being
+        #: reported; non-empty only under `'average_arrived'`, where it is the
+        #: record of who the divisor left out.
+        self.missing = tuple(missing)
+        #: Whether *this* rank contributed. False for a rank the cohort left
+        #: out, which still attended every collective at weight zero.
+        self.participated = bool(participated)
         #: The ranks this round ran over. Equal to every rank of the world --
         #: `cohort()` refuses a proper subset -- but recorded rather than
         #: assumed, so a report says what it aggregated and not what it hoped.
@@ -839,6 +1064,7 @@ class Engine:
     def __init__(self, model, method=None, aggregator=None, rounds=1,
                  group=None, lr=1e-3, optimizer=None, select=None,
                  allow_missing=False, on_missing="refuse",
+                 min_participants=None,
                  secure_aggregation=False, differential_privacy=None,
                  **optimizer_kwargs):
         if method is None:
@@ -873,23 +1099,42 @@ class Engine:
                 "torchnative.nn.federated.Engine: on_missing=%r. One of %s"
                 % (on_missing, list(self.ON_MISSING))
             )
+        # `min_participants` is what turns "however many arrived" into a
+        # number the caller chose. Without it this policy is exactly the
+        # defect `RankDropped` exists to refuse -- a weighted mean over a
+        # cohort decided by a socket close, reported as success.
         if on_missing == "average_arrived":
-            raise NotImplementedError(
-                "torchnative.nn.federated.Engine: on_missing='average_arrived' "
-                "is not implemented. It would divide by the weights that "
-                "arrived, which is a divisor nobody chose: the round would "
-                "return a weighted mean over a cohort decided by a socket "
-                "timeout, and report success. Every caller downstream sees the "
-                "same shape of table either way.\n"
-                "It also cannot be honest at this world size. Two ranks minus "
-                "one is a world of one, where FedAvg is the identity -- so the "
-                "'partial average' would be the surviving rank's own delta, "
-                "and a test of it would pass with no aggregation at all.\n"
-                "Next: ProcessGroupLocal at world_size N, so that a survivor "
-                "set of two or more exists, and a caller-supplied minimum "
-                "cohort size and divisor so the number is chosen rather than "
-                "observed."
+            if min_participants is None:
+                raise TypeError(
+                    "torchnative.nn.federated.Engine: "
+                    "on_missing='average_arrived' requires "
+                    "min_participants=k. Averaging over whoever arrived, with "
+                    "no floor, makes the divisor a number nobody chose: the "
+                    "round returns a weighted mean over a cohort decided by a "
+                    "socket close and reports success (docs/DESIGN.md §6). "
+                    "The floor is the caller saying how few ranks an aggregate "
+                    "may still be built from.\n"
+                    "Check: min_participants=2 or more."
+                )
+            if not isinstance(min_participants, int) or min_participants < 2:
+                raise ValueError(
+                    "torchnative.nn.federated.Engine: min_participants=%r. It "
+                    "has to be an integer of at least 2 -- a survivor set of "
+                    "one is a world of one, where FedAvg returns the "
+                    "survivor's own delta and a round over it would report "
+                    "success having aggregated nothing (docs/FEDERATED3.md "
+                    "§4.1 measured that identity to 6e-8)."
+                    % (min_participants,)
+                )
+        elif min_participants is not None:
+            raise TypeError(
+                "torchnative.nn.federated.Engine: min_participants=%r with "
+                "on_missing=%r. A floor on the survivor set only means "
+                "something under 'average_arrived'; with 'refuse' the round "
+                "needs every rank and this would be accepted and ignored"
+                % (min_participants, on_missing)
             )
+        self.min_participants = min_participants
         if secure_aggregation:
             raise NotImplementedError(
                 "torchnative.nn.federated.Engine: secure_aggregation= is not "
@@ -987,7 +1232,26 @@ class Engine:
         # moved -- not after a round of training that then cannot be
         # contributed and cannot be undone without a revert the caller did not
         # ask for.
-        world, rank = _require_two(self.group, "Engine.participate")
+        world, rank = _require_world(self.group, "Engine.participate")
+        if self.on_missing == "average_arrived":
+            # Checked here rather than in `__init__`: the world is not known
+            # until there is a group, and this is the first moment there is.
+            if world < 3:
+                raise NotImplementedError(
+                    "torchnative.nn.federated.Engine: "
+                    "on_missing='average_arrived' in a world of %d. One rank "
+                    "leaving leaves %d, and FedAvg over one delta is that "
+                    "delta -- the partial average would be the survivor's own "
+                    "weights (docs/FEDERATED3.md §4.1 measured that identity "
+                    "to 6e-8), so this policy cannot be shown to do anything "
+                    "here.\n"
+                    "Check: init_process_group(..., world_size=3) or more."
+                    % (world, world - 1))
+            if self.min_participants > world:
+                raise ValueError(
+                    "torchnative.nn.federated.Engine: min_participants=%d in "
+                    "a world of %d, so no round could ever meet it"
+                    % (self.min_participants, world))
         # Agreed before the local epochs, for the same reason the world size
         # is: a cohort the ranks disagree about should refuse before the model
         # has moved, not after a round that cannot be contributed.
@@ -996,14 +1260,22 @@ class Engine:
         # Resolved before the local epochs, not after: a missing or nonsensical
         # weight should refuse before the model has been moved, not after a
         # round of training that then cannot be contributed.
-        resolved = (self.aggregator.resolve_weight(weight)
+        # A rank the cohort left out still attends every collective and
+        # contributes nothing -- see `_Abstain`. Its weight is resolved from
+        # ABSTAIN rather than from what the caller passed, so a caller who
+        # passed a sample count does not have it counted in a round it was not
+        # selected for.
+        participating = rank in ranks
+        contributed = weight if participating else ABSTAIN
+        resolved = (self.aggregator.resolve_weight(contributed)
                     if hasattr(self.aggregator, "resolve_weight")
-                    else (1.0 if weight is None else float(weight)))
+                    else (1.0 if contributed is None else 0.0
+                          if contributed is ABSTAIN else float(contributed)))
 
         reports = []
         try:
-            self._rounds(batches, weight, epochs, resolved, world, rank,
-                         ranks, reports)
+            self._rounds(batches, contributed, epochs, resolved, world, rank,
+                         ranks, reports, participating)
         except RankDropped:
             # Policy `on_missing='refuse'`: the round is *undone*. The local
             # epochs have already moved the model, and leaving it there would
@@ -1019,26 +1291,56 @@ class Engine:
         return reports
 
     def _rounds(self, batches, weight, epochs, resolved, world, rank, ranks,
-                reports):
+                reports, participating=True):
         """The round loop. Split out so `participate` owns the drop policy."""
         for round_idx in range(self.rounds):
             self.adapted.online()
             steps = 0
-            for _ in range(epochs):
-                for batch in batches:
-                    if isinstance(batch, dict):
-                        self.adapted.step(**batch)
-                    elif isinstance(batch, tuple):
-                        self.adapted.step(*batch)
-                    else:
-                        self.adapted.step(batch)
-                    steps += 1
+            if participating:
+                for _ in range(epochs):
+                    for batch in batches:
+                        if isinstance(batch, dict):
+                            self.adapted.step(**batch)
+                        elif isinstance(batch, tuple):
+                            self.adapted.step(*batch)
+                        else:
+                            self.adapted.step(batch)
+                        steps += 1
+            else:
+                # Not selected: no local epochs at all. This is what
+                # participant selection *is* -- a client that was not picked
+                # does not train. The delta is recorded anyway, against a model
+                # that has not moved, so it is the zero offset and it goes on
+                # the wire at weight zero. It has to go: the ranks that were
+                # picked are inside the same collectives.
+                self.adapted.adapted.record(self.model)
 
             delta = self.adapted.adapted
             local_norm = delta.norm()
-            table = delta.publish(group=self.group, weight=weight,
-                                  aggregator=self.aggregator)
-            total = _total_weight(resolved, self.group)
+            missing = ()
+            if self.on_missing == "average_arrived":
+                with tolerate_missing(self.group) as arrival:
+                    table = delta.publish(group=self.group, weight=weight,
+                                          aggregator=self.aggregator)
+                    total = _total_weight(resolved, self.group)
+                    missing = tuple(arrival.missing or ())
+                    survivors = len(arrival.survivors)
+                if survivors < self.min_participants:
+                    raise RankDropped(
+                        "torchnative.nn.federated: rank(s) %s did not report, "
+                        "leaving %d of %d, and this Engine was built with "
+                        "min_participants=%d. The aggregate is refused rather "
+                        "than divided by whoever was left: below the floor the "
+                        "caller chose, the 'partial average' stops being an "
+                        "average of anything they asked for."
+                        % (list(missing), survivors, world,
+                           self.min_participants),
+                        rank=rank, missing=missing, during="the round's "
+                        "collectives")
+            else:
+                table = delta.publish(group=self.group, weight=weight,
+                                      aggregator=self.aggregator)
+                total = _total_weight(resolved, self.group)
 
             # Install the aggregate: base + aggregated_delta.
             delta.value = dict(table)
@@ -1048,7 +1350,7 @@ class Engine:
                 rank=rank, world=world, weight=resolved, total_weight=total,
                 steps=steps, history=self.adapted.history, covers=delta.covers,
                 local_norm=local_norm, aggregate_norm=delta.norm(),
-                cohort=ranks,
+                cohort=ranks, missing=missing, participated=participating,
             ))
 
             # Re-snapshot: the next round's delta must be measured against the
@@ -1056,4 +1358,3 @@ class Engine:
             # round k+1 re-sends round 1's movement and the model diverges.
             if round_idx < self.rounds - 1:
                 delta.re_snapshot(self.model)
-
