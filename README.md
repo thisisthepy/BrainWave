@@ -220,10 +220,17 @@ loads on 3.13, 3.14 and later without a rebuild.
 <table>
 <tr><th align="left">Working</th><th align="left"></th></tr>
 <tr><td>ATen operators</td><td><b>203</b>, each compared against upstream</td></tr>
+<!-- DOCWATCH: count golden_ops_covered ge 203 -->
 <tr><td>Golden comparison cases</td><td><b>8,509 / 8,509</b> — values, shapes, dtypes, positional <i>and</i> keyword, through the door <i>and</i> through the member</td></tr>
+<!-- DOCWATCH: count golden_cases_total ge 8509 -->
+<!-- DOCWATCH: count golden_cases_passed ge 8509 -->
+<!-- DOCWATCH: count golden_pending eq 0 -->
 <tr><td>Smoke tests</td><td><b>389</b></td></tr>
+<!-- DOCWATCH: count smoke_ok ge 389 -->
 <tr><td><code>from_pretrained</code></td><td>works for models whose init computes on the <b>meta</b> device — the Llama-3.2 <code>rope_scaling</code> path needed 30-odd meta kernels that were absent (<a href="docs/META.md">META.md</a>)</td></tr>
-<tr><td>Signature and schema tables</td><td><b>4479</b> entries checked against upstream</td></tr>
+<tr><td>Signature and schema tables</td><td><b>4,641</b> entries checked against upstream (<i>corrected from 4479 — docs/DOCWATCH-round, 2026-09: another round's schema work had already moved this number before this README caught up</i>)</td></tr>
+<!-- DOCWATCH: count schema_entries_matched ge 4641 -->
+<!-- DOCWATCH: count schema_entries_total ge 4641 -->
 <tr><td>Architectures — operator coverage</td><td><b>26 of 26</b> reach zero missing operators in the traced sweep</td></tr>
 <tr><td>Architectures — <b>actually forward</b></td><td><b>26 of 26</b>, matching upstream. Agreement is module-by-module through forward hooks, because two of the toy outputs are degenerate enough that their argmax is a tie — reported as a tie rather than as a match (<a href="docs/KERNELS26.md">KERNELS26.md</a>)</td></tr>
 <tr><td>Checkpoints</td><td><code>torch.load</code> and safetensors, round-tripped against upstream</td></tr>

@@ -476,6 +476,28 @@ Not written — `aten.rs` is forbidden territory this round.
 constructor and `convolution.default`'s 2-D case — taking the sweep from 20/26
 to **22/26** (`deberta` and `deberta_v2` forward). The rest of this table stands.
 
+> **Correction (docs/DOCWATCH round, 2026-09):** "the rest of this table stands" is itself now
+> stale. Re-checking every op the §8 table named as missing against live `_aten_implemented()`
+> today finds only **four** still absent: `aten.set_.source_Tensor` (the KERNELS26 credit above
+> was for `remainder`/`sqrt`/etc., not this overload — it is still unresolved),
+> `aten.zeros.default`, `aten.randn_like.default`, `aten.masked_fill.Tensor`. Every other op this
+> table named as missing is implemented now — `aten.remainder.Scalar`, `aten.remainder.Tensor`,
+> `aten._weight_norm_interface.default`, `aten.clamp_min.default`, `aten.flip.default`,
+> `aten.leaky_relu.default`, `aten.sigmoid.default`, `aten.ones_like.default`, `aten.add.Scalar`,
+> `aten.upsample_bilinear2d.default`, `aten.avg_pool2d.default`, `aten.erf.default`,
+> `aten.native_group_norm.default`, `aten.sign.default`, `aten.all.default`,
+> `aten.div.Tensor_mode`, `aten.log2.default`. Standing check (docs/DOCWATCH.md):
+> <!-- DOCWATCH: op-not-implemented aten.set_.source_Tensor -->
+> <!-- DOCWATCH: op-not-implemented aten.zeros.default -->
+> <!-- DOCWATCH: op-not-implemented aten.randn_like.default -->
+> <!-- DOCWATCH: op-not-implemented aten.masked_fill.Tensor -->
+> <!-- DOCWATCH: op-implemented aten.remainder.Scalar -->
+> <!-- DOCWATCH: op-implemented aten._weight_norm_interface.default -->
+> <!-- DOCWATCH: op-implemented aten.clamp_min.default -->
+> <!-- DOCWATCH: op-implemented aten.leaky_relu.default -->
+> <!-- DOCWATCH: op-implemented aten.native_group_norm.default -->
+> <!-- DOCWATCH: op-implemented aten.div.Tensor_mode -->
+
 **None of these are attempted here, including the ones that look like a one-line composite
 (`aten.sqrt.default` over `pow(x, 0.5)` was considered and rejected in §1.2 — the same reasoning
 applies to every entry above: a Python-level composite that computes a value upstream reaches
