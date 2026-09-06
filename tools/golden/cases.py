@@ -23349,6 +23349,225 @@ def _clamp_member_cases_out_of_place(torch_module, c_module) -> list[Case]:
     return cases
 
 
+def _pad_nd_cases(op: str, mode: str, ndim: int):
+    """Golden cases for one of the six `reflection_pad*`/`replication_pad*` ops.
+
+    One builder shared by all six because the six kernels are one gather
+    applied per axis (docs/PAD.md §2), so the cases that distinguish a right
+    implementation from a plausible one are the same cases in every rank.
+
+    **The headline pair is reflect-vs-replicate on the same input.** Padding
+    `[1,2,3]` by 2 gives `[3,2,1,2,3,2,1]` under reflect and
+    `[1,1,1,2,3,3,3]` under replicate -- reflect does *not* repeat the edge
+    element, replicate does. Both are plausible-looking output, so an
+    implementation with the two swapped passes any check that only asserts
+    "the shape grew and the middle survived". Both spellings run the same
+    values here, and `pytests/test_pad.py` additionally asserts they
+    *disagree*.
+    """
+    def build(torch_module, c_module, torch_call) -> list[Case]:
+        cases: list[Case] = []
+
+        def case(name, flat, shape, dtype_name, padding, note, expect="match"):
+            a_t, a_c = pair_from_flat(torch_module, c_module, flat, shape, dtype_name)
+            cases.append(
+                Case(
+                    name=f"{op} {name}",
+                    op=op,
+                    run_torch=lambda a_t=a_t, p=padding: torch_call(a_t, list(p)),
+                    run_c=lambda a_c=a_c, p=padding: c_module._aten_dispatch(op, a_c, list(p)),
+                    expect=expect,
+                    note=note,
+                )
+            )
+
+        # A batched (N=1, C=1, ...) input of the right rank, plus its unbatched
+        # sibling: `ndim + 1` and `ndim + 2` are BOTH legal ranks upstream and
+        # a kernel that hardcodes one of them fails only on the other.
+        spatial = {1: (5,), 2: (3, 4), 3: (2, 3, 4)}[ndim]
+        n = 1
+        for d in spatial:
+            n *= d
+        vals = [float(v) for v in range(1, n + 1)]
+        batched = (1, 1) + spatial
+        unbatched = (1,) + spatial
+
+        ones = [1, 1] * ndim
+        zeros = [0, 0] * ndim
+        case("[1,1,...] batched", vals, batched, "float32", ones,
+             "the ordinary case, in the batched rank (ndim+2)")
+        case("[1,1,...] unbatched", vals, unbatched, "float32", ones,
+             "the SAME padding one rank down -- ndim+1 is equally legal upstream")
+        case("all-zero padding is the identity", vals, batched, "float32", zeros,
+             "a zero pad must not gather anything")
+
+        # Asymmetric, so a kernel that mirrors left onto right cannot pass, and
+        # last-axis-first, so a front-to-back reading of `padding` cannot.
+        asym = []
+        for k in range(ndim):
+            asym += [k + 1, 2 - k if 2 - k >= 0 else 0]
+        case("asymmetric, differing per axis", vals, batched, "float32", asym,
+             "padding[0:2] is the LAST axis; the pairs differ so a "
+             "front-to-back reading gives a different shape")
+
+        # The distinguishing width. Reflect refuses `pad >= extent`, replicate
+        # does not -- measured, not assumed (docs/PAD.md §2).
+        last = spatial[-1]
+        wide = [last - 1, last - 1] + [0, 0] * (ndim - 1)
+        case(f"widest legal pad on the last axis ({last - 1})", vals, batched,
+             "float32", wide,
+             "reflect's limit is `pad < extent`; this is exactly at it")
+        too_wide = [last, 0] + [0, 0] * (ndim - 1)
+        case(f"pad == extent ({last}) on the last axis", vals, batched, "float32",
+             too_wide,
+             "Argument #4: Padding size should be less than the corresponding "
+             "input dimension" if mode == "reflect"
+             else "replicate has NO such limit and computes this",
+             expect="both_error" if mode == "reflect" else "match")
+        if mode == "replicate":
+            case("pad far wider than the extent", vals, batched, "float32",
+                 [3 * last, 3 * last] + [0, 0] * (ndim - 1),
+                 "replicate repeats the edge element indefinitely; upstream "
+                 "computes this where reflect refuses it")
+
+        # Negative padding crops -- and for reflect it is a NEGATIVE OFFSET
+        # INTO ONE GATHER, not a crop pass, which is the trap.
+        case("negative on the front crops", vals, batched, "float32",
+             [-1, 0] + [0, 0] * (ndim - 1), "upstream drops the first element")
+        case("negative front AND positive back on one axis", vals, batched,
+             "float32", [-1, 2] + [0, 0] * (ndim - 1),
+             "crop and pad on the SAME axis in one gather")
+        if mode == "reflect" and last >= 4:
+            # THE case. `reflection_pad1d([1..5], [-1, 3])` reaches back to
+            # element 1, which a crop-then-mirror implementation has already
+            # discarded. See `pad_source_index` in aten.rs.
+            case("negative front, pad reaching PAST the crop", vals, batched,
+                 "float32", [-1, last - 1] + [0, 0] * (ndim - 1),
+                 "the reflection reads the ORIGINAL axis, so it reaches "
+                 "elements the crop removed -- a crop-then-mirror kernel "
+                 "cannot produce this")
+
+        # Rank refusals: ndim+1 and ndim+2 are the only legal ranks.
+        case("rank ndim (too few)", vals, spatial, "float32", ones,
+             f"Expected {ndim + 1}D or {ndim + 2}D (batch mode) tensor",
+             expect="both_error")
+        case("rank ndim+3 (too many)", vals, (1, 1, 1) + spatial, "float32", ones,
+             f"Expected {ndim + 1}D or {ndim + 2}D (batch mode) tensor",
+             expect="both_error")
+        case("wrong padding length", vals, batched, "float32", ones + [1, 1],
+             f"padding size is expected to be {2 * ndim}", expect="both_error")
+
+        # `Bool` is the one dtype upstream refuses; every other one computes.
+        case("bool is refused", [True] * n, batched, "bool", ones,
+             f'"{mode}ion_pad{ndim}d" not implemented for \'Bool\''
+             if mode == "reflect" else
+             f'"replication_pad{ndim}d" not implemented for \'Bool\'',
+             expect="both_error")
+        for dtype_name in ("float64", "float16", "bfloat16", "int64", "int32"):
+            case(f"{dtype_name} pads (pure data movement, no promotion)",
+                 vals, batched, dtype_name, ones,
+                 "upstream implements both modes for integers as well as "
+                 "floats -- unlike glu, there is no float-only gate here")
+
+        return cases
+
+    return build
+
+
+def rms_norm_cases(torch_module, c_module, torch_call) -> list[Case]:
+    """`aten.rms_norm.default` -- `nn.RMSNorm`, docs/VOICE.md §1 rank 16 (f5).
+
+    **The cases that matter are the small-magnitude ones.** The default `eps`
+    is the *accumulation* dtype's epsilon, so a `float16` input uses
+    `finfo(float32).eps` and not `finfo(float16).eps`. On ordinary magnitudes
+    the two choices produce identical tensors to every printed digit; at
+    `1e-3` they differ by an order of magnitude (docs/PAD.md §8). A suite that
+    only normalised `arange`-sized values would pass with the wrong constant.
+    """
+    op = "aten.rms_norm.default"
+    cases: list[Case] = []
+
+    def case(name, flat, shape, dtype_name, ns, weight_flat=None, eps=None,
+             note="", expect="match"):
+        a_t, a_c = pair_from_flat(torch_module, c_module, flat, shape, dtype_name)
+        if weight_flat is None:
+            w_t = w_c = None
+        else:
+            w_t, w_c = pair_from_flat(torch_module, c_module, weight_flat,
+                                      (len(weight_flat),), dtype_name)
+        cases.append(
+            Case(
+                name=f"rms_norm {name}",
+                op=op,
+                run_torch=lambda a_t=a_t, w_t=w_t: torch_call(a_t, list(ns), w_t, eps),
+                run_c=lambda a_c=a_c, w_c=w_c: c_module._aten_dispatch(
+                    op, a_c, list(ns), w_c, eps),
+                expect=expect,
+                note=note,
+            )
+        )
+
+    for dtype_name in ("float32", "float64", "float16", "bfloat16"):
+        for scale, label in ((1.0, "ordinary"), (1e-3, "small -- eps discriminates")):
+            vals = [v * scale for v in range(1, 9)]
+            case(f"({dtype_name}, {label}) normalized_shape=[4]",
+                 vals, (2, 4), dtype_name, [4],
+                 note="the default eps is finfo(ACCUMULATION dtype).eps -- "
+                      "float32's, even for a float16 input")
+            case(f"({dtype_name}, {label}) with weight",
+                 vals, (2, 4), dtype_name, [4], weight_flat=[1.0, 2.0, 3.0, 4.0],
+                 note="weight multiplies after the normalisation")
+            case(f"({dtype_name}, {label}) normalized_shape=[2,4] (whole tensor)",
+                 vals, (2, 4), dtype_name, [2, 4],
+                 note="reduces over BOTH axes, not just the last")
+            for eps in (0.0, 1e-8, 1e-2):
+                case(f"({dtype_name}, {label}) explicit eps={eps}",
+                     vals, (2, 4), dtype_name, [4], eps=eps,
+                     note="eps is INSIDE the sqrt: rsqrt(mean_square + eps)")
+
+    vals3 = [float(v) for v in range(1, 25)]
+    case("3-D, normalized_shape=[4]", vals3, (2, 3, 4), "float32", [4],
+         note="six independent rows")
+    case("3-D, normalized_shape=[3,4]", vals3, (2, 3, 4), "float32", [3, 4],
+         note="two rows of twelve -- a different answer from [4]")
+    case("3-D, normalized_shape=[2,3,4]", vals3, (2, 3, 4), "float32", [2, 3, 4],
+         note="one row; nothing is left to broadcast over")
+
+    zeros = [0.0] * 8
+    case("all-zero input with eps=0 is nan, not a division refusal",
+         zeros, (2, 4), "float32", [4], eps=0.0,
+         note="upstream answers nan; a kernel that guarded the divide would "
+              "quietly answer 0 instead")
+    case("negative eps gives inf", [1.0] * 8, (2, 4), "float32", [4], eps=-1.0,
+         note="upstream does not validate eps; rsqrt(0) is inf")
+
+    # Refusals, all upstream's own wording -- and three of them differ from
+    # native_layer_norm's despite checking the same argument.
+    case("normalized_shape does not match the trailing axes",
+         zeros, (2, 4), "float32", [3],
+         note="Given normalized_shape=[3], expected input with shape [*3] -- "
+              "`[*3]`, where layer_norm writes `[*, 3]`",
+         expect="both_error")
+    case("normalized_shape longer than the rank",
+         zeros, (2, 4), "float32", [1, 2, 4],
+         note="a ValueError upstream, not a RuntimeError",
+         expect="both_error")
+    case("empty normalized_shape", zeros, (2, 4), "float32", [],
+         note="Expected normalized_shape to be at least 1-dimensional",
+         expect="both_error")
+    case("weight shape disagrees with normalized_shape",
+         zeros, (2, 4), "float32", [4], weight_flat=[1.0, 1.0, 1.0],
+         note="Expected weight to be of same shape as normalized_shape",
+         expect="both_error")
+    for dtype_name in ("int64", "int32", "bool", "uint8"):
+        case(f"{dtype_name} is refused", [1] * 8, (2, 4), dtype_name, [4],
+             note='"rms_norm" not implemented for this dtype -- named for the '
+                  "op, where layer_norm names its kernel",
+             expect="both_error")
+
+    return cases
+
+
 def constant_pad_nd_cases(torch_module, c_module, torch_call) -> list[Case]:
     op = "aten.constant_pad_nd.default"
     cases: list[Case] = []
@@ -27145,6 +27364,13 @@ CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
     "aten.log.default": log_cases,
     "aten.expm1.default": expm1_cases,
     "aten.constant_pad_nd.default": constant_pad_nd_cases,
+    "aten.rms_norm.default": rms_norm_cases,
+    "aten.reflection_pad1d.default": _pad_nd_cases("aten.reflection_pad1d.default", "reflect", 1),
+    "aten.reflection_pad2d.default": _pad_nd_cases("aten.reflection_pad2d.default", "reflect", 2),
+    "aten.reflection_pad3d.default": _pad_nd_cases("aten.reflection_pad3d.default", "reflect", 3),
+    "aten.replication_pad1d.default": _pad_nd_cases("aten.replication_pad1d.default", "replicate", 1),
+    "aten.replication_pad2d.default": _pad_nd_cases("aten.replication_pad2d.default", "replicate", 2),
+    "aten.replication_pad3d.default": _pad_nd_cases("aten.replication_pad3d.default", "replicate", 3),
     "aten.sub_.Tensor": sub__tensor_cases,
     "aten.sub_.Scalar": sub__scalar_cases,
     "aten.mul_.Tensor": mul__tensor_cases,

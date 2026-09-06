@@ -9269,7 +9269,25 @@ def test_core_ops_and_op_tags_agree():
     # landing the same day. This number is their sum, re-measured on the merged
     # tree rather than carried from any one branch, because each branch's count
     # was correct only against its own base.
-    assert r["tag_core_count"] == 117, r["tag_core_count"]
+    # 117 -> 122 with docs/PAD.md's six padding kernels, and **the delta is
+    # five, not six**, which is the whole reason this number is pinned:
+    #
+    #     reflection_pad1d   ['core', 'pt2_compliant_tag']   <- counted
+    #     reflection_pad2d   ['core', 'pt2_compliant_tag']   <- counted
+    #     reflection_pad3d   ['core', 'pt2_compliant_tag']   <- counted
+    #     replication_pad1d  ['pt2_compliant_tag']           <- NOT core
+    #     replication_pad2d  ['core', 'pt2_compliant_tag']   <- counted
+    #     replication_pad3d  ['core', 'pt2_compliant_tag']   <- counted
+    #
+    # `replication_pad1d` is not core while `replication_pad2d` and
+    # `replication_pad3d` -- the same op one and two ranks up, implemented in
+    # this shim by the *same function* -- both are. There is no rule to derive
+    # that from; it is upstream's table, and each of the six was read off its
+    # own `.tags` rather than inferred from the five beside it. Inferring
+    # would have written 123 here and the test would still have passed the
+    # day it was written, which is exactly the failure mode `min.dim` vs
+    # `max.dim` above already recorded once.
+    assert r["tag_core_count"] == 122, r["tag_core_count"]
 
 
 def test_decompose_lowers_the_op_capture_md_named():
@@ -10853,7 +10871,17 @@ def test_schema_text_survives_the_round_trip_through_the_transcribed_tables():
     # 310 on the merged tree. Same reason as `tag_core_count` above: four
     # rounds added schema identities in parallel and no branch could see the
     # others' totals, so this is measured here rather than summed from reports.
-    assert len(keys) == 322, len(keys)
+    # 322 -> 323 with docs/PAD.md's `rms_norm`. **Exactly one**, and the
+    # arithmetic is worth writing because that round added seven kernels: the
+    # six `reflection_pad*`/`replication_pad*` ops are reached upstream only
+    # as `torch._C._nn.<name>` (there is no `torch.reflection_pad1d` and no
+    # `Tensor.reflection_pad1d` on 2.13.0 -- checked for all six), so they get
+    # no `overloads.json` or `methods.json` row and add no schema identity
+    # here. `torch.rms_norm` does exist upstream, so it gets a row and this
+    # moves by one. A round that had added six rows for the pad ops would
+    # have invented six doors upstream does not have, and this count is one
+    # of the places that would have shown it.
+    assert len(keys) == 323, len(keys)
     from_tables = sorted(
         k for k in keys
         if report["table"][f"{k[0]}|{k[1]}"]["from"] == "tables"

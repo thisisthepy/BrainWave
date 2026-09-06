@@ -854,5 +854,8 @@
   ],
   "cumprod": [
     "aten::cumprod(Tensor self, int dim, *, ScalarType? dtype=None) -> Tensor"
+  ],
+  "rms_norm": [
+    "aten::rms_norm(Tensor input, SymInt[] normalized_shape, Tensor? weight=None, float? eps=None) -> Tensor"
   ]
 }

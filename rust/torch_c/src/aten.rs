@@ -211,6 +211,13 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.randint.default",
     "aten.randint.low",
     "aten.randperm.default",
+    "aten.rms_norm.default",
+    "aten.reflection_pad1d.default",
+    "aten.reflection_pad2d.default",
+    "aten.reflection_pad3d.default",
+    "aten.replication_pad1d.default",
+    "aten.replication_pad2d.default",
+    "aten.replication_pad3d.default",
     "aten.reciprocal.default",
     "aten.reciprocal_.default",
     "aten.relu.default",
@@ -2200,6 +2207,28 @@ fn aten_dispatch_inner(
         "aten.expm1.default" => expm1_default(py, args, kwargs),
         // `bert`'s wall: `F.pad` on a bias while the model is being built.
         "aten.constant_pad_nd.default" => constant_pad_nd(py, args, kwargs),
+        // docs/PAD.md: `torch.stft`'s first wall, and four of the five
+        // speech models docs/VOICE.md ranks. Six schemas, one gather.
+        // docs/PAD.md §8: nn.RMSNorm, docs/VOICE.md rank 16 (f5).
+        "aten.rms_norm.default" => rms_norm_default(py, args, kwargs),
+        "aten.reflection_pad1d.default" => {
+            pad_nd(py, args, kwargs, "aten.reflection_pad1d.default", 1, PadMode::Reflect)
+        }
+        "aten.reflection_pad2d.default" => {
+            pad_nd(py, args, kwargs, "aten.reflection_pad2d.default", 2, PadMode::Reflect)
+        }
+        "aten.reflection_pad3d.default" => {
+            pad_nd(py, args, kwargs, "aten.reflection_pad3d.default", 3, PadMode::Reflect)
+        }
+        "aten.replication_pad1d.default" => {
+            pad_nd(py, args, kwargs, "aten.replication_pad1d.default", 1, PadMode::Replicate)
+        }
+        "aten.replication_pad2d.default" => {
+            pad_nd(py, args, kwargs, "aten.replication_pad2d.default", 2, PadMode::Replicate)
+        }
+        "aten.replication_pad3d.default" => {
+            pad_nd(py, args, kwargs, "aten.replication_pad3d.default", 3, PadMode::Replicate)
+        }
         "aten.softplus.default" => softplus_default(py, args, kwargs),
         "aten.convolution.default" => convolution_default(py, args, kwargs),
         "aten.zeros_like.default" => zeros_or_empty_like(py, args, kwargs, "aten.zeros_like.default"),
@@ -2686,6 +2715,431 @@ fn constant_pad_nd(
                 .map_err(|e| candle_err(OP, e))?;
         }
     }
+    finish(py, out, tag)
+}
+
+
+/// The two non-constant modes `torch._C._nn.pad` dispatches to. `constant`
+/// is not here because it is a different kernel entirely
+/// (`constant_pad_nd`, above) and `circular` is not here because upstream
+/// has no aten op for it at all -- traced, it decomposes into
+/// `new_empty`/`slice`/`copy_` above the dispatcher (docs/PAD.md §3).
+#[derive(Clone, Copy, PartialEq)]
+enum PadMode {
+    Reflect,
+    Replicate,
+}
+
+impl PadMode {
+    /// Upstream's own kernel name, which the `'Bool'` refusal has to spell:
+    /// the message names the *kernel*, not the Python-level mode, so
+    /// `F.pad(bool_tensor, (1,1), "reflect")` says `"reflection_pad1d"`.
+    fn kernel(self, ndim: usize) -> &'static str {
+        match (self, ndim) {
+            (PadMode::Reflect, 1) => "reflection_pad1d",
+            (PadMode::Reflect, 2) => "reflection_pad2d",
+            (PadMode::Reflect, _) => "reflection_pad3d",
+            (PadMode::Replicate, 1) => "replication_pad1d",
+            (PadMode::Replicate, 2) => "replication_pad2d",
+            (PadMode::Replicate, _) => "replication_pad3d",
+        }
+    }
+}
+
+/// Where output position `j` reads from, along an axis of extent `w` padded
+/// by `left` on the front.
+///
+/// **This is a gather over the original axis, not a crop followed by a
+/// mirror, and the difference is observable.** `reflection_pad1d([1,2,3,4],
+/// [-1, 3])` is `[2,3,4,3,2,1]` upstream -- the trailing `1` is the element a
+/// crop-then-reflect implementation has already thrown away. Reading it as
+/// "output index minus left pad, folded back into range" reproduces that;
+/// reading it as two passes cannot. Eight hostile cases (`[4,4]`, `[0,4]`,
+/// `[4,0]`, `[-2,4]`, `[4,-2]`, `[-4,4]`, `[2,2]`, `[-1,1]`) were predicted
+/// by this function and then checked against upstream, and all eight agreed.
+///
+/// **Reflect does not repeat the edge element; replicate does.** Padding
+/// `[1,2,3]` by 2 each side gives `[3,2,1,2,3,2,1]` for reflect and
+/// `[1,1,1,2,3,3,3]` for replicate. Both are plausible-looking output, which
+/// is why `test_pad.py` checks them against each other on the same input
+/// rather than only against a literal.
+fn pad_source_index(mode: PadMode, j: i64, left: i64, w: i64) -> i64 {
+    let mut i = j - left;
+    match mode {
+        PadMode::Replicate => i.clamp(0, w - 1),
+        PadMode::Reflect => {
+            // Terminates because the caller has already refused
+            // `left >= w || right >= w`, so `|i| < w` on entry and at most
+            // two folds are needed. That refusal is upstream's own, and it is
+            // load-bearing here rather than merely faithful.
+            while i < 0 || i > w - 1 {
+                if i < 0 {
+                    i = -i;
+                }
+                if i > w - 1 {
+                    i = 2 * (w - 1) - i;
+                }
+            }
+            i
+        }
+    }
+}
+
+/// `aten::reflection_pad{1,2,3}d` and `aten::replication_pad{1,2,3}d`.
+///
+/// ```text
+/// aten::reflection_pad1d(Tensor self, SymInt[2] padding) -> Tensor
+/// aten::reflection_pad2d(Tensor self, SymInt[4] padding) -> Tensor
+/// aten::reflection_pad3d(Tensor self, SymInt[6] padding) -> Tensor
+/// aten::replication_pad1d(Tensor self, SymInt[2] padding) -> Tensor
+/// aten::replication_pad2d(Tensor self, SymInt[4] padding) -> Tensor
+/// aten::replication_pad3d(Tensor self, SymInt[6] padding) -> Tensor
+/// ```
+///
+/// **`torch.stft`'s first wall, and it has nothing to do with complex
+/// numbers.** docs/COMPLEX.md §5 measured that both `return_complex=True` and
+/// `return_complex=False` raise the identical error before any transform,
+/// because `stft` reflect-pads its input by `n_fft // 2` when `center=True`.
+/// A `TorchDispatchMode` trace of `torch.stft` confirms the order:
+/// `view` -> **`reflection_pad1d`** -> `view` -> `unsqueeze` -> `as_strided`
+/// -> `mul` -> `_fft_r2c` -> `transpose_` -> `squeeze_`. So this op moves that
+/// wall; it does not remove it (docs/PAD.md §4).
+///
+/// docs/VOICE.md §1 ranks `F.pad(mode="reflect")` as blocking four of its five
+/// speech models (bigvgan, f5, parler, vocos) and `mode="replicate"` a fifth
+/// case in bigvgan, which is the other direction this op is demanded from.
+///
+/// **The three ranks are separate upstream kernels with separate schemas, and
+/// they are implemented together here because the arithmetic is one gather
+/// applied per axis, not because upstream fuses them.** Both modes are
+/// separable: `reflection_pad2d` on a `(1,3,4)` equals padding the last axis
+/// then the one before it, checked against upstream on `[1,2,1,0]` rather
+/// than assumed. `padding` is read back to front in pairs, the same
+/// convention `constant_pad_nd` documents -- `padding[0..2]` is the last axis.
+///
+/// Everything below is upstream's message, transcribed from a run rather than
+/// paraphrased, because docs/CKPT2.md §4's point applies here twice over: a
+/// caller that pads too wide gets an error either way, and the only thing that
+/// tells it *which* limit it hit is the wording.
+///
+/// * **Reflect refuses a pad as wide as the axis; replicate does not.**
+///   `reflect` needs `left < w` and `right < w` ("Argument #4: Padding size
+///   should be less than the corresponding input dimension, ..."), while
+///   `replication_pad1d(zeros(1,1,4), [99,99])` happily returns a length-202
+///   tensor. The `Argument #N` counter is `4 + 2k` for the `k`-th pair, so
+///   the height pair of a `pad2d` is `#6` and the depth pair of a `pad3d` is
+///   `#8`; all three were read off upstream.
+/// * **Rank is `ndim + 1` or `ndim + 2`, and only the batch axis may be
+///   empty.** `(0,2,4)` pads fine through `reflection_pad1d`; `(1,0,4)` is
+///   refused. That is exactly what "possibly 0 batch size and other non-zero
+///   dimensions" means, and it is measured rather than read off the sentence.
+/// * **`pad1d` refuses an empty output; `pad2d` and `pad3d` return one.**
+///   `replication_pad1d(x, [-5,0])` on `W=4` is "input (W: 4) is too small.
+///   Calculated output W: -1", but `replication_pad2d(zeros(1,3,4),
+///   [-4,0,0,0])` is a `(1,3,0)` tensor and not an error. The inconsistency is
+///   upstream's; reproducing it is the point.
+/// * **Negative padding crops** -- but see `pad_source_index`: it is a
+///   negative offset into one gather, not a separate crop pass.
+/// * **`Bool` is refused, every other dtype computes.** `int32`, `int64`,
+///   `float16`, `bfloat16`, `float32` and `float64` all pad upstream, which
+///   is why this kernel has no float-only gate: unlike `glu`, both of these
+///   are pure data movement and upstream implements them for integers.
+fn pad_nd(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+    op: &'static str,
+    ndim: usize,
+    mode: PadMode,
+) -> PyResult<Py<PyAny>> {
+    let input = tensor_arg(op, args, kwargs, 0, "self")?;
+    let padding: Vec<i64> = required(op, args, kwargs, 1, "padding")?.extract()?;
+    if padding.len() != 2 * ndim {
+        // **The two modes word this differently and it is not a typo
+        // upstream.** All six were run: `reflection_pad*` appends
+        // ", but got: N" and `replication_pad*` stops at the expected count.
+        // Transcribed rather than unified, per docs/CKPT2.md §4.
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(match mode {
+            PadMode::Reflect => format!(
+                "padding size is expected to be {}, but got: {}",
+                2 * ndim,
+                padding.len()
+            ),
+            PadMode::Replicate => {
+                format!("padding size is expected to be {}", 2 * ndim)
+            }
+        }));
+    }
+
+    let dims = input.tensor()?.dims().to_vec();
+    let rank = dims.len();
+    // `ndim + 1` is the unbatched form, `ndim + 2` the batched one, and the
+    // leading axis of the batched form is the only one allowed to be empty.
+    let shaped = rank == ndim + 1 || rank == ndim + 2;
+    if !shaped || !dims[rank - (ndim + 1)..].iter().all(|&d| d != 0) {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "Expected {}D or {}D (batch mode) tensor with possibly 0 batch size \
+             and other non-zero dimensions for input, but got: {dims:?}",
+            ndim + 1,
+            ndim + 2,
+        )));
+    }
+
+    let tag = input.tag();
+    if tag == TorchDType::Bool {
+        // Upstream's exact wording, kernel name and quoting included.
+        return Err(not_implemented(format!(
+            "\"{}\" not implemented for 'Bool'",
+            mode.kernel(ndim)
+        )));
+    }
+
+    // Every axis is validated against the ORIGINAL extents, before any of
+    // them is gathered. Upstream reports the shape it was handed, so a check
+    // interleaved with the gathers would name a half-padded shape from the
+    // second axis onward -- a message that is wrong in exactly the place it
+    // is read.
+    let mut out_dims: Vec<i64> = dims.iter().map(|&d| d as i64).collect();
+    for k in 0..ndim {
+        let axis = rank - 1 - k;
+        let (left, right) = (padding[2 * k], padding[2 * k + 1]);
+        let w = dims[axis] as i64;
+        if mode == PadMode::Reflect && (left >= w || right >= w) {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "Argument #{}: Padding size should be less than the corresponding \
+                 input dimension, but got: padding ({left}, {right}) at dimension \
+                 {axis} of input {dims:?}",
+                4 + 2 * k
+            )));
+        }
+        let extent = w + left + right;
+        // `pad1d` alone checks this, and it checks `<= 0` where the others
+        // tolerate `== 0`. Both halves are upstream's, measured.
+        if ndim == 1 && extent <= 0 {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "input (W: {w}) is too small. Calculated output W: {extent}"
+            )));
+        }
+        out_dims[axis] = extent;
+    }
+    if let Some(bad) = out_dims.iter().copied().find(|&d| d < 0) {
+        // Upstream reaches this at tensor construction, after every axis has
+        // been resolved -- hence the fully substituted shape rather than the
+        // first offending axis alone.
+        //
+        // **`reflection_pad2d` alone reports something else**, and it was
+        // measured on all four of the >=2-D kernels rather than assumed to
+        // follow its siblings: it multiplies the resolved extents into a
+        // `numel` before constructing, so a negative extent surfaces as an
+        // overflow. `reflection_pad3d`, `replication_pad2d` and
+        // `replication_pad3d` all give the "negative dimension" message.
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            if mode == PadMode::Reflect && ndim == 2 {
+                "numel: integer multiplication overflow".to_string()
+            } else {
+                format!(
+                    "Trying to create tensor with negative dimension {bad}: {out_dims:?}"
+                )
+            },
+        ));
+    }
+
+    let device = input.tensor()?.device().clone();
+    let mut out = input.tensor()?.contiguous().map_err(|e| candle_err(op, e))?;
+    for k in 0..ndim {
+        let axis = rank - 1 - k;
+        let (left, right) = (padding[2 * k], padding[2 * k + 1]);
+        if left == 0 && right == 0 {
+            continue;
+        }
+        let w = dims[axis] as i64;
+        let extent = out_dims[axis];
+        let index: Vec<i64> = (0..extent)
+            .map(|j| pad_source_index(mode, j, left, w))
+            .collect();
+        // The index is built on the tensor's own device and the gather is
+        // candle's `index_select`, so no element of `self` is ever read back
+        // to the host. That is what keeps this op off
+        // `device.rs::MPS_HOST_READBACK_OPS`: only the *shape* is inspected
+        // here, never the data.
+        let index = Tensor::from_vec(index, extent as usize, &device)
+            .map_err(|e| candle_err(op, e))?;
+        out = out
+            .index_select(&index, axis)
+            .and_then(|t| t.contiguous())
+            .map_err(|e| candle_err(op, e))?;
+    }
+    finish(py, out, tag)
+}
+
+
+/// `aten::rms_norm(Tensor input, SymInt[] normalized_shape, Tensor? weight=None,
+/// float? eps=None) -> Tensor`
+///
+/// `nn.RMSNorm`, docs/VOICE.md §1 rank 16 -- `f5`'s forward. Root-mean-square
+/// normalisation: unlike `layer_norm` it does **not** subtract the mean, so
+/// there is no `centred` step and no bias.
+///
+/// ```text
+/// out = input * rsqrt(mean(input^2, over the trailing k axes) + eps) * weight
+/// ```
+///
+/// **`eps` is inside the square root, not added to the root.** Measured
+/// against upstream on `[[1,2,3,4],[5,6,7,8]]`: the inside form reproduces
+/// upstream to the last `float32` digit and the outside form differs from the
+/// seventh, which is the sibling trap `native_layer_norm`'s doc comment
+/// records for `var + eps`.
+///
+/// **The default `eps` is the *accumulation* dtype's epsilon, not the input's,
+/// and this is the trap worth the measurement.** For a `float16` or
+/// `bfloat16` input upstream uses `finfo(float32).eps` (1.1920929e-07), *not*
+/// `finfo(float16).eps` (9.765625e-04). The two agree to every printed digit
+/// on ordinary-magnitude inputs -- both probes of `[[1,2,3,4],[5,6,7,8]]`
+/// returned identical tensors -- and diverge by an order of magnitude once the
+/// mean square approaches epsilon:
+///
+/// ```text
+/// rms_norm([[1e-3, 2e-3, 3e-3, 4e-3]], [4])      input dtype float16
+///     upstream                       0.362305 ...   <- finfo(f32).eps
+///     with finfo(float16).eps        0.031891 ...   <- an order of magnitude out
+/// ```
+///
+/// So a single-point check at ordinary magnitudes passes while being wrong,
+/// which is why `test_pad.py`'s `rms_norm` cases use small values. `float64`
+/// takes `finfo(float64).eps`, so the rule is the accumulation dtype's
+/// epsilon throughout rather than a hardcoded `float32` constant.
+///
+/// The refusals are upstream's, and three of them differ from
+/// `native_layer_norm`'s despite validating the same argument:
+///
+/// * `Given normalized_shape=[3], expected input with shape [*3], but got
+///   input of size[2, 4]` -- **`[*3]`, where `layer_norm` writes `[*, 3]`**.
+///   Both were run side by side on the same input to be sure this is
+///   upstream's inconsistency and not a transcription slip here.
+/// * `Input tensor must have at least 3 dimensions, but got 2` -- and it is a
+///   **`ValueError`**, not the `RuntimeError` every other check here raises.
+/// * `"rms_norm" not implemented for 'Long'` -- named for the op, where
+///   `layer_norm` names its kernel (`"LayerNormKernelImpl"`).
+///
+/// A `weight` whose dtype differs from the input is **accepted** (`float32`
+/// weight on a `bfloat16` input computes and returns `bfloat16`), where
+/// `native_layer_norm` has a whole "mixed dtype (CPU)" refusal ladder. Also
+/// measured rather than inherited from the sibling.
+fn rms_norm_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.rms_norm.default";
+    let input = tensor_arg(OP, args, kwargs, 0, "input")?;
+    let normalized = shape_arg(OP, args, kwargs, 1, "normalized_shape")?;
+    let weight = optional_tensor_arg(OP, args, kwargs, 2, "weight")?;
+    let eps_arg = scalar_arg(OP, args, kwargs, 3, "eps")?.map(|s| s.as_f64());
+
+    if normalized.is_empty() {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "Expected normalized_shape to be at least 1-dimensional, i.e., containing at \
+             least one element, but got normalized_shape = []",
+        ));
+    }
+
+    let dims = input.tensor()?.dims().to_vec();
+    let k = normalized.len();
+    if dims.len() < k {
+        // A `ValueError` upstream, not a `RuntimeError`. Reproduced as one:
+        // a caller distinguishing "bad argument" from "bad state" by
+        // exception type would be misled by the tidier choice.
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "Input tensor must have at least {k} dimensions, but got {}",
+            dims.len()
+        )));
+    }
+    let suffix_matches = dims[dims.len() - k..]
+        .iter()
+        .zip(normalized.iter())
+        .all(|(&extent, &wanted)| wanted >= 0 && extent == wanted as usize);
+    if !suffix_matches {
+        let star: Vec<String> = normalized.iter().map(|v| v.to_string()).collect();
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "Given normalized_shape={normalized:?}, expected input with shape [*{}], \
+             but got input of size{dims:?}",
+            star.join(", ")
+        )));
+    }
+    let ns: Vec<usize> = normalized.iter().map(|&v| v as usize).collect();
+
+    let tag = input.tag();
+    if !tag.is_floating_point() {
+        return Err(pyo3::exceptions::PyNotImplementedError::new_err(format!(
+            "\"rms_norm\" not implemented for '{}'",
+            scalar_type_name(tag)
+        )));
+    }
+    if let Some(weight) = &weight {
+        if weight.tensor()?.dims() != ns.as_slice() {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "Expected weight to be of same shape as normalized_shape, but got \
+                 weight of shape {:?} and normalized_shape = {ns:?}",
+                weight.tensor()?.dims()
+            )));
+        }
+    }
+
+    let storage = PyDtype::new(tag).storage(OP)?;
+    // `opmath_type`: the reduced dtypes accumulate in `f32` and narrow once,
+    // the same rule `native_layer_norm` applies just above.
+    let acc = match storage {
+        candle_core::DType::F16 | candle_core::DType::BF16 => candle_core::DType::F32,
+        other => other,
+    };
+    // The default is this dtype's epsilon -- see the doc comment. Taken from
+    // `acc` and not from `storage`, which is the whole point.
+    let eps = eps_arg.unwrap_or(match acc {
+        candle_core::DType::F64 => f64::EPSILON,
+        _ => f32::EPSILON as f64,
+    });
+
+    let rows: usize = dims[..dims.len() - k].iter().product();
+    let cols: usize = ns.iter().product();
+    let device = input.tensor()?.device().clone();
+    if rows == 0 || cols == 0 {
+        // Upstream answers an empty tensor of the input's shape for both
+        // `(0, 4)` with `[4]` and `(2, 0)` with `[0]`; candle's reductions
+        // have nothing to say about a zero-length axis.
+        let out = Tensor::zeros(dims.as_slice(), storage, &device)
+            .map_err(|e| candle_err(OP, e))?;
+        return finish(py, out, tag);
+    }
+
+    let flat = input
+        .tensor()?
+        .contiguous()
+        .and_then(|t| t.fast_to(acc))
+        .and_then(|t| t.reshape((rows, cols)))
+        .map_err(|e| candle_err(OP, e))?;
+    // No mean subtraction: that is the entire difference from `layer_norm`.
+    let rstd = flat
+        .sqr()
+        .and_then(|t| t.mean_keepdim(1))
+        // `mean_square + eps` first, *then* rsqrt.
+        .and_then(|t| t.affine(1.0, eps))
+        .and_then(|t| t.sqrt())
+        .and_then(|t| t.recip())
+        .map_err(|e| candle_err(OP, e))?;
+    let mut out = flat.broadcast_mul(&rstd).map_err(|e| candle_err(OP, e))?;
+    if let Some(weight) = &weight {
+        let row = weight
+            .tensor()?
+            .contiguous()
+            .and_then(|t| t.fast_to(acc))
+            .and_then(|t| t.reshape((1, cols)))
+            .map_err(|e| candle_err(OP, e))?;
+        out = out.broadcast_mul(&row).map_err(|e| candle_err(OP, e))?;
+    }
+    let out = out
+        .reshape(dims.as_slice())
+        .and_then(|t| t.fast_to(storage))
+        .map_err(|e| candle_err(OP, e))?;
     finish(py, out, tag)
 }
 
