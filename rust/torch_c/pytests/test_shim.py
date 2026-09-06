@@ -10884,7 +10884,13 @@ def test_schema_text_survives_the_round_trip_through_the_transcribed_tables():
     # `polar`'s five TorchScript numeric overloads (`polar.int`,
     # `polar.float`, ...) are deliberately not in the table -- see
     # `overloads.json`'s own note -- so `polar` adds one identity, not six.
-    assert len(keys) == 327, len(keys)
+    # 328 on the merged tree. docs/COMPLEX2.md took it to 327 with five
+    # `overloads.json` entries and docs/PAD.md added `rms_norm`; the six pad
+    # kernels contribute **zero**, because upstream has no `torch.<name>`
+    # spelling for them -- a row would invent a door upstream lacks. Measured
+    # here rather than summed from either report, since each branch's count
+    # was correct only against its own base.
+    assert len(keys) == 328, len(keys)
     from_tables = sorted(
         k for k in keys
         if report["table"][f"{k[0]}|{k[1]}"]["from"] == "tables"
