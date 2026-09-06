@@ -142,6 +142,19 @@ Pass it as TORCH_C_DYLD_LIBRARY_PATH instead; this script re-exports it.
 EOF
 fi
 
+# The crate's own unit tests, before the Python suite.
+#
+# There are 30 of them and **nothing ran them until docs/TRAIN2.md noticed**.
+# One had been red for an unknown length of time -- `RULE_OPS` was not sorted,
+# and its own `assert_eq!(sorted, RULE_OPS)` said so to nobody. A test that
+# nothing invokes is not a gate, which is the same finding this repository
+# already recorded for the golden self-test and the documentation checker, both
+# of which are invoked from this script for exactly that reason.
+#
+# They cost about a second: the crate is already built by the line above, and
+# these are pure-Rust assertions over constant tables with no Python involved.
+cargo test --release --quiet || exit $?
+
 # Every `test_*.py` in `pytests/`, not just `test_shim.py`.
 #
 # One file was the whole suite for a long time, and the cost showed up in
