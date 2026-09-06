@@ -233,6 +233,30 @@ impl PyDevice {
     pub fn resolve(&self) -> PyResult<Device> {
         match self.kind.as_str() {
             "cpu" => Ok(Device::Cpu),
+            // The one accelerator this build has, and it is one *arm* rather
+            // than a subsystem because candle already owns the backend:
+            // `Device::Metal(MetalDevice)` is a variant of the same closed enum
+            // that `docs/VULKAN2.md` §5.1 found had nowhere to put a Vulkan
+            // handle. So an `mps` tensor is an ordinary `candle_core::Tensor`
+            // and needs no `tensor::Repr` arm, no dispatcher arm and no kernel
+            // of ours -- every kernel in this crate that already goes through
+            // candle runs on the GPU here because candle's own op does.
+            // docs/VULKAN3.md §1 is why that asymmetry put `mps` first.
+            //
+            // Not a silent fallback in either direction. Where the Metal
+            // feature is not compiled in -- Android, Linux, wasm, all of which
+            // fail `target_vendor = "apple"` in `Cargo.toml` -- this arm does
+            // not exist and `mps` falls through to the `other` arm's refusal
+            // naming it. Where it is compiled in but no GPU answers,
+            // `new_metal` returns its own error and it is raised, not swallowed.
+            //
+            // The index is passed through rather than pinned to 0, unlike
+            // `from_candle`'s hardcoding: here it comes from the label the
+            // caller wrote, so `mps:1` asks candle for device 1 and gets
+            // candle's own out-of-range error rather than device 0's results
+            // under device 1's name.
+            #[cfg(target_vendor = "apple")]
+            "mps" => Self::metal_device(self.index.unwrap_or(0).max(0) as usize),
             // `meta` is not a backend this build is missing -- it is a device
             // with no backend *by definition*, so it never becomes a candle
             // handle. A caller that reaches here with `meta` has forgotten to
@@ -248,6 +272,56 @@ impl PyDevice {
                 "device not available in torch._C shim: {other}"
             ))),
         }
+    }
+
+    /// One `MetalDevice` per index, for the process.
+    ///
+    /// **Not an optimisation -- without it `mps` is broken, and it was broken
+    /// in the obvious-looking first version of the arm above.** `Device::new_metal`
+    /// *constructs* a device: it opens its own `MTLCommandQueue` and takes a
+    /// fresh id. candle's `Device::same_device` compares those ids, so calling
+    /// `resolve()` twice produced two handles that did not consider themselves
+    /// equal, and the mixed-device gate in `aten.rs` then rejected two `mps`
+    /// tensors against each other with
+    ///
+    /// ```text
+    /// Expected all tensors to be on the same device, but found at least two
+    /// devices, mps:0 and mps:0!
+    /// ```
+    ///
+    /// -- a message that names the same device twice, which is what a
+    /// per-call constructor looks like from the outside. Caching makes
+    /// `resolve()` an accessor, which is what every caller already assumed it
+    /// was and what the `Cpu` arm has always been.
+    ///
+    /// Keyed by index and a `Vec` rather than a `OnceLock<Device>`, because
+    /// `mps:1` on a two-GPU Mac must not silently hand back device 0's handle
+    /// -- the exact class of mistake `from_candle`'s hardcoded index comment
+    /// warns about, from the other direction.
+    ///
+    /// A poisoned lock is recovered rather than raised on: the only thing this
+    /// mutex guards is a lookup table, so a panic elsewhere cannot have left it
+    /// meaningfully inconsistent, and refusing every subsequent `mps` call for
+    /// the life of the process would be a worse failure than the one that
+    /// poisoned it.
+    #[cfg(target_vendor = "apple")]
+    fn metal_device(index: usize) -> PyResult<Device> {
+        use std::sync::{Mutex, OnceLock};
+        static CACHE: OnceLock<Mutex<Vec<(usize, Device)>>> = OnceLock::new();
+        let mut cached = CACHE
+            .get_or_init(|| Mutex::new(Vec::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some((_, device)) = cached.iter().find(|(i, _)| *i == index) {
+            return Ok(device.clone());
+        }
+        let device = Device::new_metal(index).map_err(|e| {
+            not_implemented(format!(
+                "torch._C shim: the mps device is compiled in but did not open                  (metal device {index}): {e}"
+            ))
+        })?;
+        cached.push((index, device.clone()));
+        Ok(device)
     }
 
     /// A label for a live candle handle.

@@ -367,8 +367,8 @@ module does not have, and a target this repo cannot check would ship unchecked
 |---|:--:|:--:|:--:|:--:|:--:|:--:|---|
 | `cpu` | ✅ | ✅ | ⚠️ | ⚠️ | ⚠️ | ✅ | the only device that holds a tensor |
 | `meta` | ✅ | ✅ | ⚠️ | ⚠️ | ⚠️ | 🔲 | shape and dtype, no storage |
-| `mps` | ❌ | — | ❌ | — | — | — | candle has the backend; not enabled |
-| `vulkan` | — | ❌ | — | 🔲 | 🔲 | — | refuses by name; compute proven in a probe, not wired |
+| `mps` | ✅ | — | 🔲 | — | — | — | candle's Metal backend, on. `ones`/`_to_copy`, elementwise and matmul checked against `cpu` |
+| `vulkan` | ✅ | ❌ | — | 🔲 | 🔲 | — | four ops by name through real `VkBuffer`s; every other op refuses naming itself |
 | NNAPI · CoreML | — | ❌ | ❌ | — | — | — | needs the graph path, blocked at decomposition |
 | `cuda` | ❌ | ❌ | ❌ | 🔲 | 🔲 | — | constructible as a label, refuses to allocate |
 | WebGPU | — | — | — | — | — | 🔲 | the only accelerator a browser offers |
@@ -473,9 +473,9 @@ torchnative.nn.federated    rounds · client selection · aggregation · dropout
 | | |
 |---|---|
 | **Device abstraction** | `torch.device`, per-device dispatch. Everything else waits on it. |
-| **Metal** | candle already has the backend; disabled here for build isolation, not absent. |
+| **Metal** | On, Apple targets only. One arm of `resolve()` -- an `mps` tensor is an ordinary candle tensor, so no kernel here had to be taught it ([`docs/VULKAN3.md`](docs/VULKAN3.md)). |
 | **`torch.distributed`** | From `world_size = 1` upward. Unblocks `transformers` as a side effect. |
-| **Vulkan** | No candle backend and no `vulkan` slot in the `kernels` contract — genuinely new work. Wiring and correctness are testable on an emulator; only the performance question needs a phone. |
+| **Vulkan** | No candle backend, so it is a fourth arm of `tensor::Repr` outside candle entirely — which is what makes a silent CPU fallback unrepresentable rather than merely avoided ([`docs/VULKAN3.md`](docs/VULKAN3.md)). Wiring and correctness are testable on this host; only the performance question needs a phone. |
 | **NPU** | NNAPI, CoreML and QNN compile at runtime, so no export step is added — but they take a whole subgraph, not one operator. That needs a capture layer, and the single door is where it attaches. |
 
 ---

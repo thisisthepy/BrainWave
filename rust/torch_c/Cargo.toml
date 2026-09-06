@@ -73,6 +73,24 @@ half = "2.7"
 # by going through `F32`, and no code here calls `F8E4M3::to_f64` at all.
 float8 = "0.7"
 
+# The Vulkan bindings for `src/vulkan.rs`.
+#
+# **`loaded`, not `linked`, and that is the whole reason this is safe to put in
+# the shipping extension module.** `ash` is a generated binding over the Vulkan
+# headers with no runtime of its own, and with `loaded` it *dlopens* the loader
+# at first use rather than linking it. So the artefact still builds and still
+# loads on iOS, on a Linux box with no GPU and on an Android device without a
+# Vulkan driver -- absence becomes a value `_C._vulkan_probe()` reports, not a
+# link error and not an `ImportError` for the whole of `torch._C`.
+#
+# `debug` is on for one reason: `_vulkan_probe()` reports the physical device
+# type, and without it that field is an integer the reader would have to open a
+# header to interpret.
+#
+# `default-features = false` keeps `linked` off; leaving the defaults on is the
+# mistake that would turn every platform build into "requires libvulkan".
+ash = { version = "0.38", default-features = false, features = ["loaded", "std", "debug"] }
+
 # Apple only. `target_vendor = "apple"` covers macOS and iOS, device and
 # simulator alike, and excludes Android and Linux -- where turning this on would
 # not merely be useless but would fail to link, there being no Accelerate
@@ -119,3 +137,34 @@ float8 = "0.7"
 # not a quietly meaningless comparison.
 [target.'cfg(all(target_vendor = "apple", not(torch_c_no_accelerate)))'.dependencies]
 candle-core = { version = "0.11.0", default-features = false, features = ["accelerate"] }
+
+# Apple only, and a *separate* entry from the Accelerate one above on purpose.
+#
+# Metal is candle's own backend -- `Device::Metal(MetalDevice)` is already a
+# variant of the closed enum that `docs/VULKAN2.md` §5.1 found had nowhere to
+# put a Vulkan handle. So unlike Vulkan, an `mps` tensor is an **ordinary
+# `candle_core::Tensor`**: it needs no `tensor::Repr` arm, no dispatcher arm and
+# no kernel of ours. The entire difference is `PyDevice::resolve()` learning to
+# return `Device::new_metal(index)`, after which every one of this crate's
+# kernels that already goes through candle runs on the GPU because candle's own
+# op does. That asymmetry is why `mps` landed before `vulkan` this round
+# (docs/VULKAN3.md §1).
+#
+# Why not folded into the entry above: that one is gated on
+# `not(torch_c_no_accelerate)`, which `scripts/device_android.sh parity` sets to
+# take Accelerate *out* of the host build so it compares gemm against gemm. That
+# switch is about BLAS and has nothing to say about the GPU; folding metal in
+# would make the parity build silently lose the `mps` device as well, and the
+# `mps` tests would then skip rather than fail -- a gate that stops testing
+# without saying so. Cargo unions features across a dependency's entries, so two
+# entries add up to `["accelerate", "metal"]` here and to `["metal"]` alone under
+# the parity cfg, which is what each build wants.
+#
+# Cost, measured on this checkout and recorded in docs/VULKAN3.md §2: it adds
+# the `metal`/`objc2` binding crates and `candle-metal-kernels`, and the shaders
+# are compiled by candle at runtime from source it embeds, so there is no build
+# step and no `.metallib` to ship. It does not reach the Android or wasm targets
+# at all -- they do not match `target_vendor = "apple"` -- and the iOS cross
+# build was re-run to confirm the one target that *does* match still links.
+[target.'cfg(target_vendor = "apple")'.dependencies]
+candle-core = { version = "0.11.0", default-features = false, features = ["metal"] }
