@@ -1,5 +1,13 @@
 # ARCH100 — every `transformers` architecture, swept: 215 of 297 forward, 31 operators missing
 
+> **Re-swept in `docs/ARCH200.md`.** Two batches of operator work landed between this round and
+> that one — `__setitem__`, the scatter family, `index_select`, `glu`, `linalg_qr`,
+> `linalg_norm`, complex tensors, reflect/replicate padding, rank-5 `matmul`, `eye`, `erfinv`,
+> `scatter_reduce`, `index_add`, `view_as`, `bitwise_xor`, and more. The headline below (215/297,
+> 31 operators) no longer describes the current tree: ARCH200 measures **270/297 (91%), 16
+> operators**. This document is left in place as the record of what was true at `6d016f0` — the
+> comparison ARCH200 exists to make depends on this baseline staying unedited.
+
 Worktree `work/arch` on develop `6d016f0`. torch 2.13.0 upstream
 (`/Volumes/macMini/caches/spike-venv/bin/python`), `transformers` 5.15.1.
 No Rust was changed in this round: golden stays at **8921/8921, ops=222**, exactly unmoved.
