@@ -142,7 +142,24 @@ Pass it as TORCH_C_DYLD_LIBRARY_PATH instead; this script re-exports it.
 EOF
 fi
 
-PYTHONPATH="$stage" "${PYTHON:-python3}" "$crate_dir/pytests/test_shim.py" || exit $?
+# Every `test_*.py` in `pytests/`, not just `test_shim.py`.
+#
+# One file was the whole suite for a long time, and the cost showed up in
+# merges rather than in tests: several rounds land in parallel, all of them
+# append before `if __name__ == "__main__"`, and git resolves that as one
+# conflict hunk spanning thousands of lines. Reconstructing it by hand has
+# twice silently dropped tests that the branch had added -- once seven of
+# them, caught only because DOCWATCH markers named them.
+#
+# Splitting by topic makes those merges disjoint. The files share helpers by
+# importing `test_shim`, which is why `pytests/` is on PYTHONPATH; each one's
+# `__main__` guard keeps that import from running anything.
+suite_failed=0
+for suite in "$crate_dir"/pytests/test_*.py; do
+    echo "--- $(basename "$suite") ---"
+    PYTHONPATH="$stage:$crate_dir/pytests" "${PYTHON:-python3}" "$suite" || suite_failed=1
+done
+[ "$suite_failed" -eq 0 ] || exit 1
 
 # The golden harness has its own self-test -- it injects a fault shaped like a
 # plausible misimplementation at each comparator and checks the comparator
