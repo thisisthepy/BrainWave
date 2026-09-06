@@ -1532,6 +1532,22 @@ impl PyTensorBase {
         self.dims().len()
     }
 
+    /// `rwkv`'s wall, and a **spelling, not a kernel** -- checked rather than
+    /// assumed. On torch 2.13.0 `Tensor.ndimension` and `Tensor.dim` are two
+    /// distinct method objects (`torch.Tensor.ndimension is torch.Tensor.dim`
+    /// is `False`) that return the same `int` for every rank measured,
+    /// including `0` for a 0-d tensor. There is no `torch.ndimension` free
+    /// function and no `aten::ndimension` schema, so nothing is added to
+    /// `overloads.json` or to `aten.rs`'s dispatch -- inventing either would
+    /// invent a surface upstream does not have.
+    ///
+    /// It sits here rather than in `bootstrap.py` for the reason `dim` does:
+    /// the answer is `dims().len()` and routing it through Python would add a
+    /// frame to a call `transformers` makes inside its shape logic.
+    fn ndimension(&self) -> usize {
+        self.dims().len()
+    }
+
     #[getter]
     fn _backward_hooks(&self) -> Option<&Py<PyAny>> {
         self.backward_hooks.as_ref()

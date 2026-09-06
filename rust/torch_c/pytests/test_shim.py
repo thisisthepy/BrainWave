@@ -9173,7 +9173,15 @@ def test_core_ops_and_op_tags_agree():
     # `squeeze.dims` and +1 for `randperm.default`.
     #
     # 106 with `nonzero.default` (docs/NONZERO.md).
-    assert r["tag_core_count"] == 106, r["tag_core_count"]
+    #
+    # 107 with docs/DEMAND8.md's four, and the *one* is the point again: only
+    # `floor.default` is `core` upstream. Each was read off its own `.tags`
+    # rather than inferred -- `floor_.default` is `inplace`/`pointwise`,
+    # `index_add_.default` is `inplace`, and `upsample_bicubic2d.default`
+    # carries only `pt2_compliant_tag` (its bilinear sibling already in this
+    # shim is not core either). Getting 110 here would mean the tags were
+    # guessed from the neighbours.
+    assert r["tag_core_count"] == 107, r["tag_core_count"]
 
 
 def test_decompose_lowers_the_op_capture_md_named():
@@ -10659,7 +10667,16 @@ def test_schema_text_survives_the_round_trip_through_the_transcribed_tables():
     # table from the one this counts. That asymmetry is the check: +4 rather
     # than +5 or +8 is what says `where.ScalarSelf` was the unbound-member
     # shape and the other three were genuinely new names.
-    assert len(keys) == 287, len(keys)
+    # 291 with docs/DEMAND8.md's names. **+4, and the arithmetic is the
+    # check**: `floor` brings two identities (`default` and `.out`, both
+    # declared in `overloads.json` the way `ceil`'s are, only one of which has
+    # a kernel), `floor_` brings one, and `index_add_` brings one. The round's
+    # fourth op, `upsample_bicubic2d`, brings **none** -- it is a
+    # `torch._C._nn` binding installed from `bootstrap.py`, with no entry in
+    # either transcribed table, exactly as `upsample_bilinear2d` already is.
+    # Getting +5 here would mean a `_nn` name had been given a table entry
+    # upstream does not have.
+    assert len(keys) == 291, len(keys)
     from_tables = sorted(
         k for k in keys
         if report["table"][f"{k[0]}|{k[1]}"]["from"] == "tables"
@@ -22410,6 +22427,261 @@ def test_lower_to_refuses_a_graph_it_could_not_finish_and_names_the_ops():
     # Specifically: it stopped on a missing `prims.*` op rather than on a
     # missing decomposition rule, which is the round's whole finding.
     assert "prims." in r["lower_to_refusal"], r["lower_to_refusal"]
+
+
+    # docs/DEMAND8.md §2: `floor_` and `index_add_` are this round's two
+    # mutating additions, and both are `Tensor(a!) self` upstream. Two, not
+    # four: `floor.default` and `upsample_bicubic2d.default` landed in the
+    # same round and are out-of-place, so they must NOT appear here -- which
+    # is what makes this list a check on the schema parse rather than a
+    # restatement of "what changed".
+    "aten.floor_.default",
+    "aten.index_add_.default",
+_DEMAND8_ROAD_SCRIPT = r"""
+import json, math, sys
+import torch
+import torch.nn.functional as F
+
+out = {}
+
+def rec(key, value_fn):
+    try:
+        out[key] = value_fn()
+    except Exception as e:
+        out[key] = f"ERROR:{type(e).__name__}:{e}"
+
+out["is_shim"] = hasattr(torch._C, "_aten_implemented")
+
+# --- floor: BOTH doors, plus the in-place one --------------------------
+f = torch.tensor([1.7, -2.3, -0.5, 3.0])
+rec("floor_fn", lambda: torch.floor(f).tolist())
+rec("floor_member", lambda: f.floor().tolist())
+rec("floor__member", lambda: f.clone().floor_().tolist())
+rec("floor__fn", lambda: torch.floor_(f.clone()).tolist())
+# `floor_` writes through: the receiver itself changes, and it is the same
+# object that comes back.
+def floor_inplace_identity():
+    g = f.clone()
+    r = g.floor_()
+    return [r is g, g.tolist()]
+rec("floor__is_self", floor_inplace_identity)
+# The one row that separates floor from ceil: -0.5.
+rec("floor_vs_ceil_at_half", lambda: [torch.floor(torch.tensor([-0.5])).item(),
+                                      torch.ceil(torch.tensor([-0.5])).item()])
+# `-0.0` keeps its sign bit, which `tolist()` alone cannot see.
+rec("floor_neg_zero_sign",
+    lambda: [math.copysign(1.0, v)
+             for v in torch.floor(torch.tensor([-0.0, 0.0])).tolist()])
+rec("floor_int_identity", lambda: torch.arange(3).floor().tolist())
+def floor_bool():
+    try:
+        torch.tensor([True]).floor()
+    except NotImplementedError as e:
+        return f"refused:{e}"
+    return "ACCEPTED"
+rec("floor_bool", floor_bool)
+
+# --- ndimension: a spelling over the same answer `dim()` gives ----------
+rec("ndimension_3d", lambda: torch.zeros(2, 3, 4).ndimension())
+rec("ndimension_0d", lambda: torch.tensor(1.0).ndimension())
+rec("ndimension_matches_dim",
+    lambda: [torch.zeros(2, 3, 4).ndimension() == torch.zeros(2, 3, 4).dim(),
+             isinstance(torch.zeros(2, 3).ndimension(), int)])
+# Upstream has no free function and no attribute of that name on `torch`;
+# inventing one would be a surface this shim made up.
+rec("ndimension_not_a_free_function", lambda: hasattr(torch, "ndimension"))
+
+# --- index_add_: the member spelling, write-through, and accumulation ---
+def index_add_basic():
+    x = torch.zeros(4, 2)
+    r = x.index_add_(0, torch.tensor([0, 2]), torch.ones(2, 2))
+    return [r is x, x.tolist()]
+rec("index_add__basic", index_add_basic)
+rec("index_add__accumulates",
+    lambda: torch.zeros(3).index_add_(
+        0, torch.tensor([1, 1, 1]), torch.tensor([1.0, 2.0, 3.0])).tolist())
+rec("index_add__alpha",
+    lambda: torch.zeros(3).index_add_(
+        0, torch.tensor([0, 1]), torch.tensor([1.0, 2.0]), alpha=3).tolist())
+def index_add_view():
+    v = torch.zeros(6)
+    v[1:4].index_add_(0, torch.tensor([0, 2]), torch.tensor([7.0, 9.0]))
+    return v.tolist()
+rec("index_add__through_view", index_add_view)
+def index_add_neg():
+    try:
+        torch.zeros(3).index_add_(0, torch.tensor([-1]), torch.tensor([5.0]))
+    except IndexError as e:
+        return f"refused:{e}"
+    return "ACCEPTED"
+rec("index_add__negative_index", index_add_neg)
+# `alpha` is keyword-only upstream; a fourth positional is a TypeError.
+def index_add_positional_alpha():
+    try:
+        torch.zeros(3).index_add_(0, torch.tensor([0]), torch.tensor([1.0]), 3)
+    except TypeError as e:
+        return "TypeError"
+    return "ACCEPTED"
+rec("index_add__alpha_is_kwonly", index_add_positional_alpha)
+
+# --- upsample_bicubic2d: through F.interpolate, both flag values --------
+x = torch.arange(16.0).reshape(1, 1, 4, 4)
+rec("bicubic_interp_false",
+    lambda: [round(v, 4) for v in
+             F.interpolate(x, size=(6, 6), mode="bicubic",
+                           align_corners=False).flatten().tolist()[:6]])
+rec("bicubic_interp_true",
+    lambda: [round(v, 4) for v in
+             F.interpolate(x, size=(6, 6), mode="bicubic",
+                           align_corners=True).flatten().tolist()[:6]])
+rec("bicubic_scale_factor",
+    lambda: list(F.interpolate(x, scale_factor=1.5, mode="bicubic",
+                               align_corners=False).shape))
+rec("bicubic_leaf_5arg",
+    lambda: [round(v, 4) for v in torch._C._nn.upsample_bicubic2d(
+        torch.arange(3.0).reshape(1, 1, 1, 3), [1, 4], False, None, 1.5
+    ).flatten().tolist()])
+
+json.dump(out, sys.stdout)
+"""
+
+
+def _demand8_road_fixture():
+    env = dict(os.environ)
+    env["PYTHONPATH"] = _CKPT_VENDOR_DIR
+    env["TORCH_USE_RTLD_GLOBAL"] = "1"  # VENDOR.md wall 1
+    proc = subprocess.run(
+        [sys.executable, "-c", _DEMAND8_ROAD_SCRIPT],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=180,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"demand8-road subprocess exited {proc.returncode}\n"
+            f"--- stdout ---\n{proc.stdout}\n--- stderr ---\n{proc.stderr}"
+        )
+    return json.loads(proc.stdout)
+
+
+def test_demand8_four_names_reach_their_kernels_through_the_vendored_tree():
+    """docs/DEMAND8.md §2's four names, each through a real `import torch`
+    against this shim.
+
+    The golden harness is **blind to spelling**: it calls `_aten_dispatch`
+    with a dispatch key, so `torch.floor`, `Tensor.floor_`,
+    `Tensor.ndimension` and `F.interpolate(..., mode="bicubic")` could all be
+    missing while every golden case stayed green. `ndimension` in particular
+    has no dispatch key at all -- it is a `TensorBase` method over
+    `dims().len()` -- so this is the *only* place it is checked.
+
+    Every expected value below is transcribed from upstream torch 2.13.0, run
+    separately; none is derived from this shim.
+
+    Deleting `overloads.json`'s `floor` entry, `methods.json`'s `floor_` or
+    `index_add_` entry, `tensor.rs`'s `ndimension`, or `bootstrap.py`'s
+    `_install_nn` registration turns the matching assertion red by name --
+    see docs/DEMAND8.md §2.5 for the sabotage that was actually run.
+    """
+    if not os.path.isfile(_CKPT_VENDOR_SHIM):
+        return  # vendor tree not installed -- see vendor/install_shim.sh
+    out = _demand8_road_fixture()
+    assert out["is_shim"] is True, "the subprocess imported upstream torch, not the shim"
+
+    def eq(key, expected):
+        got = out.get(key, "<missing>")
+        assert got == expected, f"{key}: expected {expected!r}, got {got!r}"
+
+    def close(key, expected, tol=1e-4):
+        got = out.get(key, "<missing>")
+        assert isinstance(got, list) and len(got) == len(expected), f"{key}: got {got!r}"
+        for g, e in zip(got, expected):
+            assert abs(g - e) < tol, f"{key}: expected {expected!r}, got {got!r}"
+
+    # --- floor -----------------------------------------------------------
+    eq("floor_fn", [1.0, -3.0, -1.0, 3.0])
+    eq("floor_member", [1.0, -3.0, -1.0, 3.0])
+    eq("floor__member", [1.0, -3.0, -1.0, 3.0])
+    eq("floor__fn", [1.0, -3.0, -1.0, 3.0])
+    eq("floor__is_self", [True, [1.0, -3.0, -1.0, 3.0]])
+    # The row that separates `floor` from `ceil`. A kernel wired to the
+    # sibling passes every other assertion in this block.
+    eq("floor_vs_ceil_at_half", [-1.0, -0.0])
+    eq("floor_neg_zero_sign", [-1.0, 1.0])
+    eq("floor_int_identity", [0, 1, 2])
+    got = out.get("floor_bool", "")
+    assert got.startswith("refused:") and "floor_vml_cpu" in got, got
+
+    # --- ndimension ------------------------------------------------------
+    eq("ndimension_3d", 3)
+    eq("ndimension_0d", 0)
+    eq("ndimension_matches_dim", [True, True])
+    eq("ndimension_not_a_free_function", False)
+
+    # --- index_add_ ------------------------------------------------------
+    eq("index_add__basic", [True, [[1.0, 1.0], [0.0, 0.0], [1.0, 1.0], [0.0, 0.0]]])
+    eq("index_add__accumulates", [0.0, 6.0, 0.0])
+    eq("index_add__alpha", [3.0, 6.0, 0.0])
+    # The BASE, not the return value: a rebinding kernel gives all zeros.
+    eq("index_add__through_view", [0.0, 7.0, 0.0, 9.0, 0.0, 0.0])
+    got = out.get("index_add__negative_index", "")
+    assert got.startswith("refused:") and "index out of range in self" in got, got
+    eq("index_add__alpha_is_kwonly", "TypeError")
+
+    # --- upsample_bicubic2d ----------------------------------------------
+    # The first six elements of the first row. `align_corners=False` starts
+    # NEGATIVE -- the value a clamped source index cannot produce.
+    close("bicubic_interp_false", [-0.4340, 0.0590, 0.8657, 1.4398, 2.2465, 2.7396])
+    close("bicubic_interp_true", [0.0, 0.5040, 1.2480, 1.7520, 2.4960, 3.0])
+    eq("bicubic_scale_factor", [1, 1, 6, 6])
+    close("bicubic_leaf_5arg", [-0.0868, 0.4062, 1.2303, 1.8738])
+
+
+def test_capture_refuses_demand8_inplace_names_and_lets_the_others_through():
+    """docs/DEMAND8.md §2's two mutating additions (`floor_`, `index_add_`) at
+    the raw `_aten_dispatch` level.
+
+    `capture.rs::is_mutating` reads the trailing `_` off the op segment rather
+    than consulting a list, so it needed no change for either -- but "needed
+    no change" is a claim to measure, not to assume (docs/INPLACE.md §4 makes
+    the same point about its fourteen).
+
+    The controls are the point of the second half: `floor.default` and
+    `upsample_bicubic2d.default` are out-of-place ops added in the same round,
+    and they must record cleanly. A refusal rule broad enough to poison
+    everything this round touched would pass the first half of this test.
+    """
+    d = _C._aten_dispatch
+    a = _C._tensor_new_from_data([1.5, -2.5, 3.5, -4.5])
+    idx = _C._tensor_new_from_data([0, 2])
+    src = _C._tensor_new_from_data([9.0, 8.0])
+
+    for op, args in (
+        ("aten.floor_.default", (a,)),
+        ("aten.index_add_.default", (a, 0, idx, src)),
+    ):
+        got = _capture_refusal(lambda op=op, args=args: d(op, *args), [a])
+        assert op in got, (op, got)
+        assert "in place" in got, (op, got)
+
+    # Control 1: floor.default is out-of-place and must record cleanly.
+    _C._capture_begin([a])
+    out = d("aten.floor.default", a)
+    trace = _C._capture_end(out)
+    ops = [n["op"] if isinstance(n, dict) else n.op for n in trace.nodes]
+    assert ops == ["aten.floor.default"], ops
+
+    # Control 2: so must the round's other out-of-place kernel.
+    img = _C._tensor_from_flat([float(v) for v in range(16)], [1, 1, 4, 4],
+                               dtype=_C.float32)
+    _C._capture_begin([img])
+    out = d("aten.upsample_bicubic2d.default", img, [6, 6], False, None, None)
+    trace = _C._capture_end(out)
+    ops = [n["op"] if isinstance(n, dict) else n.op for n in trace.nodes]
+    assert ops == ["aten.upsample_bicubic2d.default"], ops
+
+
 
 
 if __name__ == "__main__":

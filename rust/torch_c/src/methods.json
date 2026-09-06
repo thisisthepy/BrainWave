@@ -337,6 +337,15 @@
   "ceil_": [
     "aten::ceil_(Tensor(a!) self) -> Tensor(a!)"
   ],
+  "floor": [
+    "aten::floor(Tensor self) -> Tensor"
+  ],
+  "floor_": [
+    "aten::floor_(Tensor(a!) self) -> Tensor(a!)"
+  ],
+  "index_add_": [
+    "aten::index_add_(Tensor(a!) self, int dim, Tensor index, Tensor source, *, Scalar alpha=1) -> Tensor(a!)"
+  ],
   "unbind": [
     "aten::unbind.int(Tensor(a -> *) self, int dim=0) -> Tensor(a)[]"
   ],
