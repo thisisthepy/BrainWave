@@ -569,8 +569,185 @@ fn shim_same_device(left: PyDevice, right: PyDevice) -> bool {
     left.same_physical_device(&right)
 }
 
+// ---------------------------------------------------------------------------
+// The `mps` host-readback gate (docs/MPS.md)
+// ---------------------------------------------------------------------------
+
+/// The ops whose kernels in this crate read a dispatched tensor's bytes back
+/// to host memory to compute their result.
+///
+/// **Deriving this list mechanically is the whole design, so the derivation is
+/// written down here and re-run as a test.** `aten.rs` is scanned for the four
+/// candle calls that move device bytes to the host -- `to_vec0`, `to_vec1`,
+/// `to_vec2`, `to_vec3`, `to_scalar`, `to_cpu` -- and an op is on this list if
+/// its kernel makes one, or calls one of the six helpers that do
+/// (`read_flat`, `side_from_tensor`, `mask_to_indices`, `nan_along_dim`,
+/// `narrow_through`, `local_scalar_dense`).
+/// `test_the_mps_readback_list_is_what_the_kernels_actually_do` re-runs that
+/// scan against the source and fails if the answer has moved, which is what
+/// stops the list from decaying as `aten.rs` changes -- a kernel that acquires
+/// a readback fails the suite until it is named here.
+///
+/// **Why a list of the unsafe ops rather than a list of the safe ones.** The
+/// safe direction would be the conservative choice if the unsafe set were
+/// unknowable, and it is not: candle's Metal backend has **no silent CPU
+/// fallback**. Every op it does not implement bails
+/// (`candle-core-0.11.0/src/metal_backend/mod.rs`), which is why
+/// `aten.sort.default` on an mps tensor already raised
+/// `Metal contiguous to_dtype F32 F64 not implemented` before this gate
+/// existed. So the only way an mps tensor's arithmetic can happen on the CPU
+/// is that a kernel *here* read it back, and that is a property of this
+/// crate's own source, which the scan above can see completely at the level it
+/// looks. An allowlist would have paid for that with over-refusal -- `abs` and
+/// `neg` read back only on their integral path and run on the GPU for floats,
+/// and an op-level allowlist cannot express that.
+///
+/// **What the scan cannot see** is stated so nobody reads it as more than it
+/// is: it follows one level of helper calls, chosen by name, so a readback
+/// added *two* levels down inside a helper this list does not know about would
+/// not be caught. That is why the test also asserts that every function in
+/// `aten.rs` holding a readback marker is either a kernel on this list, one of
+/// the six helpers, or on a named exemption list -- so a new readback anywhere
+/// in the file has to be classified by a human before the suite goes green.
+pub const MPS_HOST_READBACK_OPS: [&str; 54] = [
+    "aten._grouped_mm.default",
+    "aten._log_softmax.default",
+    "aten._safe_softmax.default",
+    "aten._softmax.default",
+    "aten.abs.default",
+    "aten.abs_.default",
+    "aten.adaptive_avg_pool1d.default",
+    "aten.adaptive_avg_pool2d.default",
+    "aten.argmax.default",
+    "aten.avg_pool2d.default",
+    "aten.bitwise_and.Scalar",
+    "aten.bitwise_and.Tensor",
+    "aten.bitwise_not.default",
+    "aten.bitwise_or.Scalar",
+    "aten.bitwise_or.Tensor",
+    "aten.cumsum.default",
+    "aten.div.Scalar_mode",
+    "aten.div.Tensor_mode",
+    "aten.expm1.default",
+    "aten.expm1_.default",
+    "aten.gather.default",
+    "aten.histc.default",
+    "aten.index.Tensor",
+    "aten.index_add_.default",
+    "aten.index_put_.default",
+    "aten.isin.Tensor_Tensor",
+    "aten.log2.default",
+    "aten.log2_.default",
+    "aten.masked_select.default",
+    "aten.max.default",
+    "aten.max.dim",
+    "aten.max.other",
+    "aten.max_pool2d.default",
+    "aten.maximum.default",
+    "aten.min.default",
+    "aten.min.dim",
+    "aten.min.other",
+    "aten.multinomial.default",
+    "aten.native_dropout.default",
+    "aten.neg.default",
+    "aten.nll_loss_forward.default",
+    "aten.nonzero.default",
+    "aten.one_hot.default",
+    "aten.pow.Scalar",
+    "aten.pow.Tensor_Scalar",
+    "aten.pow.Tensor_Tensor",
+    "aten.remainder.Scalar",
+    "aten.remainder.Tensor",
+    "aten.scatter.src",
+    "aten.softplus.default",
+    "aten.upsample_bicubic2d.default",
+    "aten.upsample_bilinear2d.default",
+    "aten.where.default",
+    "prims.neg.default",
+];
+
+/// The two ops that read device bytes back and are **not** refused, with the
+/// reason each is different in kind from the fifty-four above.
+///
+/// The scan finds these too, so leaving them out of `MPS_HOST_READBACK_OPS`
+/// without saying why would look like an oversight rather than a decision.
+///
+/// * `aten._local_scalar_dense.default` is `.item()`. The readback *is* what
+///   the caller asked for, exactly as `.cpu()` is; refusing it would refuse
+///   the only way to read a value off the device. It is the mps analogue of
+///   `aten._to_copy.default`, not of `aten.nonzero.default`.
+/// * `aten.uniform_.default` never reads the tensor it writes. Its markers are
+///   on host-generated random values and on a dtype round-trip of a
+///   *constant* (`narrow_roundtrip_f32`); there is no input datum to compute
+///   on the wrong device, so refusing it would cost `nn.init` on mps and buy
+///   nothing.
+pub const MPS_READBACK_BUT_ALLOWED: [&str; 2] = [
+    "aten._local_scalar_dense.default",
+    "aten.uniform_.default",
+];
+
+/// Is this candle handle a Metal one?
+///
+/// A free function rather than a `matches!` at the call site so that the one
+/// place `aten.rs` has to know about Metal is a call by name. The variant
+/// exists in candle's enum on every target (the `metal` feature changes what
+/// `MetalDevice` *is*, not whether the arm is there), so no `cfg` is needed
+/// and the gate cannot go missing on a target nobody compiled.
+#[inline]
+pub fn is_metal(device: &Device) -> bool {
+    matches!(device, Device::Metal(_))
+}
+
+/// Refuse an op that would compute on the CPU under an `mps` label.
+///
+/// Called from the single door in `aten.rs` for exactly the dispatches whose
+/// tensor arguments live on Metal, so a CPU dispatch pays nothing at all and
+/// an mps dispatch pays one scan of a 54-entry static table of `&'static str`.
+///
+/// The refusal is `NotImplementedError` and not `RuntimeError`, matching what
+/// this shim raises for an op it does not implement on a device -- because
+/// that is what this is. The op is not implemented *for mps*; it is
+/// implemented for the CPU, and the message says so and says how to get it.
+pub fn mps_host_readback_gate(op: &str) -> PyResult<()> {
+    if !MPS_HOST_READBACK_OPS.contains(&op) {
+        return Ok(());
+    }
+    Err(not_implemented(format!(
+        "{op}: not implemented for the mps device. This kernel reads the tensor \
+         back to host memory and computes there, so it would return a correct \
+         value that the GPU did not compute, under an mps label -- the shim \
+         refuses that rather than doing it silently. Move the tensor with \
+         .cpu() to ask for the CPU on purpose. {} of the ops this build \
+         implements are refused on mps for this reason; \
+         torch._C._shim_mps_host_readback_ops() lists them (docs/MPS.md).",
+        MPS_HOST_READBACK_OPS.len(),
+    )))
+}
+
+/// The gate's table, readable from Python so a test can check the *artefact*
+/// rather than the constant it was compiled from.
+///
+/// `_shim_`-prefixed for the reason `_shim_same_device` is: upstream has no
+/// such name and shim-only introspection must be impossible to mistake for
+/// surface.
+#[pyfunction]
+#[pyo3(name = "_shim_mps_host_readback_ops")]
+fn shim_mps_host_readback_ops() -> Vec<&'static str> {
+    MPS_HOST_READBACK_OPS.to_vec()
+}
+
+/// The companion list, for the same reason: a test that checked only the
+/// refusals could not tell a deliberate exemption from a missed op.
+#[pyfunction]
+#[pyo3(name = "_shim_mps_readback_but_allowed")]
+fn shim_mps_readback_but_allowed() -> Vec<&'static str> {
+    MPS_READBACK_BUT_ALLOWED.to_vec()
+}
+
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyDevice>()?;
     m.add_function(wrap_pyfunction!(shim_same_device, m)?)?;
+    m.add_function(wrap_pyfunction!(shim_mps_host_readback_ops, m)?)?;
+    m.add_function(wrap_pyfunction!(shim_mps_readback_but_allowed, m)?)?;
     Ok(())
 }

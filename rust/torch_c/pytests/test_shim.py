@@ -14,7 +14,9 @@ adding a test dependency to a package that has none.
 """
 
 import math
+import os
 import pathlib
+import re
 
 import _C
 
@@ -24942,6 +24944,15 @@ def test_an_op_mps_cannot_run_refuses_and_names_the_op():
     not implement raises, the message names the op, and it says `Metal` -- and
     a `NotImplementedError` naming the op is what an op this shim never
     implemented gives on any device.
+
+    **The paragraph above is corrected by docs/MPS.md and left standing because
+    the assertions below are still exactly right.** candle does *not* copy a
+    Metal tensor back for ops its backend lacks -- it bails, which is what this
+    test sees. The correct-answer-from-the-CPU that §3 caught came from
+    kernels in `aten.rs` reading the tensor back themselves, and
+    `test_an_mps_op_that_would_compute_on_the_cpu_is_refused_and_names_the_op`
+    is the gate for that. What is checked here is still the other half: that an
+    op *candle* cannot run says so.
     """
     mps = _mps_or_skip("mps refusal")
     if mps is None:
@@ -24995,6 +25006,310 @@ def test_mps_is_refused_by_name_where_it_is_not_compiled_in():
 
 
 
+# --- the mps host-readback gate (docs/MPS.md) --------------------------------
+#
+# What the tests above could not see, and what these close.
+#
+# docs/VULKAN3.md §3 recorded that an `mps` tensor can be computed on the CPU
+# and still report `mps`, and attributed the readback to candle. It is not
+# candle's: candle's Metal backend has no silent fallback at all -- every op it
+# lacks bails, which is why `aten.sort.default` raises `Metal contiguous
+# to_dtype F32 F64 not implemented` rather than answering. The readbacks are in
+# *this crate's own kernels*, and there are fifty-four of them, not two.
+#
+# `device.rs::MPS_HOST_READBACK_OPS` is the list and `aten_dispatch` refuses
+# against it at the single door. The list is derived from `aten.rs` by a scan,
+# and the scan is re-run below rather than trusted -- a list nobody re-derives
+# is a list that decays, and this one decays in the direction of silence.
+
+_MPS_READBACK_MARKERS = re.compile(r"\.to_vec[0-3]|\.to_scalar|\.to_cpu\(")
+
+# The six helpers that move a dispatched tensor's bytes to the host. An op that
+# calls one of these computes on the CPU even though its own body is clean --
+# `aten._softmax.default` is the one worth naming, since a model on `mps` goes
+# through it on every attention block.
+_MPS_READBACK_HELPERS = (
+    "read_flat",
+    "side_from_tensor",
+    "mask_to_indices",
+    "nan_along_dim",
+    "narrow_through",
+    "local_scalar_dense",
+)
+
+# Functions that hold a marker but do **not** read a dispatched tensor, each
+# with the reason. Kept as data rather than as a filter in the scan so that the
+# scan cannot quietly grow an excuse: adding a name here is a visible edit.
+_MPS_READBACK_EXEMPT = {
+    "scalar_arg": "reads a *zero-dim tensor argument* to form a Scalar, which "
+                  "is what upstream does for the Scalar overloads too. The "
+                  "data operand stays on the GPU.",
+    "scale_by_alpha": "to_scalar on `Tensor::full(alpha, ())` -- a constant "
+                      "this function just built on the host, not an input.",
+    "narrow_roundtrip_f32": "same: a dtype round-trip of a constant, used by "
+                            "`uniform_` to find the representable bound.",
+    "old_path_f32": "unreachable from the dispatcher -- no op maps to it.",
+    "an_unrecognised_layout_still_widens_correctly": "a #[cfg(test)] proof.",
+    "squaring_matches_the_libm_round_trip_bit_for_bit": "a #[cfg(test)] proof.",
+    "widening_a_transposed_operand_matches_candle_bit_for_bit":
+        "a #[cfg(test)] proof.",
+}
+
+
+def _aten_rs_functions():
+    """`aten.rs` split into `{function name: body}`, or None if it is not here.
+
+    Reads the source rather than the artefact on purpose: the claim being
+    checked is about what the kernels *do*, and only the source says that. It
+    is the one test in this file that needs the tree, so it skips by name where
+    the tree is absent (an installed wheel), rather than failing there.
+    """
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src", "aten.rs")
+    if not os.path.exists(path):
+        return None
+    with open(path, encoding="utf-8") as handle:
+        text = handle.read()
+    # Line comments are stripped first. This file is unusually comment-heavy
+    # and several comments quote `to_vec1` while explaining why a kernel does
+    # *not* call it -- counting those would put clean ops on the list.
+    text = "\n".join(
+        "" if line.lstrip().startswith("//") else line for line in text.split("\n")
+    )
+    bodies = {}
+    for match in re.finditer(
+        r"(?m)^\s*(?:pub(?:\([^)]*\))?\s+)?fn\s+([A-Za-z0-9_]+)\s*[(<]", text
+    ):
+        start = text.find("{", match.end() - 1)
+        if start < 0:
+            continue
+        depth, cursor = 0, start
+        while cursor < len(text):
+            if text[cursor] == "{":
+                depth += 1
+            elif text[cursor] == "}":
+                depth -= 1
+                if depth == 0:
+                    break
+            cursor += 1
+        bodies.setdefault(match.group(1), "")
+        bodies[match.group(1)] += "\n" + text[start:cursor + 1]
+    return bodies, text
+
+
+def _aten_dispatch_targets(text):
+    """`{op key: kernel function}` read off `aten_dispatch_inner`'s match."""
+    start = text.find("fn aten_dispatch_inner")
+    end = text.find("\n#[pyfunction]", start)
+    inner = text[start:end]
+    ops = {}
+    for match in re.finditer(
+        r'((?:"[a-z_]+\.[A-Za-z0-9_.]+"\s*\|\s*)*"[a-z_]+\.[A-Za-z0-9_.]+")'
+        r"\s*=>\s*\{?\s*([a-z_][A-Za-z0-9_]*)\s*\(",
+        inner,
+    ):
+        for op in re.findall(r'"([^"]+)"', match.group(1)):
+            ops.setdefault(op, match.group(2))
+    return ops
+
+
+def test_the_mps_readback_list_is_what_the_kernels_actually_do():
+    """Re-derive the refusal list from `aten.rs` and compare it to the build.
+
+    **This is the only thing that keeps the list honest, so it re-runs the
+    derivation rather than restating its answer.** A kernel that acquires a
+    `to_vec1` -- or starts calling `read_flat` -- lands on the derived set and
+    fails here until somebody puts it in `MPS_HOST_READBACK_OPS`; a kernel that
+    loses one stops being refused for a reason that no longer exists.
+
+    The comparison is against `_C._shim_mps_host_readback_ops()`, which is the
+    table *the loaded artefact* is gating on, not the constant in the source
+    beside it. A test reading the source on both sides would agree with itself
+    after a change nobody rebuilt.
+
+    Runs everywhere, Metal or no Metal: it is a claim about source, so a Linux
+    runner checks it too. That matters, because the machines that cannot
+    exercise the gate are the ones most likely to change a kernel under it.
+    """
+    parsed = _aten_rs_functions()
+    if parsed is None:
+        print("   (skipped mps readback derivation: rust/torch_c/src/aten.rs "
+              "is not beside this file -- installed rather than in-tree)")
+        return
+    bodies, text = parsed
+    ops = _aten_dispatch_targets(text)
+    assert len(ops) > 200, len(ops)
+
+    allowed = set(_C._shim_mps_readback_but_allowed())
+    derived = set()
+    for op, fn in ops.items():
+        body = bodies.get(fn, "")
+        reads = bool(_MPS_READBACK_MARKERS.search(body)) or any(
+            re.search(r"\b" + helper + r"\s*\(", body)
+            for helper in _MPS_READBACK_HELPERS
+        )
+        if reads and op not in allowed:
+            derived.add(op)
+
+    declared = set(_C._shim_mps_host_readback_ops())
+    missing = sorted(derived - declared)
+    stale = sorted(declared - derived)
+    assert not missing, (
+        "these ops read an mps tensor back to the host and are NOT refused -- "
+        "add them to MPS_HOST_READBACK_OPS in device.rs: " + repr(missing)
+    )
+    assert not stale, (
+        "these ops are refused on mps but no longer read back -- remove them "
+        "from MPS_HOST_READBACK_OPS in device.rs: " + repr(stale)
+    )
+    # The two exemptions have to still be real, or the set difference above is
+    # hiding them rather than exempting them.
+    for op in allowed:
+        fn = ops[op]
+        assert _MPS_READBACK_MARKERS.search(bodies.get(fn, "")), (op, fn)
+
+
+def test_every_host_readback_in_aten_is_classified():
+    """The half the per-op scan cannot see, made impossible to add quietly.
+
+    The scan above follows helper calls **one level, by name**. A readback
+    added two levels down, inside a helper that list does not know, would not
+    reach any op and the gate would silently stop covering it.
+
+    So this asserts the stronger thing: every function in `aten.rs` that moves
+    device bytes to the host is one of three known kinds -- a kernel already
+    refused, one of the six readback helpers, or a named exemption with a
+    reason. A new one is none of those and fails here, which forces it to be
+    classified by a person before the suite goes green.
+    """
+    parsed = _aten_rs_functions()
+    if parsed is None:
+        print("   (skipped mps readback classification: aten.rs is not beside "
+              "this file -- installed rather than in-tree)")
+        return
+    bodies, text = parsed
+    ops = _aten_dispatch_targets(text)
+    refused = set(_C._shim_mps_host_readback_ops())
+    allowed = set(_C._shim_mps_readback_but_allowed())
+    kernels_of = {}
+    for op, fn in ops.items():
+        kernels_of.setdefault(fn, set()).add(op)
+
+    unclassified = []
+    for fn, body in bodies.items():
+        if not _MPS_READBACK_MARKERS.search(body):
+            continue
+        if fn in _MPS_READBACK_HELPERS or fn in _MPS_READBACK_EXEMPT:
+            continue
+        owned = kernels_of.get(fn)
+        if owned and owned <= (refused | allowed):
+            continue
+        unclassified.append(fn)
+    assert not unclassified, (
+        "these functions in aten.rs read device bytes to the host and are "
+        "neither a refused kernel, a known readback helper, nor an exemption "
+        "with a reason: " + repr(sorted(unclassified))
+    )
+
+
+def test_an_mps_op_that_would_compute_on_the_cpu_is_refused_and_names_the_op():
+    """The gate, from the caller's side.
+
+    `nonzero` is the op docs/VULKAN3.md §3 caught returning a correct value
+    from the CPU under an `mps` label; `_softmax` is the one that matters more,
+    because a transformer on `mps` goes through it on every attention block and
+    nothing said a word.
+
+    Three things are asserted and each is separately load-bearing: that it
+    raises, that the message names the op and the device (a refusal that does
+    not say which op is a refusal nobody can act on), and that the *same* call
+    on the CPU is untouched -- the gate is scoped to Metal arguments, so a
+    version of it that fired everywhere would pass the first two.
+
+    **Removing the gate puts `nonzero` and `_softmax` back to answering
+    correctly off the CPU with `mps` on the label**, which is what this test
+    fails to notice if the arm in `aten_dispatch` is deleted -- verified by
+    deleting it, not by assuming.
+    """
+    mps = _mps_or_skip("mps host-readback gate")
+    if mps is None:
+        return
+    d = _C._aten_dispatch
+    a = d("aten._to_copy.default", _f32([0, 1, 2, 3], [2, 2]), device=mps)
+
+    for op in ("aten.nonzero.default", "aten._softmax.default"):
+        try:
+            d(op, a) if op == "aten.nonzero.default" else d(op, a, 0, False)
+        except NotImplementedError as e:
+            message = str(e)
+            assert op in message, message
+            assert "mps" in message, message
+            # It has to say what to do instead, or the refusal is a dead end.
+            assert ".cpu()" in message, message
+        else:
+            raise AssertionError(f"{op} must not compute on the CPU under mps")
+
+    # The identical call on the CPU is unaffected. The gate reads the *device*
+    # of the arguments, so a scoping mistake shows up here and nowhere else.
+    cpu = _f32([0, 1, 2, 3], [2, 2])
+    assert d("aten.nonzero.default", cpu).tolist() == [[0, 1], [1, 0], [1, 1]]
+
+
+def test_the_mps_refusal_list_is_not_empty_and_covers_the_named_regressions():
+    """A guard against the guard being switched off.
+
+    An empty table would make `mps_host_readback_gate` a function that always
+    returns `Ok`, and every test above it would still pass -- the refusal tests
+    skip where there is no Metal device, and on a machine with one they would
+    be the only thing that noticed. This one notices on every machine, because
+    it reads the table rather than the behaviour.
+    """
+    ops = _C._shim_mps_host_readback_ops()
+    assert len(ops) > 40, len(ops)
+    assert len(set(ops)) == len(ops), "duplicate entries"
+    assert ops == sorted(ops), "kept sorted so a diff is readable"
+    for named in ("aten.nonzero.default", "aten._softmax.default",
+                  "aten.where.default", "aten.index.Tensor"):
+        assert named in ops, named
+    # `.item()` and `.cpu()` are transfers the caller asked for and must never
+    # be on it -- refusing them would leave no way to read a value off mps.
+    assert "aten._local_scalar_dense.default" not in ops
+    assert "aten._to_copy.default" not in ops
+
+
+def test_tril_on_mps_computes_on_the_gpu_after_all():
+    """A correction to docs/VULKAN3.md §3, kept as a test so it stays corrected.
+
+    That section named `aten.tril.default` alongside `aten.nonzero.default` as
+    an op computing on the CPU under an `mps` label. `nonzero` is: its kernel
+    calls `to_vec1::<u8>()` and does the index arithmetic in Rust. `tril` is
+    not, and the difference was inferred rather than measured -- both returned
+    a correct value, and a correct value is what a host readback and a Metal
+    kernel both produce.
+
+    `tril_triu` builds its mask on the host (the mask is data-independent),
+    uploads it, and calls `where_cond`, which candle implements as a real Metal
+    kernel (`candle-core-0.11.0/src/metal_backend/mod.rs`). No byte of the
+    input is read back. So it is *not* on the refusal list, and this asserts
+    the shape of that claim: it runs, it agrees with the CPU, and it agrees
+    across dtypes -- an op faking it through the host would not care which
+    dtype it was handed, and candle's kernels do.
+    """
+    mps = _mps_or_skip("mps tril")
+    if mps is None:
+        return
+    d = _C._aten_dispatch
+    assert "aten.tril.default" not in _C._shim_mps_host_readback_ops()
+    cpu = _f32([1, 2, 3, 4, 5, 6, 7, 8, 9], [3, 3])
+    got = d("aten.tril.default", d("aten._to_copy.default", cpu, device=mps))
+    assert got.device.type == "mps", got.device
+    assert got.cpu().tolist() == d("aten.tril.default", cpu).tolist()
+    for dtype in (_C.float16, _C.bfloat16, _C.int64):
+        wide = d("aten._to_copy.default", cpu, dtype=dtype)
+        on_gpu = d("aten._to_copy.default", wide, device=mps)
+        assert (d("aten.tril.default", on_gpu).cpu().tolist()
+                == d("aten.tril.default", wide).tolist()), dtype
+
+
 # --- the vulkan device: a representation candle has no variant for -----------
 #
 # The contrast with the mps tests above is the point, and docs/VULKAN3.md §4
@@ -25021,10 +25336,41 @@ def test_mps_is_refused_by_name_where_it_is_not_compiled_in():
 # ordinary run of this suite these skip and say the loader's own words.
 
 
+def _sip_stripped_the_loader_path():
+    """Did macOS SIP eat the `DYLD_*` this process was supposed to inherit?
+
+    docs/VULKAN3.md §6.1: running the suite as `DYLD_LIBRARY_PATH=... sh
+    run.sh` skipped all four Vulkan tests *while the loader was pointed at
+    correctly*, because SIP strips `DYLD_*` from the environment when exec'ing
+    a protected binary such as `/bin/sh`. The variable was in the caller's
+    shell and gone by the time Python looked.
+
+    It cannot be observed directly -- what was stripped left no trace. But it
+    leaves a signature, and this is it: `VK_DRIVER_FILES` is **not** a `DYLD_*`
+    name, so SIP does not touch it. Someone who set one and not the other set
+    both and lost one.
+
+    Naming that is the whole point. "no vulkan" was a true sentence about the
+    process and a false one about the machine, and the person who had just
+    handed it a loader is the person least able to tell the difference.
+    """
+    return bool(os.environ.get("VK_DRIVER_FILES")) and not os.environ.get(
+        "DYLD_LIBRARY_PATH"
+    )
+
+
 def _vulkan_or_skip(what):
     """A live `vulkan` device, or None having said why not."""
     probe = _C._vulkan_probe()
     if not probe["available"]:
+        if _sip_stripped_the_loader_path():
+            print(f"   (skipped {what}: VK_DRIVER_FILES is set but "
+                  "DYLD_LIBRARY_PATH is not -- macOS SIP strips DYLD_* when "
+                  "exec'ing /bin/sh, so run.sh never received it. Pass it as "
+                  "TORCH_C_DYLD_LIBRARY_PATH instead, which run.sh re-exports "
+                  "(docs/VULKAN3.md §6.1). The loader said: "
+                  f"{str(probe['error']).splitlines()[0]})")
+            return None
         print(f"   (skipped {what}: no vulkan -- {str(probe['error']).splitlines()[0]})")
         return None
     return _C.device("vulkan")

@@ -367,7 +367,7 @@ module does not have, and a target this repo cannot check would ship unchecked
 |---|:--:|:--:|:--:|:--:|:--:|:--:|---|
 | `cpu` | ✅ | ✅ | ⚠️ | ⚠️ | ⚠️ | ✅ | the only device that holds a tensor |
 | `meta` | ✅ | ✅ | ⚠️ | ⚠️ | ⚠️ | 🔲 | shape and dtype, no storage |
-| `mps` | ⚠️ | — | 🔲 | — | — | — | candle's Metal backend, on — but an op Metal lacks is computed on the **CPU under an `mps` label**, silently ([`docs/VULKAN3.md`](docs/VULKAN3.md) §3) |
+| `mps` | ✅ | — | 🔲 | — | — | — | candle's Metal backend, on. An op whose kernel would compute on the **CPU under an `mps` label** is refused at the door, naming the op — 54 of them, listed by `_C._shim_mps_host_readback_ops()` ([`docs/MPS.md`](docs/MPS.md)) |
 | `vulkan` | ✅ | ❌ | — | 🔲 | 🔲 | — | four ops by name through real `VkBuffer`s; every other op refuses naming itself |
 | NNAPI · CoreML | — | ❌ | ❌ | — | — | — | needs the graph path, blocked at decomposition |
 | `cuda` | ❌ | ❌ | ❌ | 🔲 | 🔲 | — | constructible as a label, refuses to allocate |
@@ -473,7 +473,7 @@ torchnative.nn.federated    rounds · client selection · aggregation · dropout
 | | |
 |---|---|
 | **Device abstraction** | `torch.device`, per-device dispatch. Everything else waits on it. |
-| **Metal** | On, Apple targets only. One arm of `resolve()` -- an `mps` tensor is an ordinary candle tensor, so no kernel here had to be taught it ([`docs/VULKAN3.md`](docs/VULKAN3.md)). |
+| **Metal** | On, Apple targets only. One arm of `resolve()` -- an `mps` tensor is an ordinary candle tensor, so no kernel here had to be taught it ([`docs/VULKAN3.md`](docs/VULKAN3.md)). That is also why it needs a gate the Vulkan representation does not: the ops whose kernels read the tensor back to the host are refused by name ([`docs/MPS.md`](docs/MPS.md)). |
 | **`torch.distributed`** | From `world_size = 1` upward. Unblocks `transformers` as a side effect. |
 | **Vulkan** | No candle backend, so it is a fourth arm of `tensor::Repr` outside candle entirely — which is what makes a silent CPU fallback unrepresentable rather than merely avoided ([`docs/VULKAN3.md`](docs/VULKAN3.md)). Wiring and correctness are testable on this host; only the performance question needs a phone. |
 | **NPU** | NNAPI, CoreML and QNN compile at runtime, so no export step is added — but they take a whole subgraph, not one operator. That needs a capture layer, and the single door is where it attaches. |
