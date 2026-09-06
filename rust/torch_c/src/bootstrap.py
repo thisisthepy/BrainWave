@@ -2467,6 +2467,45 @@ def _describe_call(args, kwargs) -> str:
 # refused at the *factory* -- no evidence about autograd at all, since
 # `.requires_grad_(True)` walks past it -- and now refuses at `.backward()`,
 # which is the thing the sentence claims to test.
+# `install()` fills this in with the live `_C` module once dtype singletons
+# exist (`module.bool`, `module.int64`, ...), the same one-slot-list pattern
+# `_C_TENSORBASE` above uses -- a global rebound later so `_strip_python_only_
+# kwargs` reads a container that exists at definition time.
+_PY_DTYPE_MODULE = [None]
+
+# docs/ARGFORM.md. `dtype=bool`/`dtype=int`/`dtype=float` (the *Python* types,
+# not `torch.bool`/`torch.int64`/`torch.float32`) are upstream's own overload
+# resolver accepting a `type` wherever a schema takes `ScalarType` -- measured
+# on 2.13.0 with `torch.ones(2, dtype=bool)`, `.to(dtype=int)`, and
+# `torch.tensor([1], dtype=float)`, all of which upstream accepts and maps to
+# exactly these three dtypes (bool -> `torch.bool`, int -> `torch.int64`,
+# float -> `torch.float64` for `torch.tensor`/`.to()` but -- measured
+# separately -- `torch.float64` for `torch.ones(dtype=float)` too). `complex`
+# is deliberately left out: it maps to `torch.complex128` upstream, but
+# `_NUMPY_DTYPE_TO_TORCH`'s own note records that complex dtypes have no
+# candle storage behind them here, so mapping `dtype=complex` to a name this
+# shim cannot back would trade one refusal for a worse one further in.
+_PY_TYPE_TO_DTYPE_NAME = {
+    bool: "bool",
+    int: "int64",
+    float: "float64",
+}
+
+# docs/ARGFORM.md. `axis=`/`keepdims=` are numpy's spellings of `dim=`/
+# `keepdim=`, and upstream accepts them on some reductions and not others --
+# docs/SCALAR2.md found the same "per-op, no principle" shape for scalar
+# dispatch. Each key here was measured against torch 2.13.0 directly
+# (`x.mean(axis=1, keepdim=True)`, `torch.mean(x, axis=1, keepdim=True)`) and
+# accepted; nothing is added on the strength of "this is probably fine
+# elsewhere too". `keepdims` is included for `mean` because it was measured
+# alongside `axis` on the same call and both are accepted -- it was not
+# separately requested by any of the six architectures, so it rides on
+# `mean`'s own measurement rather than starting one of its own.
+_NUMPY_KEYWORD_ALIASES = {
+    "mean": {"axis": "dim", "keepdims": "keepdim"},
+}
+
+
 def _strip_python_only_kwargs(name: str, kwargs: dict):
     """Returns `(kwargs_for_the_schema, requires_grad)`.
 
@@ -2487,6 +2526,34 @@ def _strip_python_only_kwargs(name: str, kwargs: dict):
     # argument of it), so the call would report no matching overload.
     if "out" in kwargs and kwargs["out"] is None:
         del kwargs["out"]
+    # numpy-spelling aliases -- see `_NUMPY_KEYWORD_ALIASES` above. Renaming
+    # rather than adding: if the caller already gave the canonical name too,
+    # this must not silently pick one. A plain `kwargs[canonical] = kwargs.
+    # pop(alias)` would overwrite the caller's `dim` with `axis` and never
+    # notice -- a dict assignment does not raise on a key that already
+    # exists -- so the collision is refused by name here instead, matching
+    # upstream's own refusal (measured: `mean(dim=1, axis=1)` raises
+    # `TypeError: mean() received multiple values for argument 'dim'`).
+    aliases = _NUMPY_KEYWORD_ALIASES.get(name)
+    if aliases:
+        for alias, canonical in aliases.items():
+            if alias in kwargs:
+                if canonical in kwargs:
+                    raise TypeError(
+                        f"{name}() received multiple values for argument "
+                        f"{canonical!r} ({alias!r} is its numpy-spelling alias)"
+                    )
+                kwargs[canonical] = kwargs.pop(alias)
+    # `dtype=bool`/`dtype=int`/`dtype=float` -- see `_PY_TYPE_TO_DTYPE_NAME`
+    # above. Applied wherever a `dtype=` keyword shows up rather than per-op,
+    # because the measurement this rests on (`.to()`, `torch.tensor()`,
+    # `torch.ones()`) is upstream's *overload resolver* accepting a `type` for
+    # `ScalarType`, not a rule any one op adds on top of it.
+    dtype = kwargs.get("dtype")
+    if dtype in _PY_TYPE_TO_DTYPE_NAME:
+        dtype_module = _PY_DTYPE_MODULE[0]
+        if dtype_module is not None:
+            kwargs["dtype"] = getattr(dtype_module, _PY_TYPE_TO_DTYPE_NAME[dtype])
     return kwargs, requires_grad
 
 
@@ -2613,6 +2680,13 @@ def install(module, surface_json: str, overloads_json: str, methods_json: str) -
     # is why it is here and not beside the `TensorBase` member installation
     # further down.
     _C_TENSORBASE[0] = module.TensorBase
+    # See `_PY_DTYPE_MODULE`'s own comment above `_strip_python_only_kwargs`:
+    # filled in here so `dtype=bool`/`dtype=int`/`dtype=float` can be resolved
+    # to `module.bool`/`module.int64`/`module.float64` at call time. Safe to
+    # set this early -- it is only ever read after `install()` has returned,
+    # by which point every dtype singleton below exists regardless of whether
+    # it came from Rust (`real`) or the types loop just below.
+    _PY_DTYPE_MODULE[0] = module
 
     # -- types ------------------------------------------------------------
     resolved = {}
@@ -3007,6 +3081,57 @@ def install(module, surface_json: str, overloads_json: str, methods_json: str) -
         if name.startswith("__"):
             continue
         setattr(varfns, name, _torch_level_function(name, dispatch, overloads))
+    # `torch.div(int, int, rounding_mode=...)` -- docs/ARGFORM.md,
+    # `longformer`'s wall. Measured with a `TorchDispatchMode` logger on
+    # 2.13.0: `torch.div(7, 2, rounding_mode='trunc')` reaches
+    # `aten.div.Tensor_mode` -- upstream wraps a bare Python number into a
+    # 0-dim tensor wherever a schema position wants `Tensor` and gets a
+    # `Scalar` instead ("wrapped number" promotion), which every overload
+    # table entry here already assumes never happens for `self` (the table's
+    # `Tensor self` position has no `Scalar self` sibling, because nothing
+    # else needed one).
+    #
+    # `div` needs it because `torch.div(a, b, ...)` has no requirement that
+    # `a` be a Tensor upstream, unlike (measured) `torch.add`/`torch.mean`/
+    # most everything else that takes a leading `Tensor self` -- `torch.mean(5)`
+    # refuses upstream with "argument 'input' ... must be Tensor, not int",
+    # so this wrapping is written for `div` alone rather than generalised into
+    # the table-driven resolver, which would make every `Tensor self` position
+    # accept a bare number regardless of whether upstream does.
+    #
+    # The dtype a wrapped number gets is upstream's own rule too (measured):
+    # a Python `bool` wraps to `torch.bool`, an `int` to `torch.int64`, a
+    # `float` to `torch.float32` -- and from there the real `aten.div.*`
+    # kernel does upstream's own type promotion (true division promotes an
+    # int/int divide to float32 even with no `rounding_mode`), so nothing
+    # about *how* the divide computes is decided here.
+    def _wrap_number_self(value):
+        if isinstance(value, module.TensorBase):
+            return value
+        if isinstance(value, bool):
+            return dispatch("aten.scalar_tensor.default", value, dtype=module.bool)
+        if isinstance(value, int):
+            return dispatch("aten.scalar_tensor.default", value, dtype=module.int64)
+        if isinstance(value, float):
+            return dispatch("aten.scalar_tensor.default", value, dtype=module.float32)
+        return value
+
+    _table_div = varfns.div
+
+    def div(input, other, *args, **kwargs):
+        if not isinstance(input, module.TensorBase) and isinstance(
+            input, (bool, int, float)
+        ):
+            input = _wrap_number_self(input)
+            if not isinstance(other, module.TensorBase) and isinstance(
+                other, (bool, int, float)
+            ):
+                other = _wrap_number_self(other)
+        return _table_div(input, other, *args, **kwargs)
+
+    div.__name__ = div.__qualname__ = "div"
+    varfns.div = div
+
     # `torch.tensor` is the one name on this object that is not an overload set
     # -- see `_tensor_factory`.
     varfns.tensor = _tensor_factory(module, dispatch)
@@ -4952,6 +5077,70 @@ def _install_tensor_indexing(module, tensorbase, dispatch) -> None:
         """
         index = _index_tuple(index)
         index = _expand_ellipsis(self, index)
+
+        # A step != 1 slice on the *write* side, lowered to `index_put_`.
+        #
+        # `aten.slice.Tensor` reaches a step above 1 through `index_select`,
+        # which materialises (docs/VIEWS.md §6.4), so the basic walk below
+        # would narrow to a tensor that does not share storage with the
+        # receiver and the write would be silently lost. The positions the
+        # slice names are handed to `index_put_` as an integer index instead,
+        # and `index_put_` writes through the receiver's own buffer.
+        #
+        # Restricted, on purpose, to **one** stepped slice with every other
+        # item a full slice: `index_put_` implements a single index group, and
+        # a second one has to be refused rather than approximated. That covers
+        # every call site the 297-architecture sweep found (docs/SETITEM.md
+        # §1) -- `pe[:, 0::2] = v` and `freqs_t[..., k::3] = v`.
+        #
+        # The dtype cast is not incidental. Upstream reaches this through
+        # `copy_`, which casts (measured: `int64 x; x[0::2] = [1.7, 2.7, 3.7]`
+        # gives `[1, 0, 2, 0, 3, 0]`), while `index_put_` requires the dtypes
+        # to match exactly. Without the cast this path would refuse a write
+        # upstream performs.
+        _stepped = [
+            k
+            for k, item in enumerate(index)
+            if isinstance(item, slice) and item.step is not None and item.step != 1
+        ]
+        if _stepped:
+            if len(_stepped) > 1 or any(
+                not (
+                    _is_full_slice(item)
+                    or (isinstance(item, slice) and item.step not in (None, 1))
+                )
+                for item in index
+            ):
+                raise NotImplementedError(
+                    "not implemented in torch._C shim: TensorBase.__setitem__ with a "
+                    "stepped slice alongside another non-trivial index -- the write "
+                    "lowers to aten.index_put_, which implements a single index "
+                    "group, and a second group is refused rather than approximated "
+                    "(docs/SETITEM.md §3)"
+                )
+            axis = _stepped[0]
+            item = index[axis]
+            if item.step <= 0:
+                # torch's own wording, from aten.slice.Tensor.
+                raise ValueError(f"step must be greater than zero, got {item.step}")
+            positions = list(range(*item.indices(self.shape[axis])))
+            source = _lift(value, self)
+            if source.dtype != self.dtype:
+                source = dispatch("aten._to_copy.default", source, dtype=self.dtype)
+            if not positions:
+                # Upstream writes nothing here but still checks the broadcast,
+                # and raises with `copy_`'s wording rather than
+                # `index_put_`'s. Not reproduced: an empty stepped write is
+                # not a form any swept architecture uses (docs/SETITEM.md §4).
+                return
+            dispatch(
+                "aten.index_put_.default",
+                self,
+                [None] * axis + [_lift_sequence_index(positions)],
+                source,
+                False,
+            )
+            return
 
         if any(
             isinstance(item, tensorbase) or _is_sequence_index(item) for item in index
@@ -7202,6 +7391,38 @@ def _install_nn(module, dispatch) -> None:
 
 
     def adaptive_avg_pool2d(input, output_size):
+        """`torch._C._nn.adaptive_avg_pool2d` -- docs/FIXES.md §3.
+
+        Measured: `F.adaptive_avg_pool2d`'s Python wrapper
+        (`torch/nn/functional.py`) calls `_list_with_default(output_size,
+        input.size())` and then hands the result straight to
+        `torch._C._nn.adaptive_avg_pool2d` -- which is *this* binding, not
+        `torch.ops.aten.adaptive_avg_pool2d.default`. `_list_with_default`
+        (measured, `torch/nn/modules/utils.py`) returns a bare int
+        **unchanged** when given one, so the int-to-pair normalisation upstream
+        visibly performs is not in the Python layer either -- it is inside
+        this C++ binding's own argument parser (`BroadcastingList2[int]`),
+        which is a step the raw aten op's schema (`SymInt[2] output_size`,
+        no default expansion) does not have.
+
+        docs/FIXES.md §3 tried the expansion at the aten level instead and
+        `tools/golden/compare.py`, which calls the raw aten op directly,
+        caught it as a SILENT DIVERGENCE: upstream's raw aten op refuses a
+        bare int and this shim's would not have. So the expansion belongs
+        here, one door up, where upstream itself puts it -- the raw aten call
+        this dispatches to is untouched and still refuses a scalar.
+
+        `None` entries mean "keep this axis's current size", the same
+        broadcasting rule `_list_with_default` applies to the tuple form
+        (measured: `F.adaptive_avg_pool2d(x, (None, 4))` keeps the height).
+        """
+        if isinstance(output_size, int):
+            output_size = [output_size, output_size]
+        elif isinstance(output_size, (list, tuple)):
+            sizes = input.shape[-2:]
+            output_size = [
+                v if v is not None else sizes[i] for i, v in enumerate(output_size)
+            ]
         return dispatch("aten.adaptive_avg_pool2d.default", input, output_size)
 
     def hardtanh(input, min_val=-1.0, max_val=1.0):
@@ -7408,6 +7629,31 @@ def _install_nn(module, dispatch) -> None:
         """
         return dispatch("aten.leaky_relu.default", input, negative_slope)
 
+    def glu(input, dim=-1):
+        """`torch._C._nn.glu` -- `F.glu(x, dim)` *is* this binding, not a
+        wrapper around it, the same relationship `gelu`/`leaky_relu` have to
+        `_nn` (`torch/nn/functional.py` binds `F.glu` straight to
+        `torch._C._nn.glu`). There is no `torch.glu` or `Tensor.glu` upstream
+        (`hasattr` is False for both on 2.13.0), so no `overloads.json` or
+        `methods.json` entry is wanted -- same reasoning as `silu`/`gelu`.
+
+        docs/ARCH100.md: blocks seven ASR encoders (`parakeet` x3, `lasr` x2,
+        `cohere_asr`, `parakeet_tdt`), all of which gate the trailing channel
+        axis after a conv or linear -- which is why the default below is
+        `dim=-1` and not `dim=0`: measured against upstream 2.13.0, a bare
+        `F.glu(x)` with no `dim` halves the *last* axis, not the first.
+
+        Kernel behaviour (measured, not re-derived here): an odd size at
+        `dim` raises `RuntimeError("Halving dimension must be even, but "
+        "dimension {d} is size {n}")` rather than floor-dividing, and it is
+        float-only -- `NotImplementedError('"glu_cpu" not implemented for '
+        "'Long'")` on an integer input, the same refusal shape `silu` has
+        rather than `sigmoid`'s promotion. Both are the kernel's own rules
+        (`aten.glu.default`); this binding only supplies the default `dim`
+        and the pass-through.
+        """
+        return dispatch("aten.glu.default", input, dim)
+
     # -- the cross-entropy composites (docs/LOSS.md) ---------------------
     #
     # Three names, all `CompositeImplicitAutograd`, and **none of them appears
@@ -7527,6 +7773,7 @@ def _install_nn(module, dispatch) -> None:
         (nll_loss, "nll_loss"),
         (nll_loss_nd, "nll_loss_nd"),
         (cross_entropy_loss, "cross_entropy_loss"),
+        (glu, "glu"),
     ):
         fn.__name__ = fn.__qualname__ = name
         fn.__module__ = "torch._C._nn"
@@ -7535,7 +7782,7 @@ def _install_nn(module, dispatch) -> None:
     # Readable for the same reason as `_shim_overloads`: which of `_nn`'s 70
     # names does something should be answerable by asking.
     module._shim_nn_implemented = [
-        "adaptive_avg_pool2d", "cross_entropy_loss", "gelu", "hardtanh", "leaky_relu", "linear", "nll_loss",
+        "adaptive_avg_pool2d", "cross_entropy_loss", "gelu", "glu", "hardtanh", "leaky_relu", "linear", "nll_loss",
         "nll_loss_nd", "one_hot", "pad", "scaled_dot_product_attention", "silu",
         "softplus", "upsample_bicubic2d", "upsample_bilinear2d",
     ]
