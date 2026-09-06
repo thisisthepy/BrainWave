@@ -20974,5 +20974,368 @@ def test_float8_to_float64_terminates():
     assert widened.tolist() == [1.0, 2.0], widened.tolist()
 
 
+# --- lowering toward a device operator set (docs/DECOMP.md §12) --------------
+#
+# `torchnative/export/decompose.py` lowers to Core ATen because that is what
+# ExecuTorch's Edge dialect is defined over. NNAPI and CoreML are listed
+# unsupported in the README for a different reason: each takes a graph of its
+# *own* small fixed set, and neither set is Core ATen. `export/target.py` makes
+# the destination a parameter.
+#
+# These run in the vendored tree, like the capture-road test above, because
+# `torchnative.export` and `torch._decomp` both live there and neither is
+# reachable from the bare staged artefact.
+
+_TARGET_LOWERING_SCRIPT = r"""
+import json, importlib, torch
+
+T = importlib.import_module("torchnative.export.target")
+D = importlib.import_module("torchnative.export.decompose")
+C = torch._C
+
+CORE_T = D.decomposition_table()
+FULL_T = T.full_decomposition_table()
+UNION = dict(FULL_T); UNION.update(CORE_T)
+
+out = {
+    "is_shim": hasattr(torch._C, "_aten_implemented"),
+    "nnapi_n": len(T.nnapi_ops()),
+    "nnapi_ops": sorted(T.nnapi_ops()),
+    "core_n": len(D.core_ops()),
+    "core_table_n": len(CORE_T),
+    "full_table_n": len(FULL_T),
+}
+
+core_base = {o.split(".")[1] for o in D.core_ops()}
+out["nnapi_in_core"] = sorted(o for o in T.nnapi_ops() if o in core_base)
+out["nnapi_outside_core"] = sorted(o for o in T.nnapi_ops() if o not in core_base)
+
+# CoreML has no readable op set in this tree, and the module must say so rather
+# than invent one.
+try:
+    T.coreml_ops()
+    out["coreml"] = "ANSWERED"
+except NotImplementedError as error:
+    out["coreml"] = str(error)
+
+
+def record(inputs, fn):
+    C._capture_begin(list(inputs))
+    result = fn(*inputs)
+    return C._capture_end([result])
+
+
+def lower_one(inputs, fn, table):
+    trace = record(inputs, fn)
+    survey = T.survey(trace, T.NNAPI, table=table)
+    lowered = survey["trace"]
+    return survey, lowered, trace
+
+
+def prove(name, inputs, fn, fresh, table=UNION):
+    survey, lowered, trace = lower_one(inputs, fn, table)
+    op = trace.nodes[0]["op"]
+    verdict = survey["verdicts"].get(op, "?")
+    entry = {
+        "op": op,
+        "verdict": verdict.split(":")[0],
+        "nodes_before": len(trace.nodes),
+        "nodes_after": len(lowered.nodes),
+        "ops_after": sorted({n["op"] for n in lowered.nodes}),
+    }
+    worst = 0.0
+    for xs in fresh:
+        xs = tuple(xs)
+        want = fn(*xs)
+        got = lowered.replay(list(xs))
+        got = got[0] if isinstance(got, (list, tuple)) else got
+        entry.setdefault("shapes", []).append(
+            [list(want.shape), list(got.shape), str(want.dtype), str(got.dtype)]
+        )
+        worst = max(worst, (want.float() - got.float()).abs().max().item())
+    entry["max_abs_diff"] = worst
+    out[name] = entry
+
+
+# `Generator.manual_seed` is not implemented in this shim, so the seed is set
+# globally. Determinism here only has to make a failure reproducible.
+torch.manual_seed(20260906)
+def rnd(*shape):
+    return torch.randn(*shape)
+
+x = rnd(4, 8)
+prove("gelu", [x], torch.nn.functional.gelu, [(rnd(4, 8),) for _ in range(3)])
+prove("gelu_tanh", [x],
+      lambda a: torch.nn.functional.gelu(a, approximate="tanh"),
+      [(rnd(4, 8),) for _ in range(3)])
+prove("silu", [x], torch.nn.functional.silu, [(rnd(4, 8),) for _ in range(3)])
+prove("t", [x], torch.t, [(rnd(4, 8),) for _ in range(3)])
+prove("matmul", [rnd(4, 8), rnd(8, 5)], torch.matmul,
+      [(rnd(4, 8), rnd(8, 5)) for _ in range(3)])
+
+# The table choice is the finding, so it is asserted rather than described:
+# `gelu` IS Core ATen, so the core table deliberately drops its rule, and a
+# pass that reached for the core table here would silently not lower it.
+survey_core, _, _ = lower_one([x], torch.nn.functional.gelu, CORE_T)
+out["gelu_with_core_table"] = survey_core["verdicts"].get(
+    "aten.gelu.default", "?"
+).split(":")[0]
+out["gelu_in_core_table"] = "aten.gelu.default" in CORE_T
+out["gelu_in_full_table"] = "aten.gelu.default" in FULL_T
+
+# A whole module graph, lowered best-effort, still computes what it computed.
+torch.manual_seed(0)
+model = torch.nn.Sequential(
+    torch.nn.Linear(4, 8), torch.nn.GELU(), torch.nn.Linear(8, 3),
+).eval()
+seed = rnd(2, 4)
+C._capture_begin([seed])
+with torch.no_grad():
+    _ = model(seed)
+trace = C._capture_end([_])
+survey = T.survey(trace, T.NNAPI, table=UNION)
+whole = {
+    "nodes_before": survey["nodes_before"],
+    "nodes_after": survey["nodes_after"],
+    "outside_before": survey["outside_before"],
+    "outside_after": survey["outside_after"],
+    "ops_after": sorted({n["op"] for n in survey["trace"].nodes}),
+}
+worst = 0.0
+for _i in range(3):
+    xs = rnd(2, 4)
+    with torch.no_grad():
+        want = model(xs)
+    got = survey["trace"].replay([xs])
+    got = got[0] if isinstance(got, (list, tuple)) else got
+    worst = max(worst, (want - got).abs().max().item())
+whole["max_abs_diff"] = worst
+out["whole_module"] = whole
+
+# `lower_to` must refuse rather than hand back a partly-lowered graph.
+try:
+    T.lower_to(trace, T.NNAPI, table=UNION)
+    out["lower_to_refusal"] = "ACCEPTED"
+except D.DecompositionRefused as error:
+    out["lower_to_refusal"] = str(error)
+
+print(json.dumps(out))
+"""
+
+
+def _target_lowering_fixture():
+    env = dict(os.environ)
+    env["PYTHONPATH"] = _CKPT_VENDOR_DIR
+    env["TORCH_USE_RTLD_GLOBAL"] = "1"  # VENDOR.md wall 1
+    proc = subprocess.run(
+        [sys.executable, "-c", _TARGET_LOWERING_SCRIPT],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=300,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"target-lowering subprocess exited {proc.returncode}\n"
+            f"--- stdout ---\n{proc.stdout}\n--- stderr ---\n{proc.stderr}"
+        )
+    return json.loads(proc.stdout.strip().splitlines()[-1])
+
+
+def test_nnapi_target_set_is_read_from_the_vendored_serializer():
+    """The NNAPI op set is parsed out of `torch/backends/_nnapi/serializer.py`.
+
+    Not transcribed. `ADDER_MAP` is the code that would do the serialising, so
+    an op absent from it cannot reach NNAPI through this PyTorch whatever the
+    hardware supports -- which makes it authoritative in the only sense that
+    matters here, and makes a hand-copied list in our tree a thing that can
+    drift from it.
+
+    The membership assertions below are by *name* rather than by count, because
+    the Core ATen list grows and a count would go red on somebody else's
+    progress. What must not change is which side of the line these sit on.
+    """
+    if not os.path.isfile(_CKPT_VENDOR_SHIM):
+        print("   (skipped: vendored tree has no _C.abi3.so)")
+        return
+    r = _target_lowering_fixture()
+    assert r["is_shim"] is True, r["is_shim"]
+    assert r["nnapi_n"] == 29, r["nnapi_n"]
+
+    # The split that is the reason `target.py` exists at all: NNAPI's set is
+    # not a subset of Core ATen, so "lower to Core ATen, then hand to NNAPI"
+    # would take apart ops NNAPI natively accepts.
+    for op in ("add", "addmm", "mul", "relu", "sigmoid", "cat", "mean"):
+        assert op in r["nnapi_in_core"], (op, r["nnapi_in_core"])
+    for op in ("linear", "conv2d", "softmax", "max_pool2d", "flatten", "reshape"):
+        assert op in r["nnapi_outside_core"], (op, r["nnapi_outside_core"])
+    assert len(r["nnapi_outside_core"]) >= 15, r["nnapi_outside_core"]
+
+
+def test_coreml_operator_set_refuses_instead_of_inventing_one():
+    """There is no CoreML op set in this tree, and `coreml_ops()` says so.
+
+    `torch/backends/_coreml` is a packaging wrapper around `coremltools
+    .convert`; the registry lives in coremltools, which is not installed. A
+    plausible hand-written list would decide the answer to "how many ops need
+    decomposing for CoreML" by the act of writing it, and that answer would
+    then get reported as a measurement. This asserts the refusal names the real
+    source so the next reader goes to it rather than to a list here.
+    """
+    if not os.path.isfile(_CKPT_VENDOR_SHIM):
+        print("   (skipped: vendored tree has no _C.abi3.so)")
+        return
+    r = _target_lowering_fixture()
+    assert r["coreml"] != "ANSWERED", r["coreml"]
+    assert "coremltools" in r["coreml"], r["coreml"]
+
+
+def test_gelu_lowers_to_erf_primitives_and_computes_the_same_values():
+    """docs/DECOMP.md §12. The task's named example, proven numerically.
+
+    `gelu` is exactly the shape of decomposition that is target-*independent*:
+    it is an identity over primitives, not a layout change, so the same rule
+    serves NNAPI and CoreML and anything else. Upstream owns the rule; this
+    checks that running it here reproduces `gelu` bit for bit on tensors it has
+    not seen, which is the only claim a delegate can rely on.
+    """
+    if not os.path.isfile(_CKPT_VENDOR_SHIM):
+        print("   (skipped: vendored tree has no _C.abi3.so)")
+        return
+    r = _target_lowering_fixture()
+
+    exact = r["gelu"]
+    assert exact["verdict"] == "LOWERED", exact
+    assert "aten.erf.default" in exact["ops_after"], exact["ops_after"]
+    assert exact["nodes_after"] > exact["nodes_before"], exact
+    # Bit for bit, not merely close.
+    assert exact["max_abs_diff"] == 0.0, exact["max_abs_diff"]
+    for want_shape, got_shape, want_dtype, got_dtype in exact["shapes"]:
+        assert want_shape == got_shape, exact["shapes"]
+        assert want_dtype == got_dtype, exact["shapes"]
+
+    approx = r["gelu_tanh"]
+    assert approx["verdict"] == "LOWERED", approx
+    assert "aten.tanh.default" in approx["ops_after"], approx["ops_after"]
+    assert approx["max_abs_diff"] == 0.0, approx["max_abs_diff"]
+    # The two approximations really are different graphs; a rule that ignored
+    # `approximate=` would produce the erf one twice and still be "close".
+    assert "aten.erf.default" not in approx["ops_after"], approx["ops_after"]
+
+
+def test_the_core_table_cannot_lower_gelu_and_the_full_table_can():
+    """The round's finding, as a test that fails if the finding is undone.
+
+    `core_aten_decompositions()` is a *filtered* view of upstream's registry:
+    it keeps the rules that get you down to Core ATen and drops the rules for
+    ops that already are Core ATen, because when Core ATen is the destination
+    there is nothing to do for them. `gelu` is core, so the core table has no
+    rule for it.
+
+    NNAPI's set is not Core ATen and does not contain `gelu`, so lowering it
+    needs precisely the rule the core table dropped -- which upstream still
+    has, unfiltered, in `global_decomposition_table["post_autograd"]`. Pointing
+    the pass at the right *view of upstream's own table* is what moves `gelu`,
+    and no rule was written here to do it.
+
+    This is what turns "write N decompositions for NNAPI" into a much smaller
+    number, so it is pinned rather than only written down.
+    """
+    if not os.path.isfile(_CKPT_VENDOR_SHIM):
+        print("   (skipped: vendored tree has no _C.abi3.so)")
+        return
+    r = _target_lowering_fixture()
+    assert r["gelu_in_core_table"] is False, r["gelu_in_core_table"]
+    assert r["gelu_in_full_table"] is True, r["gelu_in_full_table"]
+    assert r["gelu_with_core_table"] == "REFUSED", r["gelu_with_core_table"]
+    # And the full table really is the larger view, not a relabelling.
+    assert r["full_table_n"] > r["core_table_n"], (r["full_table_n"], r["core_table_n"])
+
+
+def test_more_ops_lower_toward_nnapi_and_each_keeps_its_values():
+    """`silu`, `t` and `matmul`, each proven on fresh tensors.
+
+    `t` and `matmul` matter for a different reason than `silu`: they lower to
+    `permute` and `mm`, which NNAPI does *not* have either. Lowering that moves
+    an op from one unsupported form to another unsupported form is still
+    progress toward Core ATen and still not progress toward NNAPI, and the
+    numbers in docs/DECOMP.md §12 count it honestly as the latter.
+    """
+    if not os.path.isfile(_CKPT_VENDOR_SHIM):
+        print("   (skipped: vendored tree has no _C.abi3.so)")
+        return
+    r = _target_lowering_fixture()
+    for name, expect in (("silu", "aten.sigmoid.default"),
+                         ("t", "aten.permute.default"),
+                         ("matmul", "aten.mm.default")):
+        entry = r[name]
+        assert entry["verdict"] == "LOWERED", (name, entry)
+        assert expect in entry["ops_after"], (name, entry["ops_after"])
+        # float32 accumulation noise only; `silu` reassociates, so not bitwise.
+        assert entry["max_abs_diff"] <= 1e-6, (name, entry["max_abs_diff"])
+
+
+def test_lowering_a_whole_module_graph_preserves_what_it_computes():
+    """A recorded `nn.Module` forward, lowered best-effort, replayed.
+
+    Per-op proofs do not compose on their own: the splice has to renumber every
+    value reference in the parent graph, and an off-by-one there produces a
+    graph that still runs and answers something else. Running the whole lowered
+    graph against the module on inputs it never saw is what catches that.
+    """
+    if not os.path.isfile(_CKPT_VENDOR_SHIM):
+        print("   (skipped: vendored tree has no _C.abi3.so)")
+        return
+    r = _target_lowering_fixture()
+    whole = r["whole_module"]
+    assert whole["nodes_after"] > whole["nodes_before"], whole
+    # The GELU really was taken apart in the module graph, not just in isolation.
+    assert "aten.erf.default" in whole["ops_after"], whole["ops_after"]
+    assert "aten.gelu.default" not in whole["ops_after"], whole["ops_after"]
+    assert whole["max_abs_diff"] <= 1e-6, whole["max_abs_diff"]
+
+    # And now the part worth writing down, because it is the opposite of what
+    # a decomposition round is assumed to do: the count of ops outside NNAPI
+    # did **not** go down. Two went in (`t`, `gelu`) and two came out
+    # (`permute`, `erf`). Lowering is target-relative, and against NNAPI's set
+    # these particular rules trade one unsupported op for another.
+    #
+    # This is pinned rather than described because it is the shape of result a
+    # sizing round is most likely to overstate -- "9 ops now lower" reads like
+    # 9 ops of progress toward NNAPI, and for this module it is zero. What
+    # actually blocks NNAPI is one level down: `erf` and `permute` both have
+    # upstream rules, and both refuse here on missing `prims.*` ops in the
+    # shim. docs/DECOMP.md §12 carries that list.
+    assert whole["outside_before"] == ["aten.t.default", "aten.gelu.default"], whole
+    assert whole["outside_after"] == ["aten.permute.default", "aten.erf.default"], whole
+    assert len(whole["outside_after"]) == len(whole["outside_before"]), whole
+
+
+def test_lower_to_refuses_a_graph_it_could_not_finish_and_names_the_ops():
+    """`lower_to` is all-or-nothing; `survey` is the best-effort one.
+
+    Handing a delegate a partly-lowered graph is the failure this layer is
+    most likely to commit, because such a graph looks exactly like a finished
+    one. `survey` exists for sizing and says what it left; `lower_to` refuses
+    and names what it could not reach.
+    """
+    if not os.path.isfile(_CKPT_VENDOR_SHIM):
+        print("   (skipped: vendored tree has no _C.abi3.so)")
+        return
+    r = _target_lowering_fixture()
+    assert r["lower_to_refusal"] != "ACCEPTED", r["lower_to_refusal"]
+    # The refusal names an op, not just a count. It arrives as the *first*
+    # thing that could not be lowered rather than as a summary at the end --
+    # `_lower_node` raises through `lower_to` -- and either wording is a
+    # refusal that a caller can act on, which is the contract.
+    assert "aten." in r["lower_to_refusal"], r["lower_to_refusal"]
+    assert "cannot lower" in r["lower_to_refusal"] or (
+        "outside the target set" in r["lower_to_refusal"]
+    ), r["lower_to_refusal"]
+    # Specifically: it stopped on a missing `prims.*` op rather than on a
+    # missing decomposition rule, which is the round's whole finding.
+    assert "prims." in r["lower_to_refusal"], r["lower_to_refusal"]
+
+
 if __name__ == "__main__":
     raise SystemExit(_main())
