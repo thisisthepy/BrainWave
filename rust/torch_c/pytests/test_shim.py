@@ -25985,5 +25985,71 @@ def test_the_eager_tape_refuses_and_releases_when_it_grows_past_its_bound():
         _C._eager_reset()
 
 
+def test_the_arch_sweep_classifier_maps_real_refusals_to_the_operator_they_name():
+    """`arch_sweep.py`'s classifier, checked against refusal texts it must sort.
+
+    docs/ARCH100.md's ranked list is produced by parsing refusal messages, so the
+    number it reports is only as good as this classifier. The sweep itself is not
+    in this suite -- it constructs 528 models and takes minutes -- but the
+    classifier is pure text and there is no reason to leave it unchecked.
+
+    Every string below was **transcribed from a real run**, not composed here.
+    Two of them are the cases that a careless rule gets wrong and that would move
+    the headline number:
+
+      * `no matching overload` is NOT a missing operator. `torch.ones` exists;
+        the `dtype=bool` argument form does not resolve. Folding these into the
+        missing-operator count inflates the one number the sweep exists to give.
+      * `No module named 'timm'` is not our gap at all. It must never reach the
+        operator ranking.
+    """
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import arch_sweep
+
+    cases = [
+        # (transcribed refusal, expected kind, expected operator)
+        ("NotImplementedError: aten op not implemented in torch._C shim: "
+         "aten.scatter.value", "missing_aten_op", "aten.scatter.value"),
+        ("NotImplementedError: not implemented in torch._C shim: torch.argsort(...) -- "
+         "overload resolution has no table entry for this op "
+         "(rust/torch_c/src/overloads.json)", "missing_aten_op", "argsort"),
+        ("NotImplementedError: not implemented in torch._C shim: TensorBase.scatter_",
+         "missing_shim_name", "TensorBase.scatter_"),
+        ("NotImplementedError: not implemented in torch._C shim: torch._C._nn.glu",
+         "missing_shim_name", "torch._C._nn.glu"),
+        # the operator exists; the ARGUMENT FORM does not
+        ("TypeError: torch.ones(): no matching overload in torch._C shim for "
+         "(tuple, dtype=type). Candidates tried, in order:",
+         "unsupported_arg_form", "torch.ones.(tuple, dtype=type)"),
+        ("NotImplementedError: aten.convolution.default: an asymmetric padding "
+         "[32, 0] is not implemented in torch._C shim",
+         "unsupported_arg_form", "aten.convolution.default"),
+        # a backend layout refusal, not a missing kernel
+        ("RuntimeError: aten.matmul.default: candle: MatMulUnexpectedStriding "
+         "{ lhs_l: Layout { shape: [1, 1, 2] } }",
+         "backend_limitation", "aten.matmul.default.MatMulUnexpectedStriding"),
+        # never ours
+        ("ImportError: This model requires timm: No module named 'timm'",
+         "missing_dependency", "timm"),
+        # and the honest bucket: a message with no rule must NOT be guessed at
+        ("RuntimeError: adaptive_avg_pool2d: output_size must be 2",
+         "unclassified", None),
+    ]
+    for text, want_kind, want_op in cases:
+        kind, op = arch_sweep.classify(text)
+        assert (kind, op) == (want_kind, want_op), (
+            "the classifier that produces docs/ARCH100.md's ranking sorted\n"
+            f"  {text!r}\n"
+            f"as {(kind, op)}, expected {(want_kind, want_op)}"
+        )
+
+    # A missing dependency must never be counted as an operator gap: that is the
+    # rule that keeps the headline honest, so it is asserted separately rather
+    # than left implied by the row above.
+    kind, _ = arch_sweep.classify("ModuleNotFoundError: No module named 'sentencepiece'")
+    assert kind == "missing_dependency", kind
+
+
+
 if __name__ == "__main__":
     raise SystemExit(_main())
