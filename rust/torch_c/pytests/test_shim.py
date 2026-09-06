@@ -22345,27 +22345,58 @@ def test_the_eager_graph_refuses_a_write_through_a_view_of_a_value_it_holds():
     _C._eager_reset()
 
 
-def test_tensor_backward_still_refuses_even_though_an_eager_graph_exists():
-    """docs/BACKWARD7.md §5. W8 and W9 landed; the **engine did not**.
+def test_the_engine_answers_now_that_an_eager_graph_exists():
+    """docs/BACKWARD9.md §1 -- **the inversion docs/BACKWARD7.md §6 asked for.**
 
-    The distinction this keeps is the one the round was told to keep: a graph
-    that records ops is not an engine. `_ImperativeEngine.run_backward` is
-    where `Tensor.backward()` and `torch.autograd.grad()` both land, and
-    wiring it needs `.grad` accumulation onto leaves, `allow_unused`,
-    `retain_grad`, hooks and `create_graph` -- none of which this round built
-    or checked. A refusal that names the wall is worth more than a
-    `.backward()` that half works.
+    The previous revision of this test pinned that
+    `_ImperativeEngine.run_backward` refused *while a graph existed*, and its
+    docstring said: "Invert this test when the engine lands; do not delete it."
+    The engine landed. So this asserts the stronger thing the inversion is for,
+    which is not "it does not raise":
 
-    Invert this test when the engine lands; do not delete it.
+      1. the engine **answers** through the same door `Tensor.backward()` and
+         `torch.autograd.grad()` both reach (docs/BACKWARD2.md §1.3);
+      2. the number it produces is the derivative and not the seed -- `y = x³`
+         at `x = 2` gives `12`, which no confusion of seed, operand or zeros
+         reaches;
+      3. it **writes** that number into the leaf, which is the whole difference
+         between `_eager_backward` (which returns gradients beside tensors) and
+         an engine (which accumulates onto `.grad`);
+      4. and `accumulate_grad=False` -- `torch.autograd.grad`'s spelling --
+         returns instead of writing, from the same function.
+
+    Row 4 is the control for row 3. Without it, an engine that wrote `.grad`
+    unconditionally would pass rows 1-3 and be wrong about `torch.autograd.grad`,
+    which upstream promises does not touch `.grad` at all.
     """
     assert hasattr(_C, "_eager_backward"), "W8 did not land"
-    try:
-        _C._ImperativeEngine().run_backward()
-    except NotImplementedError as exc:
-        message = str(exc)
-    else:
-        raise AssertionError("run_backward no longer refuses -- invert this test")
-    assert "_ImperativeEngine.run_backward" in message, message
+    _C._eager_reset()
+    engine = _C._ImperativeEngine()
+
+    x = _tape_f64([2.0, 2.0], [2]).to(_C.float32)
+    x.requires_grad = True
+    cube = _C._aten_dispatch("aten.pow.Tensor_Scalar", x, 3.0)
+    total = _C._aten_dispatch("aten.sum.default", cube)
+    assert total.grad_fn is not None
+    assert _C._eager_tape_size() > 0, "no graph existed -- this test is vacuous"
+
+    assert x.grad is None, "a gradient existed before any backward"
+    assert engine.run_backward((total,), (), False, False, (), True, True) == ()
+    assert x.grad is not None
+    assert [round(float(v), 5) for v in x.grad.flatten()] == [12.0, 12.0], (
+        [float(v) for v in x.grad.flatten()]
+    )
+
+    # 4. The same function, the other door: returns and does not write.
+    x.grad = None
+    _C._eager_reset()
+    cube = _C._aten_dispatch("aten.pow.Tensor_Scalar", x, 3.0)
+    total = _C._aten_dispatch("aten.sum.default", cube)
+    got = engine.run_backward((total,), (), False, False, (x,), False, False)
+    assert len(got) == 1 and got[0] is not None
+    assert [round(float(v), 5) for v in got[0].flatten()] == [12.0, 12.0]
+    assert x.grad is None, "autograd.grad's spelling wrote .grad"
+
 
 # --- lowering toward a device operator set (docs/DECOMP.md §12) --------------
 #
