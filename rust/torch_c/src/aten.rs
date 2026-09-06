@@ -313,6 +313,21 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.scatter.value",
     "aten.scatter_.src",
     "aten.scatter_.value",
+    "aten._unique2.default",
+    "aten.diag.default",
+    "aten.i0.default",
+    "aten.im2col.default",
+    "aten.col2im.default",
+    "aten.upsample_nearest1d.default",
+    "aten.std.default",
+    "aten.std.dim",
+    "aten.std.correction",
+    "aten.var.default",
+    "aten.var.dim",
+    "aten.var.correction",
+    "aten.kaiser_window.default",
+    "aten.kaiser_window.periodic",
+    "aten.kaiser_window.beta",
 ];
 
 /// Ops with a real kernel that `_aten_implemented()` does **not** advertise.
@@ -2210,6 +2225,21 @@ fn aten_dispatch_inner(
         }
         "aten.tril.default" => tril_triu(py, args, kwargs, Triangle::Lower),
         "aten.triu.default" => tril_triu(py, args, kwargs, Triangle::Upper),
+        "aten.upsample_nearest1d.default" => upsample_nearest1d_default(py, args, kwargs),
+        "aten.diag.default" => diag_default(py, args, kwargs),
+        "aten.i0.default" => i0_default(py, args, kwargs),
+        "aten.im2col.default" => im2col_default(py, args, kwargs),
+        "aten.col2im.default" => col2im_default(py, args, kwargs),
+        "aten._unique2.default" => unique2_default(py, args, kwargs),
+        "aten.var.default" => var_default(py, args, kwargs),
+        "aten.std.default" => std_default(py, args, kwargs),
+        "aten.std.dim" => std_dim(py, args, kwargs),
+        "aten.std.correction" => std_correction(py, args, kwargs),
+        "aten.var.dim" => var_dim(py, args, kwargs),
+        "aten.var.correction" => var_correction(py, args, kwargs),
+        "aten.kaiser_window.default"
+        | "aten.kaiser_window.periodic"
+        | "aten.kaiser_window.beta" => kaiser_window_default(py, args, kwargs, op),
         "aten.any.default" => {
             any_or_all_default(py, args, kwargs, "aten.any.default", BoolReduce::Any)
         }
@@ -25479,4 +25509,1318 @@ fn stft_kernel(
         let stacked = Tensor::stack(&[&re, &im], re.dims().len()).map_err(|e| candle_err(op, e))?;
         finish(py, stacked, tag)
     }
+}
+
+
+// ---------------------------------------------------------------------------
+// docs/VOICE3.md -- the walls seven rounds stopped at, by name.
+//
+// `rwkv`'s `diag`, `vilt`'s `_unique2`, `llama4`'s `im2col`, `f5-tts`'s
+// `col2im`, `bigvgan`'s `kaiser_window` (and the `i0` under it), and `voice`'s
+// `upsample_nearest1d` and `var`.
+//
+// **Two of the seven were checked for being aliases first and are not.**
+// docs/ARCH100.md measured missing *names* outnumbering missing *kernels* 49
+// to 22 in this tail, so each op was looked for under another spelling before
+// a kernel was written:
+//
+//   `var`                 beside `native_batch_norm`'s statistics. NOT an
+//                         alias: `native_batch_norm_default` computes a
+//                         *biased* (correction = 0) variance over the
+//                         batch-and-spatial axes only, folded straight into
+//                         `alpha`/`beta`, and never materialises it as a
+//                         tensor. There is no reduction to borrow.
+//   `upsample_nearest1d`  beside `upsample_nearest2d`. NOT an alias either --
+//                         `upsample_nearest1d` is its own aten schema with its
+//                         own rank check (`input_size equals to 3`) and its
+//                         own dtype-refusal kernel name
+//                         (`compute_indices_weights_nearest`, where the 2-D op
+//                         says `upsample_nearest2d_channels_last`). The index
+//                         *rule* is shared, and this file shares it, but the
+//                         op is not a table row.
+//   `col2im`/`im2col`     not inverses of each other. `col2im` SUMS
+//                         overlapping windows.
+//   `std`                 IS `sqrt(var)` and is deliberately not landed here.
+// ---------------------------------------------------------------------------
+
+/// Chebyshev coefficients for `exp(-x) I0(x)` on `[0, 8]`, Cephes' by way of
+/// `ATen/native/Math.h`'s `chebyshev_coefficients_i0e_A`.
+///
+/// **Held as `f64` and narrowed at use, which is the whole accuracy story of
+/// this op.** Upstream's array is `static const T coeff[]` inside a template
+/// that is instantiated at `T = float` as well as at `T = double`, so the
+/// `float` kernel runs the *float-rounded* coefficients through *float*
+/// arithmetic. `calc_i0_f32` therefore casts each coefficient as it reads it
+/// rather than accumulating in `f64` -- see its own note for what the shortcut
+/// costs.
+static I0E_A: [f64; 30] = [
+    -4.41534164647933937950E-18,
+    3.33079451882223809783E-17,
+    -2.43127984654795469359E-16,
+    1.71539128555513303061E-15,
+    -1.16853328779934516808E-14,
+    7.67618549860493561688E-14,
+    -4.85644678311192946090E-13,
+    2.95505266312963983461E-12,
+    -1.72682629144155570723E-11,
+    9.67580903537323691224E-11,
+    -5.18979560163526290666E-10,
+    2.65982372468238665035E-9,
+    -1.30002500998624804212E-8,
+    6.04699502254191894932E-8,
+    -2.67079385394061173391E-7,
+    1.11738753912010371815E-6,
+    -4.41673835845875056359E-6,
+    1.64484480707288970893E-5,
+    -5.75419501008210370398E-5,
+    1.88502885095841655729E-4,
+    -5.76375574538582365885E-4,
+    1.63947561694133579842E-3,
+    -4.32430999505057594430E-3,
+    1.05464603945949983183E-2,
+    -2.37374148058994688156E-2,
+    4.93052842396707084878E-2,
+    -9.49010970480476444210E-2,
+    1.71620901522208775349E-1,
+    -3.04682672343198398683E-1,
+    6.76795274409476084995E-1,
+];
+
+/// Chebyshev coefficients for `exp(-x) sqrt(x) I0(x)` on the inverted interval
+/// `[8, inf)`, `chebyshev_coefficients_i0e_B`.
+static I0E_B: [f64; 25] = [
+    -7.23318048787475395456E-18,
+    -4.83050448594418207126E-18,
+    4.46562142029675999901E-17,
+    3.46122286769746109310E-17,
+    -2.82762398051658348494E-16,
+    -3.42548561967721913462E-16,
+    1.77256013305652638360E-15,
+    3.81168066935262242075E-15,
+    -9.55484669882830764870E-15,
+    -4.15056934728722208663E-14,
+    1.54008621752140982691E-14,
+    3.85277838274214270114E-13,
+    7.18012445138366623367E-13,
+    -1.79417853150680611778E-12,
+    -1.32158118404477131188E-11,
+    -3.14991652796324136454E-11,
+    1.18891471078464383424E-11,
+    4.94060238822496958910E-10,
+    3.39623202570838634515E-9,
+    2.26666899049817806459E-8,
+    2.04891858946906374183E-7,
+    2.89137052083475648297E-6,
+    6.88975834691682398426E-5,
+    3.36911647825569408990E-3,
+    8.04490411014108831608E-1,
+];
+
+/// Cephes' `chbevl`, at `f32`, with the coefficients narrowed on the way in.
+///
+/// **`mul_add`, not `x * b1 - b2`, and that is a measurement.** Upstream is
+/// C++ compiled with clang's default `-ffp-contract=on`, so
+/// `x * b1 - b2 + array[i]` is emitted as `fma(x, b1, -b2) + array[i]` --
+/// one rounding where the written expression has two. Rust does not contract,
+/// and the un-contracted form disagrees with upstream on **2.2%** of a sweep
+/// of `[0, 88]` at `f32`, worst case `3.58e-07` relative (at `x = 0.013`,
+/// where the Chebyshev recurrence cancels and the extra rounding is
+/// amplified). Spelling the FMA makes it **bit-identical**. The same holds at
+/// `f64`.
+fn chbevl_f32(x: f32, array: &[f64]) -> f32 {
+    let mut b0 = array[0] as f32;
+    let mut b1 = 0.0f32;
+    let mut b2 = 0.0f32;
+    for &c in &array[1..] {
+        b2 = b1;
+        b1 = b0;
+        b0 = x.mul_add(b1, -b2) + c as f32;
+    }
+    0.5f32 * (b0 - b2)
+}
+
+/// The same at `f64`.
+fn chbevl_f64(x: f64, array: &[f64]) -> f64 {
+    let mut b0 = array[0];
+    let mut b1 = 0.0f64;
+    let mut b2 = 0.0f64;
+    for &c in &array[1..] {
+        b2 = b1;
+        b1 = b0;
+        b0 = x.mul_add(b1, -b2) + c;
+    }
+    0.5f64 * (b0 - b2)
+}
+
+/// `ATen/native/Math.h::calc_i0<float>` -- the modified Bessel function of the
+/// first kind, order zero, **computed at `f32` on purpose**.
+///
+/// This is the op the round was warned about, and the warning was right. Two
+/// approximations meet at `x == 8`: a Chebyshev series in `exp(-x) I0(x)`
+/// below, and one in `exp(-x) sqrt(x) I0(x)` above. They agree to well within
+/// `f32` in the middle of each interval and disagree at the ends, so it was
+/// checked **across the argument range** -- 8001 points on `[0, 8]` plus the
+/// tail out to overflow -- rather than at one point.
+///
+/// **Computing in `f64` and narrowing once is wrong, measured.** The worst
+/// relative disagreement with upstream's `float` kernel over `[0, 8]` is
+/// `4.83e-07` (at `x = 7.675`), which is eight times `f32`'s epsilon, and the
+/// disagreement is not a rounding artefact but a different function: upstream
+/// answers `i0(0.0f) == 0.9999999403953552`, not `1.0`, because the
+/// coefficients themselves are `float`. `hann_window_default` had the same
+/// shape of finding and reached the same conclusion (docs/VOICE.md §4.1);
+/// this op is the second instance and the reason the rule is written down.
+///
+/// `f16`/`bf16` go through here too and narrow once at the end, which is
+/// upstream's own `calc_i0(c10::Half a) { return calc_i0(float(a)); }`.
+///
+/// NaN and the infinities fall out of the branch rather than being cased:
+/// `NaN <= 8.0` is false, so both take the `[8, inf)` arm, and
+/// `exp(inf) * finite / sqrt(inf)` is `inf/inf` = NaN -- which is what
+/// upstream answers for `i0(inf)` (measured; it is not `inf`).
+fn calc_i0_f32(value: f32) -> f32 {
+    let x = value.abs();
+    if x <= 8.0f32 {
+        let y = x / 2.0f32 - 2.0f32;
+        x.exp() * chbevl_f32(y, &I0E_A)
+    } else {
+        x.exp() * chbevl_f32(32.0f32 / x - 2.0f32, &I0E_B) / x.sqrt()
+    }
+}
+
+/// `calc_i0<double>`.
+fn calc_i0_f64(value: f64) -> f64 {
+    let x = value.abs();
+    if x <= 8.0f64 {
+        let y = x / 2.0f64 - 2.0f64;
+        x.exp() * chbevl_f64(y, &I0E_A)
+    } else {
+        x.exp() * chbevl_f64(32.0f64 / x - 2.0f64, &I0E_B) / x.sqrt()
+    }
+}
+
+/// Which width `calc_i0` runs at for a given output dtype, and therefore also
+/// which width `kaiser_window` builds its window at.
+///
+/// `Float64` is the only one that is not `f32`: upstream's `calc_i0` overloads
+/// send `Half` and `BFloat16` through `float`, and `float` is `float`.
+fn i0_at(tag: TorchDType, x: f64) -> f64 {
+    if tag == TorchDType::Float64 {
+        calc_i0_f64(x)
+    } else {
+        calc_i0_f32(x as f32) as f64
+    }
+}
+
+/// `aten::i0(Tensor self) -> Tensor`
+///
+/// Landed for `kaiser_window`, which is `bigvgan`'s construction wall and
+/// divides one `i0` by another for every sample of the window -- but it is a
+/// real op in its own right (`torch.i0`, `Tensor.i0`) and is registered as one
+/// rather than hidden inside the window.
+///
+/// Integral and boolean inputs **compute** rather than refusing: measured,
+/// `torch.i0(tensor([0, 1, 2]))` is `float32`, and `torch.i0(tensor([True,
+/// False]))` is `float32` `[1.2661, 1.0]`. That is `unary_float`'s rule and
+/// not this op's invention.
+fn i0_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.i0.default";
+    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let tag = if input.tag().is_floating_point() {
+        input.tag()
+    } else {
+        default_float()
+    };
+    let dims = input.tensor()?.dims().to_vec();
+    let device = input.tensor()?.device().clone();
+    let source: Vec<f64> = match read_flat(OP, input.tensor()?, input.tag())? {
+        Flat::Float(values) => values,
+        Flat::Int(values) => values.into_iter().map(|v| v as f64).collect(),
+    };
+    let out: Vec<f64> = source.into_iter().map(|x| i0_at(tag, x)).collect();
+    let tensor = write_flat(OP, Flat::Float(out), dims, &device, tag)?;
+    finish(py, tensor, tag)
+}
+
+/// `aten::kaiser_window(int window_length, *, ...)`,
+/// `aten::kaiser_window.periodic(int window_length, bool periodic, *, ...)` and
+/// `aten::kaiser_window.beta(int window_length, bool periodic, float beta, *, ...)`.
+///
+/// `bigvgan`'s construction wall and docs/VOICE.md rank 7 -- the one entry on
+/// that list that was left open because it needs a modified Bessel function
+/// and nothing else in the shim had one.
+///
+/// Upstream (`ATen/native/TensorFactories.cpp`):
+///
+/// ```text
+/// window_length == 0  ->  empty({0})          (before any other check)
+/// window_length == 1  ->  ones({1})
+/// periodic            ->  window_length += 1, and the last sample is narrowed
+///                         back off at the end
+/// alpha  = (window_length - 1) / 2            AFTER the increment
+/// out[i] = i0(beta * sqrt(1 - ((i - alpha)/alpha)^2)) / i0(beta)
+/// ```
+///
+/// so `periodic` lengthens the window that is *built* and then truncates,
+/// exactly as `hann_window` does -- `kaiser_window(4, True)` and
+/// `kaiser_window(4, False)` are both four long and share only element 0.
+/// Both were measured rather than carried over from `hann_window`, and the
+/// shared first element is the check that the periodic form is a truncation
+/// and not a re-parameterisation.
+///
+/// `beta` defaults to `12.0`. `beta = 0` makes numerator and denominator the
+/// same `i0(0)` and the window is all ones (measured -- it is not a
+/// degenerate case that raises).
+///
+/// The refusals are `hann_window`'s and are upstream's own wording, re-measured:
+/// a negative length is `"kaiser_window requires non-negative window_length"`
+/// and a non-floating dtype is `"kaiser_window expects floating point dtypes"`.
+fn kaiser_window_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+    op: &str,
+) -> PyResult<Py<PyAny>> {
+    let has_periodic = op != "aten.kaiser_window.default";
+    let has_beta = op == "aten.kaiser_window.beta";
+    let length =
+        int_arg(args, kwargs, 0, "window_length")?.ok_or_else(|| missing(op, "window_length"))?;
+    let periodic = if has_periodic {
+        bool_arg(args, kwargs, 1, "periodic")?.ok_or_else(|| missing(op, "periodic"))?
+    } else {
+        true
+    };
+    let beta = if has_beta {
+        scalar_arg(op, args, kwargs, 2, "beta")?
+            .map(|s| s.as_f64())
+            .ok_or_else(|| missing(op, "beta"))?
+    } else {
+        12.0
+    };
+    let first_kwarg = if has_beta {
+        3
+    } else if has_periodic {
+        2
+    } else {
+        1
+    };
+    let dtype = dtype_arg(args, kwargs, first_kwarg, "dtype")?.unwrap_or_else(default_float);
+    reject_unsupported(
+        op,
+        args,
+        kwargs,
+        &[(first_kwarg + 1, "layout"), (first_kwarg + 3, "pin_memory")],
+    )?;
+    let label = device_arg_or_label(args, kwargs, first_kwarg + 2, "device", &PyDevice::cpu())?;
+
+    if length < 0 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "kaiser_window requires non-negative window_length, got window_length={length}"
+        )));
+    }
+    if !dtype.is_floating_point() {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "kaiser_window expects floating point dtypes, got: {}",
+            scalar_type_name(dtype)
+        )));
+    }
+    let n = length as usize;
+    if label.is_meta() {
+        return meta_result(py, vec![n], dtype);
+    }
+    let device = label.resolve()?;
+    let storage = PyDtype::new(dtype).storage(op)?;
+    if n == 0 {
+        let tensor = Tensor::zeros(0, storage, &device).map_err(|e| candle_err(op, e))?;
+        return finish(py, tensor, dtype);
+    }
+    if n == 1 {
+        let tensor = Tensor::ones(1, storage, &device).map_err(|e| candle_err(op, e))?;
+        return finish(py, tensor, dtype);
+    }
+
+    // The built length, which is one longer than the answer when `periodic`.
+    let built = if periodic { n + 1 } else { n };
+    let alpha = (built - 1) as f64 / 2.0;
+    // Every intermediate rounds to the *computation* width, not the storage
+    // width, which is `float` for everything except `float64`. `float16` and
+    // `bfloat16` therefore narrow exactly once, at the end -- upstream's
+    // `calc_i0(c10::Half)` upcast, not a shortcut.
+    let narrow = if dtype == TorchDType::Float64 {
+        (|v: f64| v) as fn(f64) -> f64
+    } else {
+        (|v: f64| v as f32 as f64) as fn(f64) -> f64
+    };
+    let denominator = i0_at(dtype, beta);
+    let values: Vec<f64> = (0..built)
+        .map(|i| {
+            let ratio = narrow(narrow(narrow(i as f64) - narrow(alpha)) / narrow(alpha));
+            let inside = narrow(1.0 - narrow(ratio * ratio));
+            let argument = narrow(narrow(beta) * narrow(inside.sqrt()));
+            narrow(i0_at(dtype, argument) / denominator)
+        })
+        .take(n)
+        .collect();
+    let tensor = Tensor::from_vec(values, n, &device)
+        .and_then(|t| t.fast_to(storage))
+        .map_err(|e| candle_err(op, e))?;
+    finish(py, tensor, dtype)
+}
+
+/// `aten::diag(Tensor self, int diagonal=0) -> Tensor`
+///
+/// **`rwkv`'s last construction wall**, one line after `linalg_qr` returns:
+/// `torch/nn/init.py:710` is `d = torch.diag(r, 0)` inside `orthogonal_`,
+/// followed by `ph = d.sign()` and `q *= ph`. `rwkv` has moved wall by wall
+/// for four rounds now (`new_empty` -> `maximum` -> `linalg_qr` -> here).
+///
+/// **This is two operations sharing one name, and both are implemented rather
+/// than only the one the caller needs.** A 1-D input *builds* a square matrix
+/// with that vector on its `diagonal`-th diagonal; a 2-D input *extracts* that
+/// diagonal as a vector. `rwkv` takes the 2-D branch (`r` is the triangular
+/// factor of a QR), but implementing only that would leave `torch.diag(v)` --
+/// the far commoner spelling -- answering nothing, and the branch is chosen by
+/// rank, not by anything a caller can be trusted to have.
+///
+/// Measured on 2.13.0, and the third and fourth of these are the ones a guess
+/// gets wrong:
+///
+/// ```text
+/// diag(3x4, 0)   -> 3 elements    min(rows, cols - d)
+/// diag(3x4, 1)   -> 3            (0,1) (1,2) (2,3)
+/// diag(3x4, -1)  -> 2            min(rows + d, cols), i.e. rows - |d|
+/// diag(3x4, 5)   -> shape (0,)   an EMPTY answer, not an error
+/// diag(3x4, -5)  -> shape (0,)   likewise
+/// diag([1,2,3], -2) -> 5x5, not 3x3 -- the offset grows the matrix
+/// ```
+///
+/// Rank 0 and rank 3 are upstream's own
+/// `"diag(): Supports 1D or 2D tensors. Got {n}D"`. `bool` and the integral
+/// dtypes are answers, not refusals: `diag(tensor([True, False]))` is
+/// `torch.bool`.
+fn diag_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.diag.default";
+    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let offset = int_arg(args, kwargs, 1, "diagonal")?.unwrap_or(0);
+    let dims = input.tensor()?.dims().to_vec();
+    if dims.len() != 1 && dims.len() != 2 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "diag(): Supports 1D or 2D tensors. Got {}D",
+            dims.len()
+        )));
+    }
+    let tag = input.tag();
+    let device = input.tensor()?.device().clone();
+    let source = read_flat(OP, input.tensor()?, tag)?;
+
+    let (out, out_dims) = if dims.len() == 1 {
+        // Build. The matrix is `n + |diagonal|` square, so a non-zero offset
+        // makes it BIGGER than the vector -- `diag([1,2,3], -2)` is 5x5.
+        let n = dims[0];
+        let side = n + offset.unsigned_abs() as usize;
+        let mut out = source.empty_like(side * side);
+        let (row0, col0) = if offset >= 0 {
+            (0usize, offset as usize)
+        } else {
+            (offset.unsigned_abs() as usize, 0usize)
+        };
+        for i in 0..n {
+            let target = (row0 + i) * side + (col0 + i);
+            match (&source, &mut out) {
+                (Flat::Float(src), Flat::Float(dst)) => dst[target] = src[i],
+                (Flat::Int(src), Flat::Int(dst)) => dst[target] = src[i],
+                _ => unreachable!("empty_like keeps the variant"),
+            }
+        }
+        (out, vec![side, side])
+    } else {
+        // Extract. The length is a clamped minimum and NOT an error when the
+        // offset walks off the matrix.
+        let (rows, cols) = (dims[0] as i64, dims[1] as i64);
+        let (row0, col0) = if offset >= 0 { (0i64, offset) } else { (-offset, 0i64) };
+        let len = (rows - row0).min(cols - col0).max(0) as usize;
+        let mut out = source.empty_like(len);
+        for i in 0..len {
+            let from = ((row0 + i as i64) * cols + (col0 + i as i64)) as usize;
+            match (&source, &mut out) {
+                (Flat::Float(src), Flat::Float(dst)) => dst[i] = src[from],
+                (Flat::Int(src), Flat::Int(dst)) => dst[i] = src[from],
+                _ => unreachable!("empty_like keeps the variant"),
+            }
+        }
+        (out, vec![len])
+    };
+    let tensor = write_flat(OP, out, out_dims, &device, tag)?;
+    finish(py, tensor, tag)
+}
+
+/// The reduction behind all three `var` overloads.
+///
+/// **`correction` is Bessel's, and its default is 1, not 0.** That is the trap
+/// this op carries: getting it wrong scales every answer by `n/(n-1)`, which
+/// is invisible at large `n` and unmissable at `n = 2` --
+/// `var([1., 3.])` is `2.0` with the default and `1.0` with `correction=0`, so
+/// the test for this op is at `n = 2` rather than on a comfortable sample.
+/// `unbiased=` is the older spelling of the same knob and is `correction=1`
+/// when true, `correction=0` when false.
+///
+/// **`std` shares this body, and that was checked rather than assumed.**
+/// `torch.std` dispatches to `aten::std.correction` as a leaf -- it is not a
+/// composite over `var` -- so the question was whether it accumulates the same
+/// way. It does: rooting the `f64` accumulator here and narrowing once
+/// reproduces upstream on 1199 of 1200 random `float32` cases. What is NOT
+/// the same is `var(x).sqrt()`, which narrows first and then roots: that
+/// disagrees with `torch.std` on 53 of 288 combinations, always by one ULP.
+/// So the code is shared and the *order* is the thing that had to be measured.
+///
+/// A non-positive denominator is `inf` or `nan` and never a negative variance
+/// -- see the clamp below, which is the trap a first draft of this got wrong.
+/// Upstream additionally emits a `UserWarning`; this shim has no warning
+/// channel on this path and answers the value.
+///
+/// Accumulated in `f64` and narrowed once, which is **not** the shortcut
+/// `hann_window` and `i0` refuse: upstream's own kernel reduces in
+/// `acc_type`, so the wide accumulator is the behaviour rather than a
+/// deviation from it. Checked element-wise against upstream at `float32`,
+/// `float64`, `float16` and `bfloat16`.
+fn var_reduce(
+    py: Python<'_>,
+    op: &str,
+    input: &PyTensorBase,
+    source: Vec<f64>,
+    dims_arg: Option<Vec<isize>>,
+    correction: f64,
+    keepdim: bool,
+    root: bool,
+) -> PyResult<Py<PyAny>> {
+    let tag = input.tag();
+    let dims = input.tensor()?.dims().to_vec();
+    let rank = dims.len();
+    let device = input.tensor()?.device().clone();
+
+    // `dim=None` and `dim=[]` both mean "every axis", which is upstream's
+    // rule for the reduction family and was re-measured for `var` rather
+    // than inherited: `var(x, [])` equals `var(x)`.
+    let reduced: Vec<usize> = match &dims_arg {
+        None => (0..rank).collect(),
+        Some(list) if list.is_empty() => (0..rank).collect(),
+        Some(list) => {
+            let mut seen: Vec<usize> = Vec::with_capacity(list.len());
+            for &d in list {
+                let index = normalise_dim(op, d, rank)?;
+                if seen.contains(&index) {
+                    return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "dim {d} appears multiple times in the list of dims"
+                    )));
+                }
+                seen.push(index);
+            }
+            seen
+        }
+    };
+    let is_reduced: Vec<bool> = (0..rank).map(|d| reduced.contains(&d)).collect();
+
+    // Output shape, and the strides needed to map each input element to its
+    // output lane. Written out rather than done with candle ops because the
+    // two-pass mean has to see the same lane twice.
+    let out_dims: Vec<usize> = (0..rank)
+        .filter(|d| keepdim || !is_reduced[*d])
+        .map(|d| if is_reduced[d] { 1 } else { dims[d] })
+        .collect();
+    let kept: Vec<usize> = (0..rank).filter(|d| !is_reduced[*d]).collect();
+    let lanes: usize = kept.iter().map(|&d| dims[d]).product::<usize>().max(1);
+    let group: usize = reduced.iter().map(|&d| dims[d]).product::<usize>();
+
+    // Strides of the input, and the stride of each kept axis in the output.
+    let mut in_stride = vec![1usize; rank];
+    for d in (0..rank.saturating_sub(1)).rev() {
+        in_stride[d] = in_stride[d + 1] * dims[d + 1];
+    }
+    let mut lane_stride = vec![0usize; kept.len()];
+    let mut acc = 1usize;
+    for (position, &d) in kept.iter().enumerate().rev() {
+        lane_stride[position] = acc;
+        acc *= dims[d];
+    }
+
+    let mut sums = vec![0.0f64; lanes];
+    let mut lane_of = vec![0usize; source.len()];
+    for (flat, slot) in lane_of.iter_mut().enumerate() {
+        let mut lane = 0usize;
+        for (position, &d) in kept.iter().enumerate() {
+            let coordinate = (flat / in_stride[d]) % dims[d];
+            lane += coordinate * lane_stride[position];
+        }
+        *slot = lane;
+    }
+    for (flat, &value) in source.iter().enumerate() {
+        sums[lane_of[flat]] += value;
+    }
+    let mut m2 = vec![0.0f64; lanes];
+    let means: Vec<f64> = sums.iter().map(|s| s / group as f64).collect();
+    for (flat, &value) in source.iter().enumerate() {
+        let lane = lane_of[flat];
+        let deviation = value - means[lane];
+        m2[lane] += deviation * deviation;
+    }
+    // **The divisor is CLAMPED AT ZERO, and the difference is `inf` versus
+    // `nan`.** Upstream is `n = max(0, n - correction)` followed by a plain
+    // division, so a correction that overshoots does not produce a negative
+    // variance -- it divides by zero:
+    //
+    //     n - correction > 0                   ->  m2 / (n - correction)
+    //     n - correction == 0, m2 > 0          ->  inf     (var([1.,3.], correction=2))
+    //     n - correction == 0, m2 == 0         ->  nan     (var(tensor(3.)))
+    //     n - correction < 0,  m2 > 0          ->  inf     (var([1.,3.], correction=3))
+    //     n - correction < 0,  m2 == 0         ->  nan     (var(zeros(0)))
+    //
+    // All five measured on 2.13.0. A first draft of this answered `nan` for
+    // every non-positive denominator, which is right for the two cases the
+    // obvious tests reach (`var` of a scalar and of an empty tensor, both
+    // `m2 == 0`) and wrong for the two where `m2 > 0` -- so the clamp is
+    // written out and tested at `correction=2` on two elements, where the
+    // answers differ.
+    let denominator = (group as f64 - correction).max(0.0);
+    let out: Vec<f64> = m2
+        .into_iter()
+        .map(|v| {
+            let variance = v / denominator;
+            // `std` takes the root **in the accumulator**, not on the narrowed
+            // variance. Measured: `torch.std(x)` and `torch.var(x).sqrt()`
+            // disagree on 53 of 288 (dtype, shape, dim, correction)
+            // combinations at `float32`, always by one ULP, because the
+            // second narrows to `float32` before rooting. Rooting here and
+            // narrowing once matches upstream on 1199 of 1200 random cases;
+            // rooting after the narrowing matches on 1043.
+            if root {
+                variance.sqrt()
+            } else {
+                variance
+            }
+        })
+        .collect();
+    let tensor = write_flat(op, Flat::Float(out), out_dims, &device, tag)?;
+    finish(py, tensor, tag)
+}
+
+/// The dtype refusal `var` and `std` share, so that each of the six dispatch
+/// targets can refuse **before** reading anything.
+///
+/// The `read_flat` beside each call to this is spelled out at the dispatch
+/// target rather than folded in here, and **that is not a style preference.**
+/// `test_the_mps_readback_list_is_what_the_kernels_actually_do` derives the
+/// `MPS_HOST_READBACK_OPS` set by scanning each dispatch target's body for a
+/// readback marker and following helper calls **one level, by name**.
+/// `var_reduce` is not on that list of helpers, so a `read_flat` inside it
+/// was invisible to the scan -- and `var`/`std` would have been the one
+/// family in this file that silently computed on the CPU with an `mps`
+/// tensor, with nothing in the suite to say so. Reading at the dispatch
+/// target puts all six ops back on the derived set.
+fn var_std_dtype_check(input: &PyTensorBase) -> PyResult<()> {
+    if !input.tag().is_floating_point() {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "std and var only support floating point and complex dtypes",
+        ));
+    }
+    Ok(())
+}
+
+/// `aten::var(Tensor self, bool unbiased=True) -> Tensor`
+fn var_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.var.default";
+    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let unbiased = bool_arg(args, kwargs, 1, "unbiased")?.unwrap_or(true);
+    var_std_dtype_check(&input)?;
+    let source: Vec<f64> = match read_flat(OP, input.tensor()?, input.tag())? {
+        Flat::Float(values) => values,
+        Flat::Int(values) => values.into_iter().map(|v| v as f64).collect(),
+    };
+    var_reduce(py, OP, &input, source, None, if unbiased { 1.0 } else { 0.0 }, false, false)
+}
+
+/// `aten::var.dim(Tensor self, int[1]? dim, bool unbiased=True, bool keepdim=False)`
+fn var_dim(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.var.dim";
+    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let dims = optional_shape(OP, args, kwargs, 1, "dim")?;
+    let unbiased = bool_arg(args, kwargs, 2, "unbiased")?.unwrap_or(true);
+    let keepdim = bool_arg(args, kwargs, 3, "keepdim")?.unwrap_or(false);
+    var_std_dtype_check(&input)?;
+    let source: Vec<f64> = match read_flat(OP, input.tensor()?, input.tag())? {
+        Flat::Float(values) => values,
+        Flat::Int(values) => values.into_iter().map(|v| v as f64).collect(),
+    };
+    var_reduce(py, OP, &input, source, dims, if unbiased { 1.0 } else { 0.0 }, keepdim, false)
+}
+
+/// `aten::var.correction(Tensor self, int[1]? dim=None, *, Scalar? correction=None,
+///     bool keepdim=False)`
+///
+/// The overload torch's Python binding reaches for `torch.var(x,
+/// correction=...)`, and the one whose default is the trap: `correction=None`
+/// means **1**, not 0.
+///
+/// `correction` is a `Scalar` and not an `int`, so a fractional one is legal:
+/// measured, `var(x, correction=0.5)` over six elements divides by `5.5`.
+fn var_correction(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.var.correction";
+    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let dims = optional_shape(OP, args, kwargs, 1, "dim")?;
+    let correction = scalar_arg(OP, args, kwargs, 2, "correction")?
+        .map(|s| s.as_f64())
+        .unwrap_or(1.0);
+    let keepdim = bool_arg(args, kwargs, 3, "keepdim")?.unwrap_or(false);
+    var_std_dtype_check(&input)?;
+    let source: Vec<f64> = match read_flat(OP, input.tensor()?, input.tag())? {
+        Flat::Float(values) => values,
+        Flat::Int(values) => values.into_iter().map(|v| v as f64).collect(),
+    };
+    var_reduce(py, OP, &input, source, dims, correction, keepdim, false)
+}
+
+/// `aten::std(Tensor self, bool unbiased=True) -> Tensor`
+///
+/// **`gemma3n_text`'s wall**, `modeling_gemma3n.py:1745`, inside the decoder
+/// layer -- and its second this batch, after `erfinv`.
+///
+/// `torch.std` is a **leaf**, not a composite over `var`: it dispatches
+/// straight to `aten::std.correction`, so there was no existing kernel it
+/// reached under another name and `linalg_vector_norm` is not a substitute
+/// (no mean subtraction). docs/BIND2.md §4.
+///
+/// The `correction` trap is `var`'s, identically: the default is **1**, and
+/// getting it wrong scales by `sqrt(n/(n-1))` -- 0.05% at `n = 1000` and
+/// 41% at `n = 2`, which is where it is tested.
+fn std_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.std.default";
+    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let unbiased = bool_arg(args, kwargs, 1, "unbiased")?.unwrap_or(true);
+    var_std_dtype_check(&input)?;
+    let source: Vec<f64> = match read_flat(OP, input.tensor()?, input.tag())? {
+        Flat::Float(values) => values,
+        Flat::Int(values) => values.into_iter().map(|v| v as f64).collect(),
+    };
+    var_reduce(py, OP, &input, source, None, if unbiased { 1.0 } else { 0.0 }, false, true)
+}
+
+/// `aten::std.dim(Tensor self, int[1]? dim, bool unbiased=True, bool keepdim=False)`
+fn std_dim(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.std.dim";
+    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let dims = optional_shape(OP, args, kwargs, 1, "dim")?;
+    let unbiased = bool_arg(args, kwargs, 2, "unbiased")?.unwrap_or(true);
+    let keepdim = bool_arg(args, kwargs, 3, "keepdim")?.unwrap_or(false);
+    var_std_dtype_check(&input)?;
+    let source: Vec<f64> = match read_flat(OP, input.tensor()?, input.tag())? {
+        Flat::Float(values) => values,
+        Flat::Int(values) => values.into_iter().map(|v| v as f64).collect(),
+    };
+    var_reduce(py, OP, &input, source, dims, if unbiased { 1.0 } else { 0.0 }, keepdim, true)
+}
+
+/// `aten::std.correction(Tensor self, int[1]? dim=None, *, Scalar? correction=None,
+///     bool keepdim=False)`
+///
+/// The overload `torch.std` actually resolves to, and the one whose
+/// `correction=None` means **1**.
+fn std_correction(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.std.correction";
+    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let dims = optional_shape(OP, args, kwargs, 1, "dim")?;
+    let correction = scalar_arg(OP, args, kwargs, 2, "correction")?
+        .map(|s| s.as_f64())
+        .unwrap_or(1.0);
+    let keepdim = bool_arg(args, kwargs, 3, "keepdim")?.unwrap_or(false);
+    var_std_dtype_check(&input)?;
+    let source: Vec<f64> = match read_flat(OP, input.tensor()?, input.tag())? {
+        Flat::Float(values) => values,
+        Flat::Int(values) => values.into_iter().map(|v| v as f64).collect(),
+    };
+    var_reduce(py, OP, &input, source, dims, correction, keepdim, true)
+}
+
+/// `shape_arg` for an `int[1]?` -- present, absent, or explicitly `None`, and
+/// an int where a list is allowed.
+fn optional_shape(
+    _op: &str,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+    index: usize,
+    name: &str,
+) -> PyResult<Option<Vec<isize>>> {
+    match optional(args, kwargs, index, name)? {
+        Some(value) if !value.is_none() => match value.extract::<Vec<isize>>() {
+            Ok(list) => Ok(Some(list)),
+            Err(_) => Ok(Some(vec![value.extract::<isize>()?])),
+        },
+        _ => Ok(None),
+    }
+}
+
+/// `aten::_unique2(Tensor self, bool sorted=True, bool return_inverse=False,
+///     bool return_counts=False) -> (Tensor, Tensor, Tensor)`
+///
+/// **`vilt`'s wall**, and the one it reached only because a previous round gave
+/// it `upsample_nearest2d` (docs/BINDINGS.md): `modeling_vilt.py:144` is
+/// `valid_idx[:, 0].unique()`, and `Tensor.unique` -> `torch.unique` ->
+/// `torch._unique2` with all three flags at their defaults.
+///
+/// Four things were measured rather than inferred:
+///
+/// * **`sorted=False` still sorts.** The CPU kernel has one path. The flag is
+///   a CUDA-only optimisation upstream, so answering an unsorted result when
+///   asked for one would differ from upstream *on CPU*, which is what this
+///   shim is compared against.
+/// * **`inverse_indices` has the INPUT's shape**, not the values' -- a `2x2`
+///   input gives a `2x2` inverse, and a 0-D input gives a 0-D one. Only
+///   `values` is flattened.
+/// * **The tensors that were not asked for are empty, not absent.** The
+///   schema returns three tensors always; `return_inverse=False` makes the
+///   second one shape `[0]`, and `vilt`, which asks for neither, still gets
+///   three.
+/// * **NaN is never equal to itself, so every NaN survives as its own
+///   value**, and they sort last. `_unique2([nan, 1., nan, 0.])` is
+///   `([0., 1., nan, nan], [2, 1, 3, 0], [1, 1, 1, 1])` -- four values from
+///   four elements. Deduplicating with `==` reproduces this for free;
+///   deduplicating on a sort key would collapse them.
+///
+/// The sort is `cmp_torch_f64`'s, which is torch's float order (NaN greatest)
+/// and not IEEE's, and it is stable so that the two NaNs keep their input
+/// order.
+///
+/// **Reads the tensor back to the host**, unavoidably -- the sort is the op.
+fn unique2_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten._unique2.default";
+    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    // Read and ignored: the CPU kernel sorts either way, and binding the
+    // argument keeps a caller that passes it from getting a TypeError.
+    let _sorted = bool_arg(args, kwargs, 1, "sorted")?.unwrap_or(true);
+    let return_inverse = bool_arg(args, kwargs, 2, "return_inverse")?.unwrap_or(false);
+    let return_counts = bool_arg(args, kwargs, 3, "return_counts")?.unwrap_or(false);
+
+    let tag = input.tag();
+    let dims = input.tensor()?.dims().to_vec();
+    let device = input.tensor()?.device().clone();
+    let source = read_flat(OP, input.tensor()?, tag)?;
+    let count = match &source {
+        Flat::Float(v) => v.len(),
+        Flat::Int(v) => v.len(),
+    };
+
+    let mut order: Vec<usize> = (0..count).collect();
+    match &source {
+        Flat::Float(values) => {
+            order.sort_by(|&a, &b| cmp_torch_f64(values[a], values[b]));
+        }
+        Flat::Int(values) => order.sort_by_key(|&i| values[i]),
+    }
+
+    let mut values = source.empty_like(0);
+    let mut counts: Vec<i64> = Vec::new();
+    let mut inverse = vec![0i64; count];
+    for &index in &order {
+        let same = match (&source, &values) {
+            (Flat::Float(src), Flat::Float(seen)) => {
+                seen.last().map(|&last| last == src[index]).unwrap_or(false)
+            }
+            (Flat::Int(src), Flat::Int(seen)) => {
+                seen.last().map(|&last| last == src[index]).unwrap_or(false)
+            }
+            _ => unreachable!("empty_like keeps the variant"),
+        };
+        if !same {
+            match (&source, &mut values) {
+                (Flat::Float(src), Flat::Float(dst)) => dst.push(src[index]),
+                (Flat::Int(src), Flat::Int(dst)) => dst.push(src[index]),
+                _ => unreachable!("empty_like keeps the variant"),
+            }
+            counts.push(0);
+        }
+        let slot = counts.len() - 1;
+        counts[slot] += 1;
+        inverse[index] = slot as i64;
+    }
+    let unique_count = counts.len();
+
+    let values_t = write_flat(OP, values, vec![unique_count], &device, tag)?;
+    let inverse_t = if return_inverse {
+        Tensor::from_vec(inverse, dims, &device)
+    } else {
+        Tensor::from_vec(Vec::<i64>::new(), 0usize, &device)
+    }
+    .map_err(|e| candle_err(OP, e))?;
+    let counts_t = if return_counts {
+        Tensor::from_vec(counts, unique_count, &device)
+    } else {
+        Tensor::from_vec(Vec::<i64>::new(), 0usize, &device)
+    }
+    .map_err(|e| candle_err(OP, e))?;
+
+    // Promoted element by element for `native_batch_norm`'s reason: `promote`
+    // at the dispatcher's exit does not look inside a tuple.
+    let triple = [
+        crate::tensor::promote(py, finish(py, values_t, tag)?)?,
+        crate::tensor::promote(py, finish(py, inverse_t, TorchDType::Int64)?)?,
+        crate::tensor::promote(py, finish(py, counts_t, TorchDType::Int64)?)?,
+    ];
+    Ok(PyTuple::new(py, triple)?.into_any().unbind())
+}
+
+/// The four `int[2]` arguments `im2col` and `col2im` share, with their length
+/// check. An `int` where a pair is allowed broadcasts to both axes, which is
+/// what `F.unfold(x, kernel_size=2)` sends.
+fn pair_arg(
+    op: &str,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+    index: usize,
+    name: &str,
+) -> PyResult<(i64, i64)> {
+    let list = shape_arg(op, args, kwargs, index, name)?;
+    match list.len() {
+        1 => Ok((list[0] as i64, list[0] as i64)),
+        2 => Ok((list[0] as i64, list[1] as i64)),
+        n => Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "{op}: expected {name} to be a single value or a list of 2 values, got {n}"
+        ))),
+    }
+}
+
+/// `im2col`/`col2im` refuse everything upstream refuses, by the name upstream
+/// puts in the message. **`bool` computes and the integral dtypes do not**,
+/// which is backwards from most of this file and was measured rather than
+/// assumed: `im2col(bool)` is `torch.bool`, `im2col(int32)` raises
+/// `"im2col_out_cpu" not implemented for 'Int'`.
+fn im2col_dtype_check(op: &str, kernel: &str, tag: TorchDType) -> PyResult<()> {
+    if tag.is_floating_point() || tag == TorchDType::Bool {
+        return Ok(());
+    }
+    Err(pyo3::exceptions::PyNotImplementedError::new_err(format!(
+        "{op}: \"{kernel}\" not implemented for '{}'",
+        scalar_type_name(tag)
+    )))
+}
+
+/// The number of sliding blocks along one axis, and upstream's refusal when
+/// there are none.
+fn sliding_blocks(size: i64, kernel: i64, dilation: i64, padding: i64, stride: i64) -> i64 {
+    (size + 2 * padding - dilation * (kernel - 1) - 1) / stride + 1
+}
+
+/// `aten::im2col(Tensor self, int[2] kernel_size, int[2] dilation,
+///     int[2] padding, int[2] stride) -> Tensor`
+///
+/// **`llama4`'s vision tower** (docs/COMPLEX2.md §8) -- `F.unfold` *is* this
+/// binding, patchifying the image before the projection. `f5-tts` needs its
+/// inverse, which is the next function.
+///
+/// The layout is upstream's and was read off a `4x4` with `kernel=2,
+/// stride=1` rather than derived:
+///
+/// ```text
+/// out[n][c*kh*kw + i*kw + j][oh*out_w + ow]
+///     = in[n][c][oh*sh - ph + i*dh][ow*sw - pw + j*dw]     or 0 if padded
+/// ```
+///
+/// so the channel is the *slowest* axis of the folded dimension and the
+/// kernel position the fastest. A transposed reading of that (kernel slowest)
+/// produces the same shape and the wrong matrix, which is why the golden cases
+/// compare a multi-channel input rather than the single-channel one that
+/// cannot tell the two apart.
+///
+/// A 3-D input is the unbatched form and answers 2-D, which is how
+/// `F.unfold`'s own `no-batch-dim` path arrives.
+fn im2col_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.im2col.default";
+    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let (kh, kw) = pair_arg(OP, args, kwargs, 1, "kernel_size")?;
+    let (dh, dw) = pair_arg(OP, args, kwargs, 2, "dilation")?;
+    let (ph, pw) = pair_arg(OP, args, kwargs, 3, "padding")?;
+    let (sh, sw) = pair_arg(OP, args, kwargs, 4, "stride")?;
+    let tag = input.tag();
+    im2col_dtype_check(OP, "im2col_out_cpu", tag)?;
+
+    let dims = input.tensor()?.dims().to_vec();
+    let batched = dims.len() == 4;
+    if dims.len() != 3 && dims.len() != 4 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "Expected 3D or 4D (batch mode) tensor with possibly 0 batch size \
+             and other non-zero dimensions for input, but got: {dims:?}"
+        )));
+    }
+    for (name, (a, b)) in [
+        ("kernel_size", (kh, kw)),
+        ("dilation", (dh, dw)),
+        ("stride", (sh, sw)),
+    ] {
+        if a <= 0 || b <= 0 {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "{name} should be greater than zero, but got ({a}, {b})"
+            )));
+        }
+    }
+    if ph < 0 || pw < 0 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "padding should be non-negative, but got ({ph}, {pw})"
+        )));
+    }
+
+    let (n, c, h, w) = if batched {
+        (dims[0], dims[1], dims[2] as i64, dims[3] as i64)
+    } else {
+        (1usize, dims[0], dims[1] as i64, dims[2] as i64)
+    };
+    let out_h = sliding_blocks(h, kh, dh, ph, sh);
+    let out_w = sliding_blocks(w, kw, dw, pw, sw);
+    if out_h < 1 || out_w < 1 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "Given input with spatial size ({h}, {w}), kernel_size=({kh}, {kw}), \
+             dilation=({dh}, {dw}), padding=({ph}, {pw}), calculated shape of the \
+             array of sliding blocks as ({out_h}, {out_w}), but its components \
+             must be at least one."
+        )));
+    }
+
+    let blocks = (out_h * out_w) as usize;
+    let folded = c * (kh * kw) as usize;
+    let source = read_flat(OP, input.tensor()?, tag)?;
+    let mut out = source.empty_like(n * folded * blocks);
+    let plane = (h * w) as usize;
+    for image in 0..n {
+        for channel in 0..c {
+            let base = (image * c + channel) * plane;
+            for i in 0..kh {
+                for j in 0..kw {
+                    let row = channel * (kh * kw) as usize + (i * kw + j) as usize;
+                    let row_base = (image * folded + row) * blocks;
+                    for oh in 0..out_h {
+                        let y = oh * sh - ph + i * dh;
+                        for ow in 0..out_w {
+                            let x = ow * sw - pw + j * dw;
+                            let target = row_base + (oh * out_w + ow) as usize;
+                            if y < 0 || y >= h || x < 0 || x >= w {
+                                continue; // `empty_like` already zeroed it
+                            }
+                            let from = base + (y * w + x) as usize;
+                            match (&source, &mut out) {
+                                (Flat::Float(src), Flat::Float(dst)) => dst[target] = src[from],
+                                (Flat::Int(src), Flat::Int(dst)) => dst[target] = src[from],
+                                _ => unreachable!("empty_like keeps the variant"),
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let out_dims = if batched {
+        vec![n, folded, blocks]
+    } else {
+        vec![folded, blocks]
+    };
+    let device = input.tensor()?.device().clone();
+    let tensor = write_flat(OP, out, out_dims, &device, tag)?;
+    finish(py, tensor, tag)
+}
+
+/// `aten::col2im(Tensor self, SymInt[2] output_size, int[2] kernel_size,
+///     int[2] dilation, int[2] padding, int[2] stride) -> Tensor`
+///
+/// **`f5-tts`'s wall**, `F.fold`, and docs/VOICE.md rank 15 ranks it with
+/// `im2col` because vocos needs the pair.
+///
+/// **It is not `im2col`'s inverse, and the difference is the op.** Where two
+/// windows overlap, `col2im` **sums** the contributions; it does not overwrite
+/// with the last one. `col2im(ones(1, 4, 9), [4,4], k=2, s=1)` is
+///
+/// ```text
+/// 1 2 2 1
+/// 2 4 4 2      -- the interior pixels are covered by four windows
+/// 2 4 4 2
+/// 1 2 2 1
+/// ```
+///
+/// and a stride equal to the kernel gives all ones, which is why the golden
+/// cases use `stride < kernel`: **a non-overlapping test cannot tell a summing
+/// implementation from an overwriting one.** `col2im(im2col(x))` is therefore
+/// not `x` but `x` weighted by that cover count, and that round trip is a case
+/// here for the same reason.
+fn col2im_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.col2im.default";
+    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let output_size = pair_arg(OP, args, kwargs, 1, "output_size")?;
+    let (kh, kw) = pair_arg(OP, args, kwargs, 2, "kernel_size")?;
+    let (dh, dw) = pair_arg(OP, args, kwargs, 3, "dilation")?;
+    let (ph, pw) = pair_arg(OP, args, kwargs, 4, "padding")?;
+    let (sh, sw) = pair_arg(OP, args, kwargs, 5, "stride")?;
+    let (oh_size, ow_size) = output_size;
+    let tag = input.tag();
+    im2col_dtype_check(OP, "col2im_out_cpu", tag)?;
+
+    let dims = input.tensor()?.dims().to_vec();
+    let batched = dims.len() == 3;
+    if dims.len() != 2 && dims.len() != 3 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "Expected 2D or 3D (batch mode) tensor for input, but got: {dims:?}"
+        )));
+    }
+    for (name, (a, b)) in [
+        ("kernel_size", (kh, kw)),
+        ("dilation", (dh, dw)),
+        ("stride", (sh, sw)),
+    ] {
+        if a <= 0 || b <= 0 {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "{name} should be greater than zero, but got ({a}, {b})"
+            )));
+        }
+    }
+    if oh_size <= 0 || ow_size <= 0 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "Expected output spatial size to be positive, but got: output_size=\
+             ({oh_size}, {ow_size})"
+        )));
+    }
+
+    let (n, folded, length) = if batched {
+        (dims[0], dims[1], dims[2])
+    } else {
+        (1usize, dims[0], dims[1])
+    };
+    let kernel_area = (kh * kw) as usize;
+    if folded % kernel_area != 0 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "Expected size of input's dimension 1 to be divisible by the product \
+             of kernel_size, but got input.size(1)={folded} and \
+             kernel_size=({kh}, {kw})."
+        )));
+    }
+    let c = folded / kernel_area;
+    let out_h = sliding_blocks(oh_size, kh, dh, ph, sh);
+    let out_w = sliding_blocks(ow_size, kw, dw, pw, sw);
+    if out_h < 1 || out_w < 1 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "Given output_size=({oh_size}, {ow_size}), kernel_size=({kh}, {kw}), \
+             dilation=({dh}, {dw}), padding=({ph}, {pw}), stride=({sh}, {sw}), \
+             calculated shape of the array of sliding blocks as ({out_h}, \
+             {out_w}), but its components must be at least one."
+        )));
+    }
+    if length != (out_h * out_w) as usize {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "Given output_size=({oh_size}, {ow_size}), kernel_size=({kh}, {kw}), \
+             dilation=({dh}, {dw}), padding=({ph}, {pw}), stride=({sh}, {sw}), \
+             expected size of input's dimension 2 to match the calculated number \
+             of sliding blocks {out_h} * {out_w} = {}, but got \
+             input.size(2)={length}.",
+            out_h * out_w
+        )));
+    }
+
+    let plane = (oh_size * ow_size) as usize;
+    let source = read_flat(OP, input.tensor()?, tag)?;
+    let mut out = source.empty_like(n * c * plane);
+    let blocks = length;
+    for image in 0..n {
+        for channel in 0..c {
+            let base = (image * c + channel) * plane;
+            for i in 0..kh {
+                for j in 0..kw {
+                    let row = channel * kernel_area + (i * kw + j) as usize;
+                    let row_base = (image * folded + row) * blocks;
+                    for oh in 0..out_h {
+                        let y = oh * sh - ph + i * dh;
+                        if y < 0 || y >= oh_size {
+                            continue;
+                        }
+                        for ow in 0..out_w {
+                            let x = ow * sw - pw + j * dw;
+                            if x < 0 || x >= ow_size {
+                                continue;
+                            }
+                            let from = row_base + (oh * out_w + ow) as usize;
+                            let target = base + (y * ow_size + x) as usize;
+                            // `+=`, NOT `=`. Overlapping windows accumulate.
+                            match (&source, &mut out) {
+                                (Flat::Float(src), Flat::Float(dst)) => dst[target] += src[from],
+                                (Flat::Int(src), Flat::Int(dst)) => dst[target] += src[from],
+                                _ => unreachable!("empty_like keeps the variant"),
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let out_dims = if batched {
+        vec![n, c, oh_size as usize, ow_size as usize]
+    } else {
+        vec![c, oh_size as usize, ow_size as usize]
+    };
+    let device = input.tensor()?.device().clone();
+    let tensor = write_flat(OP, out, out_dims, &device, tag)?;
+    finish(py, tensor, tag)
+}
+
+/// `aten::upsample_nearest1d(Tensor self, SymInt[1] output_size,
+///     float? scales=None) -> Tensor`
+///
+/// docs/VOICE.md rank 14 -- `bigvgan` upsamples its latent sequence with
+/// `F.interpolate(..., mode="nearest")` on a 3-D tensor, which binds
+/// `torch._C._nn.upsample_nearest1d` and not the 2-D op.
+///
+/// **Not an alias of `upsample_nearest2d`**, which is the first thing that was
+/// checked (docs/ARCH100.md's 49-to-22 finding). The index arithmetic is
+/// shared and is `nearest_neighbor_compute_source_index` --
+/// `floor(dst * scale)` with the scale INVERTED from the argument and no
+/// half-pixel correction -- but the schema, the rank check
+/// (`input_size equals to 3`) and the dtype refusal name differ. Upstream
+/// names `compute_indices_weights_nearest` here where the 2-D op names
+/// `upsample_nearest2d_channels_last`; transcribing the wrong one would say
+/// the wrong thing about which kernel a caller failed to reach.
+///
+/// `uint8` computes for `upsample_nearest2d`'s reason: a nearest resample is a
+/// gather and never averages, so there is no fixed-point rounding for a
+/// separate kernel to do differently. `bool` does NOT (measured -- upstream
+/// raises), which is the one place the two ops' dtype sets differ.
+fn upsample_nearest1d_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.upsample_nearest1d.default";
+    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let output_size = shape_arg(OP, args, kwargs, 1, "output_size")?;
+    let scales = scalar_arg(OP, args, kwargs, 2, "scales")?.map(|s| s.as_f64());
+
+    if output_size.len() != 1 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "It is expected output_size equals to 1, but got size {}",
+            output_size.len()
+        )));
+    }
+    let dims = input.tensor()?.dims().to_vec();
+    if dims.len() != 3 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "It is expected input_size equals to 3, but got size {}",
+            dims.len()
+        )));
+    }
+    let in_w = dims[2] as i64;
+    let out_w = output_size[0] as i64;
+    if in_w <= 0 || out_w <= 0 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "Input and output sizes should be greater than 0, but got input (W: \
+             {in_w}) output (W: {out_w})"
+        )));
+    }
+    if dims[1..].iter().product::<usize>() == 0 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "Non-empty 3D data tensor expected but got a tensor with sizes {dims:?}"
+        )));
+    }
+    let tag = input.tag();
+    if !(tag.is_floating_point() || tag == TorchDType::UInt8) {
+        return Err(pyo3::exceptions::PyNotImplementedError::new_err(format!(
+            "\"compute_indices_weights_nearest\" not implemented for '{}'",
+            scalar_type_name(tag)
+        )));
+    }
+
+    let out_dims = vec![dims[0], dims[1], out_w as usize];
+    let device = input.tensor()?.device().clone();
+    if dims[0] == 0 {
+        let out = Tensor::zeros(out_dims, PyDtype::new(tag).storage(OP)?, &device)
+            .map_err(|e| candle_err(OP, e))?;
+        return finish(py, out, tag);
+    }
+
+    let acc32 = tag != TorchDType::Float64;
+    let scale = match scales {
+        Some(given) if given > 0.0 => {
+            if acc32 {
+                (1.0 / given) as f32 as f64
+            } else {
+                1.0 / given
+            }
+        }
+        _ => {
+            if acc32 {
+                (in_w as f32 / out_w as f32) as f64
+            } else {
+                in_w as f64 / out_w as f64
+            }
+        }
+    };
+    let grid: Vec<usize> = (0..out_w)
+        .map(|index| {
+            let src = if acc32 {
+                (scale as f32 * index as f32).floor() as i64
+            } else {
+                (scale * index as f64).floor() as i64
+            };
+            src.min(in_w - 1).max(0) as usize
+        })
+        .collect();
+
+    let source = read_flat(OP, input.tensor()?, tag)?;
+    let lanes = dims[0] * dims[1];
+    let mut out = source.empty_like(lanes * out_w as usize);
+    for lane in 0..lanes {
+        let base = lane * in_w as usize;
+        let target_base = lane * out_w as usize;
+        for (ow, &from) in grid.iter().enumerate() {
+            match (&source, &mut out) {
+                (Flat::Float(src), Flat::Float(dst)) => dst[target_base + ow] = src[base + from],
+                (Flat::Int(src), Flat::Int(dst)) => dst[target_base + ow] = src[base + from],
+                _ => unreachable!("empty_like keeps the variant"),
+            }
+        }
+    }
+    let tensor = write_flat(OP, out, out_dims, &device, tag)?;
+    finish(py, tensor, tag)
 }

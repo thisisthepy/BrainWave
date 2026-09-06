@@ -620,7 +620,7 @@ fn shim_same_device(left: PyDevice, right: PyDevice) -> bool {
 /// RMSNorm's `x.pow(2)` and the attention mask -- and none of them is a
 /// widening of this gate: the scan re-derives the list from the kernels and
 /// would put them straight back if the readback were still there.
-pub const MPS_HOST_READBACK_OPS: [&str; 72] = [
+pub const MPS_HOST_READBACK_OPS: [&str; 84] = [
     "aten._fft_c2c.default",
     "aten._fft_c2r.default",
     "aten._fft_r2c.default",
@@ -628,6 +628,7 @@ pub const MPS_HOST_READBACK_OPS: [&str; 72] = [
     "aten._log_softmax.default",
     "aten._safe_softmax.default",
     "aten._softmax.default",
+    "aten._unique2.default",
     "aten.abs.default",
     "aten.abs_.default",
     "aten.acos.default",
@@ -644,6 +645,8 @@ pub const MPS_HOST_READBACK_OPS: [&str; 72] = [
     "aten.bitwise_xor.Tensor",
     "aten.bucketize.Scalar",
     "aten.bucketize.Tensor",
+    "aten.col2im.default",
+    "aten.diag.default",
     "aten.div.Scalar_mode",
     "aten.div.Tensor_mode",
     "aten.erfinv.default",
@@ -653,6 +656,8 @@ pub const MPS_HOST_READBACK_OPS: [&str; 72] = [
     "aten.fmod.Tensor",
     "aten.gather.default",
     "aten.histc.default",
+    "aten.i0.default",
+    "aten.im2col.default",
     "aten.index.Tensor",
     "aten.index_add.default",
     "aten.index_add_.default",
@@ -687,11 +692,18 @@ pub const MPS_HOST_READBACK_OPS: [&str; 72] = [
     "aten.scatter.value",
     "aten.scatter_reduce.two",
     "aten.softplus.default",
+    "aten.std.correction",
+    "aten.std.default",
+    "aten.std.dim",
     "aten.stft.center",
     "aten.stft.default",
     "aten.upsample_bicubic2d.default",
     "aten.upsample_bilinear2d.default",
+    "aten.upsample_nearest1d.default",
     "aten.upsample_nearest2d.default",
+    "aten.var.correction",
+    "aten.var.default",
+    "aten.var.dim",
     "aten.where.default",
 ];
 

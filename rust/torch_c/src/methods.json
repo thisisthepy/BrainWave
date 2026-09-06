@@ -701,5 +701,21 @@
   ],
   "cumprod": [
     "aten::cumprod(Tensor self, int dim, *, ScalarType? dtype=None) -> Tensor"
+  ],
+  "diag": [
+    "aten::diag(Tensor self, int diagonal=0) -> Tensor"
+  ],
+  "i0": [
+    "aten::i0(Tensor self) -> Tensor"
+  ],
+  "var": [
+    "aten::var(Tensor self, bool unbiased=True) -> Tensor",
+    "aten::var.dim(Tensor self, int[1]? dim, bool unbiased=True, bool keepdim=False) -> Tensor",
+    "aten::var.correction(Tensor self, int[1]? dim=None, *, Scalar? correction=None, bool keepdim=False) -> Tensor"
+  ],
+  "std": [
+    "aten::std(Tensor self, bool unbiased=True) -> Tensor",
+    "aten::std.dim(Tensor self, int[1]? dim, bool unbiased=True, bool keepdim=False) -> Tensor",
+    "aten::std.correction(Tensor self, int[1]? dim=None, *, Scalar? correction=None, bool keepdim=False) -> Tensor"
   ]
 }

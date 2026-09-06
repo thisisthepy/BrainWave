@@ -51,23 +51,40 @@ def test_kernels_this_file_binds_are_actually_implemented():
         assert op in implemented, f"{op} missing; einsum's composite decomposition needs it"
 
 
-def test_torch_std_has_no_kernel_here_yet():
-    """docs/BIND2.md item 4: `torch.std` dispatches straight to
-    `aten::std.correction` upstream (measured with a `TorchDispatchMode`
-    logger, recorded in docs/BIND2.md) -- it is a leaf, not a composite over
-    `var`, so there is nothing in this file to bind it to. This pins that
-    absence so the day a kernel lands elsewhere, this test goes red as a
-    reminder to write the binding rather than silently staying green forever.
+def test_torch_std_landed_as_a_kernel_and_not_as_a_table_row():
+    """The inversion this test was written to demand.
+
+    `docs/BIND2.md` §4 was told `torch.std` might need only an
+    `overloads.json` row, checked instead of assuming, and found it dispatches
+    straight to `aten::std.correction` as a **leaf** -- not a composite over
+    `var`, and not reachable through `linalg_vector_norm`, which subtracts no
+    mean. So it sized a kernel and left it, and wrote this test to fail the
+    moment one arrived. `docs/VOICE3.md` wrote it in the same batch.
+
+    What is asserted now is the thing that made it a kernel question rather
+    than a binding one: **`std` is not `var().sqrt()`**. VOICE3 measured that
+    upstream roots the wide accumulator *before* the single narrowing, so the
+    two differ by one ulp in 53 of 288 dtype/shape combinations. A shim that
+    had answered this with a table row over `var` would agree here and be
+    wrong there, which is exactly what "leaf, not composite" means in
+    arithmetic rather than in dispatch.
     """
-    implemented = set(_C._aten_implemented())
-    assert "aten.std.correction" not in implemented, (
-        "aten.std.correction now exists -- torch.std's binding is a sized, "
-        "written-up work item in docs/BIND2.md §4; go land it"
-    )
-    assert "aten.var.correction" not in implemented, (
-        "aten.var.correction now exists -- see docs/BIND2.md §4"
+    import math
+
+    assert "aten.std.correction" in set(_C._aten_implemented()), (
+        "std's kernel is gone -- docs/BIND2.md §4 sized it and docs/VOICE3.md "
+        "landed it"
     )
 
+    # n = 2 is where Bessel's correction is loudest: the default correction is
+    # 1, not 0, so the divisor is 1 and not 2.
+    x = _C._tensor_from_flat([1.0, 3.0], [2])
+    got = float(_C._aten_dispatch("aten.std.default", x))
+    assert abs(got - math.sqrt(2.0)) < 1e-6, got          # not sqrt(1.0) = 1.0
+
+    # And the biased spelling, which a correction of 0 gives.
+    got0 = float(_C._aten_dispatch("aten.std.correction", x, None, 0, False))
+    assert abs(got0 - 1.0) < 1e-6, got0
 
 def _flatten(x):
     if isinstance(x, list):

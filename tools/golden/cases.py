@@ -27968,7 +27968,855 @@ def eye_m_cases(torch_module, c_module, torch_call) -> list[Case]:
     return _eye_cases(torch_module, c_module, torch_call, "aten.eye.m", True)
 
 
+
+# --- docs/VOICE3.md: the seven walls -----------------------------------------
+#
+# `diag` (rwkv), `_unique2` (vilt), `im2col` (llama4), `col2im` (f5-tts),
+# `kaiser_window` + `i0` (bigvgan), `upsample_nearest1d` and `var` (voice).
+#
+# What each set of cases is *for*, since the shapes below otherwise look
+# arbitrary:
+#
+#   i0                  swept, not spot-checked. Two Chebyshev approximations
+#                       meet at x == 8 and agree in the middle of each
+#                       interval, so the cases walk both intervals and the
+#                       junction. Compared BIT-EXACTLY: upstream's float
+#                       kernel answers i0(0) = 0.99999994, and an f64-and-
+#                       narrow implementation answers 1.0 -- a difference the
+#                       default float32 tolerance absorbs completely.
+#   var                 at n = 2. The default correction is 1, and the wrong
+#                       default scales by n/(n-1) -- 0.1% at n = 1000 and a
+#                       factor of two at n = 2.
+#   col2im              with stride < kernel, always. A non-overlapping case
+#                       cannot tell a summing implementation from an
+#                       overwriting one.
+#   im2col              on a MULTI-channel input. A one-channel image cannot
+#                       tell the channel-slowest folded layout from its
+#                       transpose.
+#   upsample_nearest1d  with an explicit `scales` that DISAGREES with
+#                       `output_size`. The argument is inverted, not used
+#                       directly, and every call F.interpolate makes hides it.
+#   diag                on both a 1-D and a 2-D receiver, and with an offset
+#                       that walks off the matrix (an empty answer, not an
+#                       error).
+
+_I0_SWEEP_LOW = [round(i * 0.05, 4) for i in range(0, 161)]          # [0, 8]
+_I0_SWEEP_HIGH = [round(8.0 + i * 0.25, 4) for i in range(0, 161)]   # [8, 48]
+_I0_EDGES = [0.0, 1e-8, 7.999, 8.0, 8.001, -1.0, -8.0, -30.0,
+             float("nan"), float("inf"), float("-inf")]
+
+
+def i0_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.i0.default"
+    cases: list[Case] = []
+    # **Bit-exact, and swept.** See the note above: the tolerance the default
+    # pipeline would use for float32 is ~1e-6 relative, and the difference
+    # between reproducing upstream's float coefficients and computing in f64
+    # is 4.8e-7 at worst -- inside that tolerance, and a different function.
+    for dtype_name in ("float64", "float32"):
+        for flat, note in (
+            (_I0_SWEEP_LOW, "the [0, 8] Chebyshev interval, swept"),
+            (_I0_SWEEP_HIGH, "the [8, inf) interval, swept"),
+            (_I0_EDGES, "the junction, both signs, NaN and the infinities"),
+        ):
+            a_t, a_c = _t1(torch_module, c_module, flat, (len(flat),), dtype_name)
+            cases.append(
+                Case(
+                    name=f"i0(dtype={dtype_name}, n={len(flat)}) [{note}]",
+                    op=op,
+                    run_torch=lambda a_t=a_t: torch_call(a_t),
+                    run_c=lambda a_c=a_c: c_module._aten_dispatch(op, a_c),
+                    value_check=_bit_exact,
+                    note=note + " -- bit-exact, because f64-and-narrow is inside tolerance",
+                )
+            )
+    # The reduced floats upcast to float and narrow once, which is upstream's
+    # own `calc_i0(c10::Half a) { return calc_i0(float(a)); }`.
+    for dtype_name in ("float16", "bfloat16"):
+        a_t, a_c = _t1(torch_module, c_module, [0.0, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 12.0],
+                       (8,), dtype_name)
+        cases.append(
+            Case(
+                name=f"i0(dtype={dtype_name}) [computed at float, narrowed once]",
+                op=op,
+                run_torch=lambda a_t=a_t: torch_call(a_t),
+                run_c=lambda a_c=a_c: c_module._aten_dispatch(op, a_c),
+                value_check=_bit_exact,
+            )
+        )
+    # Integral and boolean COMPUTE, at the default float. Measured -- this is
+    # not an op that refuses them.
+    for dtype_name in ("int64", "int32", "uint8", "bool"):
+        a_t, a_c = _t1(torch_module, c_module, [0, 1], (2,), dtype_name)
+        cases.append(
+            Case(
+                name=f"i0(dtype={dtype_name}) [promotes to the default float]",
+                op=op,
+                run_torch=lambda a_t=a_t: torch_call(a_t),
+                run_c=lambda a_c=a_c: c_module._aten_dispatch(op, a_c),
+                note="upstream computes here; refusing would be a lie",
+            )
+        )
+    return cases
+
+
+_KAISER_DTYPES = ["float64", "float32", "float16", "bfloat16"]
+_KAISER_LENGTHS = [0, 1, 2, 3, 4, 5, 7, 12, 16, 64]
+
+
+def _kaiser_cases(op, arity):
+    """`arity` is how many of `(window_length, periodic, beta)` the overload
+    takes. One body for the three overloads, because upstream has one."""
+
+    def build(torch_module, c_module, torch_call) -> list[Case]:
+        cases: list[Case] = []
+        for length in _KAISER_LENGTHS:
+            periodics = [True] if arity == 1 else [True, False]
+            for periodic in periodics:
+                args = (length,) if arity == 1 else (length, periodic)
+                if arity == 3:
+                    args = args + (12.0,)
+                cases.append(
+                    Case(
+                        name=f"kaiser_window{args}",
+                        op=op,
+                        run_torch=lambda a=args: torch_call(*a),
+                        run_c=lambda a=args: c_module._aten_dispatch(op, *a),
+                        value_check=_bit_exact,
+                        note="length 0 is empty and length 1 is [1.0]; neither is an error",
+                    )
+                )
+        if arity == 3:
+            # `beta` is the whole point of this overload. `beta=0` makes the
+            # window all ones (i0(0)/i0(0)), which is an answer and not a
+            # degenerate case.
+            for beta in (0.0, 0.5, 1.0, 5.0, 9.0, 14.0, 38.0):
+                for periodic in (True, False):
+                    cases.append(
+                        Case(
+                            name=f"kaiser_window(16, {periodic}, beta={beta})",
+                            op=op,
+                            run_torch=lambda b=beta, p=periodic: torch_call(16, p, b),
+                            run_c=lambda b=beta, p=periodic: c_module._aten_dispatch(
+                                op, 16, p, b
+                            ),
+                            value_check=_bit_exact,
+                            note="beta=0 is all ones -- the check that the denominator is i0(beta)",
+                        )
+                    )
+        for dtype_name in _KAISER_DTYPES:
+            args = (12,) if arity == 1 else (12, True)
+            if arity == 3:
+                args = args + (9.0,)
+            cases.append(
+                Case(
+                    name=f"kaiser_window{args}, dtype={dtype_name})",
+                    op=op,
+                    run_torch=lambda a=args, d=dtype_name: torch_call(
+                        *a, dtype=getattr(torch_module, d)
+                    ),
+                    run_c=lambda a=args, d=dtype_name: c_module._aten_dispatch(
+                        op, *a, dtype=getattr(c_module, d)
+                    ),
+                    value_check=_bit_exact,
+                    note="f16/bf16 compute at float and narrow ONCE, upstream's own upcast",
+                )
+            )
+        bad = (-1,) if arity == 1 else (-1, True)
+        if arity == 3:
+            bad = bad + (12.0,)
+        cases.append(
+            Case(
+                name=f"kaiser_window{bad} [negative length, rejected]",
+                op=op,
+                run_torch=lambda a=bad: torch_call(*a),
+                run_c=lambda a=bad: c_module._aten_dispatch(op, *a),
+                expect="both_error",
+                note="upstream: 'kaiser_window requires non-negative window_length'",
+            )
+        )
+        good = (4,) if arity == 1 else (4, True)
+        if arity == 3:
+            good = good + (12.0,)
+        cases.append(
+            Case(
+                name=f"kaiser_window{good}, dtype=int64) [rejected]",
+                op=op,
+                run_torch=lambda a=good: torch_call(*a, dtype=torch_module.int64),
+                run_c=lambda a=good: c_module._aten_dispatch(op, *a, dtype=c_module.int64),
+                expect="both_error",
+                note="upstream: 'kaiser_window expects floating point dtypes'",
+            )
+        )
+        return cases
+
+    return build
+
+
+kaiser_window_default_cases = _kaiser_cases("aten.kaiser_window.default", 1)
+kaiser_window_periodic_cases = _kaiser_cases("aten.kaiser_window.periodic", 2)
+kaiser_window_beta_cases = _kaiser_cases("aten.kaiser_window.beta", 3)
+
+
+def diag_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.diag.default"
+    cases: list[Case] = []
+    # BOTH operations. A 1-D receiver builds, a 2-D receiver extracts, and
+    # `rwkv` only ever takes the second branch -- so the first is here to keep
+    # a caller-shaped implementation from passing.
+    for shape, note in (((3, 4), "wide"), ((4, 3), "tall"), ((3, 3), "square")):
+        n = shape[0] * shape[1]
+        for offset in (-6, -3, -1, 0, 1, 2, 5):
+            for dtype_name in ("float32", "float64", "int64"):
+                flat = (list(range(n)) if dtype_name == "int64"
+                        else [float(v) for v in range(n)])
+                a_t, a_c = _t1(torch_module, c_module, flat, shape, dtype_name)
+                cases.append(
+                    Case(
+                        name=f"diag(2-D {shape} {dtype_name}, diagonal={offset}) [{note}, extract]",
+                        op=op,
+                        run_torch=lambda a_t=a_t, o=offset: torch_call(a_t, o),
+                        run_c=lambda a_c=a_c, o=offset: c_module._aten_dispatch(op, a_c, o),
+                        note="an offset off the matrix gives an EMPTY answer, not an error",
+                    )
+                )
+    for offset in (-4, -2, -1, 0, 1, 3):
+        for dtype_name in ("float32", "float64", "int64", "bool"):
+            flat = [1, 0, 3] if dtype_name == "bool" else [1.0, 2.0, 3.0]
+            a_t, a_c = _t1(torch_module, c_module, flat, (3,), dtype_name)
+            cases.append(
+                Case(
+                    name=f"diag(1-D {dtype_name}, diagonal={offset}) [build]",
+                    op=op,
+                    run_torch=lambda a_t=a_t, o=offset: torch_call(a_t, o),
+                    run_c=lambda a_c=a_c, o=offset: c_module._aten_dispatch(op, a_c, o),
+                    note="a non-zero offset makes the matrix BIGGER: diag([1,2,3], -2) is 5x5",
+                )
+            )
+    e_t, e_c = _t1(torch_module, c_module, [], (0,), "float32")
+    cases.append(
+        Case(
+            name="diag(empty 1-D) [0x0]",
+            op=op,
+            run_torch=lambda: torch_call(e_t, 0),
+            run_c=lambda: c_module._aten_dispatch(op, e_c, 0),
+        )
+    )
+    for shape, label in (((2, 2, 2), "3-D"), ((), "0-D")):
+        n = 8 if shape else 1
+        b_t, b_c = _t1(torch_module, c_module, [0.0] * n, shape, "float32")
+        cases.append(
+            Case(
+                name=f"diag({label} self) [rejected]",
+                op=op,
+                run_torch=lambda b_t=b_t: torch_call(b_t, 0),
+                run_c=lambda b_c=b_c: c_module._aten_dispatch(op, b_c, 0),
+                expect="both_error",
+                note="upstream: 'diag(): Supports 1D or 2D tensors.'",
+            )
+        )
+    return cases
+
+
+_VAR_SIX = [1.0, 2.0, 4.0, 8.0, 16.0, 32.0]
+_VAR_TWENTY_FOUR = [float(v) * 0.5 for v in range(24)]
+
+
+def _var_cases(op, spelling):
+    """`spelling` turns a `(dim, correction, keepdim)` triple into the
+    positional/keyword form this overload takes."""
+
+    def build(torch_module, c_module, torch_call) -> list[Case]:
+        cases: list[Case] = []
+        # **n = 2 first.** The default correction is 1, and this is the shape
+        # where getting that wrong is a factor of two rather than a rounding
+        # difference.
+        for dtype_name in ("float32", "float64"):
+            t_t, t_c = _t1(torch_module, c_module, [1.0, 3.0], (2,), dtype_name)
+            for dim, correction, keepdim, note in (
+                (None, None, False, "the DEFAULT correction -- 2.0, not 1.0"),
+                (None, 0, False, "correction=0 -- 1.0"),
+                (None, 1, False, "correction=1 explicitly"),
+            ):
+                spelled = spelling(dim, correction, keepdim)
+                if spelled is None:
+                    continue
+                args_t, kw_t = spelled
+                cases.append(
+                    Case(
+                        name=(f"{op.split('.')[1]}(n=2, {dtype_name}, dim={dim}, "
+                              f"correction={correction}) [{note}]"),
+                        op=op,
+                        run_torch=lambda t=t_t, a=args_t, k=kw_t: torch_call(t, *a, **k),
+                        run_c=lambda t=t_c, a=args_t, k=kw_t: c_module._aten_dispatch(
+                            op, t, *a, **k
+                        ),
+                        note=note,
+                    )
+                )
+        for dtype_name in ("float32", "float64", "float16", "bfloat16"):
+            a_t, a_c = _t1(torch_module, c_module, _VAR_SIX, (2, 3), dtype_name)
+            for dim, correction, keepdim in (
+                (None, None, False),
+                (None, 0, False),
+                (None, 2, False),
+                (0, None, False),
+                (1, None, False),
+                (-1, None, False),
+                (0, 0, True),
+                ([0, 1], None, False),
+                ([], None, False),
+            ):
+                spelled = spelling(dim, correction, keepdim)
+                if spelled is None:
+                    continue
+                args, kw = spelled
+                cases.append(
+                    Case(
+                        name=(f"{op.split('.')[1]}(2x3, {dtype_name}, dim={dim}, "
+                              f"correction={correction}, keepdim={keepdim})"),
+                        op=op,
+                        run_torch=lambda t=a_t, a=args, k=kw: torch_call(t, *a, **k),
+                        run_c=lambda t=a_c, a=args, k=kw: c_module._aten_dispatch(
+                            op, t, *a, **k
+                        ),
+                    )
+                )
+        c_t, c_c = _t1(torch_module, c_module, _VAR_TWENTY_FOUR, (2, 3, 4), "float32")
+        for dim, correction, keepdim in (
+            (1, None, False), ([0, 2], None, False), ([0, 2], 0, True), (2, 3, False),
+        ):
+            spelled = spelling(dim, correction, keepdim)
+            if spelled is None:
+                continue
+            args, kw = spelled
+            cases.append(
+                Case(
+                    name=(f"{op.split('.')[1]}(2x3x4, dim={dim}, "
+                          f"correction={correction}, keepdim={keepdim})"),
+                    op=op,
+                    run_torch=lambda t=c_t, a=args, k=kw: torch_call(t, *a, **k),
+                    run_c=lambda t=c_c, a=args, k=kw: c_module._aten_dispatch(op, t, *a, **k),
+                )
+            )
+        # A non-positive denominator is NaN, not a signed zero: `0.0 / -1.0`
+        # is `-0.0`, which compares equal to `0.0`.
+        # **The clamp, `max(0, n - correction)`.** The first two rows have
+        # `m2 == 0` and answer `nan`; the last three have `m2 > 0` and answer
+        # `inf`. An implementation that returns `nan` for every non-positive
+        # denominator passes the first two and fails the last three, which is
+        # exactly the bug a first draft of this kernel had.
+        for flat, shape, dim, correction, note in (
+            ([3.0], (), None, None, "n - correction == 0, m2 == 0 -> nan"),
+            ([], (0,), None, None, "n - correction == -1, m2 == 0 -> nan"),
+            ([1.0, 3.0], (2,), None, 2, "n - correction == 0, m2 > 0 -> inf"),
+            ([1.0, 3.0], (2,), None, 3, "n - correction == -1, m2 > 0 -> inf"),
+            ([2.0, 2.0], (2,), None, 2, "n - correction == 0, m2 == 0 -> nan"),
+        ):
+            d_t, d_c = _t1(torch_module, c_module, flat, shape, "float32")
+            spelled = spelling(dim, correction, False)
+            if spelled is None:
+                continue
+            args, kw = spelled
+            cases.append(
+                Case(
+                    name=f"{op.split('.')[1]}({shape}, correction={correction}) [{note}]",
+                    op=op,
+                    run_torch=lambda t=d_t, a=args, k=kw: torch_call(t, *a, **k),
+                    run_c=lambda t=d_c, a=args, k=kw: c_module._aten_dispatch(op, t, *a, **k),
+                    note=note + " -- nan, not -0.0",
+                )
+            )
+        for dtype_name in ("int64", "int32", "bool"):
+            i_t, i_c = _t1(torch_module, c_module, [1, 2, 3, 4], (4,), dtype_name)
+            spelled = spelling(None, None, False)
+            if spelled is None:
+                continue
+            args, kw = spelled
+            cases.append(
+                Case(
+                    name=f"{op.split('.')[1]}(dtype={dtype_name}) [rejected]",
+                    op=op,
+                    run_torch=lambda t=i_t, a=args, k=kw: torch_call(t, *a, **k),
+                    run_c=lambda t=i_c, a=args, k=kw: c_module._aten_dispatch(op, t, *a, **k),
+                    expect="both_error",
+                    note="'std and var only support floating point and complex dtypes'",
+                )
+            )
+        return cases
+
+    return build
+
+
+def _var_dim_spelling(dim, correction, keepdim):
+    """`var.dim(self, dim, unbiased, keepdim)`."""
+    if correction not in (None, 0, 1):
+        return None
+    return ((dim, correction in (None, 1), keepdim), {})
+
+
+def _var_correction_spelling(dim, correction, keepdim):
+    """`var.correction(self, dim, *, correction, keepdim)`."""
+    return ((dim,), {"correction": correction, "keepdim": keepdim})
+
+
+def _bare_cases(op, label):
+    """`var(self, unbiased)` / `std(self, unbiased)` -- the overload with no
+    `dim` at all, so most of the shared table above is unrepresentable for it
+    and it gets its own body."""
+
+    def build(torch_module, c_module, torch_call) -> list[Case]:
+        return _bare_cases_body(op, label, torch_module, c_module, torch_call)
+
+    return build
+
+
+def _bare_cases_body(op, label, torch_module, c_module, torch_call) -> list[Case]:
+    cases: list[Case] = []
+    for dtype_name in ("float32", "float64", "float16", "bfloat16"):
+        for flat, shape in ((_VAR_SIX, (2, 3)), ([1.0, 3.0], (2,)),
+                            (_VAR_TWENTY_FOUR, (2, 3, 4))):
+            for unbiased in (True, False):
+                a_t, a_c = _t1(torch_module, c_module, flat, shape, dtype_name)
+                cases.append(
+                    Case(
+                        name=f"{label}({shape}, {dtype_name}, unbiased={unbiased})",
+                        op=op,
+                        run_torch=lambda t=a_t, u=unbiased: torch_call(t, u),
+                        run_c=lambda t=a_c, u=unbiased: c_module._aten_dispatch(op, t, u),
+                        note="unbiased=True is correction=1, the default -- 2.0 at n=2, not 1.0",
+                    )
+                )
+    for flat, shape, note in (([3.0], (), "n - 1 == 0"), ([], (0,), "n - 1 == -1")):
+        d_t, d_c = _t1(torch_module, c_module, flat, shape, "float32")
+        cases.append(
+            Case(
+                name=f"{label}({shape}) [{note} -> nan]",
+                op=op,
+                run_torch=lambda t=d_t: torch_call(t, True),
+                run_c=lambda t=d_c: c_module._aten_dispatch(op, t, True),
+                note="nan, not the -0.0 that 0.0 / -1.0 gives",
+            )
+        )
+    for dtype_name in ("int64", "bool"):
+        i_t, i_c = _t1(torch_module, c_module, [1, 0, 1, 1], (4,), dtype_name)
+        cases.append(
+            Case(
+                name=f"{label}(dtype={dtype_name}) [rejected]",
+                op=op,
+                run_torch=lambda t=i_t: torch_call(t, True),
+                run_c=lambda t=i_c: c_module._aten_dispatch(op, t, True),
+                expect="both_error",
+            )
+        )
+    return cases
+
+
+# The two overloads that take a `dim`, driven by one table. `var.default` has
+# its own builder above because it takes no `dim` at all, so most of the table
+# is unrepresentable for it and a shared driver would be mostly `continue`.
+var_default_cases = _bare_cases("aten.var.default", "var")
+var_dim_cases = _var_cases("aten.var.dim", _var_dim_spelling)
+var_correction_cases = _var_cases("aten.var.correction", _var_correction_spelling)
+
+# `std` shares every one of these bodies, which is the point: it shares
+# `var_reduce` in the kernel too. What it does NOT share is the exit -- the
+# square root is taken in the f64 accumulator, before the single narrowing,
+# and `torch.std(x)` is therefore not bit-equal to `torch.var(x).sqrt()`
+# (measured: 53 of 288 combinations differ by one ULP at float32). That is a
+# claim about *upstream* and lives in `pytests/test_voice3.py`; here it is
+# enough that both ops are compared against upstream separately.
+std_default_cases = _bare_cases("aten.std.default", "std")
+std_dim_cases = _var_cases("aten.std.dim", _var_dim_spelling)
+std_correction_cases = _var_cases("aten.std.correction", _var_correction_spelling)
+
+
+def _unique2_check(t_res, c_res) -> tuple[bool, str]:
+    """`(values, inverse_indices, counts)`.
+
+    Compared as three tensors rather than through the default pipeline, which
+    cannot read a tuple -- and the *shapes* carry as much of the contract as
+    the values: `inverse_indices` has the INPUT's shape, and the tensors that
+    were not asked for come back empty rather than absent.
+    """
+    labels = ("values", "inverse_indices", "counts")
+    try:
+        t_parts = tuple(t_res[i] for i in range(3))
+        c_parts = tuple(c_res[i] for i in range(3))
+    except (TypeError, IndexError, KeyError) as e:
+        return False, f"expected a 3-element result on both sides: {e!r}"
+    for label, t_part, c_part in zip(labels, t_parts, c_parts):
+        t_dtype, c_dtype = dt.dtype_name(t_part.dtype), dt.dtype_name(c_part.dtype)
+        if t_dtype != c_dtype:
+            return False, f"{label} dtype mismatch: torch={t_dtype} c={c_dtype}"
+        t_shape = tuple(int(x) for x in t_part.shape)
+        c_shape = tuple(int(x) for x in c_part.shape)
+        if t_shape != c_shape:
+            return False, f"{label} shape mismatch: torch={t_shape} c={c_shape}"
+        t_flat = _flatten_values(t_part.tolist())
+        c_flat = _flatten_values(c_part.tolist())
+        for i, (x, y) in enumerate(zip(t_flat, c_flat)):
+            xf, yf = float(x), float(y)
+            if math.isnan(xf) or math.isnan(yf):
+                if math.isnan(xf) and math.isnan(yf):
+                    continue
+                return False, f"{label}[{i}]: torch={x!r} c={y!r} (NaN on one side only)"
+            if xf != yf:
+                return False, f"{label}[{i}] mismatch: torch={x!r} c={y!r}"
+    return True, (
+        "values/inverse_indices/counts matched, shapes "
+        f"{[tuple(int(v) for v in p.shape) for p in t_parts]}"
+    )
+
+
+def unique2_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten._unique2.default"
+    cases: list[Case] = []
+    for flat, shape, dtype_name, note in (
+        ([3, 1, 2, 1, 3, 3], (6,), "int64", "vilt's shape: repeats, unsorted"),
+        ([3, 1, 2, 1], (2, 2), "int64", "2-D -- the inverse keeps THIS shape"),
+        ([3.0, 1.0, 2.0, 1.0], (2, 2), "float32", "2-D float"),
+        ([0, -1, 5, -1, 0], (5,), "int64", "negatives sort before zero"),
+        ([2.5, -0.5, 2.5, 7.0], (4,), "float64", "float64"),
+        ([1, 0, 1], (3,), "bool", "bool -- False then True"),
+        ([7], (), "int64", "0-D: the inverse is 0-D too"),
+        ([], (0,), "int64", "empty"),
+        ([5, 5, 5, 5], (4,), "int32", "one distinct value"),
+        # NaN is never equal to itself, so BOTH survive and they sort last.
+        ([float("nan"), 1.0, float("nan"), 0.0], (4,), "float32",
+         "two NaNs, two values -- four uniques from four elements"),
+    ):
+        a_t, a_c = _t1(torch_module, c_module, flat, shape, dtype_name)
+        for sorted_flag in (True, False):
+            for return_inverse in (False, True):
+                for return_counts in (False, True):
+                    cases.append(
+                        Case(
+                            name=(f"_unique2({dtype_name}{shape}, sorted={sorted_flag}, "
+                                  f"return_inverse={return_inverse}, "
+                                  f"return_counts={return_counts}) [{note}]"),
+                            op=op,
+                            run_torch=lambda t=a_t, s=sorted_flag, ri=return_inverse,
+                            rc=return_counts: torch_call(t, s, ri, rc),
+                            run_c=lambda t=a_c, s=sorted_flag, ri=return_inverse,
+                            rc=return_counts: c_module._aten_dispatch(op, t, s, ri, rc),
+                            value_check=_unique2_check,
+                            note=note + " -- sorted=False still sorts on CPU",
+                        )
+                    )
+    return cases
+
+
+_IM2COL_IMAGE = [float(v) for v in range(1, 17)]
+_IM2COL_MULTI = [float(v) for v in range(24)]
+
+
+def im2col_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.im2col.default"
+    cases: list[Case] = []
+    for dtype_name in ("float32", "float64", "float16", "bfloat16"):
+        for kernel, dilation, padding, stride, note in (
+            ([2, 2], [1, 1], [0, 0], [1, 1], "overlapping, stride 1"),
+            ([2, 2], [1, 1], [0, 0], [2, 2], "non-overlapping"),
+            ([2, 2], [2, 2], [0, 0], [1, 1], "dilated"),
+            ([3, 3], [1, 1], [1, 1], [1, 1], "padded -- the pad is ZERO, not edge"),
+            ([3, 2], [1, 1], [1, 0], [2, 1], "asymmetric everything"),
+            ([4, 4], [1, 1], [0, 0], [1, 1], "kernel == image"),
+        ):
+            a_t, a_c = _t1(torch_module, c_module, _IM2COL_IMAGE, (1, 1, 4, 4), dtype_name)
+            cases.append(
+                Case(
+                    name=(f"im2col({dtype_name}, k={kernel}, d={dilation}, "
+                          f"p={padding}, s={stride}) [{note}]"),
+                    op=op,
+                    run_torch=lambda t=a_t, k=kernel, d=dilation, p=padding, s=stride:
+                        torch_call(t, k, d, p, s),
+                    run_c=lambda t=a_c, k=kernel, d=dilation, p=padding, s=stride:
+                        c_module._aten_dispatch(op, t, k, d, p, s),
+                    note=note,
+                )
+            )
+    # **The multi-channel case is the only one that can see the layout.** A
+    # 1-channel image gives the same shape and the same numbers whether the
+    # channel or the kernel position is the slower axis of the folded
+    # dimension.
+    m_t, m_c = _t1(torch_module, c_module, _IM2COL_MULTI, (1, 2, 3, 4), "float32")
+    cases.append(
+        Case(
+            name="im2col(2 channels) [channel is the SLOWEST folded axis]",
+            op=op,
+            run_torch=lambda: torch_call(m_t, [2, 2], [1, 1], [0, 0], [1, 1]),
+            run_c=lambda: c_module._aten_dispatch(op, m_c, [2, 2], [1, 1], [0, 0], [1, 1]),
+            note="a 1-channel image cannot distinguish this from the transpose",
+        )
+    )
+    b_t, b_c = _t1(torch_module, c_module, [float(v) for v in range(48)],
+                   (2, 2, 3, 4), "float32")
+    cases.append(
+        Case(
+            name="im2col(batch 2, 2 channels)",
+            op=op,
+            run_torch=lambda: torch_call(b_t, [2, 2], [1, 1], [0, 0], [1, 1]),
+            run_c=lambda: c_module._aten_dispatch(op, b_c, [2, 2], [1, 1], [0, 0], [1, 1]),
+        )
+    )
+    u_t, u_c = _t1(torch_module, c_module, _IM2COL_IMAGE, (1, 4, 4), "float32")
+    cases.append(
+        Case(
+            name="im2col(3-D self) [unbatched, answers 2-D]",
+            op=op,
+            run_torch=lambda: torch_call(u_t, [2, 2], [1, 1], [0, 0], [1, 1]),
+            run_c=lambda: c_module._aten_dispatch(op, u_c, [2, 2], [1, 1], [0, 0], [1, 1]),
+            note="F.unfold's no-batch-dim path arrives here",
+        )
+    )
+    # **`bool` computes and the integral dtypes do not**, which is backwards
+    # from most of this file and was measured rather than inferred.
+    o_t, o_c = _t1(torch_module, c_module, [1, 0, 1, 1] * 4, (1, 1, 4, 4), "bool")
+    cases.append(
+        Case(
+            name="im2col(bool) [computes -- measured, not inferred]",
+            op=op,
+            run_torch=lambda: torch_call(o_t, [2, 2], [1, 1], [0, 0], [1, 1]),
+            run_c=lambda: c_module._aten_dispatch(op, o_c, [2, 2], [1, 1], [0, 0], [1, 1]),
+        )
+    )
+    for dtype_name in ("int64", "int32", "uint8"):
+        i_t, i_c = _t1(torch_module, c_module, list(range(16)), (1, 1, 4, 4), dtype_name)
+        cases.append(
+            Case(
+                name=f"im2col(dtype={dtype_name}) [rejected]",
+                op=op,
+                run_torch=lambda t=i_t: torch_call(t, [2, 2], [1, 1], [0, 0], [1, 1]),
+                run_c=lambda t=i_c: c_module._aten_dispatch(
+                    op, t, [2, 2], [1, 1], [0, 0], [1, 1]),
+                expect="both_error",
+                note='upstream: \'"im2col_out_cpu" not implemented\'',
+            )
+        )
+    k_t, k_c = _t1(torch_module, c_module, _IM2COL_IMAGE, (1, 1, 4, 4), "float32")
+    cases.append(
+        Case(
+            name="im2col(kernel larger than the image) [rejected]",
+            op=op,
+            run_torch=lambda: torch_call(k_t, [5, 5], [1, 1], [0, 0], [1, 1]),
+            run_c=lambda: c_module._aten_dispatch(op, k_c, [5, 5], [1, 1], [0, 0], [1, 1]),
+            expect="both_error",
+            note="'calculated shape of the array of sliding blocks as (0, 0)'",
+        )
+    )
+    r_t, r_c = _t1(torch_module, c_module, [1.0, 2.0, 3.0, 4.0], (4,), "float32")
+    cases.append(
+        Case(
+            name="im2col(1-D self) [rejected]",
+            op=op,
+            run_torch=lambda: torch_call(r_t, [2, 2], [1, 1], [0, 0], [1, 1]),
+            run_c=lambda: c_module._aten_dispatch(op, r_c, [2, 2], [1, 1], [0, 0], [1, 1]),
+            expect="both_error",
+        )
+    )
+    return cases
+
+
+def col2im_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.col2im.default"
+    cases: list[Case] = []
+    ones9 = [1.0] * 36
+    ramp9 = [float(v) for v in range(36)]
+    # **Every case here uses stride < kernel.** A non-overlapping stride
+    # cannot tell a summing implementation from an overwriting one -- the
+    # single `stride == kernel` case below is kept only for the contrast.
+    for dtype_name in ("float32", "float64", "float16", "bfloat16"):
+        for flat, note in ((ones9, "all ones -- the answer IS the cover count"),
+                           (ramp9, "a ramp, so the sum order is visible too")):
+            a_t, a_c = _t1(torch_module, c_module, flat, (1, 4, 9), dtype_name)
+            cases.append(
+                Case(
+                    name=f"col2im({dtype_name}, 4x4 <- 4x9, k=2, s=1) [{note}]",
+                    op=op,
+                    run_torch=lambda t=a_t: torch_call(t, [4, 4], [2, 2], [1, 1], [0, 0], [1, 1]),
+                    run_c=lambda t=a_c: c_module._aten_dispatch(
+                        op, t, [4, 4], [2, 2], [1, 1], [0, 0], [1, 1]),
+                    note=note + " -- OVERLAPS SUM",
+                )
+            )
+    n_t, n_c = _t1(torch_module, c_module, [1.0] * 16, (1, 4, 4), "float32")
+    cases.append(
+        Case(
+            name="col2im(stride == kernel) [the case that CANNOT see the sum]",
+            op=op,
+            run_torch=lambda: torch_call(n_t, [4, 4], [2, 2], [1, 1], [0, 0], [2, 2]),
+            run_c=lambda: c_module._aten_dispatch(
+                op, n_c, [4, 4], [2, 2], [1, 1], [0, 0], [2, 2]),
+            note="all ones on both a summing and an overwriting implementation",
+        )
+    )
+    for flat, shape, output_size, kernel, dilation, padding, stride, note in (
+        ([float(v) for v in range(48)], (1, 8, 6), [3, 4], [2, 2], [1, 1], [0, 0], [1, 1],
+         "2 channels"),
+        ([float(v) for v in range(72)], (2, 4, 9), [4, 4], [2, 2], [1, 1], [0, 0], [1, 1],
+         "batch 2"),
+        ([1.0] * 36, (4, 9), [4, 4], [2, 2], [1, 1], [0, 0], [1, 1],
+         "2-D self -- unbatched, answers 3-D"),
+        ([1.0] * 36, (1, 4, 9), [2, 2], [2, 2], [1, 1], [1, 1], [1, 1], "padded"),
+        ([float(v) for v in range(16)], (1, 4, 4), [4, 4], [2, 2], [2, 2], [0, 0], [1, 1],
+         "dilated, still overlapping"),
+        ([float(v) for v in range(3 * 24)], (1, 12, 6), [3, 4], [2, 2], [1, 1], [0, 0], [1, 1],
+         "3 channels"),
+    ):
+        a_t, a_c = _t1(torch_module, c_module, flat, shape, "float32")
+        cases.append(
+            Case(
+                name=f"col2im({shape} -> {output_size}, k={kernel}, s={stride}) [{note}]",
+                op=op,
+                run_torch=lambda t=a_t, o=output_size, k=kernel, d=dilation, p=padding,
+                s=stride: torch_call(t, o, k, d, p, s),
+                run_c=lambda t=a_c, o=output_size, k=kernel, d=dilation, p=padding,
+                s=stride: c_module._aten_dispatch(op, t, o, k, d, p, s),
+                note=note,
+            )
+        )
+    for flat, shape, note in (
+        ([1.0] * 32, (1, 4, 8), "the block count does not match output_size"),
+        ([1.0] * 45, (1, 5, 9), "dimension 1 is not divisible by kernel_size"),
+    ):
+        b_t, b_c = _t1(torch_module, c_module, flat, shape, "float32")
+        cases.append(
+            Case(
+                name=f"col2im({shape}) [rejected -- {note}]",
+                op=op,
+                run_torch=lambda t=b_t: torch_call(t, [4, 4], [2, 2], [1, 1], [0, 0], [1, 1]),
+                run_c=lambda t=b_c: c_module._aten_dispatch(
+                    op, t, [4, 4], [2, 2], [1, 1], [0, 0], [1, 1]),
+                expect="both_error",
+                note=note,
+            )
+        )
+    for dtype_name in ("int64", "int32", "uint8"):
+        i_t, i_c = _t1(torch_module, c_module, [1] * 36, (1, 4, 9), dtype_name)
+        cases.append(
+            Case(
+                name=f"col2im(dtype={dtype_name}) [rejected]",
+                op=op,
+                run_torch=lambda t=i_t: torch_call(t, [4, 4], [2, 2], [1, 1], [0, 0], [1, 1]),
+                run_c=lambda t=i_c: c_module._aten_dispatch(
+                    op, t, [4, 4], [2, 2], [1, 1], [0, 0], [1, 1]),
+                expect="both_error",
+                note='upstream: \'"col2im_out_cpu" not implemented\'',
+            )
+        )
+    return cases
+
+
+def upsample_nearest1d_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.upsample_nearest1d.default"
+    cases: list[Case] = []
+    four = [0.0, 1.0, 2.0, 3.0]
+    for dtype_name in ("float32", "float64", "float16", "bfloat16"):
+        for out_w, note in (
+            (1, "down to a single sample"),
+            (2, "downsample by 2"),
+            (3, "a non-integer ratio, 4/3"),
+            (4, "identity"),
+            (7, "a non-integer ratio up"),
+            (8, "upsample by 2"),
+            (11, "a longer non-integer ratio"),
+        ):
+            a_t, a_c = _t1(torch_module, c_module, four, (1, 1, 4), dtype_name)
+            cases.append(
+                Case(
+                    name=f"upsample_nearest1d({dtype_name}, out={out_w}) [{note}]",
+                    op=op,
+                    run_torch=lambda t=a_t, w=out_w: torch_call(t, [w]),
+                    run_c=lambda t=a_c, w=out_w: c_module._aten_dispatch(op, t, [w]),
+                    note=note,
+                )
+            )
+    # THE case: an explicit `scales` that disagrees with `output_size`. The
+    # argument is INVERTED, not used directly.
+    for scale, out_w, note in (
+        (2.0, 8, "explicit scale that agrees"),
+        (1.5, 3, "explicit scale that DISAGREES -- gathers [0,0,1], not [0,1,2]"),
+        (0.5, 2, "a downsampling scale"),
+        (3.0, 12, "a larger scale"),
+        (4.0 / 3.0, 3, "the scale that reproduces the size-derived one"),
+    ):
+        a_t, a_c = _t1(torch_module, c_module, four, (1, 1, 4), "float32")
+        cases.append(
+            Case(
+                name=f"upsample_nearest1d(out={out_w}, scales={scale}) [{note}]",
+                op=op,
+                run_torch=lambda t=a_t, w=out_w, s=scale: torch_call(t, [w], s),
+                run_c=lambda t=a_c, w=out_w, s=scale: c_module._aten_dispatch(op, t, [w], s),
+                note=note,
+            )
+        )
+    l_t, l_c = _t1(torch_module, c_module, [float(v) for v in range(30)], (2, 3, 5), "float32")
+    cases.append(
+        Case(
+            name="upsample_nearest1d((2,3,5) -> 8) [batch and channels]",
+            op=op,
+            run_torch=lambda: torch_call(l_t, [8]),
+            run_c=lambda: c_module._aten_dispatch(op, l_c, [8]),
+        )
+    )
+    # `uint8` computes -- a gather never averages, so there is no rounding for
+    # a fixed-point kernel to do differently.
+    for out_w in (3, 7, 8):
+        u_t, u_c = _t1(torch_module, c_module, [0, 1, 2, 3], (1, 1, 4), "uint8")
+        cases.append(
+            Case(
+                name=f"upsample_nearest1d(uint8, out={out_w}) [a gather, so uint8 computes]",
+                op=op,
+                run_torch=lambda t=u_t, w=out_w: torch_call(t, [w]),
+                run_c=lambda t=u_c, w=out_w: c_module._aten_dispatch(op, t, [w]),
+            )
+        )
+    # ...and `bool` does NOT, which is where this op's dtype set differs from
+    # `upsample_nearest2d`'s and why it could not be an alias of it.
+    for dtype_name in ("int64", "int32", "bool"):
+        i_t, i_c = _t1(torch_module, c_module, [0, 1, 1, 0], (1, 1, 4), dtype_name)
+        cases.append(
+            Case(
+                name=f"upsample_nearest1d(dtype={dtype_name}) [no kernel upstream]",
+                op=op,
+                run_torch=lambda t=i_t: torch_call(t, [7]),
+                run_c=lambda t=i_c: c_module._aten_dispatch(op, t, [7]),
+                expect="both_error",
+                note='"compute_indices_weights_nearest" not implemented for this dtype',
+            )
+        )
+    r_t, r_c = _t1(torch_module, c_module, [float(v) for v in range(16)],
+                   (1, 1, 4, 4), "float32")
+    cases.append(
+        Case(
+            name="upsample_nearest1d(4-D self) [rejected -- expects rank 3]",
+            op=op,
+            run_torch=lambda: torch_call(r_t, [8]),
+            run_c=lambda: c_module._aten_dispatch(op, r_c, [8]),
+            expect="both_error",
+            note="'It is expected input_size equals to 3'",
+        )
+    )
+    return cases
+
+
 CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
+    "aten.i0.default": i0_cases,
+    "aten.kaiser_window.default": kaiser_window_default_cases,
+    "aten.kaiser_window.periodic": kaiser_window_periodic_cases,
+    "aten.kaiser_window.beta": kaiser_window_beta_cases,
+    "aten.diag.default": diag_cases,
+    "aten.var.default": var_default_cases,
+    "aten.var.dim": var_dim_cases,
+    "aten.var.correction": var_correction_cases,
+    "aten.std.default": std_default_cases,
+    "aten.std.dim": std_dim_cases,
+    "aten.std.correction": std_correction_cases,
+    "aten._unique2.default": unique2_cases,
+    "aten.im2col.default": im2col_cases,
+    "aten.col2im.default": col2im_cases,
+    "aten.upsample_nearest1d.default": upsample_nearest1d_cases,
     "aten.adaptive_avg_pool2d.default": adaptive_avg_pool2d_cases,
     "aten.where.ScalarSelf": where_scalar_self_cases,
     "aten.greater.Scalar": greater_scalar_cases,
