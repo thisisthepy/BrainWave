@@ -609,7 +609,18 @@ fn shim_same_device(left: PyDevice, right: PyDevice) -> bool {
 /// `aten.rs` holding a readback marker is either a kernel on this list, one of
 /// the six helpers, or on a named exemption list -- so a new readback anywhere
 /// in the file has to be classified by a human before the suite goes green.
-pub const MPS_HOST_READBACK_OPS: [&str; 71] = [
+///
+/// **Four ops left this list by being rewritten, not by being excused**
+/// (docs/MPSFWD.md §3): `aten.neg.default` and `prims.neg.default` are now
+/// `0 - x` in `int64` on the device instead of a `to_vec1` and `wrapping_neg`
+/// in Rust; `aten.pow.Tensor_Scalar` is `widen_f64` + candle's `powf` (the
+/// same `f64::powf` the host loop called) with squaring-by-multiplication on
+/// the integral path; `aten.cumsum.default` is `n - 1` narrow/add pairs in the
+/// loop's own order. Each of those is a SmolLM2 forward's path -- `rotate_half`,
+/// RMSNorm's `x.pow(2)` and the attention mask -- and none of them is a
+/// widening of this gate: the scan re-derives the list from the kernels and
+/// would put them straight back if the readback were still there.
+pub const MPS_HOST_READBACK_OPS: [&str; 67] = [
     "aten._grouped_mm.default",
     "aten._log_softmax.default",
     "aten._safe_softmax.default",
@@ -630,7 +641,6 @@ pub const MPS_HOST_READBACK_OPS: [&str; 71] = [
     "aten.bitwise_xor.Tensor",
     "aten.bucketize.Scalar",
     "aten.bucketize.Tensor",
-    "aten.cumsum.default",
     "aten.div.Scalar_mode",
     "aten.div.Tensor_mode",
     "aten.erfinv.default",
@@ -661,12 +671,10 @@ pub const MPS_HOST_READBACK_OPS: [&str; 71] = [
     "aten.min.other",
     "aten.multinomial.default",
     "aten.native_dropout.default",
-    "aten.neg.default",
     "aten.nll_loss_forward.default",
     "aten.nonzero.default",
     "aten.one_hot.default",
     "aten.pow.Scalar",
-    "aten.pow.Tensor_Scalar",
     "aten.pow.Tensor_Tensor",
     "aten.prod.default",
     "aten.prod.dim_int",
@@ -680,11 +688,10 @@ pub const MPS_HOST_READBACK_OPS: [&str; 71] = [
     "aten.upsample_bilinear2d.default",
     "aten.upsample_nearest2d.default",
     "aten.where.default",
-    "prims.neg.default",
 ];
 
 /// The two ops that read device bytes back and are **not** refused, with the
-/// reason each is different in kind from the fifty-four above.
+/// reason each is different in kind from the sixty-seven above.
 ///
 /// The scan finds these too, so leaving them out of `MPS_HOST_READBACK_OPS`
 /// without saying why would look like an oversight rather than a decision.
@@ -719,7 +726,7 @@ pub fn is_metal(device: &Device) -> bool {
 ///
 /// Called from the single door in `aten.rs` for exactly the dispatches whose
 /// tensor arguments live on Metal, so a CPU dispatch pays nothing at all and
-/// an mps dispatch pays one scan of a 54-entry static table of `&'static str`.
+/// an mps dispatch pays one scan of a 67-entry static table of `&'static str`.
 ///
 /// The refusal is `NotImplementedError` and not `RuntimeError`, matching what
 /// this shim raises for an op it does not implement on a device -- because

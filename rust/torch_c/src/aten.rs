@@ -3774,8 +3774,7 @@ fn scale_by_alpha(
     if acc == storage {
         return operand.affine(alpha, 0.0).map_err(|e| candle_err(op, e));
     }
-    let narrowed = Tensor::full(alpha, (), operand.device())
-        .and_then(|t| t.fast_to(storage))
+    let narrowed = host_const(alpha, &[storage], &Device::Cpu)
         .and_then(|t| widen_f64(&t))
         .and_then(|t| t.to_scalar::<f64>())
         .map_err(|e| candle_err(op, e))?;
@@ -4282,8 +4281,7 @@ fn addmm_scale(
         if k == 1 {
             return Ok(tensor.clone());
         }
-        let scale = Tensor::full(k, (), tensor.device())
-            .and_then(|t| t.fast_to(storage))
+        let scale = host_const(k, &[storage], tensor.device())
             .map_err(|e| candle_err(op, e))?;
         tensor.broadcast_mul(&scale).map_err(|e| candle_err(op, e))
     } else {
@@ -4871,7 +4869,7 @@ fn sdpa_flash_cpu(
             // assignments happen. That is the whole difference between this
             // and the rejected change above, and it is why the prefill digests
             // hold at every length docs/SEQLEN.md §1.3 pins.
-            .and_then(|kt| crate::tensor::transposed_contiguous(&kt))
+            .and_then(|kt| contiguous_blocked(&kt))
             .and_then(|kt| q.matmul(&kt))
             .map_err(|e| candle_err(OP, e))?;
 
@@ -4890,7 +4888,7 @@ fn sdpa_flash_cpu(
         // infinity into a NaN. docs/SEQLEN.md §8.3.
         let mut scores = if is_causal {
             // Upper-left aligned, per the measurement above.
-            crate::tensor::scale_and_causal_mask(&raw, scale).map_err(|e| candle_err(OP, e))?
+            scale_and_causal_mask_anywhere(&raw, scale).map_err(|e| candle_err(OP, e))?
         } else {
             raw.affine(scale, 0.0).map_err(|e| candle_err(OP, e))?
         };
@@ -4914,7 +4912,7 @@ fn sdpa_flash_cpu(
         // docs/SEQLEN.md §7. The two agree bit for bit on every input this line
         // can produce -- §7.2 has the argument, and it is an argument rather
         // than a tolerance.
-        let row_max = crate::tensor::amax_keepdim(&scores, 3).map_err(|e| candle_err(OP, e))?;
+        let row_max = amax_keepdim_anywhere(&scores, 3).map_err(|e| candle_err(OP, e))?;
         let weights = scores
             .broadcast_sub(&row_max)
             .and_then(|s| s.exp())
@@ -5742,7 +5740,6 @@ fn pow_tensor_scalar(
     if let Some(t) = pow_square_fast_path(OP, base.tensor()?, exponent, tag)? {
         return finish(py, t, tag);
     }
-    let bases = side_from_tensor(OP, base.tensor()?, tag)?;
     // `side_from_scalar` narrows a float exponent into `tag` before the `f64`
     // `powf` call, on the theory (its own doc comment) that upstream narrows
     // the scalar into the dispatched `scalar_t` first. That theory holds for
@@ -5757,22 +5754,75 @@ fn pow_tensor_scalar(
     // precision here, and only the final result is narrowed (`pow_from_pairs`
     // already narrows via `fast_to(storage)`). `float64` is unaffected either
     // way since narrowing to `float64` is a no-op.
-    let exponents = if tag == TorchDType::Float32 && !exponent.is_int() {
-        PowSide::Floats(vec![exponent.as_f64()])
-    } else {
-        side_from_scalar(&exponent, tag)
-    };
-    pow_from_pairs(
-        py,
-        OP,
-        bases,
-        exponents,
-        shape,
-        tag,
-        base.tensor()?.device(),
+    // **Everything below stays on the device.** It used to be
+    // `side_from_tensor` -> `Vec<f64>` -> `powf` in Rust -> `from_vec`, which
+    // is why `aten.pow.Tensor_Scalar` was refused on `mps` -- and RMSNorm's
+    // `hidden_states.pow(2)` is the reason a SmolLM2 forward could not start
+    // (docs/MPSFWD.md §3). The two paths below compute the same values the
+    // host loop did, in the same dtype and the same order.
+    let _ = &shape;
+    let source = base.tensor()?;
+    if tag.is_floating_point() {
+        // `widen_f64` then candle's `powf` is *the same call*: candle's `F64`
+        // arm is `unary_map(|v| v.powf(e))`, i.e. `f64::powf`, which is what
+        // `pow_from_pairs` ran on the host. So the CPU answer is unchanged bit
+        // for bit, and `float64` accumulation is not quietly dropped to
+        // `float32` on a device that cannot do it -- Metal has no `f64`, so a
+        // non-square exponent raises there rather than computing at a
+        // precision the CPU would not have used. Refusing loudly on the
+        // device is the same choice docs/MPS.md made at the door.
+        let e = if tag == TorchDType::Float32 && !exponent.is_int() {
+            exponent.as_f64()
+        } else {
+            float_narrower(tag)(exponent.as_f64())
+        };
+        let storage = PyDtype::new(tag).storage(OP)?;
+        let out = widen_f64(source)
+            .and_then(|t| t.powf(e))
+            .and_then(|t| t.fast_to(storage))
+            .map_err(|err| candle_err(OP, err))?;
+        return finish(py, out, tag);
+    }
+    // The integral path is `powi` by squaring, in `int64`, on the device.
+    // Identical to `powi`'s `wrapping_pow`: both are the same sequence of
+    // wrapping `int64` multiplications, and `wrapping_pow`'s own `u32` cap is
+    // reproduced so an absurd exponent behaves the same rather than looping.
+    let e = exponent.as_i64();
+    if e < 0 {
         // The one overload where upstream refuses a negative integer exponent.
-        NegativeIntExponent::Refuse,
-    )
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "Integers to negative integer powers are not allowed.",
+        ));
+    }
+    let storage = PyDtype::new(tag).storage(OP)?;
+    let source = source
+        .fast_to(candle_core::DType::I64)
+        .map_err(|err| candle_err(OP, err))?;
+    let mut acc: Option<Tensor> = None;
+    let mut square = source.clone();
+    let mut bits = e.min(u32::MAX as i64) as u32;
+    while bits > 0 {
+        if bits & 1 == 1 {
+            acc = Some(match acc {
+                None => square.clone(),
+                Some(a) => a.mul(&square).map_err(|err| candle_err(OP, err))?,
+            });
+        }
+        bits >>= 1;
+        if bits > 0 {
+            square = square.mul(&square).map_err(|err| candle_err(OP, err))?;
+        }
+    }
+    let out = match acc {
+        // `x ** 0` is one everywhere, `wrapping_pow(0)` included.
+        None => host_const(1i64, &[], source.device())
+            .and_then(|t| t.broadcast_as(source.shape()))
+            .and_then(|t| t.contiguous()),
+        Some(a) => Ok(a),
+    }
+    .and_then(|t| t.fast_to(storage))
+    .map_err(|err| candle_err(OP, err))?;
+    finish(py, out, tag)
 }
 
 fn pow_scalar(
@@ -7145,8 +7195,124 @@ fn div_scalar_reduced_float(
         return Ok(None);
     }
     let inv = 1.0f32 / (scalar as f32);
-    let right = Tensor::full(inv, (), left.device()).map_err(|e| candle_err(op, e))?;
+    let right = host_const(inv, &[], left.device()).map_err(|e| candle_err(op, e))?;
     Ok(Some(apply_arith(op, Arith::Mul, left, &right)?))
+}
+
+/// `crate::tensor::amax_keepdim`, except on Metal.
+///
+/// The third `cpu_fwd`-only `CustomOp1` on SDPA's path (docs/MPSFWD.md §2).
+/// `amax` exists because candle's `max_keepdim` also computes an argmax and
+/// measured 57x slower than upstream's `amax` at this shape -- 24.3% of a
+/// `float32` prefill (docs/SEQLEN.md §7). That is a *speed* argument, and the
+/// two are documented to agree **bit for bit on every input this line can
+/// produce** (§7.2, an argument rather than a tolerance), so falling back to
+/// the reduction candle does have on Metal changes nothing but the time.
+fn amax_keepdim_anywhere(t: &Tensor, dim: usize) -> candle_core::Result<Tensor> {
+    if crate::device::is_metal(t.device()) {
+        return t.max_keepdim(dim);
+    }
+    crate::tensor::amax_keepdim(t, dim)
+}
+
+/// `crate::tensor::scale_and_causal_mask`, except on Metal.
+///
+/// Same shape of problem as `contiguous_blocked` above: the fused pass is a
+/// `CustomOp1` with only a `cpu_fwd`, so an `mps` score matrix gets
+/// `no metal implementation for torch._C shim: scale + causal mask`. That was
+/// the second thing a SmolLM2 forward hit inside SDPA (docs/MPSFWD.md §2).
+///
+/// The fallback is **the two-op spelling the fused pass was measured against**,
+/// not an approximation of it: `affine(scale, 0.0)` and then a `broadcast_add`
+/// of an upper-left-aligned `-inf` mask. `tensor.rs::scale_and_mask_rows` is
+/// documented as bit-for-bit that spelling, including the `+ 0.0` that turns a
+/// negative-zero product positive and the `+ -inf` that turns a `+inf` product
+/// into a NaN -- which is why the mask is *added* here and not assigned.
+///
+/// The fused pass exists because the two-op form was three passes over
+/// `[batch, head, S, S]` plus a rebuilt mask, measured at 5.68 ms of a 21.2 ms
+/// call (docs/SEQLEN.md §8.3). That cost is a CPU measurement and it is the
+/// price paid here for the op existing at all on the device.
+fn scale_and_causal_mask_anywhere(raw: &Tensor, scale: f64) -> candle_core::Result<Tensor> {
+    if !crate::device::is_metal(raw.device()) {
+        return crate::tensor::scale_and_causal_mask(raw, scale);
+    }
+    let dims = raw.dims();
+    if dims.len() < 2 {
+        candle_core::bail!(
+            "torch._C shim: a causal mask needs a rank-2 or deeper score matrix, got rank {}",
+            dims.len()
+        );
+    }
+    let (rows, cols) = (dims[dims.len() - 2], dims[dims.len() - 1]);
+    let mut mask = Vec::with_capacity(rows * cols);
+    for r in 0..rows {
+        // Upper-left aligned: column `c` survives when `c <= r`, exactly the
+        // alignment `scale_and_mask_rows` uses.
+        let keep = (r + 1).min(cols);
+        mask.extend(std::iter::repeat(0f64).take(keep));
+        mask.extend(std::iter::repeat(f64::NEG_INFINITY).take(cols - keep));
+    }
+    // Built on the host and uploaded, for `host_const`'s reason: Metal has no
+    // `f64`, and this is a constant rather than anything read off the device.
+    let mask = Tensor::from_vec(mask, (rows, cols), &Device::Cpu)?
+        .fast_to(raw.dtype())?
+        .to_device(raw.device())?;
+    raw.affine(scale, 0.0)?.broadcast_add(&mask)
+}
+
+/// `crate::tensor::transposed_contiguous`, except on Metal.
+///
+/// The blocked transposed copy is a `CustomOp1` with a `cpu_fwd` and nothing
+/// else, so candle answers `no metal implementation for torch._C shim:
+/// transposed copy` for an `mps` tensor -- which is where a SmolLM2 forward
+/// stopped once the refused kernels were off its path, inside SDPA's
+/// `k.transpose(2, 3)` (docs/MPSFWD.md §2).
+///
+/// Falling back to candle's own `contiguous` there is safe for the reason
+/// `transposed_contiguous` gives for its *other* fallback: the blocked copy is
+/// bit-identical to `contiguous` by construction -- every output element is a
+/// copy of exactly one input element, so there is nothing to reassociate. The
+/// blocking is a cache-traversal order and nothing else, and it was measured
+/// on the CPU; a Metal buffer is not that machine.
+fn contiguous_blocked(t: &Tensor) -> candle_core::Result<Tensor> {
+    if crate::device::is_metal(t.device()) {
+        return t.contiguous();
+    }
+    crate::tensor::transposed_contiguous(t)
+}
+
+/// A constant, built on the host and then moved to `device`.
+///
+/// `Tensor::full(v, shape, device)` asks the **device** to materialise the
+/// fill. Metal has no `f64` at all, so every float kernel that builds its
+/// scalar operand the obvious way dies at the first one with
+/// `candle: unsupported const-set f64` -- which is where a SmolLM2 forward on
+/// `mps` stopped, in `mul.Scalar` inside the rotary embedding
+/// (docs/MPSFWD.md §2).
+///
+/// `steps` are the dtype conversions applied **on the host**, in order, before
+/// the move; the call sites pass exactly the ones they used to apply after the
+/// `full`, so the arithmetic is unchanged value for value on every device.
+///
+/// This is not a host readback and must not be read as one: nothing of any
+/// dispatched tensor travels. The value is a constant this crate just made up
+/// from a Python scalar, and it travels host -> device, which is the direction
+/// `.to(device)` already goes.
+fn host_const<T: candle_core::WithDType>(
+    value: T,
+    steps: &[candle_core::DType],
+    device: &Device,
+) -> candle_core::Result<Tensor> {
+    let mut t = Tensor::full(value, (), &Device::Cpu)?;
+    for step in steps {
+        t = t.fast_to(*step)?;
+    }
+    if matches!(device, Device::Cpu) {
+        Ok(t)
+    } else {
+        t.to_device(device)
+    }
 }
 
 fn arith_scalar(
@@ -7194,11 +7360,11 @@ fn arith_scalar(
     // upstream separates them (docs/TRAIN.md §5, S4).
     let widen_scalar = matches!(kind, Arith::Mul | Arith::Div);
     let right = if storage.is_int() {
-        Tensor::full(other.as_i64() * (alpha as i64), (), left.device()).and_then(|t| t.fast_to(acc))
+        host_const(other.as_i64() * (alpha as i64), &[acc], left.device())
     } else if widen_scalar {
         // Built at `acc` and never at `storage`: `fast_to(acc)` on an `f64`
         // fill is exactly `opmath_t(scalar)`, the `float` upstream reads.
-        Tensor::full(other.as_f64() * alpha, (), left.device()).and_then(|t| t.fast_to(acc))
+        host_const(other.as_f64() * alpha, &[acc], left.device())
     } else {
         // Narrowed to `storage` and widened back, not built at `acc`: torch's
         // promotion makes a python float beside a `bfloat16` tensor a
@@ -7222,9 +7388,7 @@ fn arith_scalar(
         // prefill digest moves.
         let narrow = float_narrower(tag);
         let scaled = narrow(narrow(other.as_f64()) * narrow(alpha));
-        Tensor::full(scaled, (), left.device())
-            .and_then(|t| t.fast_to(storage))
-            .and_then(|t| t.fast_to(acc))
+        host_const(scaled, &[storage, acc], left.device())
     }
     .map_err(|e| candle_err(op, e))?;
     let computed = match kind {
@@ -7267,11 +7431,9 @@ fn rsub_scalar(
     let alpha = alpha_arg(OP, args, kwargs)?;
     let right = scale_by_alpha(OP, &right, alpha, storage)?;
     let left = if storage.is_int() {
-        Tensor::full(other.as_i64(), (), right.device()).and_then(|t| t.fast_to(acc))
+        host_const(other.as_i64(), &[acc], right.device())
     } else {
-        Tensor::full(other.as_f64(), (), right.device())
-            .and_then(|t| t.fast_to(storage))
-            .and_then(|t| t.fast_to(acc))
+        host_const(other.as_f64(), &[storage, acc], right.device())
     }
     .map_err(|e| candle_err(OP, e))?;
     let out = apply_arith(OP, Arith::Sub, &left, &right)?
@@ -7439,9 +7601,9 @@ fn compare_scalar(
     let floating = lhs.tag().is_floating_point() || !other.is_int();
     let left = compare_common(op, lhs.tensor()?, floating, lhs.tag())?;
     let right = if floating {
-        Tensor::full(other.as_f64(), (), left.device())
+        host_const(other.as_f64(), &[], left.device())
     } else {
-        Tensor::full(wrap_unsigned_scalar(other.as_i64(), lhs.tag()), (), left.device())
+        host_const(wrap_unsigned_scalar(other.as_i64(), lhs.tag()), &[], left.device())
     }
     .map_err(|e| candle_err(op, e))?;
     finish(py, apply_cmp(op, kind, &left, &right)?, TorchDType::Bool)
@@ -8173,21 +8335,29 @@ fn neg_default(
         return finish(py, out, tag);
     }
 
-    let dims = input.tensor()?.dims().to_vec();
-    let values: Vec<i64> = input
+    // The integral path is `0 - x` in `int64`, on whatever device the tensor
+    // is already on, and not candle's `neg`: candle's `neg` is a `unary_op!`
+    // whose integer arms are `todo!()`, which panics and takes the interpreter
+    // down rather than raising.
+    //
+    // **It used to be a host round trip** -- `to_vec1::<i64>()`, `wrapping_neg`
+    // in Rust, `from_vec` back -- which is why `aten.neg.default` and
+    // `prims.neg.default` were refused on `mps`, and a Llama forward reaches
+    // it twice per layer in `rotate_half` (docs/MPSFWD.md §3). `0 - x` is the
+    // same wrap: `0i64.wrapping_sub(i64::MIN)` is `i64::MIN`, exactly what
+    // `wrapping_neg` gives, and candle's `sub` is Rust's `-` on `i64`, which
+    // wraps in a release build the same way. The subtraction happens in
+    // `int64` and narrows afterwards, which is where the narrower widths get
+    // their own wrap -- unchanged from the round trip it replaces.
+    let source = input
         .tensor()?
-        .contiguous()
-        .and_then(|t| t.flatten_all())
-        .and_then(|t| t.to_dtype(candle_core::DType::I64))
-        .and_then(|t| t.to_vec1::<i64>())
+        .fast_to(candle_core::DType::I64)
         .map_err(|e| candle_err(OP, e))?;
-    let out = Tensor::from_vec(
-        values.into_iter().map(|v| v.wrapping_neg()).collect::<Vec<i64>>(),
-        dims,
-        input.tensor()?.device(),
-    )
-    .and_then(|t| t.fast_to(storage))
-    .map_err(|e| candle_err(OP, e))?;
+    let zero = host_const(0i64, &[], source.device()).map_err(|e| candle_err(OP, e))?;
+    let out = zero
+        .broadcast_sub(&source)
+        .and_then(|t| t.fast_to(storage))
+        .map_err(|e| candle_err(OP, e))?;
     finish(py, out, tag)
 }
 
@@ -9055,48 +9225,49 @@ fn cumsum_default(
     // once at the end, so this is the same shape of computation with a wider
     // accumulator: it can differ from torch in the last bit of a long
     // `bfloat16` run, in the more-accurate direction. docs/TENSORBASE.md.
+    // **The running sum is a device tensor, not a `Vec`.** It used to be
+    // `to_vec1` -> a scalar loop -> `from_vec`, which put `aten.cumsum.default`
+    // on the `mps` refusal list; a Llama forward reaches it building the
+    // attention mask (docs/MPSFWD.md §3). The rewrite is the shape
+    // docs/VOICE.md used for `cumprod`: `n - 1` narrow/add pairs that never
+    // leave the device.
+    //
+    // The *order* is the loop's order, not a parallel scan's: slice `i` is
+    // `running + x[i]`, exactly `flat[i] += flat[i-1]`, so the float result is
+    // bit-identical to the host loop it replaces rather than merely close. It
+    // costs `n` kernel launches instead of one pass, which is the price of the
+    // op staying on the device it was asked for.
     let dims = input.tensor()?.dims().to_vec();
     let n = dims[dim];
-    let inner: usize = dims[dim + 1..].iter().product();
-    let outer: usize = dims[..dim].iter().product();
-
-    let out = if storage.is_int() {
-        let mut flat: Vec<i64> = input
-            .tensor()?
-            .flatten_all()
-            .and_then(|t| t.to_dtype(candle_core::DType::I64))
-            .and_then(|t| t.to_vec1::<i64>())
-            .map_err(|e| candle_err(OP, e))?;
-        for o in 0..outer {
-            for k in 0..inner {
-                let base = o * n * inner + k;
-                for i in 1..n {
-                    // Wrapping, like torch's integer kernels.
-                    flat[base + i * inner] =
-                        flat[base + i * inner].wrapping_add(flat[base + (i - 1) * inner]);
-                }
-            }
-        }
-        Tensor::from_vec(flat, dims, input.tensor()?.device())
+    let acc = if storage.is_int() {
+        candle_core::DType::I64
     } else {
-        let mut flat: Vec<f64> = input
-            .tensor()?
-            .flatten_all()
-            .and_then(|t| widen_f64(&t))
-            .and_then(|t| t.to_vec1::<f64>())
-            .map_err(|e| candle_err(OP, e))?;
-        for o in 0..outer {
-            for k in 0..inner {
-                let base = o * n * inner + k;
-                for i in 1..n {
-                    flat[base + i * inner] += flat[base + (i - 1) * inner];
-                }
-            }
-        }
-        Tensor::from_vec(flat, dims, input.tensor()?.device())
+        candle_core::DType::F64
+    };
+    let source = if acc == candle_core::DType::F64 {
+        widen_f64(input.tensor()?)
+    } else {
+        input.tensor()?.to_dtype(acc)
     }
-    .and_then(|t| t.fast_to(storage))
     .map_err(|e| candle_err(OP, e))?;
+    let out = if n == 0 {
+        source.fast_to(storage).map_err(|e| candle_err(OP, e))?
+    } else {
+        let mut running = source.narrow(dim, 0, 1).map_err(|e| candle_err(OP, e))?;
+        let mut parts: Vec<Tensor> = Vec::with_capacity(n);
+        parts.push(running.clone());
+        for i in 1..n {
+            let next = source.narrow(dim, i, 1).map_err(|e| candle_err(OP, e))?;
+            // Wrapping on the integral path, like torch's integer kernels:
+            // candle's `add` is Rust's `+` on `i64`, which wraps in a release
+            // build exactly as `wrapping_add` did here.
+            running = running.add(&next).map_err(|e| candle_err(OP, e))?;
+            parts.push(running.clone());
+        }
+        Tensor::cat(&parts, dim)
+            .and_then(|t| t.fast_to(storage))
+            .map_err(|e| candle_err(OP, e))?
+    };
     finish(py, out, tag)
 }
 
@@ -9492,7 +9663,7 @@ fn amax_default(
     dims.dedup();
     let mut out = input.tensor()?.clone();
     for &dim in dims.iter() {
-        out = crate::tensor::amax_keepdim(&out, dim).map_err(|e| candle_err(OP, e))?;
+        out = amax_keepdim_anywhere(&out, dim).map_err(|e| candle_err(OP, e))?;
     }
     if !keepdim {
         for &dim in dims.iter().rev() {
@@ -9977,6 +10148,21 @@ fn extremum_dim(
 /// also give. Recorded because it reads like an accident and is upstream's
 /// documented behaviour.
 fn any_from(op: &str, source: &Tensor) -> PyResult<Tensor> {
+    // The widening is for the *float* dtypes and only for them: `widen_f64`
+    // routes `float8`/`bfloat16` through a comparison candle can do, and NaN
+    // has to compare unequal to zero, which it does at every width.
+    //
+    // An integral or `bool` input is compared in its own dtype instead. That
+    // is the same answer -- `x != 0` does not depend on the width it is asked
+    // in -- and it is the difference between `aten.all.default` working on
+    // `mps` and dying at `Metal contiguous to_dtype U8 F64 not implemented`,
+    // which is where a SmolLM2 forward's mask stopped (docs/MPSFWD.md §2).
+    // The scalar `0` costs nothing on the device either: candle converts a
+    // scalar operand on the host and uploads it (`cmp!`'s `to_dtype` then
+    // `to_device`).
+    if source.dtype().is_int() {
+        return source.ne(0f64).map_err(|e| candle_err(op, e));
+    }
     widen_f64(source)
         .and_then(|t| t.ne(0f64))
         .map_err(|e| candle_err(op, e))
@@ -12303,7 +12489,7 @@ fn contiguous_default(
     //
     // Bit-identical by construction: every output element is a copy of one
     // input element. docs/KERNELS26.md §7.
-    let out = crate::tensor::transposed_contiguous(input.tensor()?)
+    let out = contiguous_blocked(input.tensor()?)
         .map_err(|e| candle_err(OP, e))?;
     finish(py, out, input.tag())
 }
@@ -12663,12 +12849,23 @@ fn to_copy_default(
     let device = label.resolve()?;
 
     if tag == TorchDType::Bool {
-        let out = input
+        // `x != 0`, and the widening is for the float dtypes only -- for the
+        // same reason `any_from` stopped widening: Metal has no `U8 -> F64`,
+        // so `bool_mask.to("mps")` died with `Metal contiguous to_dtype U8 F64
+        // not implemented` on a tensor that was *already* a mask
+        // (docs/MPSFWD.md §4). The answer does not depend on the width the
+        // comparison is asked in.
+        let moved = input
             .tensor()?
             .to_device(&device)
-            .and_then(|t| widen_f64(&t))
-            .and_then(|t| t.ne(0f64))
             .map_err(|e| candle_err(OP, e))?;
+        let out = if moved.dtype().is_int() {
+            moved.ne(0f64).map_err(|e| candle_err(OP, e))?
+        } else {
+            widen_f64(&moved)
+                .and_then(|t| t.ne(0f64))
+                .map_err(|e| candle_err(OP, e))?
+        };
         return finish(py, out, tag);
     }
     let storage = PyDtype::new(tag).storage(OP)?;
@@ -13641,12 +13838,9 @@ fn arith_inplace_scalar(
     // `0.30078125` there (docs/GENERATE.md §3.2). Building at `acc` would add
     // `0.3` and the in-place form would disagree with the out-of-place one.
     let rhs = if storage.is_int() {
-        Tensor::full(other.as_i64() * (alpha as i64), (), lhs.device())
-            .and_then(|t| t.fast_to(acc))
+        host_const(other.as_i64() * (alpha as i64), &[acc], lhs.device())
     } else {
-        Tensor::full(other.as_f64() * alpha, (), lhs.device())
-            .and_then(|t| t.fast_to(storage))
-            .and_then(|t| t.fast_to(acc))
+        host_const(other.as_f64() * alpha, &[storage, acc], lhs.device())
     }
     .map_err(|e| candle_err(op, e))?;
     // `div_.Scalar` takes upstream's reduced-float reciprocal path, exactly as

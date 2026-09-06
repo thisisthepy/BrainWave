@@ -56,6 +56,13 @@ aten._softmax.default (f32)  같은 형태
 같은 스캔이 `aten._softmax.default` 를 찾아냅니다. **`mps` 위의 트랜스포머는 어텐션 블록마다
 그곳을 지납니다.** §3 이 둘이라고 적은 것은 둘을 봤기 때문이지 둘뿐이어서가 아닙니다.
 
+> **정정 (docs/MPSFWD.md §1).** 굵은 글씨의 저 문장이 틀렸습니다. SmolLM2-135M 을 `mps` 에서
+> 실제로 돌려 보니 `_softmax` 는 **한 번도 불리지 않습니다** — 어텐션은
+> `F.scaled_dot_product_attention` 으로 내려가고 그 커널은 softmax 를 candle op 으로 직접
+> 씁니다. `docs/SEQLEN.md` §7.4 가 이미 그렇게 측정해 두었는데 이 문서가 그것을 읽지 않고
+> 목록에서 이름을 보고 추론했습니다. 경로에 실제로 있던 것은 `pow.Tensor_Scalar`,
+> `neg.default`, `cumsum.default` 셋이고, 셋 다 다시 쓰여 목록에서 빠졌습니다(71 → 67).
+
 ---
 
 ## 2. 가드를 떼면 무엇이 돌아오는가 — 실측
@@ -235,8 +242,10 @@ $ TORCH_C_DYLD_LIBRARY_PATH=$V VK_DRIVER_FILES=$V/libkosmickrisp_icd.json \
 * **dtype 별 정밀도.** §3.2 의 과잉 거절 — `abs`·`neg`·`pow`·`max.other` 의 부동소수 경로는
   GPU 에 남는데 거절됩니다. 이것을 여는 유일한 안전한 방법은 그 커널들이 정수 경로를
   되읽지 **않도록** 고치는 것이지, 문 앞에서 dtype 을 다시 판단하는 것이 아닙니다.
-* **`_softmax` 를 GPU 로.** 54개 중 이것 하나가 `mps` 에서 모델을 돌리는 것과 못 돌리는 것을
-  가릅니다. `read_flat`/`widen_f64` 를 지나지 않는 경로가 필요합니다.
+* ~~**`_softmax` 를 GPU 로.** 54개 중 이것 하나가 `mps` 에서 모델을 돌리는 것과 못 돌리는 것을
+  가릅니다.~~ **그렇지 않았습니다** — §1.3 의 정정을 보십시오. 모델은 이 op 을 부르지 않고,
+  `docs/MPSFWD.md` 가 실제로 가르던 셋을 옮겨 SmolLM2 를 `mps` 에서 돌렸습니다. `_softmax` 는
+  여전히 거절되고, 여전히 `read_flat`/`widen_f64` 를 지나지 않는 경로가 필요합니다.
 * **`f32 -> f64` 가 Metal 에 없다.** `widen_f64` 를 부르는 모든 것의 벽이고, `read_flat` 의
   부동소수 경로가 조용하지 않았던 이유이기도 합니다. candle 쪽 문제입니다.
 * **`mps` 의 f64 `full`** — `VULKAN3.md` §7 이 남긴 그대로입니다.
