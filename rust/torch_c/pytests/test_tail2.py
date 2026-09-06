@@ -140,7 +140,16 @@ PROBES = {
     "polar": lambda: torch.polar(torch.ones(2), torch.zeros(2)),
     "zeros_complex64": lambda: torch.zeros(2, dtype=torch.complex64),
     "empty_complex64": lambda: torch.empty(2, dtype=torch.complex64),
-    "fft_fftn": lambda: torch._C._fft.fft_fftn(torch.ones(4)),
+    # Reports the DC term, not just a shape: docs/FFT.md's `normalization` is a
+    # code rather than a `norm=` string and the same codes serve both
+    # directions, so a wrong reading scales every bin uniformly -- which a
+    # shape check cannot see. `arange(8)` sums to 28.
+    "fft_fftn": lambda: {
+        "shape": list(torch.fft.fftn(torch.arange(8.).reshape(2, 4), dim=(0, 1)).shape),
+        "dtype": str(torch.fft.fftn(torch.arange(8.).reshape(2, 4), dim=(0, 1)).dtype),
+        "dc_real": float(torch.fft.fftn(torch.arange(8.).reshape(2, 4), dim=(0, 1)).real.flatten()[0]),
+        "dc_imag": float(torch.fft.fftn(torch.arange(8.).reshape(2, 4), dim=(0, 1)).imag.flatten()[0]),
+    },
     "stft": lambda: torch.stft(torch.arange(64).float(), n_fft=16,
                                return_complex=True),
     "stft_real": lambda: torch.stft(torch.arange(64).float(), n_fft=16,
@@ -169,7 +178,12 @@ for name, fn in PROBES.items():
         # failure to run. A probe that cannot survive its own subject
         # succeeding is not a probe. Recorded as a live gap in
         # docs/COMPLEX2.md §7: `print(z)` on a complex tensor still refuses.
-        out[name] = {"ok": f"{type(r).__name__}{tuple(getattr(r, 'shape', ()))}"}
+        # A dict result is a probe that reports values on purpose; anything
+        # else gets the type-and-shape string. `repr` is deliberately not used:
+        # once `view_as_complex` began returning a tensor it reached
+        # `torch/_tensor_str.py` and refused (docs/COMPLEX2.md).
+        out[name] = {"ok": r if isinstance(r, dict)
+                     else f"{type(r).__name__}{tuple(getattr(r, 'shape', ()))}"}
 json.dump(out, sys.stdout)
 """
 
@@ -415,64 +429,43 @@ def test_view_as_complex_copies_rather_than_aliasing():
     )
 
 
-def test_stft_computes_and_fft_fftn_is_still_unspelled():
-    """The inversion `docs/FFT.md` earned, and the third inversion, of the
-    other half, that `docs/BIND4.md`/`docs/COMPLEX3.md` earned together.
+def test_stft_and_fft_fftn_both_compute_now():
+    """Inverted a fourth time, by the merge of two rounds that each did half.
 
-    This test has now been inverted three times by three different rounds,
-    and the sequence is the point. It began asserting `stft` refused at
-    `_nn.pad(mode='reflect')`, before any complex value existed --
-    `docs/COMPLEX.md`'s reason for putting reflect pad first of three. Then
-    `docs/BIND2.md` made the pad reach its kernel and the wall moved one line,
-    to `stft`'s own missing table row. Then `docs/FFT.md` implemented the
-    transform and the wall went away.
+    The sequence is the record and it is why this test was never deleted:
 
-    So the assertion follows it rather than being deleted: `stft` **computes**,
-    and what is asserted is its shape, because a transform that returns the
-    wrong number of bins is the plausible-looking failure. `onesided` gives
-    `n_fft // 2 + 1`, which is 5 for 8 -- a full-length 8 would be
-    self-consistent and wrong.
+      1. `stft` refused at `_nn.pad(mode='reflect')`, before any complex value
+         existed -- `docs/COMPLEX.md`'s reason for ordering reflect pad first.
+      2. `docs/BIND2.md` gave the pad its kernel; the wall moved one line, to
+         `stft`'s own missing table row.
+      3. `docs/FFT.md` implemented the transform; `stft` computed, and this
+         test kept asserting `fft_fftn`'s absence, which was still true.
+      4. `docs/BIND4.md` bound `_fft.fft_fftn` and `docs/COMPLEX3.md` taught
+         `_to_copy(complex64)`. **Neither alone was enough** -- BIND4 measured
+         `fnet` stopping *inside* `fft_fftn` at the `_to_copy` gate, and said
+         it should clear once the two met. It did, on this merge.
 
-    `fft_fftn` is kept in the same test, inverted for the reason its own
-    docstring asked for: `docs/BIND4.md` landed `torch._C._fft.fft_fftn` as a
-    real function (docs/COMPLEX3.md §6.2's verbatim two-line decomposition),
-    so the name no longer falls to the catch-all `_Unimplemented` and the old
-    assertion (`"fft_fftn" in msg`) would now be false -- the catch-all's
-    message names the attribute that was looked up, and this is not that path
-    any more.
-
-    What is asserted instead is narrower, and deliberately so: THIS worktree
-    was cut before the complex round's `_to_copy(dtype=complex64)` gate
-    merged (docs/BIND4.md's own hand-off note), so `fft_fftn` still refuses
-    here -- but now from *inside* the real decomposition, at the widen-to-
-    complex step, not from the name lookup. `test_bind4.py` holds the
-    positive half (the name resolves, is not the catch-all) without needing
-    that gate open; the full numeric claim (`FNetModel` forward agreeing with
-    upstream, max abs diff 7.15e-07) belongs to the merged tree, per
-    docs/COMPLEX3.md §6.1.
+    So what is asserted is the values, and specifically the DC term, because a
+    transform that returns the right shape and the wrong normalisation is the
+    plausible failure `docs/FFT.md` warned about: `normalization` is a code,
+    not a `norm=` string, and the same three codes serve both directions, so a
+    shim reading it as a string is right forward and wrong by `n` inverse.
+    `fftn` of `arange(8)` has DC equal to the sum, 28.
     """
-    r = _raised("fft_fftn")
-    if r == "skip":
+    r = _probe()
+    if r.get("skip"):
         return
-    assert r is not None, (
-        "fft_fftn computed -- the complex round's _to_copy gate has merged "
-        "here; invert this assertion to a shape/value check instead"
-    )
-    exc, msg = r
-    assert exc == "NotImplementedError", f"{exc}: {msg}"
-    assert "fft_fftn" not in msg, (
-        f"fft_fftn is back on the catch-all path (msg={msg!r}) -- the "
-        "binding in bootstrap.py's `install` (module._fft.fft_fftn) is "
-        "missing or was not reached"
-    )
-    assert "_to_copy" in msg and "complex64" in msg, (
-        f"fft_fftn refused somewhere unexpected: {msg}"
-    )
 
-    # And the half that inverted: both spellings compute now.
     for label in ("stft", "stft_real"):
-        got = _probe()[label]
-        assert "ok" in got, f"{label} still refuses: {got}"
+        assert "ok" in r[label], f"{label} refuses again: {r[label]}"
+
+    got = r["fft_fftn"]
+    assert "ok" in got, f"fft_fftn refuses again: {got}"
+    assert got["ok"]["shape"] == [2, 4], got
+    assert got["ok"]["dtype"] == "torch.complex64", got
+    # DC = sum of arange(8) = 28, and the imaginary part of DC is exactly 0.
+    assert abs(got["ok"]["dc_real"] - 28.0) < 1e-4, got
+    assert abs(got["ok"]["dc_imag"]) < 1e-6, got
 
 def _linalg_norm_value():
     """`float(linalg_norm(ones(2, 2)))` from the vendored tree, as a number.
