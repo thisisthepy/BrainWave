@@ -12773,13 +12773,23 @@ def test_pad_is_wired_for_constant_mode_and_refuses_the_other_three():
     assert _C._aten_dispatch("aten.constant_pad_nd.default", grid, [-1, 2]).tolist() == [
         [1.0, 2.0, 0.0, 0.0], [4.0, 5.0, 0.0, 0.0]
     ]
-    for mode in ("reflect", "replicate", "circular"):
-        try:
-            _C._nn.pad(_arch20_tensor([1.0, 2.0]), (1, 1), mode, 0)
-        except NotImplementedError as e:
-            assert mode in str(e), str(e)
-        else:
-            raise AssertionError(f"pad(mode={mode!r}) must refuse")
+    # docs/PAD.md §5's patch, landed in docs/BIND2.md item 3: reflect and
+    # replicate are wired now, through the same `n = len(pad) // 2` kernel
+    # selection the constant-mode assertions above exercise for
+    # `constant_pad_nd`. `_arch20_tensor([1.0, 2.0])` is rank 1, which neither
+    # `reflection_pad1d` nor `replication_pad1d` accepts (both want 2D/3D,
+    # matching upstream) -- a rank-2 tensor is the smallest one both take.
+    strip = _arch20_tensor([1.0, 2.0, 3.0, 4.0], (1, 4))
+    assert _C._nn.pad(strip, (1, 1), "reflect", 0).tolist() == [[2.0, 1.0, 2.0, 3.0, 4.0, 3.0]]
+    assert _C._nn.pad(strip, (1, 1), "replicate", 0).tolist() == [[1.0, 1.0, 2.0, 3.0, 4.0, 4.0]]
+    # Only circular remains unimplemented (a new_empty/slice/copy_ composite
+    # upstream, docs/PAD.md §3) -- refused by name, not approximated.
+    try:
+        _C._nn.pad(_arch20_tensor([1.0, 2.0]), (1, 1), "circular", 0)
+    except NotImplementedError as e:
+        assert "circular" in str(e), str(e)
+    else:
+        raise AssertionError("pad(mode='circular') must refuse")
 
 
 def test_autograd_function_apply_runs_the_forward():

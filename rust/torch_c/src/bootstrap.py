@@ -68,6 +68,7 @@ import math
 import numbers as _numbers
 import os
 import re
+import string
 import sys
 # `threading` for `_install_thread_local_store` only. Upstream's
 # `_stash_obj_in_tls` is a C++ thread-local, and a module-level dict would be a
@@ -7542,6 +7543,36 @@ def _install_nn(module, dispatch) -> None:
     def hardtanh(input, min_val=-1.0, max_val=1.0):
         return dispatch("aten.hardtanh.default", input, min_val, max_val)
 
+    def avg_pool2d(input, kernel_size, stride=None, padding=0, ceil_mode=False,
+                   count_include_pad=True, divisor_override=None):
+        """`torch._C._nn.avg_pool2d` -- `efficientnet`'s wall (docs/TAIL3.md
+        §7, docs/BIND2.md item 1).
+
+        `torch/nn/modules/pooling.py:779` (`nn.AvgPool2d.forward`) calls
+        `F.avg_pool2d`, which binds straight to this name with the leaf
+        schema's own seven arguments -- unlike `upsample_bilinear2d`/
+        `upsample_bicubic2d` a few lines up, there is no separate `.vec`
+        overload here to pick between (docs/BINDINGS.md's `upsample_nearest2d`
+        warning: measure the signature against upstream, not against a
+        neighbour). Measured: `torch._C._nn.avg_pool2d.__doc__` on 2.13.0
+        gives exactly `avg_pool2d(input, kernel_size, stride=None, padding=0,
+        ceil_mode=False, count_include_pad=True, divisor_override=None)`,
+        which is `aten::avg_pool2d`'s own seven parameters in order.
+
+        `aten.avg_pool2d.default` has been implemented and golden-compared
+        since `sew_d` (docs/TAIL3.md §7) -- confirmed again here in
+        `_aten_implemented()` before writing this binding, the check
+        docs/BINDINGS.md's `mish` miss says to make. It already treats a
+        `None`/empty `stride` as "the kernel size" itself (measured with a
+        `TorchDispatchMode` logger: `F.avg_pool2d(x, 2)` fires
+        `aten.avg_pool2d.default(x, [2, 2])` with no third argument at all),
+        so `stride=None` is forwarded through rather than defaulted here.
+        """
+        return dispatch(
+            "aten.avg_pool2d.default", input, kernel_size, stride, padding,
+            ceil_mode, count_include_pad, divisor_override,
+        )
+
 
 
     def one_hot(tensor, num_classes=-1):
@@ -7556,27 +7587,59 @@ def _install_nn(module, dispatch) -> None:
         is being *built*, not during a forward.
 
         `torch/nn/functional.py:5823` hands all four arguments through, and
-        upstream's binding then picks an aten op by `mode`. Only the constant
-        mode is wired: measured with a `TorchDispatchMode` logger,
-        `F.pad(x, (0, 3), "constant", 0)` produces exactly one record,
-        `aten.constant_pad_nd.default`. The other three modes are genuinely
-        different kernels (`reflection_pad{1,2,3}d`, `replication_pad*`, and a
-        `circular` path built out of `cat`), and they are refused by name
-        rather than approximated with the constant one -- a wrong padding is
-        the kind of divergence that shows up as a slightly wrong number rather
-        than as an error.
+        upstream's binding then picks an aten op by `mode`. Measured with a
+        `TorchDispatchMode` logger, `F.pad(x, (0, 3), "constant", 0)` produces
+        exactly one record, `aten.constant_pad_nd.default`; `F.pad(x, (0, 3),
+        "reflect")` and `"replicate"` likewise produce exactly one record
+        each, `aten.reflection_pad{n}d.default`/`aten.replication_pad{n}d
+        .default` with `n = len(pad) // 2` -- not derived from the input's
+        rank, because upstream itself refuses combinations that do not line
+        up with the rank *inside* the kernel, and deriving `n` from the rank
+        here would accept combinations upstream rejects (docs/PAD.md §5).
+        `circular` is a genuinely different kernel, a `new_empty`/`slice`/
+        `copy_` composite built out of `cat` rather than one of these leaves,
+        and is refused by name rather than approximated with one of the
+        above -- a wrong padding is the kind of divergence that shows up as a
+        slightly wrong number rather than as an error.
 
         `value=None` means zero, and that is upstream's own default rather
         than a choice here: `constant_pad_nd`'s schema is `Scalar value=0`,
         and `F.pad(x, (1, 1))` with no value pads with zeros (measured).
         """
         if mode != "constant":
+            n = len(pad) // 2
+            # Literal string constants, not an f-string: `tools/golden/
+            # reach.py`'s `composite_keys` finds a composite's reach by
+            # scanning `bootstrap.py` for `aten.<op>.<overload>` as an
+            # `ast.Constant` -- an f-string is a `JoinedStr` and is invisible
+            # to that scan, which would make these six look unreached the
+            # moment this landed (measured: it did, before this rewrite).
+            if mode == "reflect":
+                op = {
+                    1: "aten.reflection_pad1d.default",
+                    2: "aten.reflection_pad2d.default",
+                    3: "aten.reflection_pad3d.default",
+                }.get(n)
+            elif mode == "replicate":
+                op = {
+                    1: "aten.replication_pad1d.default",
+                    2: "aten.replication_pad2d.default",
+                    3: "aten.replication_pad3d.default",
+                }.get(n)
+            else:
+                op = None
+            if op is not None:
+                return dispatch(op, input, list(pad))
+            if mode in ("reflect", "replicate"):
+                raise NotImplementedError(
+                    f"not implemented in torch._C shim: torch._C._nn.pad(mode={mode!r}) "
+                    f"with {len(pad)} pad values (n={n}) -- only 1D/2D/3D "
+                    f"({{1,2,3}} pairs) have a kernel here"
+                )
             raise NotImplementedError(
                 f"not implemented in torch._C shim: torch._C._nn.pad(mode={mode!r}) "
-                f"-- upstream routes this to aten::reflection_pad*/"
-                f"replication_pad*/a circular composition rather than to "
-                f"aten::constant_pad_nd, and none of those has a kernel here; "
-                f"mode='constant' is implemented"
+                f"-- reflect and replicate are implemented; circular is a "
+                f"new_empty/slice/copy_ composite upstream (docs/PAD.md §3)"
             )
         return dispatch(
             "aten.constant_pad_nd.default",
@@ -7951,6 +8014,7 @@ def _install_nn(module, dispatch) -> None:
         (upsample_nearest2d, "upsample_nearest2d"),
         (leaky_relu, "leaky_relu"),
         (adaptive_avg_pool2d, "adaptive_avg_pool2d"),
+        (avg_pool2d, "avg_pool2d"),
         (hardtanh, "hardtanh"),
         (one_hot, "one_hot"),
         (nll_loss, "nll_loss"),
@@ -7965,7 +8029,7 @@ def _install_nn(module, dispatch) -> None:
     # Readable for the same reason as `_shim_overloads`: which of `_nn`'s 70
     # names does something should be answerable by asking.
     module._shim_nn_implemented = [
-        "adaptive_avg_pool2d", "cross_entropy_loss", "gelu", "glu", "hardtanh", "leaky_relu", "linear", "nll_loss",
+        "adaptive_avg_pool2d", "avg_pool2d", "cross_entropy_loss", "gelu", "glu", "hardtanh", "leaky_relu", "linear", "nll_loss",
         "nll_loss_nd", "one_hot", "pad", "scaled_dot_product_attention", "silu",
         "softplus", "upsample_bicubic2d", "upsample_bilinear2d",
         "upsample_nearest2d",
@@ -8454,10 +8518,26 @@ def _install_composites(module, varfns, dispatch) -> None:
         More than two operands fold left, which is what `torch/functional.py`
         does too when `opt_einsum` is unavailable.
 
+        **The ellipsis (`...`)** stands for the leading axes an operand has
+        beyond its explicit labels -- `longt5` (`modeling_longt5.py:662`,
+        docs/TAIL3.md §7, docs/BIND2.md item 2) passes exactly one equation
+        form, `'...qhd,...khd->...hqk'`. It is expanded to real, fresh labels
+        (drawn from letters that appear nowhere else in the equation) before
+        the rest of this function ever sees it -- so the contraction
+        machinery above never has to know an ellipsis existed, and this stays
+        "one branch that maps `...` to explicit labels", not a general
+        `numpy`-style broadcasting planner. Every operand that carries `...`
+        must have the *same* number of leading axes once its explicit labels
+        are subtracted from its rank; upstream's own ellipsis broadcasts
+        mismatched ranks against each other, and that broadcasting -- not the
+        expansion itself -- is refused by name here as out of scope, because
+        `longt5`'s call has no such mismatch and inventing the broadcast rule
+        untested would be exactly `docs/BINDINGS.md`'s `upsample_nearest2d`
+        trap the other direction: matching a *summary* ("ellipsis support")
+        rather than the measured call.
+
         **Refused by name, not approximated:**
 
-          * an ellipsis (`...`) -- it stands for a variable number of batch
-            axes and needs its own rank arithmetic;
           * a label repeated *within* one operand (`ii->i`) -- that is a
             diagonal, not a contraction, and there is no `diagonal` kernel
             here;
@@ -8485,13 +8565,12 @@ def _install_composites(module, varfns, dispatch) -> None:
         tensors = list(operands)
         if not tensors:
             raise RuntimeError("einsum(): must provide at least one operand")
-        if "..." in equation or "." in equation:
-            raise NotImplementedError(
-                "not implemented in torch._C shim: torch.einsum with an ellipsis "
-                f"({equation!r}) -- the ellipsis stands for a variable number of "
-                "batch axes and needs its own rank arithmetic"
-            )
         text = equation.replace(" ", "")
+        if "." in text and "..." not in text:
+            raise NotImplementedError(
+                "not implemented in torch._C shim: torch.einsum with a "
+                f"malformed ellipsis ({equation!r})"
+            )
         if "->" in text:
             lhs_text, out_labels = text.split("->", 1)
         else:
@@ -8502,6 +8581,44 @@ def _install_composites(module, varfns, dispatch) -> None:
                 f"einsum(): the equation has {len(terms)} operand(s) but "
                 f"{len(tensors)} were given"
             )
+        if "..." in text:
+            # Fresh labels for the axes `...` stands for, drawn from letters
+            # this equation does not already use -- `used` has to look past
+            # `...` itself, which is not a label.
+            used = set(lhs_text.replace("...", ""))
+            if out_labels is not None:
+                used |= set(out_labels.replace("...", ""))
+            pool = [c for c in string.ascii_uppercase + string.ascii_lowercase
+                    if c not in used]
+            ranks = []
+            for term, tensor in zip(terms, tensors):
+                if "..." in term:
+                    explicit = len(term) - 3
+                    erank = len(tensor.shape) - explicit
+                    if erank < 0:
+                        raise RuntimeError(
+                            f"einsum(): the subscript {term!r} has more labels "
+                            f"than the operand has dimensions"
+                        )
+                    ranks.append(erank)
+            if len(set(ranks)) > 1:
+                raise NotImplementedError(
+                    "not implemented in torch._C shim: torch.einsum(...) with "
+                    f"an ellipsis standing for a different number of axes per "
+                    f"operand ({equation!r}) -- that is upstream's broadcasting "
+                    "rule, which is not reproduced here"
+                )
+            erank = ranks[0] if ranks else 0
+            if erank > len(pool):
+                raise NotImplementedError(
+                    "not implemented in torch._C shim: torch.einsum(...) needs "
+                    f"more free labels than are available ({equation!r})"
+                )
+            ellipsis_labels = "".join(pool[:erank])
+            terms = [t.replace("...", ellipsis_labels) if "..." in t else t
+                     for t in terms]
+            if out_labels is not None and "..." in out_labels:
+                out_labels = out_labels.replace("...", ellipsis_labels)
         for term in terms:
             if len(set(term)) != len(term):
                 raise NotImplementedError(

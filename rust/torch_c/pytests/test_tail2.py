@@ -418,10 +418,16 @@ def test_view_as_complex_copies_rather_than_aliasing():
 def test_fft_and_stft_are_not_implemented():
     """`fnet` (`fft_fftn`) and the `torch.stft` a speech round wants.
 
-    Worth separating: `stft`'s *first* wall is not complex at all. Measured,
-    it is `torch._C._nn.pad(mode='reflect')`, which `stft` calls before any
-    transform happens. So `return_complex=False` does not route around this
-    round -- COMPLEX.md §5.
+    `stft`'s *first* wall used to be `torch._C._nn.pad(mode='reflect')`,
+    reached before any complex value exists, so `return_complex=False` did
+    not route around it (COMPLEX.md §5). docs/PAD.md §5's patch landed in
+    docs/BIND2.md item 3 -- `_nn.pad(mode='reflect')` now computes -- and
+    `stft` moved one wall further, to its own overload: `aten::stft` has no
+    `overloads.json` row (measured: neither `stft` nor `stft_real` reaches a
+    dispatch arm any more; both now name `stft` itself in the refusal rather
+    than `pad`). That is docs/PAD.md §5's own prediction of what landing the
+    patch does here, not a regression -- `stft`'s pad wall closing is the
+    point.
     """
     r = _raised("fft_fftn")
     if r == "skip":
@@ -433,15 +439,19 @@ def test_fft_and_stft_are_not_implemented():
 
     # Both spellings of stft, because `return_complex=False` is the obvious
     # thing to try next and it does not route around anything: the wall is
-    # reached before the transform.
+    # reached before the transform either way.
     for label in ("stft", "stft_real"):
         exc, msg = _raised(label)
         assert exc == "NotImplementedError", f"{label}: {exc}: {msg}"
-        assert "pad" in msg, (
-            f"{label}'s first wall moved. It was `_C._nn.pad(mode='reflect')`, "
-            f"which is reached before any complex value exists; if it is now "
-            f"something else, COMPLEX.md §5's advice to the speech round is "
-            f"stale. Got: {msg}"
+        assert "pad" not in msg, (
+            f"{label} is still walled on `_nn.pad(mode='reflect')` -- "
+            f"docs/BIND2.md item 3's patch should have moved this wall. "
+            f"Got: {msg}"
+        )
+        assert "stft" in msg, (
+            f"{label}'s wall moved somewhere unexpected -- expected the next "
+            f"wall to name `stft` itself (no `overloads.json` row). "
+            f"Got: {msg}"
         )
 
 

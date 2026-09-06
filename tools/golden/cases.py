@@ -9542,6 +9542,10 @@ def _einsum_cases(torch_module, c_module) -> list[Case]:
         ("abc,abd->acd", [(2, 3, 4), (2, 3, 5)],
          "b is contracted while a is a batch -- the case that separates them"),
         ("ijk->ik", [(2, 3, 4)], "one operand with a label summed out"),
+        ("...c,...c->...", [(2, 3, 4), (2, 3, 4)],
+         "an ellipsis expanding to the operands' own leading axes -- "
+         "docs/BIND2.md item 2 -- promoted here from the c_error block "
+         "below the day it landed"),
     ):
         pairs = [operand(shape, i) for i, shape in enumerate(shapes)]
         cases.append(
@@ -9554,11 +9558,9 @@ def _einsum_cases(torch_module, c_module) -> list[Case]:
         )
 
     # Deliberate gaps, refused by name rather than approximated. Upstream
-    # computes all three, so they are `c_error` and flip loudly if a kernel
+    # computes both, so they are `c_error` and flip loudly if a kernel
     # ever lands.
     for equation, shapes, note in (
-        ("...c,...c->...", [(2, 3, 4), (2, 3, 4)],
-         "an ellipsis stands for a variable number of batch axes"),
         ("ii->i", [(3, 3)], "a repeated label inside one operand is a diagonal"),
     ):
         pairs = [operand(shape, i) for i, shape in enumerate(shapes)]
