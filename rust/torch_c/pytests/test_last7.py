@@ -15,8 +15,8 @@ and the refusal it replaces was a real candle limitation that a decomposition
 walks around. `multinomial` is an argument form in `bootstrap.py`'s type
 checker and needs nothing here at all. `repeat_interleave.Tensor` is a real
 kernel, and it is the one this round did **not** land: see
-`test_repeat_interleave_with_a_tensor_repeats_is_still_refused_by_name` for
-what it needs and why none of it is in this file's territory.
+`test_repeat_interleave_with_a_tensor_repeats_now_lands_in_all_four_files`,
+which is that pin **inverted** by docs/REPEAT.md rather than deleted.
 
 Every number below was measured against real torch 2.13.0 in a separate
 process before it was written down. The values live in
@@ -429,47 +429,77 @@ print(json.dumps(out))
     assert m["scalar_bool"].startswith("RuntimeError"), m
 
 
-def test_repeat_interleave_with_a_tensor_repeats_is_still_refused_by_name():
-    """fastspeech2_conformer's wall, and the one this round did not land.
+def test_repeat_interleave_with_a_tensor_repeats_now_lands_in_all_four_files():
+    """fastspeech2_conformer's wall -- **closed**, and this is the inversion.
 
-    `modeling_fastspeech2_conformer.py:123` is
-    `torch.repeat_interleave(encoded_embedding, target_duration, dim=0)`, where
-    `target_duration` is a tensor. Upstream lowers that to
-    `aten::repeat_interleave.Tensor(Tensor repeats, *, SymInt? output_size)`
-    followed by `aten::index_select`. The second exists here; the first does
-    not, and adding it needs **three files this round may not touch**:
+    This test used to assert the refusal. docs/LAST7.md §5.2 left the kernel
+    unwritten on purpose and pinned the absence here with the file list in its
+    own docstring, because landing `aten::repeat_interleave.Tensor` alone would
+    have reddened the suite and left the architecture blocked anyway. All four
+    files landed together in docs/REPEAT.md, so the pin is inverted rather than
+    deleted -- and it is inverted into the **stronger** claim, because a test
+    that only checked the values would pass with `capture.rs` and `device.rs`
+    left untouched. Those two are the halves LAST7 said would go red, so they
+    are asserted here by name:
 
-      * `bootstrap.py` -- `torch.repeat_interleave` is a hand-written composite
-        that raises before any dispatch happens, so a kernel behind it would be
-        unreachable through the only spelling the model uses;
-      * `device.rs` -- the output length is `repeats.sum()`, so the kernel must
-        read the repeats back to the host, and
-        `test_shim.py::test_the_mps_readback_list_is_what_the_kernels_actually_do`
-        re-derives `MPS_HOST_READBACK_OPS` from `aten.rs` and goes red until the
-        op is declared there;
-      * `capture.rs` -- the output *shape* is a function of tensor values, which
-        is exactly what `DATA_DEPENDENT_SHAPE` refuses by name for `nonzero`.
-        Recording it would produce a trace whose replay is unsound on any other
-        input, so it has to join that list in the same change.
+      * `aten.repeat_interleave.Tensor` is implemented and answers upstream's
+        index vector for a NON-UNIFORM `repeats` -- a constant one cannot tell
+        this overload from the scalar one;
+      * `torch.repeat_interleave(x, tensor, dim)` reaches it, which is the only
+        spelling `modeling_fastspeech2_conformer.py:123` uses;
+      * it is in `MPS_HOST_READBACK_OPS`, because the output length is
+        `repeats.sum()` and that is a host readback;
+      * it is refused by `capture`, because the output *shape* is a function of
+        values -- the same reason `nonzero` is refused, and a trace that
+        recorded it would replay at the wrong shape.
 
-    Landing the kernel alone would have turned two of those three into a red
-    suite and left the architecture blocked anyway. So it is written down
-    instead, and this test pins the refusal so the write-down cannot rot into
-    "forgotten". docs/LAST7.md §5.
+    The integer spelling is asserted unchanged, since teaching the composite a
+    new branch is exactly how that one would have been broken.
     """
-    assert "aten.repeat_interleave.Tensor" not in _C._aten_implemented()
-    x = _C._tensor_from_flat([1.0, 2.0, 3.0], [3])
+    assert "aten.repeat_interleave.Tensor" in _C._aten_implemented()
+
+    # The kernel, on a non-uniform repeats with a zero in it. Upstream:
+    # `torch.ops.aten.repeat_interleave.Tensor(tensor([2, 0, 3]))` is
+    # `tensor([0, 0, 2, 2, 2])` -- measured in a separate process.
     reps = _C._tensor_from_flat([2.0, 0.0, 3.0], [3], dtype=_C.int64)
-    try:
-        _C._VariableFunctions.repeat_interleave(x, reps, 0)
-    except NotImplementedError as e:
-        assert "repeat_interleave" in str(e), str(e)
-    else:
-        raise AssertionError(
-            "repeat_interleave took a tensor `repeats` -- invert this test and "
-            "check that device.rs and capture.rs were updated with it"
-        )
-    # The integer spelling is implemented and unaffected.
+    index = _C._aten_dispatch("aten.repeat_interleave.Tensor", reps)
+    assert _flat(index) == [0.0, 0.0, 2.0, 2.0, 2.0], _flat(index)
+
+    # The spelling the model uses.
+    x = _C._tensor_from_flat([1.0, 2.0, 3.0], [3])
+    out = _C._VariableFunctions.repeat_interleave(x, reps, 0)
+    assert _flat(out) == [1.0, 1.0, 3.0, 3.0, 3.0], _flat(out)
+
+    # device.rs -- the readback half LAST7 named.
+    assert "aten.repeat_interleave.Tensor" in _C._shim_mps_host_readback_ops()
+
+    # capture.rs -- the data-dependent-shape half, asked of the recorder
+    # rather than of a list, so a constant that stopped being consulted would
+    # still fail here. `index_select` is captured in the same loop because a
+    # refusal that fired for *every* op would otherwise pass.
+    for op, args, refused in (
+        ("aten.repeat_interleave.Tensor", (reps,), True),
+        ("aten.nonzero.default", (x,), True),
+        ("aten.index_select.default",
+         (x, 0, _C._tensor_from_flat([0.0, 2.0], [2], dtype=_C.int64)), False),
+    ):
+        _C._capture_begin([args[0]])
+        result = _C._aten_dispatch(op, *args)
+        reason = _C._capture_reason()
+        if refused:
+            assert reason is not None and op in reason, (op, reason)
+            assert "shape that depends on tensor values" in reason, reason
+            try:
+                _C._capture_end(result)
+            except NotImplementedError:
+                pass
+            else:
+                raise AssertionError(f"{op} was recorded")
+        else:
+            assert reason is None, (op, reason)
+            assert [n["op"] for n in _C._capture_end(result).nodes] == [op]
+
+    # The integer spelling is unaffected.
     out = _C._VariableFunctions.repeat_interleave(x, 2, 0)
     assert _flat(out) == [1.0, 1.0, 2.0, 2.0, 3.0, 3.0], _flat(out)
 

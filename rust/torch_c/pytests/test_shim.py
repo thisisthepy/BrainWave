@@ -12840,13 +12840,23 @@ def test_the_three_composites_that_opened_persimmon_and_cohere():
         [0.0, 1.0, 2.0], [0.0, 1.0, 2.0], [3.0, 4.0, 5.0], [3.0, 4.0, 5.0]
     ]
     assert vf.repeat_interleave(m, 2).shape == (12,)
-    # The tensor-`repeats` overload is refused BY NAME, not approximated.
-    try:
-        vf.repeat_interleave(m, _arch20_tensor([1, 2, 3], dtype=_C.int64), dim=1)
-    except NotImplementedError as e:
-        assert "repeat_interleave.Tensor" in str(e), str(e)
-    else:
-        raise AssertionError("a tensor `repeats` must refuse")
+    # The tensor-`repeats` overload used to be refused by name here. It landed
+    # in docs/REPEAT.md, so this is that assertion **inverted** rather than
+    # dropped -- and it is inverted onto a NON-UNIFORM `repeats`, because
+    # `[2, 2, 2]` is precisely the vector the scalar overload two lines above
+    # would also answer correctly.
+    assert vf.repeat_interleave(
+        m, _arch20_tensor([1, 2, 3], dtype=_C.int64), dim=1
+    ).tolist() == [
+        [0.0, 1.0, 1.0, 2.0, 2.0, 2.0], [3.0, 4.0, 4.0, 5.0, 5.0, 5.0]
+    ]
+    # And `dim=0` on the same tensor, which disagrees -- a wrong axis passes
+    # neither, where a square input would have let it pass both.
+    assert vf.repeat_interleave(
+        m, _arch20_tensor([1, 3], dtype=_C.int64), dim=0
+    ).tolist() == [
+        [0.0, 1.0, 2.0], [3.0, 4.0, 5.0], [3.0, 4.0, 5.0], [3.0, 4.0, 5.0]
+    ]
     # `flatten`'s 0-d arm is a reshape to [1], not a no-op.
     assert _arch20_tensor([5.0], ()).flatten().shape == (1,)
 

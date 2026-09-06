@@ -803,8 +803,19 @@ const HOST_READS: &[&str] = &["aten._local_scalar_dense.default"];
 /// the allowlist explicit is what stops it from growing by accident.
 const METADATA_ONLY: &[&str] = &["aten.is_floating_point.default"];
 
+/// Ops whose output *shape* is a function of tensor **values** rather than of
+/// its inputs' shapes and dtypes.
+///
+/// A recorded node's shape has to be implied by the guards, or a replay on a
+/// different input silently produces a differently shaped answer through a
+/// graph built for the first one. `nonzero` and `where.default` count their
+/// true elements; `repeat_interleave.Tensor` sums its `repeats` (docs/REPEAT.md
+/// §3) -- the same property, arrived at from the other side, and it joined this
+/// list in the same change that gave it a kernel rather than after somebody
+/// noticed a wrong replay.
 const DATA_DEPENDENT_SHAPE: &[&str] = &[
     "aten.nonzero.default",
+    "aten.repeat_interleave.Tensor",
     "aten.where.default",
 ];
 

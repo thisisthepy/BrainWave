@@ -620,7 +620,7 @@ fn shim_same_device(left: PyDevice, right: PyDevice) -> bool {
 /// RMSNorm's `x.pow(2)` and the attention mask -- and none of them is a
 /// widening of this gate: the scan re-derives the list from the kernels and
 /// would put them straight back if the readback were still there.
-pub const MPS_HOST_READBACK_OPS: [&str; 86] = [
+pub const MPS_HOST_READBACK_OPS: [&str; 87] = [
     "aten._fft_c2c.default",
     "aten._fft_c2r.default",
     "aten._fft_r2c.default",
@@ -689,6 +689,7 @@ pub const MPS_HOST_READBACK_OPS: [&str; 86] = [
     "aten.prod.dim_int",
     "aten.remainder.Scalar",
     "aten.remainder.Tensor",
+    "aten.repeat_interleave.Tensor",
     "aten.scatter.src",
     "aten.scatter.value",
     "aten.scatter_reduce.two",
@@ -710,7 +711,7 @@ pub const MPS_HOST_READBACK_OPS: [&str; 86] = [
 ];
 
 /// The two ops that read device bytes back and are **not** refused, with the
-/// reason each is different in kind from the sixty-seven above.
+/// reason each is different in kind from the eighty-seven above.
 ///
 /// The scan finds these too, so leaving them out of `MPS_HOST_READBACK_OPS`
 /// without saying why would look like an oversight rather than a decision.

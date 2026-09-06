@@ -233,6 +233,7 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.remainder.Scalar",
     "aten.remainder.Tensor",
     "aten.repeat.default",
+    "aten.repeat_interleave.Tensor",
     "aten.rsqrt.default",
     "aten.rsqrt_.default",
     "aten.rsub.Scalar",
@@ -2408,6 +2409,7 @@ fn aten_dispatch_inner(
             remainder_op(py, args, kwargs, "aten.remainder.Tensor", false)
         }
         "aten.repeat.default" => repeat_default(py, args, kwargs),
+        "aten.repeat_interleave.Tensor" => repeat_interleave_tensor(py, args, kwargs),
         "aten.rsqrt.default" => rsqrt_default(py, args, kwargs, "aten.rsqrt.default"),
         // `sqrt` sits with the `unary_float` family rather than beside
         // `rsqrt`'s own kernel: it is one candle call, and sharing the family
@@ -23086,6 +23088,103 @@ fn max_pool2d_default(
     Ok(py_t.into_any())
 }
 
+
+/// `aten::repeat_interleave.Tensor(Tensor repeats, *, SymInt? output_size=None) -> Tensor`
+///
+/// **This op does not touch the data being repeated.** Its only argument is the
+/// `repeats` vector and its result is the *index* vector that a following
+/// `aten::index_select` gathers with -- measured on torch 2.13.0 with a
+/// `TorchDispatchMode` logger, which reports exactly
+/// `repeat_interleave.Tensor` then `index_select.default` for
+/// `torch.repeat_interleave(x, torch.tensor([2, 0, 3]), 0)`, and
+/// `repeat_interleave.Tensor(tensor([2, 0, 3]))` alone answers
+/// `tensor([0, 0, 2, 2, 2])`. docs/REPEAT.md §2.
+///
+/// **The readback is here on purpose, and it is why this op is on two lists.**
+/// The output *length* is `repeats.sum()`, a number that exists only in the
+/// tensor's bytes, so `to_vec1` below is unavoidable rather than a shortcut:
+///
+///   * `device.rs::MPS_HOST_READBACK_OPS` -- computing this on the host while
+///     the label says `mps` is the divergence docs/VULKAN3.md §3 caught for
+///     `nonzero`. `test_shim.py` re-derives that list from the bodies in this
+///     file and follows helpers **one level by name**, so the `to_vec1` is
+///     written in the dispatched function rather than behind a second helper
+///     (docs/VOICE3.md's `var`/`std` finding).
+///   * `capture.rs::DATA_DEPENDENT_SHAPE` -- the output *shape* is a function
+///     of values, exactly as `nonzero`'s is, so a recorded node would replay at
+///     the wrong shape on any other input.
+///
+/// Every refusal below is upstream's own wording, measured rather than
+/// invented; the dtype gate is `Long`/`Int` only, and upstream's message for
+/// everything else names the CPU kernel (`"repeat_interleave_cpu" not
+/// implemented for 'Float'`). The output dtype is the *repeats* dtype, so an
+/// `int32` repeats answers an `int32` index vector.
+fn repeat_interleave_tensor(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.repeat_interleave.Tensor";
+    let repeats = tensor_arg(OP, args, kwargs, 0, "repeats")?;
+    match repeats.tag() {
+        TorchDType::Int32 | TorchDType::Int64 => {}
+        other => {
+            return Err(pyo3::exceptions::PyNotImplementedError::new_err(format!(
+                "\"repeat_interleave_cpu\" not implemented for '{}'",
+                scalar_type_name(other)
+            )))
+        }
+    }
+    let source = repeats.tensor()?;
+    if source.rank() != 1 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "repeat_interleave only accept 1D vector as repeat",
+        ));
+    }
+    let output_size = dim_arg(args, kwargs, 1, "output_size")?;
+
+    // The readback. `to_dtype` is a device-side cast, so this is one transfer
+    // and not two, and `contiguous` is what makes `to_vec1` the logical order.
+    let counts = source
+        .contiguous()
+        .map_err(|e| candle_err(OP, e))?
+        .to_dtype(candle_core::DType::I64)
+        .map_err(|e| candle_err(OP, e))?
+        .to_vec1::<i64>()
+        .map_err(|e| candle_err(OP, e))?;
+
+    let mut indices: Vec<i64> = Vec::new();
+    for (position, &count) in counts.iter().enumerate() {
+        if count < 0 {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "repeats can not be negative",
+            ));
+        }
+        for _ in 0..count {
+            indices.push(position as i64);
+        }
+    }
+
+    // Upstream checks `output_size` by *allocating* to it and then finding the
+    // fill overran, so its message is about the allocation rather than about
+    // this argument. Transcribed as it is rather than improved, because a
+    // caller grepping for it will have upstream's string.
+    if let Some(claimed) = output_size {
+        if claimed != indices.len() as isize {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "allocated size does not match required size",
+            ));
+        }
+    }
+
+    let length = indices.len();
+    let out_t = Tensor::from_vec(indices, length, source.device())
+        .map_err(|e| candle_err(OP, e))?
+        .to_dtype(source.dtype())
+        .map_err(|e| candle_err(OP, e))?;
+    let out = pyo3::Py::new(py, PyTensorBase::new(out_t)?)?;
+    Ok(out.into_any())
+}
 
 fn nonzero_default(
     py: Python<'_>,

@@ -29865,6 +29865,112 @@ def t_inplace_cases(torch_module, c_module, torch_call) -> list[Case]:
 # --- aten.unfold.default (docs/LAST7.md) ------------------------------------
 
 
+def repeat_interleave_tensor_cases(torch_module, c_module, torch_call) -> list[Case]:
+    """`aten::repeat_interleave.Tensor(Tensor repeats, *, SymInt? output_size)`.
+
+    **Every value case here has a NON-UNIFORM `repeats`.** A constant repeats
+    vector -- `[2, 2, 2]` -- is exactly the input a kernel that ignored the
+    values and multiplied the length by a single count would also answer
+    correctly, which is the same class of blindness `unfold_cases` avoids by
+    never letting `step == size`. It is also the input that cannot tell this
+    overload from the *scalar* one (`repeat_interleave.self_int`), which is a
+    different code path here and upstream. So the vectors below vary, and two
+    of them contain a **zero**, which is the position a naive `for _ in
+    0..count` loop skips and an off-by-one emits anyway.
+
+    The op does not touch the data being repeated: its answer is the index
+    vector a following `index_select` gathers with (docs/REPEAT.md §2), so the
+    values compared here are indices and an order error is a value error.
+
+    `output_size` is compared in both registers -- agreeing (a no-op that must
+    not perturb the answer) and disagreeing (upstream refuses at the
+    allocation, not at the argument).
+    """
+    op = "aten.repeat_interleave.Tensor"
+    cases: list[Case] = []
+
+    for dtype_name in ["int64", "int32"]:
+        for flat, note in [
+            ([2, 0, 3], "NON-UNIFORM with a zero -- the fastspeech2_conformer shape"),
+            ([1, 2, 3, 4], "strictly increasing: an index vector read backwards differs"),
+            ([4, 3, 2, 1], "and strictly decreasing, which is that vector reversed"),
+            ([0, 0, 5], "two empty positions before a long run"),
+            ([3, 0, 0], "and the same run before the empty ones -- these disagree"),
+            ([1, 1, 1, 1], "all ones: the identity, and the only uniform case kept"),
+            ([0, 0, 0], "all zero -- an empty answer, not a length-3 one"),
+        ]:
+            _, c_t = pair_from_flat(
+                torch_module, c_module, [float(v) for v in flat], (len(flat),), dtype_name
+            )
+            t_t = torch_module.tensor(flat, dtype=dt.torch_dtype(torch_module, dtype_name))
+            cases.append(
+                Case(
+                    name=f"repeat_interleave.Tensor(dtype={dtype_name}, repeats={flat})",
+                    op=op,
+                    run_torch=(lambda t_t=t_t: torch_call(t_t)),
+                    run_c=(lambda c_t=c_t: c_module._aten_dispatch(op, c_t)),
+                    note=note,
+                )
+            )
+
+    empty_t = torch_module.tensor([], dtype=dt.torch_dtype(torch_module, "int64"))
+    _, empty_c = pair_from_flat(torch_module, c_module, [], (0,), "int64")
+    cases.append(
+        Case(
+            name="repeat_interleave.Tensor(an empty repeats)",
+            op=op,
+            run_torch=lambda: torch_call(empty_t),
+            run_c=lambda: c_module._aten_dispatch(op, empty_c),
+            note="an empty vector answers an empty one, not a refusal",
+        )
+    )
+
+    ok_t = torch_module.tensor([2, 0, 3], dtype=dt.torch_dtype(torch_module, "int64"))
+    _, ok_c = pair_from_flat(torch_module, c_module, [2.0, 0.0, 3.0], (3,), "int64")
+    cases.append(
+        Case(
+            name="repeat_interleave.Tensor(output_size=5, the agreeing one)",
+            op=op,
+            run_torch=lambda: torch_call(ok_t, output_size=5),
+            run_c=lambda: c_module._aten_dispatch(op, ok_c, output_size=5),
+            note="a correct output_size must not change the answer",
+        )
+    )
+
+    # The refusals, in upstream's own words. `output_size` is checked at the
+    # allocation upstream, so its message is about the allocation.
+    bad_shape_t = torch_module.tensor([[2, 3]], dtype=dt.torch_dtype(torch_module, "int64"))
+    _, bad_shape_c = pair_from_flat(torch_module, c_module, [2.0, 3.0], (1, 2), "int64")
+    neg_t = torch_module.tensor([2, -1], dtype=dt.torch_dtype(torch_module, "int64"))
+    _, neg_c = pair_from_flat(torch_module, c_module, [2.0, -1.0], (2,), "int64")
+    float_t = torch_module.tensor([2.0, 3.0], dtype=dt.torch_dtype(torch_module, "float32"))
+    _, float_c = pair_from_flat(torch_module, c_module, [2.0, 3.0], (2,), "float32")
+    for label, t_arg, c_arg, kw, note in [
+        ("2-D repeats", bad_shape_t, bad_shape_c, {},
+         "'repeat_interleave only accept 1D vector as repeat'"),
+        ("negative repeats", neg_t, neg_c, {}, "'repeats can not be negative'"),
+        ("float repeats", float_t, float_c, {},
+         "upstream names its CPU kernel: '\"repeat_interleave_cpu\" not "
+         "implemented for \'Float\''"),
+        ("output_size=6 against a sum of 5", ok_t, ok_c, {"output_size": 6},
+         "'allocated size does not match required size' -- upstream's message "
+         "is about the allocation, not the argument"),
+    ]:
+        cases.append(
+            Case(
+                name=f"repeat_interleave.Tensor({label}) [refused]",
+                op=op,
+                run_torch=(lambda t_arg=t_arg, kw=kw: torch_call(t_arg, **kw)),
+                run_c=(lambda c_arg=c_arg, kw=kw:
+                       c_module._aten_dispatch(op, c_arg, **kw)),
+                expect="both_error",
+                note=note,
+            )
+        )
+
+    return cases
+
+
 def unfold_cases(torch_module, c_module, torch_call) -> list[Case]:
     """`Tensor.unfold(dim, size, step)`, `univnet`'s wall.
 
@@ -30035,6 +30141,9 @@ def unfold_cases(torch_module, c_module, torch_call) -> list[Case]:
 CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
     # docs/LAST7.md
     "aten.unfold.default": unfold_cases,
+
+    # docs/REPEAT.md
+    "aten.repeat_interleave.Tensor": repeat_interleave_tensor_cases,
 
     "aten.i0.default": i0_cases,
 

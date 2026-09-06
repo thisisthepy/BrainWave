@@ -314,8 +314,26 @@ left the architecture blocked anyway. It is written down instead, and
 refusal with the three-file list in its docstring so the write-down cannot rot
 into "forgotten".
 
+> **Closed.** `docs/REPEAT.md` landed all four files in one change --
+> the kernel in `aten.rs`, the composite's new arm in `bootstrap.py`, the
+> readback declaration in `device.rs` and the `DATA_DEPENDENT_SHAPE` entry in
+> `capture.rs` -- and `fastspeech2_conformer` forwards. Every item in the
+> three-bullet list above held when it was reached: the composite really did
+> win over the table, the readback derivation really did demand `device.rs`,
+> and `capture.rs` really did have to refuse it. The pin is **inverted**, not
+> deleted, into
+> `test_repeat_interleave_with_a_tensor_repeats_now_lands_in_all_four_files`,
+> which asserts the values *and* the two list memberships -- because a test
+> that checked only the values would pass with `device.rs` and `capture.rs`
+> untouched, which are precisely the two this section said would go red.
+>
+> One correction to what is above: this section names *three* out-of-territory
+> files, and the count that matters is **four**, because `aten.rs` is the
+> fourth and it is the one that cannot be done without the other three.
+> `docs/REPEAT.md` §2 states it that way.
+
 <!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_last7.py test_multinomial_with_a_tensor_num_samples_now_matches_upstreams_symint_rule present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_last7.py test_repeat_interleave_with_a_tensor_repeats_is_still_refused_by_name present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_last7.py test_repeat_interleave_with_a_tensor_repeats_now_lands_in_all_four_files present -->
 
 ---
 

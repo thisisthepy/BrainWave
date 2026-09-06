@@ -2030,12 +2030,32 @@ class _TypeChecker:
             if base in ("int", "SymInt"):
                 # `SymInt[]` is every shape argument -- `view`, `transpose`,
                 # `expand`, `sum(dim=...)`. Worth not paying a call per element.
+                # A single-element integral Tensor sitting **inside** the list
+                # is upstream's `SymInt` rule applied per element, and it is
+                # the same rule docs/BIND5.md §7 landed one position over for
+                # a *scalar* `SymInt`. Measured on torch 2.13.0
+                # (docs/REPEAT.md §4):
+                #
+                #     x.as_strided(size=(2, tensor(2)),   ...)  -> works
+                #     x.as_strided(size=(2, tensor([2])), ...)  -> works
+                #     x.as_strided(size=(2, tensor(2.0)), ...)  -> TypeError
+                #     x.as_strided(size=(2, tensor(True)),...)  -> RuntimeError
+                #     x.as_strided(size=(2, tensor([2,3])),...) -> TypeError
+                #
+                # `bool` is accepted *here* and refused by the coercion, so
+                # upstream's two exception classes fall out rather than being
+                # chosen -- exactly as `_symint_from_tensor` does for the
+                # scalar position. This predicate is on the hot path for every
+                # shape argument, so the Tensor test is reached only after the
+                # int tests have already declined.
                 def int_list_ok(value):
                     if isinstance(value, (list, tuple)):
                         for item in value:
                             if type(item) is int:
                                 continue
-                            if not isinstance(item, int) or isinstance(item, bool):
+                            if isinstance(item, int) and not isinstance(item, bool):
+                                continue
+                            if not _symint_tensor_element_ok(item):
                                 return False
                         return True
                     return (
@@ -2190,6 +2210,7 @@ class _ArgPlan:
         "optional",
         "sized_int_list",
         "scalar_int",
+        "int_list",
         "default_source",
         "has_default",
         "predicate",
@@ -2209,6 +2230,9 @@ class _ArgPlan:
         # `sized_int_list` is: a SCALAR `int`/`SymInt` position, where the
         # predicate may now have said yes to a single-element Tensor.
         self.scalar_int = bool(not is_list and base in ("int", "SymInt"))
+        # The list twin of `scalar_int`: a `SymInt[]`/`int[]` position whose
+        # elements may each need `_symint_from_tensor`'s unpack.
+        self.int_list = bool(is_list and base in ("int", "SymInt"))
         # `_Argument.has_default_value()` is exactly this test.
         self.default_source = argument.default_value
         self.has_default = argument.default_value is not None
@@ -2390,6 +2414,8 @@ class _Overloads:
                 and isinstance(value, _C_TENSORBASE[0])
             ):
                 value = _symint_from_tensor(value)
+            elif parameter.int_list and isinstance(value, (list, tuple)):
+                value = _coerce_symint_list(value)
             bound[name] = value
         return True
 
@@ -2471,6 +2497,11 @@ class _Overloads:
                     # `bool` (numpy's integers) also lands here and `int()` is
                     # the right answer for it too.
                     value = _symint_from_tensor(value)
+                elif parameter.int_list and isinstance(value, (list, tuple)):
+                    # The same unpack, per element. `_coerce_symint_list`
+                    # returns `value` unchanged when no element is a Tensor,
+                    # which is every shape argument in a model forward.
+                    value = _coerce_symint_list(value)
                 bound[parameter.name] = value
             if bound is None:
                 continue
@@ -2734,6 +2765,69 @@ def _symint_from_tensor(value):
         )
     return int(value)
 
+
+
+def _symint_tensor_element_ok(item) -> bool:
+    """Is `item` a Tensor upstream would accept inside an int list?
+
+    One element (any ndim), an integral dtype **or `bool`**. Bool is accepted
+    here and refused by `_coerce_symint_list`, which is where upstream refuses
+    it too -- see `_symint_from_tensor` for why the split produces upstream's
+    two different exception classes.
+
+    Returns False rather than raising for anything else, because this is a
+    *predicate*: a `float` tensor here means "this overload does not bind",
+    and the caller may have another one to try. The message comes later, from
+    whoever runs out of candidates.
+    """
+    tensorbase = _C_TENSORBASE[0]
+    if tensorbase is None or not isinstance(item, tensorbase):
+        return False
+    dtypes = _C_SYMINT_TENSOR_DTYPES[0]
+    if dtypes is None:
+        return False
+    integral, boolean = dtypes
+    return item.numel() == 1 and (
+        any(item.dtype == d for d in integral) or item.dtype == boolean
+    )
+
+
+def _coerce_symint_list(values):
+    """`_symint_from_tensor`, applied to each element of a bound int list.
+
+    The predicate has already said yes, so the only thing that can raise here
+    is the `bool` tensor -- and it must, because upstream does, one layer
+    further in than the parser. `values` is returned unchanged when it holds
+    no Tensor at all, which is the case for every shape argument in a model
+    forward, so this costs one `isinstance` per element on the hot path and
+    allocates nothing.
+
+    `longformer` and `led` are the callers that made this general rather than
+    a per-composite helper: `_sliding_chunks_matmul_attn_probs_value` spells
+    `padded_value.as_strided(size=(..., seq_len // window, ...), ...)` where
+    one element arrives as a 0-dim tensor. docs/REPEAT.md §4.
+    """
+    tensorbase = _C_TENSORBASE[0]
+    for item in values:
+        if isinstance(item, tensorbase):
+            break
+    else:
+        return values
+    dtypes = _C_SYMINT_TENSOR_DTYPES[0]
+    out = []
+    for item in values:
+        if not isinstance(item, tensorbase):
+            out.append(item)
+        elif dtypes is not None and item.dtype == dtypes[1]:
+            # Upstream's wording, and its exception TYPE, both measured.
+            raise RuntimeError(
+                "Expected scalar.isIntegral( false) to be true, but got false.  "
+                "(Could this error message be improved?  If so, please report an "
+                "enhancement request to PyTorch.)"
+            )
+        else:
+            out.append(int(item))
+    return out
 
 
 def _coerce_symint_size_tensors(module, name, size):
@@ -4262,6 +4356,25 @@ def _fast_symint_coerce(value):
     return value
 
 
+def _fast_symint_list_coerce(value):
+    """`resolve`'s per-element int-list coercion, for the generated fast path.
+
+    The list twin of `_fast_symint_coerce`, and it exists for the reason that
+    one does: **the fast path has to reproduce `resolve`'s coercions, not only
+    its predicates.** docs/BIND5.md §7.2 records what happened the last time
+    it did not -- the predicate started admitting a single-element Tensor at a
+    scalar `SymInt`, this path handed the raw Tensor down, and the Rust side
+    unpacked it anyway *including a `bool` one*, so the divergence came back as
+    a plausible answer rather than an error. The same trap re-fired here one
+    position over: with only the slow path taught, `x.as_strided((2, tensor
+    (True)), (4, 1))` answered shape `[2, 1]` positionally and raised
+    `RuntimeError` by keyword. Measured, not reasoned about.
+    """
+    if isinstance(value, (list, tuple)):
+        return _coerce_symint_list(value)
+    return value
+
+
 def _compile_fast_path(fn, name, entry, dispatch, is_method):
     skip = 1 if is_method else 0
     lines = [
@@ -4297,6 +4410,7 @@ def _compile_fast_path(fn, name, entry, dispatch, is_method):
         # one, so a divergence from upstream came back as a plausible answer
         # rather than as an error (docs/BIND5.md §7.2).
         "_symint_coerce": _fast_symint_coerce,
+        "_symint_list_coerce": _fast_symint_list_coerce,
     }
     
     for c_idx, (plan, key) in enumerate(entry._candidates):
@@ -4350,7 +4464,12 @@ def _compile_fast_path(fn, name, entry, dispatch, is_method):
             for i in range(L):
                 arg_idx = i + 1 if is_method else i
                 if plan.positional[skip + i].sized_int_list:
-                    call_args.append(f"(args[{arg_idx}],) if type(args[{arg_idx}]) is int else args[{arg_idx}]")
+                    call_args.append(
+                        f"(args[{arg_idx}],) if type(args[{arg_idx}]) is int"
+                        f" else _symint_list_coerce(args[{arg_idx}])"
+                    )
+                elif plan.positional[skip + i].int_list:
+                    call_args.append(f"_symint_list_coerce(args[{arg_idx}])")
                 elif plan.positional[skip + i].scalar_int:
                     call_args.append(
                         f"args[{arg_idx}] if type(args[{arg_idx}]) is int"
@@ -4632,6 +4751,7 @@ def _install_tensor_methods(module, tensorbase, dispatch, methods) -> None:
     _install_tensor_scalars(tensorbase, dispatch)
     _install_tensor_indexing(module, tensorbase, dispatch)
     _install_tensor_softmax(tensorbase, dispatch)
+    _install_tensor_where(tensorbase, dispatch)
     _install_tensor_chunk(tensorbase, dispatch)
     _install_tensor_index_put_(tensorbase, dispatch)
     _install_autograd_shape(tensorbase)
@@ -5109,6 +5229,63 @@ def _install_tensor_softmax(tensorbase, dispatch) -> None:
     log_softmax.__name__ = "log_softmax"
     log_softmax.__qualname__ = "TensorBase.log_softmax"
     setattr(tensorbase, "log_softmax", log_softmax)
+
+
+def _install_tensor_where(tensorbase, dispatch) -> None:
+    """`Tensor.where(condition, other)` -- `led` and `longformer`'s wall.
+
+    **The receiver is the `x` branch, not the condition, and that is the whole
+    reason this is not a `methods.json` row.** Measured on torch 2.13.0 in a
+    separate process:
+
+        x.where(c, y)      is      torch.where(c, x, y)
+
+    with `x = [[1, 2], [3, 4]]`, `y = [[10, 20], [30, 40]]` and
+    `c = [[True, False], [False, True]]` both answering `[[1, 20], [30, 4]]`.
+    So the receiver binds into the aten schema's **second** slot:
+
+        aten::where.self(Tensor condition, Tensor self, Tensor other)
+                          ^ arg 0          ^ the receiver
+
+    `methods.json`'s machine binds the receiver into argument **0** and only
+    argument 0 -- `_Overloads(self_bound=True)` passes it as `args[0]` and
+    every positional count skips exactly one. A `where` row in that table would
+    therefore compute `torch.where(x, c, y)`: the *right shape*, the right
+    dtype, and the two branches swapped. That failure is invisible to a shape
+    check and to any test whose two branches broadcast the same, which is why
+    it is written out here instead. docs/REPEAT.md §1.
+
+    `docs/BIND5.md` §4.1 recorded this as "`methods.json` simply has no row";
+    re-measured here rather than trusted, and the row would have been wrong.
+    The kernels it named were right -- all five `where` overloads are
+    implemented and unchanged by this.
+
+    Two overloads, chosen the way upstream's parser chooses (measured: a
+    Tensor `other` takes `where.self`, a `Number` other takes
+    `where.ScalarOther`, and `x.where(c, True)` is accepted with the bool
+    treated as a wrapped number). `.ScalarSelf` and `.Scalar` are unreachable
+    through this door by construction -- the receiver is always a Tensor -- and
+    stay reachable through `torch.where`.
+    """
+
+    def where(self, condition, other):
+        if isinstance(other, tensorbase):
+            return dispatch("aten.where.self", condition, self, other)
+        if isinstance(other, (bool, int, float, complex)):
+            return dispatch("aten.where.ScalarOther", condition, self, other)
+        # Upstream's shape of message, which names both overloads rather than
+        # only the one that came closest -- a caller who passed `None` needs to
+        # see that neither door takes it.
+        raise TypeError(
+            "where() received an invalid combination of arguments - got "
+            f"(Tensor, {type(other).__name__}), but expected one of:\n"
+            " * (Tensor condition, Tensor other)\n"
+            " * (Tensor condition, Number other)\n"
+        )
+
+    where.__name__ = "where"
+    where.__qualname__ = "TensorBase.where"
+    setattr(tensorbase, "where", where)
 
 
 def _install_tensor_index_put_(tensorbase, dispatch) -> None:
@@ -9519,7 +9696,14 @@ def _install_composites(module, varfns, dispatch) -> None:
     einsum.__module__ = "torch._C"
     setattr(varfns, "einsum", einsum)
 
-    def repeat_interleave(input, repeats, dim=None, *, output_size=None):
+    # `repeats` is genuinely optional upstream, because the one-argument
+    # overload's single argument is the *repeats* vector, not an input. A
+    # `None` default would collide with nothing here, but a sentinel says
+    # "not given" rather than "given as None", and upstream distinguishes the
+    # two: `repeat_interleave(x, None)` is a combination error there.
+    _RI_UNSET = object()
+
+    def repeat_interleave(input, repeats=_RI_UNSET, dim=None, *, output_size=None):
         """`torch.repeat_interleave` -- `cohere`'s wall, also a composite.
 
         `models/cohere/modeling_cohere.py:115` is the caller, and its own
@@ -9537,9 +9721,12 @@ def _install_composites(module, varfns, dispatch) -> None:
         The integer-`repeats` overload (`aten::repeat_interleave.self_int`) is
         `CompositeImplicitAutograd` and emits *no* record of its own -- it is
         the four-op expansion above, every one of which this shim already has.
-        The tensor-`repeats` overload is a genuine kernel plus `index_select`,
-        neither of which exists here, so it is refused by name rather than
-        approximated.
+        The tensor-`repeats` overload is a genuine kernel plus `index_select`;
+        **both exist here now** (docs/REPEAT.md), where docs/LAST7.md §5.2 left
+        the first of the two missing and this function refusing by name. The
+        refusal it left behind is gone and the two callers it named --
+        `fastspeech2_conformer`'s length regulator and the one-argument
+        spelling -- reach the kernel.
 
         The expansion, transcribed from the trace rather than invented:
 
@@ -9560,27 +9747,77 @@ def _install_composites(module, varfns, dispatch) -> None:
         disagrees with the computed one. `repeats=0` is *not* an error --
         it produces a zero-length axis, and `repeats=1` is the identity.
         """
-        if isinstance(input, (list, tuple)) or not isinstance(input, tensorbase):
+        if repeats is _RI_UNSET or isinstance(input, (list, tuple)) or not isinstance(
+            input, tensorbase
+        ):
             # `aten::repeat_interleave.Tensor(Tensor repeats, ...)` -- the
-            # one-argument spelling, where the only argument is the repeats
-            # tensor. Not reachable from any measured caller and it needs the
-            # kernel this shim does not have, so it is refused with the same
-            # words as the other half below.
-            raise NotImplementedError(
-                "not implemented in torch._C shim: torch.repeat_interleave(repeats) "
-                "-- the one-argument spelling needs aten::repeat_interleave.Tensor, "
-                "a real kernel this shim does not have"
+            # one-argument spelling, where the only argument *is* the repeats
+            # vector and the answer is the index vector. `torch.repeat_interleave
+            # (tensor([2, 0, 3]))` is `tensor([0, 0, 2, 2, 2])` upstream; with
+            # the kernel present this is now that call and nothing else.
+            # docs/REPEAT.md §2.
+            if repeats is not _RI_UNSET or dim is not None or not isinstance(
+                input, tensorbase
+            ):
+                # Upstream answers a combination error here, and the shape of
+                # it is the point: the overload that takes `dim` is the one
+                # that takes an `input` *and* a `repeats`, so there is no
+                # overload left for a `dim` beside a lone repeats vector.
+                raise TypeError(
+                    "repeat_interleave() received an invalid combination of "
+                    "arguments - expected one of:\n"
+                    " * (Tensor input, Tensor repeats, int dim = None, *, "
+                    "int output_size = None)\n"
+                    " * (Tensor input, int repeats, int dim = None, *, "
+                    "int output_size = None)\n"
+                    " * (Tensor repeats, *, int output_size = None)"
+                )
+            return dispatch(
+                "aten.repeat_interleave.Tensor", input, output_size=output_size
             )
         if isinstance(repeats, tensorbase):
-            raise NotImplementedError(
-                "not implemented in torch._C shim: torch.repeat_interleave with a "
-                "tensor `repeats` -- upstream lowers it to "
-                "aten::repeat_interleave.Tensor followed by aten::index_select; "
-                "aten::index_select IS implemented here and "
-                "aten::repeat_interleave.Tensor is not, and building the index "
-                "without it would mean reading `repeats` back to the host -- the "
-                "integer `repeats` spelling is implemented"
+            # Upstream's lowering, transcribed from a `TorchDispatchMode`
+            # logger on torch 2.13.0 rather than invented (docs/REPEAT.md §2):
+            #
+            #   dim=0, repeats (3,)     repeat_interleave.Tensor, index_select
+            #   dim=0, repeats (1,)     view [1], expand [n], then the two above
+            #   dim=None                view [-1] first, then dim = 0
+            #
+            # The broadcast of a one-element `repeats` happens *here*, above
+            # the kernel, which is where upstream does it -- the kernel itself
+            # refuses a length that disagrees with the axis, and would refuse
+            # a legitimate `repeat_interleave(x, tensor([2]), 0)` if this were
+            # pushed down into it.
+            if dim is None:
+                input = dispatch("aten.view.default", input, [-1])
+                axis = 0
+            else:
+                rank = input.dim()
+                axis = dim if dim >= 0 else dim + rank
+                if axis < 0 or axis >= rank:
+                    raise IndexError(
+                        f"Dimension out of range (expected to be in range of "
+                        f"[{-rank}, {rank - 1}], but got {dim})"
+                    )
+            extent = list(input.shape)[axis]
+            if repeats.dim() == 1 and repeats.numel() == 1 and extent != 1:
+                repeats = dispatch("aten.view.default", repeats, [1])
+                repeats = dispatch("aten.expand.default", repeats, [extent])
+            # Upstream's check, and its wording, measured on
+            # `repeat_interleave(x, tensor([2, 3]), 0)` with `x.size(0) == 3`.
+            # It fires before the kernel, so a `repeats` of the wrong length
+            # never becomes an index vector that `index_select` would then
+            # reject for a different reason.
+            if repeats.dim() == 1 and repeats.numel() != extent:
+                raise RuntimeError(
+                    f"repeats must have the same size as input along dim, but "
+                    f"got repeats.size(0) = {repeats.numel()} and "
+                    f"input.size(0) = {extent}"
+                )
+            index = dispatch(
+                "aten.repeat_interleave.Tensor", repeats, output_size=output_size
             )
+            return dispatch("aten.index_select.default", input, axis, index)
         repeats = int(repeats)
         if repeats < 0:
             raise RuntimeError("Repeats must be non-negative")
