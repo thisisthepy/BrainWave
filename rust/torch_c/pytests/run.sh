@@ -181,5 +181,12 @@ TORCH_C_ARTEFACT="$stage/_C.abi3.so" \
 # `_aten_implemented()`, a key in a table, a count read from a suite's own
 # summary line), so this cannot cry wolf on prose; docs/DOCWATCH.md says what
 # it structurally cannot see.
+#
+# README.md is passed explicitly. With no arguments the checker scans `docs/*.md`
+# only -- so the fifteen markers on the README, which hold down every number a
+# reader of the front page sees, were outside the gate while every number in
+# `docs/` was inside it. The claims most likely to be read were the ones least
+# likely to be checked.
 TORCH_C_ARTEFACT="$stage/_C.abi3.so" \
-    exec "${PYTHON:-python3}" "$repo_root/tools/docwatch/check_docs.py"
+    exec "${PYTHON:-python3}" "$repo_root/tools/docwatch/check_docs.py" \
+        "$repo_root"/docs/*.md "$repo_root/README.md"

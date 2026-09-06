@@ -1197,7 +1197,19 @@ def test_grouped_mm_resolves_from_the_torch_level_name():
     # are the underscore-prefixed keys that reach a `torch.<name>` because of
     # it. All three have kernels; none would resolve under the old predicate.
     admitted = sorted(n for n in _C._shim_overloads if n.startswith("_"))
-    assert admitted == ["_grouped_mm", "_log_softmax", "_safe_softmax"], admitted
+    # `_is_all_true` joined in docs/TAIL1.md. It is `overloads.json`-only in
+    # the sense that matters here -- upstream has `torch._is_all_true` AND
+    # `Tensor._is_all_true`, and both tables carry it -- and it is the fourth
+    # underscore-prefixed key the widened predicate admits. The other seven ops
+    # that round added are all public names and none of them appears here,
+    # which is what makes this a check on the predicate rather than a tally of
+    # the round.
+    assert admitted == [
+        "_grouped_mm",
+        "_is_all_true",
+        "_log_softmax",
+        "_safe_softmax",
+    ], admitted
     assert _C._shim_overloads["_log_softmax"] == ["aten._log_softmax.default"], (
         _C._shim_overloads["_log_softmax"]
     )

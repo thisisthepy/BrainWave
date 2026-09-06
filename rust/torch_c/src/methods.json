@@ -46,7 +46,7 @@
     "table. `F.softmax` spells itself `input.softmax(dim)`, so it would",
     "belong here -- but the parser-level key is `aten.softmax.int` while the",
     "key upstream's dispatcher actually sees is `aten._softmax.default`",
-    "(measured, docs/NN_SURFACE.md \u00a76). Listing `softmax.int` would name a",
+    "(measured, docs/NN_SURFACE.md §6). Listing `softmax.int` would name a",
     "work item this shim will never implement, which is worse than naming",
     "none. Same reasoning as `to.dtype` versus `_to_copy` in",
     "`_install_tensor_conversions`. `Tensor.softmax` is still installed --",
@@ -70,7 +70,7 @@
     "key and the dispatch key genuinely disagree and no table entry could ever",
     "be right; here both keys are real and simply depend on the argument.",
     "",
-    "The seven entries added for Mixtral (docs/GROUPED_MM.md \u00a76.4), and what",
+    "The seven entries added for Mixtral (docs/GROUPED_MM.md §6.4), and what",
     "is worth knowing about each:",
     "",
     "  * `__idiv__` is not a typo for `__itruediv__`. `torch/_tensor.py:1115`",
@@ -85,14 +85,14 @@
     "    `x.div_(2.0)` dispatches `aten.div_.Tensor`, because torch's frontend",
     "    wraps the number into a tensor before it picks an overload and this",
     "    resolver does not. Exactly the divergence `div`/`add`/`sub` already",
-    "    have, and the one docs/GROUPED_MM.md \u00a76.2 records for",
+    "    have, and the one docs/GROUPED_MM.md §6.2 records for",
     "    `floor_divide.Scalar`.",
     "  * `ge`/`__ge__` complete the comparison set -- `le`, `lt`, `gt`, `eq`",
     "    and `ne` all had both spellings and `ge` had neither. Both of `ge`'s",
     "    overloads now have a kernel: `ge.Tensor` was the one missing member",
     "    of the comparison family (`le.Tensor`, `lt.Tensor` and `gt.Tensor`",
     "    all had one), so `x >= tensor` resolved here and then refused inside",
-    "    `_aten_dispatch`. Closed in docs/VIEWS.md \u00a71.",
+    "    `_aten_dispatch`. Closed in docs/VIEWS.md §1.",
     "  * `clamp_` follows the `.pyi` order -- Tensor overload first -- and the",
     "    measurement agrees with it rather than contradicting it:",
     "    `x.clamp_(max=6)` lands on `aten.clamp_.default` because an `int`",
@@ -103,7 +103,7 @@
     "  * `masked_fill_` is `masked_fill`'s in-place twin, same order, and its",
     "    `.Tensor` overload is likewise kernel-less.",
     "  * `add_`/`sub_`/`mul_`/`neg_`/`exp_`/`relu_` and the three `__i*__`",
-    "    dunders arrived together (docs/ARCH20.md \u00a78), and the gap they",
+    "    dunders arrived together (docs/ARCH20.md §8), and the gap they",
     "    closed is worth naming: `aten.add_.Tensor` had had a kernel since",
     "    docs/TAIL.md and `aten.relu_.default` since docs/KERNELS.md, and",
     "    neither name was reachable from Python -- `x += y` raised",
@@ -146,8 +146,8 @@
     "entry would break it. It did, and updating it was the notification.",
     "",
     "The `min` entry's `.dim` and `.other` schemas are no longer kernel-less",
-    "-- docs/SPELLINGS.md \u00a77.2 listed them here precisely so they would refuse",
-    "by name, and docs/TRIL.md \u00a73 implemented both. `torch.min(x, dim=0)` and",
+    "-- docs/SPELLINGS.md §7.2 listed them here precisely so they would refuse",
+    "by name, and docs/TRIL.md §3 implemented both. `torch.min(x, dim=0)` and",
     "`torch.min(x, y)` compute now."
   ],
   "mul": [
@@ -649,5 +649,14 @@
   ],
   "reshape_as": [
     "aten::reshape_as(Tensor(a) self, Tensor other) -> Tensor(a)"
+  ],
+  "acos": [
+    "aten::acos(Tensor self) -> Tensor"
+  ],
+  "logical_and": [
+    "aten::logical_and(Tensor self, Tensor other) -> Tensor"
+  ],
+  "_is_all_true": [
+    "aten::_is_all_true(Tensor self) -> Tensor"
   ]
 }

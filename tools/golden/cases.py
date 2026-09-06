@@ -24547,6 +24547,7 @@ def prims_split_dim_cases(torch_module, c_module, torch_call) -> list[Case]:
         )
     return cases
 
+<<<<<<< HEAD
 # --- docs/INDEXSEL.md: index_select, argsort, where.Scalar, new_full, -------
 # unflatten, chunk (free-function), diff, multiply, logical_and ------------
 #
@@ -24789,11 +24790,83 @@ def new_full_cases(torch_module, c_module, torch_call) -> list[Case]:
             run_c=lambda: c_module._aten_dispatch(
                 op, f32_c, [2, 2], 5, dtype=c_module.int64
             ),
+=======
+
+# --- docs/TAIL1.md: the eight one-architecture ops, plus QR -------------------
+#
+# Read docs/TAIL1.md §1 for which of these were table rows over an existing
+# kernel and which were new kernels; the cases below are written so that the
+# *plausible wrong implementation* fails, which for four of them means a very
+# specific input:
+#
+#   logical_and         integers, where `bitwise_and` gives a different answer
+#                       AND a different dtype
+#   argsort             duplicates, where a stable and an unstable sort differ
+#   upsample_nearest2d  an explicit `scales_h` that disagrees with output_size,
+#                       where deriving the scale from the sizes differs
+#   linalg_qr           `eye`, where dropping LAPACK's `xnorm == 0` short
+#                       circuit answers `-I` instead of `+I`
+
+_TAIL1_TIED = [3, 1, 3, 1, 2, 3]
+
+
+def _t1(torch_module, c_module, flat, shape, dtype_name):
+    return pair_from_flat(torch_module, c_module, flat, shape, dtype_name)
+
+
+def acos_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.acos.default"
+    cases: list[Case] = []
+    # The domain, in and out of it. `1.5` and `-2.0` are the point: upstream
+    # answers NaN rather than raising, and "raises outside [-1, 1]" is the
+    # plausible wrong guess.
+    domain = [-1.0, -0.5, 0.0, 0.5, 1.0, 1.5, -2.0, float("nan"), float("inf")]
+    for dtype_name in ("float64", "float32", "float16", "bfloat16"):
+        a_t, a_c = _t1(torch_module, c_module, domain, (9,), dtype_name)
+        cases.append(
+            Case(
+                name=f"acos(dtype={dtype_name}) [domain edges, NaN and inf]",
+                op=op,
+                run_torch=lambda a_t=a_t: torch_call(a_t),
+                run_c=lambda a_c=a_c: c_module._aten_dispatch(op, a_c),
+                note="|x|>1 and +-inf answer NaN upstream, they do not raise",
+            )
+        )
+    # Promotion: every non-floating dtype answers the default float, measured.
+    for dtype_name in ("int64", "int32", "int16", "uint8", "bool"):
+        a_t, a_c = _t1(torch_module, c_module, [0, 1], (2,), dtype_name)
+        cases.append(
+            Case(
+                name=f"acos(dtype={dtype_name}) [integral promotes to float32]",
+                op=op,
+                run_torch=lambda a_t=a_t: torch_call(a_t),
+                run_c=lambda a_c=a_c: c_module._aten_dispatch(op, a_c),
+                note="unary_float promotion: an integral or bool input answers float32",
+            )
+        )
+    a_t, a_c = _t1(torch_module, c_module, [0.5], (), "float32")
+    cases.append(
+        Case(
+            name="acos(float32, 0-d)",
+            op=op,
+            run_torch=lambda: torch_call(a_t),
+            run_c=lambda: c_module._aten_dispatch(op, a_c),
+        )
+    )
+    b_t, b_c = _t1(torch_module, c_module, [], (0,), "float32")
+    cases.append(
+        Case(
+            name="acos(float32, empty)",
+            op=op,
+            run_torch=lambda: torch_call(b_t),
+            run_c=lambda: c_module._aten_dispatch(op, b_c),
+>>>>>>> work/tail1
         )
     )
     return cases
 
 
+<<<<<<< HEAD
 def unflatten_int_cases(torch_module, c_module, torch_call) -> list[Case]:
     """`siglip_vision_model`'s wall, reached through
     `F.multi_head_attention_forward`'s `kv_proj.unflatten(-1, (2, E))`.
@@ -25031,6 +25104,698 @@ def logical_and_cases(torch_module, c_module, torch_call) -> list[Case]:
             run_c=lambda: c_module._aten_dispatch(op, row_c, col_c),
         ),
     ]
+=======
+def logical_and_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.logical_and.default"
+    cases: list[Case] = []
+    # THE case. On these operands `bitwise_and` answers int64 [0,1,0,1] and
+    # `logical_and` answers bool [F,T,F,T]: both the values and the dtype
+    # differ, so routing one at the other cannot pass here.
+    for dtype_name in ("int64", "int32", "int16", "uint8"):
+        a_t, a_c = _t1(torch_module, c_module, [0, 1, 2, 3], (4,), dtype_name)
+        b_t, b_c = _t1(torch_module, c_module, [0, 3, 0, 5], (4,), dtype_name)
+        cases.append(
+            Case(
+                name=f"logical_and(dtype={dtype_name}) [differs from bitwise_and in value AND dtype]",
+                op=op,
+                run_torch=lambda a_t=a_t, b_t=b_t: torch_call(a_t, b_t),
+                run_c=lambda a_c=a_c, b_c=b_c: c_module._aten_dispatch(op, a_c, b_c),
+                note="truthiness AND, answering bool -- not the bit-AND of the same pair",
+            )
+        )
+    for dtype_name in ("bool", "float64", "float32", "float16"):
+        a_t, a_c = _t1(torch_module, c_module, [0, 1, 2, 3], (4,), dtype_name)
+        b_t, b_c = _t1(torch_module, c_module, [0, 3, 0, 5], (4,), dtype_name)
+        cases.append(
+            Case(
+                name=f"logical_and(dtype={dtype_name})",
+                op=op,
+                run_torch=lambda a_t=a_t, b_t=b_t: torch_call(a_t, b_t),
+                run_c=lambda a_c=a_c, b_c=b_c: c_module._aten_dispatch(op, a_c, b_c),
+                note="bool is where logical_and and bitwise_and DO agree",
+            )
+        )
+    # NaN is truthy -- falls out of `x != 0` and not out of `x > 0`.
+    n_t, n_c = _t1(torch_module, c_module, [float("nan"), 0.0, -0.0, float("inf")], (4,), "float32")
+    o_t, o_c = _t1(torch_module, c_module, [1.0, 1.0, 1.0, 1.0], (4,), "float32")
+    cases.append(
+        Case(
+            name="logical_and(float32, [nan, 0.0, -0.0, inf], ones)",
+            op=op,
+            run_torch=lambda: torch_call(n_t, o_t),
+            run_c=lambda: c_module._aten_dispatch(op, n_c, o_c),
+            note="NaN is True, -0.0 is False -- both measured, both from `x != 0`",
+        )
+    )
+    # No promotion: the two sides are read at their own dtypes.
+    m_t, m_c = _t1(torch_module, c_module, [0, 1, 2], (3,), "int64")
+    p_t, p_c = _t1(torch_module, c_module, [1, 0, 1], (3,), "bool")
+    cases.append(
+        Case(
+            name="logical_and(int64, bool) [mixed dtypes, no common type built]",
+            op=op,
+            run_torch=lambda: torch_call(m_t, p_t),
+            run_c=lambda: c_module._aten_dispatch(op, m_c, p_c),
+        )
+    )
+    q_t, q_c = _t1(torch_module, c_module, [0.0, 1.0, 2.0], (3,), "float32")
+    r_t, r_c = _t1(torch_module, c_module, [0, 1, 0], (3,), "int64")
+    cases.append(
+        Case(
+            name="logical_and(float32, int64) [mixed dtypes]",
+            op=op,
+            run_torch=lambda: torch_call(q_t, r_t),
+            run_c=lambda: c_module._aten_dispatch(op, q_c, r_c),
+        )
+    )
+    # Broadcasting.
+    c_t, c_c = _t1(torch_module, c_module, [1, 0, 1], (3, 1), "bool")
+    d_t, d_c = _t1(torch_module, c_module, [1, 0], (1, 2), "bool")
+    cases.append(
+        Case(
+            name="logical_and(bool (3,1), bool (1,2)) [broadcast]",
+            op=op,
+            run_torch=lambda: torch_call(c_t, d_t),
+            run_c=lambda: c_module._aten_dispatch(op, c_c, d_c),
+        )
+    )
+    e_t, e_c = _t1(torch_module, c_module, [1, 0, 1], (3,), "bool")
+    f_t, f_c = _t1(torch_module, c_module, [1], (), "bool")
+    cases.append(
+        Case(
+            name="logical_and(bool (3,), bool 0-d) [0-d broadcast]",
+            op=op,
+            run_torch=lambda: torch_call(e_t, f_t),
+            run_c=lambda: c_module._aten_dispatch(op, e_c, f_c),
+        )
+    )
+    g_t, g_c = _t1(torch_module, c_module, [1, 0, 1], (3,), "bool")
+    h_t, h_c = _t1(torch_module, c_module, [1, 0], (2,), "bool")
+    cases.append(
+        Case(
+            name="logical_and(bool (3,), bool (2,)) [non-broadcastable]",
+            op=op,
+            run_torch=lambda: torch_call(g_t, h_t),
+            run_c=lambda: c_module._aten_dispatch(op, g_c, h_c),
+            expect="both_error",
+        )
+    )
+    return cases
+
+
+def is_all_true_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten._is_all_true.default"
+    cases: list[Case] = []
+    for flat, shape, note in (
+        ([1, 1], (2,), "every element True"),
+        ([1, 0], (2,), "one False"),
+        ([0, 0], (2,), "all False"),
+        ([], (0,), "empty -- the empty conjunction is True, measured"),
+        ([1], (), "0-d True"),
+        ([0], (), "0-d False"),
+        ([1, 1, 1, 0], (2, 2), "2-D, reduced to a 0-d result"),
+    ):
+        a_t, a_c = _t1(torch_module, c_module, flat, shape, "bool")
+        cases.append(
+            Case(
+                name=f"_is_all_true(bool, {shape}, {flat}) [{note}]",
+                op=op,
+                run_torch=lambda a_t=a_t: torch_call(a_t),
+                run_c=lambda a_c=a_c: c_module._aten_dispatch(op, a_c),
+                note=note + " -- answers a 0-d bool tensor, not a Python bool",
+            )
+        )
+    # Bool only, and upstream refuses with an INTERNAL ASSERT rather than a
+    # typed error. Both sides must refuse; "either exception is accepted" is
+    # what makes this checkable without transcribing a line number.
+    for dtype_name in ("int64", "float32", "uint8"):
+        a_t, a_c = _t1(torch_module, c_module, [1, 1], (2,), dtype_name)
+        cases.append(
+            Case(
+                name=f"_is_all_true(dtype={dtype_name}) [bool-only, both refuse]",
+                op=op,
+                run_torch=lambda a_t=a_t: torch_call(a_t),
+                run_c=lambda a_c=a_c: c_module._aten_dispatch(op, a_c),
+                expect="both_error",
+                note="self.scalar_type() == at::kBool INTERNAL ASSERT FAILED upstream",
+            )
+        )
+    return cases
+
+
+def _argsort_cases_for(op, extra, torch_module, c_module, torch_call) -> list[Case]:
+    """`extra` is the `stable=` keyword, as a dict: `{}` for `argsort.default`
+    and `{"stable": ...}` for `argsort.stable`.
+
+    It has to be a *keyword*, not a positional. `argsort.stable`'s schema marks
+    `stable` keyword-only (`*` before it) and upstream's parser enforces that:
+    `torch.ops.aten.argsort.stable(x, True, -1, False)` raises "takes 1
+    positional argument(s) but 4 was/were given". Passing it positionally here
+    would have made every stable case a SILENT DIVERGENCE -- torch refusing
+    while this shim, whose kernel reads slot 1 either way, computed an answer.
+    That is what the first run of these cases reported, and it is a fact about
+    the *call*, not about the kernel.
+
+    `dim` and `descending` are keywords here for the same reason and it is
+    stronger than the schema suggests: `OpOverload.__call__` on `.stable`
+    reports "takes 1 positional argument(s)", so *everything* past `self` is
+    keyword-only at this binding, not only the argument the schema stars."""
+    cases: list[Case] = []
+    # Duplicates. On distinct values a stable and an unstable sort agree, so a
+    # tie-free input cannot tell them apart -- these six elements can.
+    for dtype_name in ("float32", "float64", "int64", "int32"):
+        for descending in (False, True):
+            a_t, a_c = _t1(torch_module, c_module, _TAIL1_TIED, (6,), dtype_name)
+            cases.append(
+                Case(
+                    name=f"{op}(dtype={dtype_name}, descending={descending}) "
+                    f"[ties at 3 and 1, stable in both directions]",
+                    op=op,
+                    run_torch=lambda a_t=a_t, d=descending: torch_call(a_t, dim=-1, descending=d, **extra),
+                    run_c=lambda a_c=a_c, d=descending: c_module._aten_dispatch(
+                        op, a_c, dim=-1, descending=d, **extra
+                    ),
+                    note="an unstable sort is free to answer a different permutation here",
+                )
+            )
+    # Eighty equal elements: an unstable sort almost certainly permutes them.
+    a_t, a_c = _t1(torch_module, c_module, [1.0] * 80, (80,), "float32")
+    cases.append(
+        Case(
+            name=f"{op}(float32, 80 identical elements)",
+            op=op,
+            run_torch=lambda: torch_call(a_t, dim=-1, descending=False, **extra),
+            run_c=lambda: c_module._aten_dispatch(op, a_c, dim=-1, descending=False, **extra),
+            note="upstream answers 0..79; any tie-breaking difference shows here",
+        )
+    )
+    for dim in (0, 1, -1):
+        b_t, b_c = _t1(torch_module, c_module, [3, 1, 2, 0, 5, 4], (2, 3), "int64")
+        cases.append(
+            Case(
+                name=f"{op}(int64, (2,3), dim={dim})",
+                op=op,
+                run_torch=lambda b_t=b_t, dim=dim: torch_call(b_t, dim=dim, descending=False, **extra),
+                run_c=lambda b_c=b_c, dim=dim: c_module._aten_dispatch(
+                    op, b_c, dim=dim, descending=False, **extra
+                ),
+            )
+        )
+    nan_flat = [1.0, float("nan"), 0.0, float("inf"), float("-inf")]
+    for descending in (False, True):
+        c_t, c_c = _t1(torch_module, c_module, nan_flat, (5,), "float32")
+        cases.append(
+            Case(
+                name=f"{op}(float32, NaN/inf, descending={descending})",
+                op=op,
+                run_torch=lambda c_t=c_t, d=descending: torch_call(c_t, dim=-1, descending=d, **extra),
+                run_c=lambda c_c=c_c, d=descending: c_module._aten_dispatch(
+                    op, c_c, dim=-1, descending=d, **extra
+                ),
+                note="torch sorts NaN as greatest, which IEEE comparison does not",
+            )
+        )
+    d_t, d_c = _t1(torch_module, c_module, [5.0], (), "float32")
+    cases.append(
+        Case(
+            name=f"{op}(float32, 0-d)",
+            op=op,
+            run_torch=lambda: torch_call(d_t, dim=-1, descending=False, **extra),
+            run_c=lambda: c_module._aten_dispatch(op, d_c, dim=-1, descending=False, **extra),
+            note="a 0-d input answers a 0-d index of 0, not an error",
+        )
+    )
+    e_t, e_c = _t1(torch_module, c_module, [1, 0, 1], (3,), "bool")
+    cases.append(
+        Case(
+            name=f"{op}(bool)",
+            op=op,
+            run_torch=lambda: torch_call(e_t, dim=-1, descending=False, **extra),
+            run_c=lambda: c_module._aten_dispatch(op, e_c, dim=-1, descending=False, **extra),
+        )
+    )
+    return cases
+
+
+def argsort_default_cases(torch_module, c_module, torch_call) -> list[Case]:
+    return _argsort_cases_for(
+        "aten.argsort.default", {}, torch_module, c_module, torch_call
+    )
+
+
+def argsort_stable_cases(torch_module, c_module, torch_call) -> list[Case]:
+    # Both values of `stable`. They answer the same thing on CPU -- measured,
+    # docs/TAIL1.md §3 -- and comparing both is what says so rather than
+    # assuming it.
+    out: list[Case] = []
+    for stable in (True, False):
+        out.extend(
+            _argsort_cases_for(
+                "aten.argsort.stable", {"stable": stable}, torch_module, c_module, torch_call
+            )
+        )
+    return out
+
+
+def broadcast_tensors_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.broadcast_tensors.default"
+    cases: list[Case] = []
+
+    def case(name, build, expect="match", note=""):
+        return Case(
+            name=name,
+            op=op,
+            run_torch=lambda: torch_call([x[0] for x in build()]),
+            run_c=lambda: c_module._aten_dispatch(op, [x[1] for x in build()]),
+            expect=expect,
+            value_check=_chunk_list_check if expect == "match" else None,
+            note=note + " -- returns a list of tensors, see _chunk_list_check",
+        )
+
+    cases.append(
+        case(
+            "broadcast_tensors([(3,1) float32, (1,2) float32])",
+            lambda: [
+                _t1(torch_module, c_module, [0, 1, 2], (3, 1), "float32"),
+                _t1(torch_module, c_module, [0, 1], (1, 2), "float32"),
+            ],
+            note="the ordinary outer-product shape",
+        )
+    )
+    # Dtypes are NOT unified -- the plausible wrong move is `cat`'s promote.
+    cases.append(
+        case(
+            "broadcast_tensors([int64, float32]) [dtypes are not unified]",
+            lambda: [
+                _t1(torch_module, c_module, [1, 2], (2,), "int64"),
+                _t1(torch_module, c_module, [1.0, 2.0], (2,), "float32"),
+            ],
+            note="each entry keeps its own dtype; only the shapes meet",
+        )
+    )
+    cases.append(
+        case(
+            "broadcast_tensors([0-d, (2,3)])",
+            lambda: [
+                _t1(torch_module, c_module, [5.0], (), "float32"),
+                _t1(torch_module, c_module, list(range(6)), (2, 3), "float32"),
+            ],
+            note="a 0-d entry broadcasts like any size-1 axis",
+        )
+    )
+    cases.append(
+        case(
+            "broadcast_tensors([(2,3)]) [single entry]",
+            lambda: [_t1(torch_module, c_module, list(range(6)), (2, 3), "float32")],
+            note="one tensor in, one tensor out, unchanged",
+        )
+    )
+    cases.append(
+        case(
+            "broadcast_tensors([(3,1), (1,2), (3,2)]) [three entries]",
+            lambda: [
+                _t1(torch_module, c_module, [0, 1, 2], (3, 1), "float32"),
+                _t1(torch_module, c_module, [0, 1], (1, 2), "float32"),
+                _t1(torch_module, c_module, list(range(6)), (3, 2), "float32"),
+            ],
+            note="the fold runs over the whole list, not just a pair",
+        )
+    )
+    cases.append(
+        case(
+            "broadcast_tensors([(2,1,3), (4,3)]) [ranks differ]",
+            lambda: [
+                _t1(torch_module, c_module, list(range(6)), (2, 1, 3), "float32"),
+                _t1(torch_module, c_module, list(range(12)), (4, 3), "float32"),
+            ],
+            note="right-aligned: the shorter shape gains leading axes",
+        )
+    )
+    cases.append(
+        case(
+            "broadcast_tensors([(3,), (2,)]) [non-broadcastable]",
+            lambda: [
+                _t1(torch_module, c_module, [1, 2, 3], (3,), "float32"),
+                _t1(torch_module, c_module, [1, 2], (2,), "float32"),
+            ],
+            expect="both_error",
+            note="3 against 2 at a non-singleton axis",
+        )
+    )
+    cases.append(
+        Case(
+            name="broadcast_tensors([]) [empty list]",
+            op=op,
+            run_torch=lambda: torch_call([]),
+            run_c=lambda: c_module._aten_dispatch(op, []),
+            value_check=_chunk_list_check,
+            note="an empty list answers an empty list, not an error",
+        )
+    )
+    return cases
+
+
+_MAX_POOL1D_DTYPES = ("float32", "float64", "float16", "bfloat16")
+
+
+def max_pool1d_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.max_pool1d.default"
+    cases: list[Case] = []
+    twenty = [float(v) for v in range(20)]
+    for dtype_name in _MAX_POOL1D_DTYPES:
+        for args, note in (
+            ((2,), "kernel 2, stride defaults to the kernel -- not to 1"),
+            ((3, 2), "explicit stride"),
+            ((3, 2, 1), "padding 1"),
+            ((2, 1, 0, 2), "dilation 2"),
+            ((3, 3, 0, 1, True), "ceil_mode"),
+            ((3, 2, 0, 1, True), "ceil_mode with a window that starts in the padding"),
+        ):
+            a_t, a_c = _t1(torch_module, c_module, twenty, (1, 2, 10), dtype_name)
+            cases.append(
+                Case(
+                    name=f"max_pool1d(dtype={dtype_name}, args={args}) [{note}]",
+                    op=op,
+                    run_torch=lambda a_t=a_t, args=args: torch_call(a_t, *args),
+                    run_c=lambda a_c=a_c, args=args: c_module._aten_dispatch(op, a_c, *args),
+                    note=note,
+                )
+            )
+    # Unbatched (C, L) -- upstream takes both ranks.
+    b_t, b_c = _t1(torch_module, c_module, [float(v) for v in range(10)], (2, 5), "float32")
+    cases.append(
+        Case(
+            name="max_pool1d(float32, (2,5) unbatched, kernel 2)",
+            op=op,
+            run_torch=lambda: torch_call(b_t, 2),
+            run_c=lambda: c_module._aten_dispatch(op, b_c, 2),
+            note="a 2-D input is (C, L), not (N, L)",
+        )
+    )
+    # NaN propagates through the maximum.
+    nan_flat = [1.0, float("nan"), 0.0, 3.0, float("-inf"), 2.0]
+    c_t, c_c = _t1(torch_module, c_module, nan_flat, (1, 1, 6), "float32")
+    cases.append(
+        Case(
+            name="max_pool1d(float32, NaN/-inf window)",
+            op=op,
+            run_torch=lambda: torch_call(c_t, 2),
+            run_c=lambda: c_module._aten_dispatch(op, c_c, 2),
+            note="a NaN candidate wins the max, matching upstream's propagating max",
+        )
+    )
+    # The dtypes upstream refuses, with a kernel name that is NOT max_pool2d's.
+    for dtype_name in ("int64", "int32", "uint8"):
+        d_t, d_c = _t1(torch_module, c_module, list(range(10)), (1, 1, 10), dtype_name)
+        cases.append(
+            Case(
+                name=f"max_pool1d(dtype={dtype_name}) [no integral kernel upstream]",
+                op=op,
+                run_torch=lambda d_t=d_t: torch_call(d_t, 2),
+                run_c=lambda d_c=d_c: c_module._aten_dispatch(op, d_c, 2),
+                expect="both_error",
+                note='upstream: "max_pool1d_impl" not implemented for this dtype',
+            )
+        )
+    e_t, e_c = _t1(torch_module, c_module, [1, 0, 1, 1], (1, 1, 4), "bool")
+    cases.append(
+        Case(
+            name="max_pool1d(bool)",
+            op=op,
+            run_torch=lambda: torch_call(e_t, 2),
+            run_c=lambda: c_module._aten_dispatch(op, e_c, 2),
+            expect="both_error",
+        )
+    )
+    f_t, f_c = _t1(torch_module, c_module, [1.0, 2.0, 3.0, 4.0], (4,), "float32")
+    cases.append(
+        Case(
+            name="max_pool1d(float32, 1-D self) [wrong rank]",
+            op=op,
+            run_torch=lambda: torch_call(f_t, 2),
+            run_c=lambda: c_module._aten_dispatch(op, f_c, 2),
+            expect="both_error",
+        )
+    )
+    g_t, g_c = _t1(torch_module, c_module, [1.0, 2.0], (1, 1, 2), "float32")
+    cases.append(
+        Case(
+            name="max_pool1d(float32, kernel larger than the input)",
+            op=op,
+            run_torch=lambda: torch_call(g_t, 5),
+            run_c=lambda: c_module._aten_dispatch(op, g_c, 5),
+            expect="both_error",
+        )
+    )
+    return cases
+
+
+def upsample_nearest2d_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.upsample_nearest2d.default"
+    cases: list[Case] = []
+    sixteen = [float(v) for v in range(16)]
+    for dtype_name in ("float32", "float64", "float16", "bfloat16"):
+        for out_size, note in (
+            ([2, 2], "downsample by 2"),
+            ([3, 3], "a non-integer ratio, 4/3"),
+            ([8, 8], "upsample by 2"),
+            ([5, 7], "a different ratio per axis"),
+            ([4, 4], "identity"),
+            ([1, 1], "down to a single pixel"),
+            ([6, 3], "one axis up, one down"),
+        ):
+            a_t, a_c = _t1(torch_module, c_module, sixteen, (1, 1, 4, 4), dtype_name)
+            cases.append(
+                Case(
+                    name=f"upsample_nearest2d(dtype={dtype_name}, out={out_size}) [{note}]",
+                    op=op,
+                    run_torch=lambda a_t=a_t, o=out_size: torch_call(a_t, o),
+                    run_c=lambda a_c=a_c, o=out_size: c_module._aten_dispatch(op, a_c, o),
+                    note=note,
+                )
+            )
+    # **uint8 computes.** Nearest neighbour never averages, so there is no
+    # fixed-point rounding for a separate kernel to do differently -- unlike
+    # bilinear/bicubic, whose uint8 path this file must not be inferred from.
+    for out_size in ([3, 3], [8, 8], [5, 7]):
+        a_t, a_c = _t1(torch_module, c_module, list(range(16)), (1, 1, 4, 4), "uint8")
+        cases.append(
+            Case(
+                name=f"upsample_nearest2d(uint8, out={out_size}) [a gather, so uint8 computes]",
+                op=op,
+                run_torch=lambda a_t=a_t, o=out_size: torch_call(a_t, o),
+                run_c=lambda a_c=a_c, o=out_size: c_module._aten_dispatch(op, a_c, o),
+                note="upstream computes uint8 here; refusing it would be a lie",
+            )
+        )
+    # THE case for this op: an explicit `scales_h`/`scales_w` that does not
+    # agree with `output_size`. Deriving the scale from the sizes instead of
+    # inverting the argument gathers rows [0,1,2] where upstream gathers
+    # [0,0,1], and every call `F.interpolate` makes would hide the difference.
+    for scales, out_size, note in (
+        ((2.0, 2.0), [8, 8], "explicit scales that agree with output_size"),
+        ((1.5, 1.5), [3, 3], "explicit scales that DISAGREE with output_size"),
+        ((0.5, 0.5), [2, 2], "a downsampling scale"),
+        ((1.5, 3.0), [3, 6], "different scales per axis"),
+    ):
+        a_t, a_c = _t1(torch_module, c_module, sixteen, (1, 1, 4, 4), "float32")
+        cases.append(
+            Case(
+                name=f"upsample_nearest2d(float32, out={out_size}, scales={scales}) [{note}]",
+                op=op,
+                run_torch=lambda a_t=a_t, o=out_size, s=scales: torch_call(a_t, o, s[0], s[1]),
+                run_c=lambda a_c=a_c, o=out_size, s=scales: c_module._aten_dispatch(
+                    op, a_c, o, s[0], s[1]
+                ),
+                note=note + " -- the scale argument is INVERTED, not used directly",
+            )
+        )
+    # Only one axis given a scale.
+    a_t, a_c = _t1(torch_module, c_module, sixteen, (1, 1, 4, 4), "float32")
+    cases.append(
+        Case(
+            name="upsample_nearest2d(float32, out=[3,3], scales_h=1.5, scales_w=None)",
+            op=op,
+            run_torch=lambda: torch_call(a_t, [3, 3], 1.5, None),
+            run_c=lambda: c_module._aten_dispatch(op, a_c, [3, 3], 1.5, None),
+            note="one axis from the argument, the other from the sizes",
+        )
+    )
+    # Several planes, and a non-square input.
+    b_t, b_c = _t1(torch_module, c_module, [float(v) for v in range(32)], (2, 2, 2, 4), "float32")
+    cases.append(
+        Case(
+            name="upsample_nearest2d(float32, (2,2,2,4) -> [3,5]) [batch and channels]",
+            op=op,
+            run_torch=lambda: torch_call(b_t, [3, 5]),
+            run_c=lambda: c_module._aten_dispatch(op, b_c, [3, 5]),
+        )
+    )
+    c_t, c_c = _t1(torch_module, c_module, [float(v) for v in range(6)], (1, 1, 2, 3), "float32")
+    cases.append(
+        Case(
+            name="upsample_nearest2d(float32, (1,1,2,3) -> [5,7])",
+            op=op,
+            run_torch=lambda: torch_call(c_t, [5, 7]),
+            run_c=lambda: c_module._aten_dispatch(op, c_c, [5, 7]),
+        )
+    )
+    for dtype_name in ("int64", "int32", "bool"):
+        d_t, d_c = _t1(torch_module, c_module, list(range(16)), (1, 1, 4, 4), dtype_name)
+        cases.append(
+            Case(
+                name=f"upsample_nearest2d(dtype={dtype_name}) [no kernel upstream]",
+                op=op,
+                run_torch=lambda d_t=d_t: torch_call(d_t, [3, 3]),
+                run_c=lambda d_c=d_c: c_module._aten_dispatch(op, d_c, [3, 3]),
+                expect="both_error",
+                note='"upsample_nearest2d_channels_last" not implemented for this dtype',
+            )
+        )
+    e_t, e_c = _t1(torch_module, c_module, [1.0, 2.0, 3.0, 4.0], (2, 2), "float32")
+    cases.append(
+        Case(
+            name="upsample_nearest2d(float32, 2-D self) [wrong rank]",
+            op=op,
+            run_torch=lambda: torch_call(e_t, [3, 3]),
+            run_c=lambda: c_module._aten_dispatch(op, e_c, [3, 3]),
+            expect="both_error",
+        )
+    )
+    return cases
+
+
+def _qr_check(t_res, c_res) -> tuple[bool, str]:
+    """`linalg_qr` answers a `(Q, R)` pair, which the default dtype/shape/value
+    pipeline cannot read. Compares both members element-wise -- this is a
+    *convention* check as much as a numeric one, since a QR is unique only up
+    to the signs of `R`'s diagonal and the whole point is that these are
+    LAPACK's signs."""
+    t_q, t_r = t_res[0], t_res[1]
+    c_q, c_r = c_res[0], c_res[1]
+    for label, t_x, c_x in (("Q", t_q, c_q), ("R", t_r, c_r)):
+        t_dtype, c_dtype = dt.dtype_name(t_x.dtype), dt.dtype_name(c_x.dtype)
+        if t_dtype != c_dtype:
+            return False, f"{label} dtype mismatch: torch={t_dtype} c={c_dtype}"
+        t_shape = tuple(int(v) for v in t_x.shape)
+        c_shape = tuple(int(v) for v in c_x.shape)
+        if t_shape != c_shape:
+            return False, f"{label} shape mismatch: torch={t_shape} c={c_shape}"
+        tol = dt.tolerance_for(t_dtype)
+        t_flat = _flatten_values(t_x.tolist())
+        c_flat = _flatten_values(c_x.tolist())
+        for i, (x, y) in enumerate(zip(t_flat, c_flat)):
+            if not math.isclose(float(x), float(y), rel_tol=tol.rtol, abs_tol=tol.atol):
+                return False, (
+                    f"{label}[{i}] mismatch: torch={x!r} c={y!r} "
+                    f"(atol={tol.atol} rtol={tol.rtol}) -- a sign difference here is a "
+                    f"different Householder convention, not a rounding difference"
+                )
+    return True, (
+        f"Q{tuple(int(v) for v in t_q.shape)} and R{tuple(int(v) for v in t_r.shape)} "
+        f"agree element-wise, LAPACK's signs included"
+    )
+
+
+# Every matrix here is full rank on purpose. A rank-deficient input leaves the
+# trailing columns of Q determined by rounding noise -- upstream's own R[1][1]
+# for [[1,2],[2,4],[3,6]] is 8.8e-07 at float32 -- so comparing it element-wise
+# would be comparing two arbitrary answers. docs/TAIL1.md §5 has the
+# measurement; `test_tail1.py` covers that input by its *properties* instead.
+_QR_MATRICES = {
+    "3x3": ([12, -51, 4, 6, 167, -68, -4, 24, -41], (3, 3)),
+    "4x2 tall": ([1, 2, 3, 4, 5, 6, 7, 8], (4, 2)),
+    "2x4 wide": ([1, 2, 3, 4, 5, 6, 7, 9], (2, 4)),
+    "1x1": ([2], (1, 1)),
+    "1x1 negative": ([-2], (1, 1)),
+    # The identity is the case that catches a missing `xnorm == 0` short
+    # circuit in dlarfg: upstream answers R = +I, and the plausible
+    # `beta = -sign(alpha)*norm` answers -I.
+    "3x3 identity": ([1, 0, 0, 0, 1, 0, 0, 0, 1], (3, 3)),
+    "2x2 negative diagonal": ([-1, 0, 0, -1], (2, 2)),
+    "3x2 already triangular": ([1, 2, 0, 3, 0, 0], (3, 2)),
+}
+
+
+def linalg_qr_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.linalg_qr.default"
+    cases: list[Case] = []
+    for dtype_name in ("float64", "float32"):
+        for label, (flat, shape) in _QR_MATRICES.items():
+            for mode in ("reduced", "complete", "r"):
+                a_t, a_c = _t1(torch_module, c_module, flat, shape, dtype_name)
+                cases.append(
+                    Case(
+                        name=f"linalg_qr(dtype={dtype_name}, {label}, mode={mode!r})",
+                        op=op,
+                        run_torch=lambda a_t=a_t, m=mode: torch_call(a_t, m),
+                        run_c=lambda a_c=a_c, m=mode: c_module._aten_dispatch(op, a_c, m),
+                        value_check=_qr_check,
+                        note="LAPACK geqrf+orgqr, signs included -- see _qr_check",
+                    )
+                )
+    # The default mode, spelled by omission rather than by name.
+    a_t, a_c = _t1(torch_module, c_module, *_QR_MATRICES["3x3"], "float64")
+    cases.append(
+        Case(
+            name="linalg_qr(float64, 3x3) [mode omitted -- defaults to 'reduced']",
+            op=op,
+            run_torch=lambda: torch_call(a_t),
+            run_c=lambda: c_module._aten_dispatch(op, a_c),
+            value_check=_qr_check,
+        )
+    )
+    # Batched: the leading dimensions are folded over, not flattened into the
+    # matrix. A shim that reshaped to 2-D would factorise a different matrix.
+    batch = [1, 2, 3, 4, 5, 6, 7, 8, 2, 1, 4, 3, 6, 5, 8, 7]
+    for shape, note in (((2, 4, 2), "one batch axis"), ((2, 2, 2, 2), "two batch axes")):
+        b_t, b_c = _t1(torch_module, c_module, batch, shape, "float64")
+        cases.append(
+            Case(
+                name=f"linalg_qr(float64, {shape}) [{note}]",
+                op=op,
+                run_torch=lambda b_t=b_t: torch_call(b_t, "reduced"),
+                run_c=lambda b_c=b_c: c_module._aten_dispatch(op, b_c, "reduced"),
+                value_check=_qr_check,
+                note=note,
+            )
+        )
+    # Two *different* refusals upstream, which is why they cannot share a
+    # branch in the kernel: no LAPACK kernel for the reduced floats, and a
+    # type check before LAPACK for the integers.
+    for dtype_name in ("float16", "bfloat16", "int64", "int32", "uint8"):
+        c_t, c_c = _t1(torch_module, c_module, [1, 2, 3, 4], (2, 2), dtype_name)
+        cases.append(
+            Case(
+                name=f"linalg_qr(dtype={dtype_name}) [refused upstream]",
+                op=op,
+                run_torch=lambda c_t=c_t: torch_call(c_t, "reduced"),
+                run_c=lambda c_c=c_c: c_module._aten_dispatch(op, c_c, "reduced"),
+                expect="both_error",
+            )
+        )
+    d_t, d_c = _t1(torch_module, c_module, [1.0, 2.0, 3.0], (3,), "float64")
+    cases.append(
+        Case(
+            name="linalg_qr(float64, 1-D self) [needs at least 2 dimensions]",
+            op=op,
+            run_torch=lambda: torch_call(d_t, "reduced"),
+            run_c=lambda: c_module._aten_dispatch(op, d_c, "reduced"),
+            expect="both_error",
+        )
+    )
+    e_t, e_c = _t1(torch_module, c_module, [1.0, 2.0, 3.0, 4.0], (2, 2), "float64")
+    cases.append(
+        Case(
+            name="linalg_qr(float64, mode='bogus')",
+            op=op,
+            run_torch=lambda: torch_call(e_t, "bogus"),
+            run_c=lambda: c_module._aten_dispatch(op, e_c, "bogus"),
+            expect="both_error",
+        )
+    )
+    return cases
+>>>>>>> work/tail1
 
 
 CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
@@ -25319,6 +26084,7 @@ CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
     "aten.nonzero.default": nonzero_default_cases,
     "aten.where.default": where_default_cases,
 
+<<<<<<< HEAD
     # docs/INDEXSEL.md
     "aten.index_select.default": index_select_cases,
     "aten.argsort.default": argsort_default_cases,
@@ -25331,6 +26097,19 @@ CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
     "aten.multiply.Tensor": multiply_tensor_cases,
     "aten.multiply.Scalar": multiply_scalar_cases,
     "aten.logical_and.default": logical_and_cases,
+=======
+    # docs/TAIL1.md -- the eight one-architecture ops of docs/ARCH100.md's
+    # tail, plus `linalg_qr`.
+    "aten.acos.default": acos_cases,
+    "aten.logical_and.default": logical_and_cases,
+    "aten._is_all_true.default": is_all_true_cases,
+    "aten.argsort.default": argsort_default_cases,
+    "aten.argsort.stable": argsort_stable_cases,
+    "aten.broadcast_tensors.default": broadcast_tensors_cases,
+    "aten.max_pool1d.default": max_pool1d_cases,
+    "aten.upsample_nearest2d.default": upsample_nearest2d_cases,
+    "aten.linalg_qr.default": linalg_qr_cases,
+>>>>>>> work/tail1
 }
 
 
