@@ -218,6 +218,23 @@ pub struct PyTensorBase {
     /// upstream's `param.is_leaf or param.retains_grad` short-circuited on an
     /// `is_leaf` that was always `True` -- docs/BACKWARD3.md §1.2.
     retains_grad: bool,
+    /// **The `as_strided` write barrier's keep-alive handle.** `None` for every
+    /// tensor that is not an `as_strided` result.
+    ///
+    /// `Some(barrier)` means this tensor was produced by
+    /// `aten.as_strided.default`, which in this shim is a **gather** and not
+    /// the two-way view upstream returns (docs/STRIDED.md). While it is held,
+    /// `storage.rs`'s registry bars in-place writes to this tensor's storage
+    /// *and* to the base's, so the divergence a gather would otherwise have --
+    /// a write lost in either direction, silently -- is a named refusal
+    /// instead.
+    ///
+    /// The field's only job is to own the `Arc`: dropping the last handle is
+    /// what unregisters both keys, and holding it is what keeps their
+    /// addresses reserved so that neither can be reused while it is still
+    /// meaningful. docs/TAIL4.md §1.2 rejected an address-keyed poison set
+    /// precisely because it had no such handle.
+    strided: Option<std::sync::Arc<crate::storage::StridedBarrier>>,
 }
 
 /// Hand-written rather than derived: `backward_hooks` is a `Py<PyAny>`, and
@@ -244,6 +261,12 @@ impl Clone for PyTensorBase {
             // leaf upstream.
             from_op: None,
             retains_grad: false,
+            // Carried, not dropped. A `PyTensorBase` clone points at the *same*
+            // candle tensor and therefore at the same storage, so it is one
+            // more handle on a barred buffer and not a new tensor. Dropping
+            // the barrier here would let `y = x.as_strided(...)` be laundered
+            // into a writable tensor by any path that clones the wrapper.
+            strided: self.strided.clone(),
         })
     }
 }
@@ -330,6 +353,7 @@ impl PyTensorBase {
             grad: None,
             from_op: None,
             retains_grad: false,
+            strided: None,
         })
     }
 
@@ -350,6 +374,7 @@ impl PyTensorBase {
             grad: None,
             from_op: None,
             retains_grad: false,
+            strided: None,
         }
     }
 
@@ -378,6 +403,7 @@ impl PyTensorBase {
             grad: None,
             from_op: None,
             retains_grad: false,
+            strided: None,
         }
     }
 
@@ -396,6 +422,7 @@ impl PyTensorBase {
             grad: None,
             from_op: None,
             retains_grad: false,
+            strided: None,
         }
     }
 
@@ -452,6 +479,7 @@ impl PyTensorBase {
             grad: None,
             from_op: None,
             retains_grad: false,
+            strided: None,
         })
     }
 
@@ -508,6 +536,7 @@ impl PyTensorBase {
             grad: None,
             from_op: None,
             retains_grad: false,
+            strided: None,
         })
     }
 
@@ -784,6 +813,19 @@ impl PyTensorBase {
     ///
     /// Anything that means "the receiver's values change but the receiver
     /// stays the same tensor" must not come here. docs/VIEWS.md §6.
+    /// Mark this tensor as an `as_strided` result and bar its storage, and the
+    /// base's, from in-place writes for as long as it lives.
+    ///
+    /// Called from exactly one place, `aten.rs::as_strided_default`, and taking
+    /// the `Arc` rather than building it here keeps `storage.rs` the only file
+    /// that knows how the registry is keyed. docs/STRIDED.md §2.
+    pub fn bar_writes_as_strided_view(
+        &mut self,
+        barrier: std::sync::Arc<crate::storage::StridedBarrier>,
+    ) {
+        self.strided = Some(barrier);
+    }
+
     pub fn replace_with(&mut self, replacement: PyTensorBase) {
         self.inner = replacement.inner;
         self.tag = replacement.tag;
@@ -891,6 +933,47 @@ impl PyTensorBase {
                 self.device_label().__str__()
             )));
         }
+        // **The `as_strided` write barrier.** docs/STRIDED.md §2.
+        //
+        // This is the single write door -- `aten.rs::write_back` is the only
+        // caller of this function and this function is the only thing in the
+        // crate that writes through a tensor's layout -- so a check here sees
+        // every in-place op there is, on the receiver *and* on every alias of
+        // it, because the key is the storage and not the wrapper.
+        //
+        // It fires when the destination's storage is either an `as_strided`
+        // result's or the base one was taken of, which are the two directions
+        // upstream's genuine view propagates in and a gather propagates in
+        // neither. Refusing is a narrowing of upstream, which allows both; a
+        // gather that accepted them would be *wrong* at upstream, silently, in
+        // the base's values. §4 records the narrowing and the one case it does
+        // not reach.
+        //
+        // Nullifying this block is what docs/STRIDED.md 5 measured, and it is
+        // the demonstration docs/COMPLEX2.md set as the standard for calling a
+        // guard real: with `if false &&` in front of the call and nothing else
+        // changed, `x.as_strided((2,3),(3,1)).fill_(7.)` returns a filled view
+        // and leaves `x` at `[0., 1., 2., ...]` where upstream leaves it all
+        // 7s -- a **stale base**, with no exception raised. That build fails 2
+        // golden cases and 4 tests in `pytests/test_strided.py`, which is the
+        // other half of the check: a guard nothing goes red for is a guard
+        // nobody is exercising.
+        if crate::storage::write_is_barred(&dest) {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "{op}: this tensor shares storage with the result of \
+                 aten.as_strided.default, or is the tensor one was taken \
+                 of. torch._C shim materialises as_strided as a gather \
+                 (candle 0.11.0 has no public constructor for a Tensor over \
+                 an existing storage with arbitrary strides), so it is a \
+                 READ-ONLY view: upstream propagates writes between the base \
+                 and the view in both directions and this copy propagates \
+                 them in neither. Refusing rather than answering, because \
+                 the alternative is the right shape and dtype with the wrong \
+                 values. Drop the as_strided result to lift this, or \
+                 .clone() before writing. docs/STRIDED.md"
+            )));
+        }
+
         if overlap == Overlap::Refuse && has_internal_overlap(dest.layout()) {
             return Err(pyo3::exceptions::PyRuntimeError::new_err(
                 "unsupported operation: more than one element of the written-to \

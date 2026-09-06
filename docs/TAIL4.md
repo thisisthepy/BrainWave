@@ -21,7 +21,30 @@ still on `as_strided` — deliberately.**
 
 ---
 
-## 1. The `as_strided` verdict: the refusal stands
+## 1. The `as_strided` verdict: the refusal stood, and `docs/STRIDED.md` overturned it
+
+> **Superseded, and left standing rather than rewritten.** `docs/STRIDED.md`
+> implemented `aten.as_strided.default`. What follows was right about every
+> fact it checked -- the single write door (§1.1), candle's fresh `TensorId`
+> per shallow view, the address that is reused after a free (§1.2) -- and
+> wrong about one thing, which is §1.3's sizing. It sized the fix as *"one
+> field on `PyTensorBase` that survives aliasing, plus propagation through the
+> view ops"*, and that would **not** have been enough: propagation runs
+> forward from the mark, and an alias of the base taken *before* the
+> `as_strided` call is exposed backward from it. `longformer`'s own `_chunk`
+> calls `as_strided` on a `hidden_states` that is already a `.view(...)`.
+>
+> The fix was the structure this section rejected -- an address-keyed
+> registry -- with the one addition that answers §1.2's objection: the entry
+> **holds the storage alive**, so the address cannot be reused while the entry
+> means anything, and `Drop` removes the entry before releasing the hold. That
+> is not a leak relative to upstream, whose `as_strided` result keeps the
+> base's storage alive by aliasing it.
+>
+> `pytests/test_strided.py` and `docs/STRIDED.md` §4 carry it. The refusal
+> below is now a **narrowing**: the values are upstream's and only the writes
+> upstream would have propagated are refused.
+
 
 `docs/TAIL3.md` §6 refused `as_strided` because candle 0.11.0 exposes no
 storage-sharing constructor. This round was asked the narrower question, which
@@ -104,15 +127,16 @@ propagation through the view-producing ops. That is a `tensor.rs` change, and
 it is a smaller change than either of §6's two, but it is not a `longformer`-
 shaped task either and it was not this round's file.
 
-`longformer` and `led` are therefore still blocked, on purpose.
-`tools/golden/reach_allow.json` still carries the entry and its reason, the
-schema is still in `methods.json` with no kernel so the refusal names
-`aten.as_strided.default` rather than "no matching signature", and
-`aten.as_strided.default` is still absent from `_aten_implemented()`.
+`longformer` and `led` were therefore still blocked, on purpose --
+**until `docs/STRIDED.md`**, which moved both past this op onto
+`Tensor.new_zeros((tuple))`, an argument form. The `reach_allow.json` entry
+that this paragraph described has been deleted, as its own text instructed,
+and `test_the_as_strided_reach_allowlist_entry_was_removed_when_the_gap_closed`
+asserts it stayed deleted.
 
-<!-- DOCWATCH: op-not-implemented aten.as_strided.default -->
+<!-- DOCWATCH: op-implemented aten.as_strided.default -->
 <!-- DOCWATCH: json-key rust/torch_c/src/methods.json as_strided present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_tail4.py test_the_as_strided_refusal_still_stands_and_names_the_overload present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_tail4.py test_the_as_strided_refusal_was_INVERTED_by_the_strided_round present -->
 
 ---
 
@@ -132,7 +156,7 @@ aliases are the two that needed the most measurement.**
 | `t_` | **yes, for the values — no, for the write** | `t_default`'s rank rule, plus the first shape-changing in-place write path in the file. §6 |
 | `embedding` (int32 index) | **not an op at all** | a widening cast and a dtype refusal: **three lines**. §7 |
 | `logical_not` | **no — and `bitwise_not` is the trap** | one comparison, and the dtype rule that makes it not an alias. §10 |
-| `as_strided` | **refused by name** | nothing. §1 |
+| `as_strided` | **refused by name** | nothing this round; `docs/STRIDED.md` landed it. §1 |
 
 **Counted honestly: two new kernel bodies, one genuinely new piece of
 arithmetic (`nearbyint_ties_even`), one composition of existing candle
@@ -519,10 +543,11 @@ eight.
 | `granite_swa` | `logsumexp` | **forward passes** |
 | `fastspeech2_conformer` | `round` | `torch.zeros((tuple), dtype=, device=)` — an argform, the next wall |
 | `cpmant` | `aten.embedding.default.unsupported` | **forward passes** (two walls: §7, then §10) |
-| `longformer` | `aten.as_strided.default` | unchanged — §1 |
-| `led` | `aten.as_strided.default` | unchanged — §1 |
+| `longformer` | `aten.as_strided.default` | unchanged this round; `docs/STRIDED.md` moved it — §1 |
+| `led` | `aten.as_strided.default` | unchanged this round; `docs/STRIDED.md` moved it — §1 |
 
-**Five cleared, one moved, two refused on purpose.**
+**Five cleared, one moved, two refused on purpose** (and the two refused were
+cleared by `docs/STRIDED.md`).
 
 ### 8.1 `t_` was `rwkv`'s last wall
 

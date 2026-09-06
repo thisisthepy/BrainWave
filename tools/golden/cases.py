@@ -7302,6 +7302,143 @@ def cumsum_cases(torch_module, c_module, torch_call) -> list[Case]:
     return cases
 
 
+# --- aten.as_strided.default -------------------------------------------------
+
+def as_strided_cases(torch_module, c_module, torch_call) -> list[Case]:
+    """`as_strided` is the one op here whose *values* are easy and whose
+    *aliasing* is the whole question. docs/STRIDED.md.
+
+    The value cases below are chosen where a plausible wrong gather differs:
+    an overlapping stride (`longformer`'s `_chunk`, which is the caller that
+    wanted this op), a zero stride (every output row reads the same input row),
+    a non-default `storage_offset`, and the two degenerate ranks.
+
+    The last two cases are the narrowing, in `expect="c_error"` rather than
+    `expect="diverge"`, and that difference is the point of the round.
+    `aten.slice.Tensor` (step > 1) and `aten.view.dtype` are already in this
+    file as `diverge`: they alias upstream, materialise here, and a write
+    through them is *silently* lost. `as_strided` refuses the write instead,
+    in both directions, so the divergence is a refusal a caller can see rather
+    than a number a caller cannot.
+    """
+    op = "aten.as_strided.default"
+    cases: list[Case] = []
+    flat12 = [float(i) for i in range(12)]
+
+    for dtype_name in ["float64", "float32", "int64", "uint8"]:
+        b_t, b_c = pair_from_flat(torch_module, c_module, flat12, (12,), dtype_name)
+        for size, stride, off, note in [
+            ([2, 3], [3, 1], None, "the contiguous reading -- agrees with reshape"),
+            ([3, 3], [2, 1], None, "OVERLAPPING windows: longformer's _chunk shape"),
+            ([3, 3], [0, 1], None, "zero stride -- every row reads the same three elements"),
+            ([2], [1], 4, "explicit storage_offset"),
+            ([4], [3], None, "a stride wider than the extent -- skips elements"),
+        ]:
+            cases.append(
+                Case(
+                    name=f"as_strided(dtype={dtype_name}, size={size}, stride={stride}, offset={off})",
+                    op=op,
+                    run_torch=(lambda b_t=b_t, size=size, stride=stride, off=off:
+                               torch_call(b_t, size, stride, off)),
+                    run_c=(lambda b_c=b_c, size=size, stride=stride, off=off:
+                           c_module._aten_dispatch(op, b_c, size, stride, off)),
+                    note=note,
+                )
+            )
+
+    s_t, s_c = pair_from_flat(torch_module, c_module, flat12, (12,), "float32")
+    cases.append(
+        Case(
+            name="as_strided(size=[], stride=[]) [0-d]",
+            op=op,
+            run_torch=lambda: torch_call(s_t, [], [], None),
+            run_c=lambda: c_module._aten_dispatch(op, s_c, [], [], None),
+            note="an empty size is the first storage element, as a scalar",
+        )
+    )
+    cases.append(
+        Case(
+            name="as_strided(size=[0,3]) [empty extent]",
+            op=op,
+            run_torch=lambda: torch_call(s_t, [0, 3], [3, 1], None),
+            run_c=lambda: c_module._aten_dispatch(op, s_c, [0, 3], [3, 1], None),
+            note="a zero extent addresses nothing, so the bounds check must not fire",
+        )
+    )
+
+    for size, stride, off, note in [
+        ([2, 2], [1], None, "'mismatch in length of strides and shape'"),
+        ([2, 2], [-1, 1], None, "'Negative strides are not supported at the moment'"),
+        ([-1, 2], [1, 1], None, "'Storage size calculation overflowed'"),
+        ([2, 2], [1, 1], -1, "'Tensor: invalid storage offset -1'"),
+        ([100], [1], None, "'setStorage: ... out of bounds for storage of size 48'"),
+    ]:
+        cases.append(
+            Case(
+                name=f"as_strided(size={size}, stride={stride}, offset={off}) [refused]",
+                op=op,
+                run_torch=(lambda size=size, stride=stride, off=off:
+                           torch_call(s_t, size, stride, off)),
+                run_c=(lambda size=size, stride=stride, off=off:
+                       c_module._aten_dispatch(op, s_c, size, stride, off)),
+                expect="both_error",
+                note=note,
+            )
+        )
+
+    # The narrowing, both directions, each as its own case so that closing one
+    # does not hide the other.
+    cases.append(
+        Case(
+            name="as_strided: writing THROUGH the view reaches the base upstream, refused here",
+            op=op,
+            run_torch=lambda: (
+                lambda base: (
+                    torch_module.ops.aten.fill_.Scalar(torch_call(base, [2, 3], [3, 1], None), 7.0),
+                    base,
+                )[1]
+            )(torch_module.tensor(flat12, dtype=dt.torch_dtype(torch_module, "float32"))),
+            run_c=lambda: (
+                lambda base: (
+                    c_module._aten_dispatch(
+                        "aten.fill_.Scalar",
+                        c_module._aten_dispatch(op, base, [2, 3], [3, 1], None),
+                        7.0,
+                    ),
+                    base,
+                )[1]
+            )(c_module._tensor_from_flat(flat12, [12], dtype=dt.c_dtype(c_module, "float32"))),
+            expect="c_error",
+            note="upstream's as_strided is a two-way view; this is a gather, so the "
+                 "write would be lost. storage.rs::StridedBarrier refuses it. "
+                 "docs/STRIDED.md §4",
+        )
+    )
+    cases.append(
+        Case(
+            name="as_strided: writing to the BASE shows through the view upstream, refused here",
+            op=op,
+            run_torch=lambda: (
+                lambda base: (
+                    torch_call(base, [2, 3], [3, 1], None),
+                    torch_module.ops.aten.fill_.Scalar(base, 7.0),
+                )[0]
+            )(torch_module.tensor(flat12, dtype=dt.torch_dtype(torch_module, "float32"))),
+            run_c=lambda: (
+                lambda base: (
+                    c_module._aten_dispatch(op, base, [2, 3], [3, 1], None),
+                    c_module._aten_dispatch("aten.fill_.Scalar", base, 7.0),
+                )[0]
+            )(c_module._tensor_from_flat(flat12, [12], dtype=dt.c_dtype(c_module, "float32"))),
+            expect="c_error",
+            note="the other direction of the same view, and the one docs/TAIL4.md "
+                 "§1.2 said no write guard could reach. It is reachable because the "
+                 "key is the storage, not the wrapper. docs/STRIDED.md §4",
+        )
+    )
+    return cases
+
+
 # --- aten.expand.default -----------------------------------------------------
 
 def expand_cases(torch_module, c_module, torch_call) -> list[Case]:
@@ -29824,6 +29961,7 @@ CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
     "aten.sin.default": sin_cases,
     "aten.reciprocal.default": reciprocal_cases,
     "aten.cumsum.default": cumsum_cases,
+    "aten.as_strided.default": as_strided_cases,
     "aten.expand.default": expand_cases,
     "aten.masked_fill.Scalar": masked_fill_cases,
     "aten.max.default": max_default_cases,

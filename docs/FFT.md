@@ -20,7 +20,7 @@ FFT** — and the two previous rounds cleared the first two (`docs/PAD.md`,
 | What are the normalisation conventions? | The `normalization` argument is **not** a `norm=` string. `0 → 1`, `1 → 1/sqrt(n)`, `2 → 1/n`, and the **same three codes serve both directions** — `rfft`'s `backward` default is `0` and `ifft`'s `backward` default is `2`. `stft(normalized=True)` is code **1**. | §2.2 |
 | And `onesided`? | `n // 2 + 1` bins. Default `True` for a real input. `_fft_c2r` additionally reads only the first `last_dim_size // 2 + 1` bins, **even when more are supplied**. | §3 |
 | Was candle forked? | **No.** candle 0.11.0 still has no FFT (docs/VOICE.md §3) and now still has none — the arithmetic is written in `aten.rs`. | §2 |
-| Did `as_strided` have to land? | **No, and that is asserted.** Upstream's `stft` frames its input with `as_strided`; this one gathers. `aten.as_strided.default` is still unimplemented after this round. | §5.2 |
+| Did `as_strided` have to land? | **No, and that is asserted.** Upstream's `stft` frames its input with `as_strided`; this one gathers. `aten.as_strided.default` was still unimplemented after this round; `docs/STRIDED.md` landed it later and `stft` still does not use it. | §5.2 |
 | What did the test catch? | **Two defects, both of which return a plausible spectrum**: a conjugated Bluestein transform, and `_fft_c2r` reading one bin too many. | §2.1, §3 |
 
 Split the way docs/ARCH100.md §5.3 asks, rather than as one number:
@@ -47,7 +47,7 @@ Split the way docs/ARCH100.md §5.3 asks, rather than as one number:
 <!-- DOCWATCH: symbol-in-file rust/torch_c/src/aten.rs fft_bluestein present -->
 <!-- DOCWATCH: op-implemented aten.stft.default -->
 <!-- DOCWATCH: op-implemented aten.stft.center -->
-<!-- DOCWATCH: op-not-implemented aten.as_strided.default -->
+<!-- DOCWATCH: op-implemented aten.as_strided.default -->
 <!-- DOCWATCH: op-not-implemented aten.istft.default -->
 
 ## 1. The bar: `torch.stft`, on a real signal
@@ -278,10 +278,19 @@ unobservable for the same reason: the next thing that happens to the frames is
 the window multiply, and nothing in this shim can write through them in
 between.
 
-`test_fft.py::test_as_strided_is_still_unimplemented_and_that_is_deliberate`
-asserts it, so the claim "`as_strided` was not needed" stays true by
-measurement rather than by this paragraph — and so that whoever implements
-`as_strided` finds the note saying `stft` does not have to change.
+`test_fft.py::test_as_strided_landed_and_stft_still_does_not_use_it` asserts
+it, so the claim "`as_strided` was not needed" stays true by measurement rather
+than by this paragraph.
+
+**`docs/STRIDED.md` implemented `as_strided`, and `stft` still does not use
+it** — which is the note this paragraph was written to leave, arriving at its
+addressee. The test was inverted rather than deleted and now checks the
+kernel's source instead of the op list: `stft`'s frames must remain an
+`index_select` gather. The reason is no longer only "the aliasing is
+unobservable" but a cost — an `as_strided` result bars in-place writes to its
+base's storage while it lives (`docs/STRIDED.md` §2), so routing `stft` through
+it would bar `stft`'s own input for the duration of the window multiply in
+exchange for aliasing nothing here can observe.
 
 ### 5.3 What `fft_fftn` still needs
 

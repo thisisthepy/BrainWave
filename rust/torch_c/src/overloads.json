@@ -287,6 +287,9 @@
     "compared against upstream element-wise in `pytests/test_complex.py`",
     "instead. See `aten.rs`'s note on that list."
   ],
+  "as_strided": [
+    "aten::as_strided(Tensor(a) self, SymInt[] size, SymInt[] stride, SymInt? storage_offset=None) -> Tensor(a)"
+  ],
   "arange": [
     "aten::arange.start_out(Scalar start, Scalar end, Scalar step=1, *, Tensor(a!) out) -> Tensor(a!)",
     "aten::arange.out(Scalar end, *, Tensor(a!) out) -> Tensor(a!)",

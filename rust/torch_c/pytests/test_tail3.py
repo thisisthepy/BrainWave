@@ -206,6 +206,19 @@ rec("erfinv_far_tail", lambda: torch.erfinv(torch.tensor(far, dtype=torch.float6
 # -- as_strided -------------------------------------------------------------
 rec("as_strided", lambda: torch.arange(10.0).as_strided((3, 3), (1, 1)))
 
+
+# The write that upstream propagates into the base and this shim refuses.
+# Recorded on both sides: upstream must SUCCEED here, or the refusal below is
+# gratuitous rather than a narrowing. docs/STRIDED.md 4.
+def _as_strided_write():
+    x = torch.arange(10.0)
+    y = x.as_strided((3, 3), (1, 1))
+    y.fill_(7.0)
+    return x
+
+
+rec("as_strided_write_refused", _as_strided_write)
+
 json.dump(out, sys.stdout)
 """
 
@@ -603,43 +616,66 @@ def test_in_the_far_float64_tail_this_shim_is_more_accurate_than_upstream():
 # --------------------------------------------------------------------------
 
 
-def test_as_strided_refuses_by_the_name_of_the_overload_it_needed():
-    """It is listed in `methods.json` with no kernel behind it, which is
-    `clamp.Tensor`'s pattern: the refusal then names the aten overload the
-    call resolved to instead of "no matching signature".
+def test_as_strided_landed_as_a_COPY_and_the_writes_are_refused_instead():
+    """**Inverted, not deleted**, and the branch this test's old body named is
+    the one that was taken.
 
-    The reason it has no kernel is not effort. `as_strided` is the one op
-    where a wrong implementation aliases memory it should not, and candle
-    0.11.0 exposes no way to build a `Tensor` over an existing storage with
-    arbitrary strides: `Layout::new(shape, stride, offset)` is public but
-    every public constructor that reaches it (`Tensor::from_storage`) takes
-    an owned `Storage` and documents "this uses contiguous strides". A
-    materialising copy would return the right values for `longformer`'s
-    read-only `_chunk` and the wrong ones for any writer, silently. See
-    docs/TAIL3.md for the size of doing it properly.
+    Its words were: *"If a real aliasing view landed, delete this test and add
+    element-wise cases; if a COPY landed, that is the silent-divergence shape
+    this test exists to prevent."* A copy landed. The shape it existed to
+    prevent is prevented a different way, and that difference is the whole of
+    `docs/STRIDED.md`:
+
+      * The aliasing is still impossible. candle 0.11.0 still exposes no way to
+        build a `Tensor` over an existing storage with arbitrary strides --
+        `Layout::new(shape, stride, offset)` is public, `Tensor::from_storage`
+        is public and takes an *owned* `Storage`, and `Tensor_`, which is where
+        the two meet, has no public field. `test_strided.py` re-verifies it.
+      * So the result is a gather, exactly as this test warned.
+      * **But every write upstream's view would have propagated is refused**,
+        in both directions, by `storage.rs::StridedBarrier`. The divergence is
+        a named `RuntimeError` rather than a wrong number, which is what this
+        test was protecting.
+
+    So the assertion moves from "it refuses" to "it computes upstream's values
+    **and** refuses the writes". Dropping either half would be the regression.
     """
     pair = _both("as_strided")
     if pair == "skip":
         return
     got, want = pair
     assert "raised" not in want, "upstream refused as_strided, which it should not"
-    assert "raised" in got, (
-        "as_strided now computes something. If a real aliasing view landed, "
-        "delete this test and add element-wise cases; if a COPY landed, that "
-        "is the silent-divergence shape this test exists to prevent."
+    assert "raised" not in got, (
+        "as_strided refuses again. If it was reverted, invert this test back "
+        "rather than deleting it -- docs/STRIDED.md §1 is the argument."
     )
-    assert "as_strided" in got["msg"], (
-        f"the refusal does not name the overload: {got['msg']!r}"
+    assert got["ok"] == want["ok"], (got, want)
+    assert got["shape"] == want["shape"], (got, want)
+    # The half this file is actually here to protect: a copy that accepted
+    # writes would be the silent divergence. `test_strided.py` measures both
+    # directions against upstream; this asserts the refusal exists at all, so
+    # that this file cannot go green on a build with the barrier removed.
+    assert "as_strided_write_refused" in _run("shim"), (
+        "the probe in this file no longer records the write refusal"
     )
+    refused = _run("shim")["as_strided_write_refused"]
+    assert refused.get("raised") == "RuntimeError", refused
+    assert "as_strided" in refused["msg"], refused["msg"]
 
 
-def test_as_strided_is_not_advertised_as_implemented():
+def test_as_strided_is_advertised_now_that_it_has_a_kernel():
+    """The surface-honesty rule, in the other direction.
+
+    The old body asserted the op was *absent* from `_aten_implemented()`
+    because listing a schema in `methods.json` with no kernel behind it must
+    not claim a door. There is a kernel now, and the same rule says it must be
+    advertised -- `tools/golden/cases.py` carries 29 cases for it, so the
+    harness demands and gets the coverage that advertising implies.
+    """
     implemented = _C._aten_implemented()
-    assert "aten.as_strided.default" not in implemented, (
-        "listing a schema in methods.json must not put the op in "
-        "_aten_implemented() -- that is the surface-honesty rule, and the "
-        "golden harness would then demand case builders for a kernel that "
-        "does not exist"
+    assert "aten.as_strided.default" in implemented, (
+        "as_strided has a kernel and case builders but is not advertised -- "
+        "docs/STRIDED.md §1"
     )
 
 

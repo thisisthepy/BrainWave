@@ -223,6 +223,16 @@ The domain, all of it measured and none of it raising: `erfinv(±1)` is `±inf`,
 
 ## 6. `as_strided` is refused by name, and here is its size
 
+> **Superseded by `docs/STRIDED.md`, and left standing.** The constructor this
+> section says is missing is still missing — that part was never overturned and
+> `docs/STRIDED.md` §1 re-verifies it in candle's source. What this section did
+> not consider is the third option: implement the gather *and refuse the writes
+> upstream would have propagated*, in both directions, keyed on the storage
+> address with a keep-alive that makes the key un-reusable. `longformer` and
+> `led` are past this op as a result. The sizing below still describes what it
+> would take to remove the **narrowing**; it no longer describes what it takes
+> to make the op callable.
+
 `longformer._chunk` (`modeling_longformer.py:719`) is
 `hidden_states.as_strided(size=chunk_size, stride=chunk_stride)`.
 

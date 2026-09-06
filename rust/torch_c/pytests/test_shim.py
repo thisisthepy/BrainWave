@@ -9343,7 +9343,18 @@ def test_core_ops_and_op_tags_agree():
     # (three nemotron ASR encoders and `cpmant` all stop one line behind it).
     # It IS core -- read off its own `.tags`, like the eight above -- and it is
     # the round's ninth key and second core one.
-    assert r["tag_core_count"] == 132, r["tag_core_count"]
+    # 132 -> 133 with docs/STRIDED.md's one new key, `as_strided.default`, and
+    # the delta is one because the round added exactly one key:
+    #
+    #     as_strided.default   ['core', 'pt2_compliant_tag']   <- counted
+    #
+    # It is core, read off its own `.tags` like every entry above, and
+    # `docs/TAIL3.md` §7 had already recorded that it is -- that section named
+    # it as the one core op deliberately absent from this shim. So this
+    # increment is that absence ending, and if it ever goes back to 132 the
+    # thing to check is whether `as_strided` was reverted rather than whether
+    # upstream retagged something.
+    assert r["tag_core_count"] == 133, r["tag_core_count"]
 
 
 def test_decompose_lowers_the_op_capture_md_named():

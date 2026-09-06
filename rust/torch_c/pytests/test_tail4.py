@@ -13,7 +13,7 @@ the part a value comparison structurally cannot hold down:
     `write_into` is the single write door and it is reached from `aten.rs`,
     but the marker such a guard would have to carry can only live on
     `PyTensorBase`, and no identity reachable from `aten.rs` survives
-    aliasing. `test_the_as_strided_refusal_still_stands_and_names_the_overload`
+    aliasing. `test_the_as_strided_refusal_was_INVERTED_by_the_strided_round`
     and `test_the_write_door_is_single_which_is_the_precondition_a_read_only_
     as_strided_would_need` pin both halves, so the day the precondition
     changes the verdict is re-openable rather than folklore.
@@ -233,31 +233,48 @@ def _aten_source():
 # --------------------------------------------------------------------------
 
 
-def test_the_as_strided_refusal_still_stands_and_names_the_overload():
-    """The verdict this round was asked to reach, asserted as a refusal.
+def test_the_as_strided_refusal_was_INVERTED_by_the_strided_round():
+    """**Inverted, not deleted** -- `docs/FFT.md`'s pattern, as this test's own
+    previous body instructed.
 
-    `docs/TAIL3.md` §6 refused `as_strided` by name and this round did not
-    overturn it. `longformer` and `led` are still blocked on it and that is a
-    complete outcome rather than an omission -- **but only while the refusal is
-    real**, so this asserts the two properties that make it honest:
+    What it said until `docs/STRIDED.md` landed: `as_strided` is refused, it is
+    not in `_aten_implemented()`, and `longformer`/`led` are blocked on it on
+    purpose. That was the answer for two rounds (`docs/TAIL3.md` §6,
+    `docs/TAIL4.md` §1) and the reason is kept here rather than thrown away,
+    because the reason is what changed and not the facts it rested on:
 
-      * the schema is declared, so the message names `aten.as_strided.default`
-        rather than "no matching signature"; and
-      * it is NOT in `_aten_implemented()`, so the surface does not claim it.
+      * candle 0.11.0 still has no storage-sharing strided constructor. That
+        was never overturned; `test_strided.py` re-verifies it in candle's own
+        source.
+      * So the result is still a materialised **gather**, and a gather is
+        silently wrong for a writer in both directions.
 
-    **If a later round implements it, invert this test rather than deleting
-    it** -- `docs/FFT.md`'s round did exactly that for its own refusal and said
-    so. Deleting it would remove the record that the answer was once no, and
-    with it the reason.
+    What `docs/STRIDED.md` added is the third option neither previous round
+    reached: **refuse the writes**. `storage.rs::StridedBarrier` bars in-place
+    writes to the result's storage and to the base's while the result is alive,
+    keyed on the storage address -- with a keep-alive that makes the address
+    reservation and the registry entry end in the same statement, which is what
+    `docs/TAIL4.md` §1.2 correctly said an address-keyed poison set could not
+    do without one.
+
+    So the op is implemented and it is a **narrowing**, not a widening: every
+    case where upstream's two-way view would have shown a write through is a
+    named refusal here. `pytests/test_strided.py` holds that down.
     """
-    assert "aten.as_strided.default" not in _C._aten_implemented()
+    assert "aten.as_strided.default" in _C._aten_implemented(), (
+        "as_strided left _aten_implemented(). If it was reverted, this test "
+        "should be inverted BACK rather than deleted -- docs/STRIDED.md §1"
+    )
     pair = _both("as_strided")
     if pair == "skip":
         return
     got, want = pair
     assert "raised" not in want, f"upstream refused as_strided: {want}"
-    assert got["raised"] == "NotImplementedError", got
-    assert "aten.as_strided.default" in got["msg"], got["msg"]
+    assert "raised" not in got, (
+        f"as_strided is advertised but still refuses: {got}"
+    )
+    assert got["ok"] == want["ok"], (got, want)
+    assert got["shape"] == want["shape"], (got, want)
 
 
 def test_the_write_door_is_single_which_is_the_precondition_a_read_only_as_strided_would_need():
@@ -308,22 +325,24 @@ def test_the_write_door_is_single_which_is_the_precondition_a_read_only_as_strid
         assert len(re.findall(r"\.write_into\s*\(", tensor_text)) == 0
 
 
-def test_the_as_strided_gap_is_still_declared_in_the_reach_allowlist():
-    """The bookkeeping half, so the entry cannot outlive the gap.
+def test_the_as_strided_reach_allowlist_entry_was_removed_when_the_gap_closed():
+    """The bookkeeping half, inverted with the verdict it belonged to.
 
-    `tools/golden/reach_allow.json` carries `as_strided` with its reason and
-    the checker matches that file in both directions, so the entry has to be
-    deleted the day the gap closes. This asserts the entry is still there
-    *and* still says the same thing -- a reason rewritten to "not needed"
-    would be the quiet way for the refusal to stop being a decision.
+    The entry's own text said "Delete this entry the day either lands". One of
+    the two landed -- not the constructor, but the third option in
+    `docs/STRIDED.md` -- so the entry is gone, and this asserts it *stayed*
+    gone. An allowlist entry that outlives its gap is how a closed gap goes on
+    being reported as a known one.
     """
     path = os.path.join(_REPO_ROOT, "tools", "golden", "reach_allow.json")
     if not os.path.isfile(path):
         print("   (skipped: reach_allow.json is not in this tree)")
         return
-    blob = json.dumps(json.load(open(path, encoding="utf-8")))
-    assert "as_strided" in blob, (
-        "as_strided left reach_allow.json but is still unimplemented"
+    table = json.load(open(path, encoding="utf-8"))
+    blob = json.dumps(table)
+    assert "methods:as_strided" not in blob, (
+        "as_strided is implemented but reach_allow.json still declares it a "
+        "gap -- docs/STRIDED.md §1"
     )
 
 
