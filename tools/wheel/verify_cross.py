@@ -3,6 +3,7 @@
 
     python tools/wheel/verify_cross.py dist/torchnative-*-android_21_arm64_v8a.whl
     python tools/wheel/verify_cross.py dist/torchnative-*-ios_12_0_arm64_iphoneos.whl
+    python tools/wheel/verify_cross.py dist/torchnative-*-pyemscripten_2026_0_wasm32.whl
 
 `tools/wheel/verify.py` proves a host wheel by installing it into a clean venv
 and watching `torch.__file__` come out of that venv. Nothing here can do that:
@@ -29,6 +30,17 @@ plainly that they are not the same claim:
   the archive is internally consistent        RECORD hashes every member, which
                                               is what pip verifies on install
 
+The four families do not all answer the same subset of those, and the report
+says which. `pyemscripten_*_wasm32` is the widest gap and the newest: a
+WebAssembly module has no symbol table, no version fields and no platform
+record, so the "contents are for that platform" line above degrades to
+"contents are wasm32, are `dlopen`-able, and export `PyInit__C`". The version
+half of the tag -- the `2026_0` that pins Pyodide's ABI -- is checked against the
+Pyodide distribution on this machine and *cannot* be checked against the
+artefact, because nothing in a wasm module records it. See
+`PyEmscriptenExpectation`, which lists the declined questions one by one rather
+than answering nearby easier ones.
+
 What it does NOT establish: that the extension loads, that `import torch`
 completes, or that any kernel computes. For Android that gap is closed
 separately by `tools/wheel/verify_android.py`, which runs on a device. For iOS
@@ -45,6 +57,7 @@ import base64
 import csv
 import hashlib
 import io
+import json
 import re
 import sys
 import zipfile
@@ -52,7 +65,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from binfmt import (describe, elf_dynamic, elf_info,  # noqa: E402
-                    macho_info, pe_imports, pe_info)
+                    macho_info, pe_imports, pe_info, wasm_exports,
+                    wasm_import_records, wasm_info)
 # The manylinux checks have to agree with the builder about what PEP 599 allows
 # and how glibc version names order. Importing rather than restating is the
 # difference between one rule and two that can drift apart silently.
@@ -89,9 +103,11 @@ class Expectation:
             return LinuxExpectation(plat)
         if plat.startswith("win"):
             return WindowsExpectation(plat)
+        if plat.startswith("pyemscripten_"):
+            return PyEmscriptenExpectation(plat)
         raise SystemExit(
             f"{plat!r} is not a PEP 738 android_*, PEP 730 ios_*, PEP 600 "
-            "manylinux_* or win* tag. For a host wheel use "
+            "manylinux_*, win* or pyemscripten_* tag. For a host wheel use "
             "tools/wheel/verify.py, which actually installs it."
         )
 
@@ -111,6 +127,19 @@ class Expectation:
     #: `_manager_path()` checks this exists -- but only on non-Windows, where it
     #: returns `b""` before looking. docs/VENDOR.md wall 4.
     shm_manager_required = True
+
+    def check_linkage(self, zf: zipfile.ZipFile, names: list[str],
+                      problems: list[str]) -> None:
+        """Anything the *whole archive's* binaries say about each other.
+
+        A no-op for the four families that had no use for it: their per-member
+        `check_binary` is the whole of what their format makes decidable without
+        a device. wasm needs it because the question worth asking there --
+        "would every Python C API symbol this module imports be resolved by the
+        interpreter that loads it" -- is answered by comparing two files, not by
+        reading one.
+        """
+        return
 
     def global_deps_name(self) -> str | None:
         # `_load_global_deps()` builds the filename with
@@ -437,6 +466,260 @@ class WindowsExpectation(Expectation):
                   "from python3.dll (the stable-ABI forwarder)")
 
 
+# Where the Pyodide distribution lives. Same shape as `TARGET_PYTHON_ROOT` above
+# and deliberately a *second* variable rather than a subdirectory of it: the
+# thing being read here is not a CPython distribution. It is a Pyodide one, and
+# the difference is the whole of docs/WASM.md §9.4a -- the tag's version
+# component exists only in Pyodide's `pyodide-lock.json`, and the CPython inside
+# it answers a different, plausible, wrong tag.
+PYODIDE_ROOT = Path(os.environ.get(
+    "TORCHNATIVE_PYODIDE", "/Volumes/macMini/caches/pyodide/pyodide"))
+
+
+class PyEmscriptenExpectation(Expectation):
+    """`pyemscripten_<abi-version>_wasm32` -- and the family that can answer least.
+
+    Every other family here is checked against a *symbol table*. WebAssembly has
+    none. What it has is an import section and an export section, which name
+    every symbol the host must supply and every symbol offered, as strings, in
+    the module. So the linkage questions get easier and the platform questions
+    become unanswerable, and those two facts have to be reported separately
+    rather than netted off against each other.
+
+    **Answered here, from the artefact:**
+
+      wasm32, not wasm64      the memory type's limits flags. A side module
+                              imports its memory, so this is read from the
+                              import section (`binfmt._wasm_memory_bits`).
+      loadable at all         a side module imports `env.memory` and
+                              `env.__indirect_function_table`; a main-module
+                              link defines and exports them, and Emscripten's
+                              `dlopen` refuses it. This is the wasm spelling of
+                              "is it a DLL and not an EXE", and docs/WASM.md
+                              §9.2 hit it: `ctypes.CDLL` on the global-deps stub
+                              is `dlopen`, so *both* wasm members have to be
+                              side modules, not only the extension.
+      `PyInit__C` is exported, and is a *function*. `dlsym` finds it and the
+                              import system calls it; an export of that name
+                              with kind `global` is a linker accident that fails
+                              at import with nothing pointing at the module.
+      nothing linked in that should not be -- `check_linkage` below.
+
+    **Declined here, and each one is a question another family does answer:**
+
+      the platform             Mach-O has `LC_BUILD_VERSION`; a wasm module
+                               records no Emscripten version, no Pyodide ABI
+                               version and no minimum anything. `2026_0` in the
+                               tag is checked against `pyodide-lock.json`, which
+                               is a check on *this machine's distribution*, not
+                               on the wheel. If the wheel were built against a
+                               different Pyodide, nothing in the wasm bytes
+                               would say so.
+      the abi3 binding         `WindowsExpectation` proves it by reading which
+                               DLL each import is attributed to: `python3.dll`
+                               and not `python313.dll`. Emscripten attributes
+                               every undefined symbol to the single import
+                               module `env`, so that distinction has no wasm
+                               spelling. docs/WASM.md §9.3 makes this less
+                               costly than it sounds -- the platform tag pins
+                               CPython 3.14 and Emscripten 5.0.3 together, so
+                               the abi3 field is inert here -- but inert is not
+                               checked, and it is reported as unchecked.
+      a manylinux-style floor  no counterpart, same as Mach-O and Android.
+      whether every import resolves. Only the Python C API subset is decidable;
+                               see `check_linkage`.
+    """
+
+    family = "pyemscripten"
+
+    #: Supplied per-module by the dynamic loader when it places the module in
+    #: memory, so they are undefined in the artefact by construction and their
+    #: absence from the host's export table means nothing.
+    LOADER_SUPPLIED = frozenset({"__memory_base", "__table_base"})
+
+    def __init__(self, plat: str):
+        super().__init__(plat)
+        m = re.match(r"^pyemscripten_(\d+_\d+)_(wasm\d+)$", plat)
+        if not m:
+            raise SystemExit(
+                f"malformed pyemscripten tag {plat!r}; the spelling Pyodide "
+                "publishes is pyemscripten_<abi-version>_wasm32, e.g. "
+                "pyemscripten_2026_0_wasm32")
+        self.abi_version = m.group(1)
+        self.arch = m.group(2)
+        # `pyodide.asm.wasm` is the main module, and it is what
+        # `check_suffix_is_searched` reads: CPython's `_PyImport_DynLoadFiletab`
+        # is compiled into it as string constants exactly as it is into
+        # `libpython3.x.so` on Android, so that check needs no wasm exception.
+        main = PYODIDE_ROOT / "pyodide.asm.wasm"
+        self.interpreters = [main] if main.exists() else []
+        self.lock = PYODIDE_ROOT / "pyodide-lock.json"
+
+    def check_tag(self, problems: list[str]) -> None:
+        # `packaging.tags` has no `pyemscripten_platforms`. On the target itself
+        # `sys_tags()` does yield this tag (docs/WASM.md §9.3 read 110 of them
+        # off the real interpreter), but that generator reads
+        # `sys.implementation._multiarch` and Pyodide's own patches, neither of
+        # which exists here. Same shape of gap as manylinux and Windows, and
+        # reported the same way rather than hidden.
+        print(f"  tag                 {self.plat}  "
+              f"(Pyodide ABI {self.abi_version}, {self.arch})")
+        print("  ! packaging has no pyemscripten_platforms, so unlike the "
+              "android and ios tags\n"
+              "    this spelling is not confirmed against pip's own generator")
+        # The one thing that *can* be confirmed, and the trap docs/WASM.md §9.4a
+        # names: the version component is Pyodide's `PYODIDE_ABI_VERSION`, which
+        # the CPython inside Pyodide has never heard of. Asking the interpreter
+        # instead yields `emscripten_5_0_3_wasm32` -- accepted by `packaging`,
+        # used by nothing. So it is checked against the distribution that owns
+        # the number.
+        before = len(problems)
+        if not self.lock.exists():
+            problems.append(
+                f"no {self.lock} -- the {self.abi_version} in this tag is "
+                "Pyodide's PYODIDE_ABI_VERSION and exists in no other "
+                "machine-readable place (docs/WASM.md §9.4a). Without the "
+                "distribution it cannot be checked at all, and it is the one "
+                "component of this tag that is checkable; set "
+                "TORCHNATIVE_PYODIDE")
+            return
+        try:
+            info = json.loads(self.lock.read_text())["info"]
+        except (ValueError, KeyError) as exc:
+            problems.append(f"{self.lock} has no readable info block: {exc}")
+            return
+        if info.get("abi_version") != self.abi_version:
+            problems.append(
+                f"tag says Pyodide ABI {self.abi_version}, but {self.lock.name} "
+                f"says {info.get('abi_version')!r} -- a wheel tagged for an ABI "
+                "version this Pyodide does not have is one `micropip` will "
+                "refuse by tag, before any of the contents matter")
+        if info.get("arch") != self.arch:
+            problems.append(
+                f"tag says {self.arch}, but {self.lock.name} says "
+                f"{info.get('arch')!r}")
+        if len(problems) == before:
+            print(f"  Pyodide             abi_version={info.get('abi_version')} "
+                  f"platform={info.get('platform')} python={info.get('python')}")
+
+    def check_binary(self, name: str, data: bytes, problems: list[str]) -> None:
+        info = wasm_info(data)
+        if info is None:
+            problems.append(
+                f"{name} is not a readable WebAssembly module: "
+                f"{describe(data)}")
+            return
+        if info["machine"] != self.arch:
+            problems.append(
+                f"{name} is {info['machine']}, but the tag says {self.arch}")
+        if not info["side_module"]:
+            problems.append(
+                f"{name} is a main-module link, not a side module -- it defines "
+                "its own memory instead of importing one, and Emscripten's "
+                "`dlopen` cannot load it. Both wasm members go through `dlopen` "
+                "(the extension via the import system, the global-deps library "
+                "via `ctypes.CDLL`), so this makes the wheel fail at import "
+                "(docs/WASM.md §9.2)")
+        exports = wasm_exports(data)
+        if exports is None:
+            problems.append(
+                f"{name} has an unreadable export section -- reported rather "
+                "than treated as exporting nothing")
+            return
+        if name != self.extension_member:
+            return
+        kind = exports.get("PyInit__C")
+        if kind is None:
+            near = sorted(e for e in exports if e.startswith("PyInit"))
+            problems.append(
+                f"{name} exports no PyInit__C -- the import system `dlsym`s "
+                "exactly that name and raises ImportError when it is absent. "
+                f"Its export section has {len(exports)} entries"
+                + (f", including {near}" if near else
+                   " and no PyInit_* at all"))
+        elif kind != "func":
+            problems.append(
+                f"{name} exports PyInit__C as a {kind}, not a function -- "
+                "`dlsym` finds it and the import system calls it")
+        else:
+            print(f"  wasm entry point    PyInit__C (func), "
+                  f"{len(exports)} exports")
+
+    def check_linkage(self, zf: zipfile.ZipFile, names: list[str],
+                      problems: list[str]) -> None:
+        """Would the interpreter resolve what the modules ask it for?
+
+        Scoped to `Py*` / `_Py*` deliberately, and the scoping is the finding
+        rather than a shortcut. Emscripten puts every undefined symbol under the
+        import module `env`, and three different things end up there:
+
+          * Python C API symbols, which **must** come out of the interpreter --
+            they are compiled into `pyodide.asm.wasm`, and one that is missing is
+            a module that cannot load;
+          * C runtime symbols the Emscripten **JS** library supplies at load time
+            (`exit`, `__assert_fail`), which are not in the main module's export
+            section at all;
+          * symbols another **side module in the same wheel** provides.
+
+        Only the first is decidable from the artefacts. Measured against the six
+        Pyodide wheels and one main module on this machine: all 2,736 `Py*`
+        imports across those 32 modules resolve, while `kiwisolver` alone has 341
+        unresolved non-`Py` ones and is a shipped, working package. Checking the
+        whole `env` set would therefore reject correct wheels -- so the narrow
+        check is the true one, and the breadth it does not have is stated here
+        instead of being quietly assumed away.
+        """
+        if not self.interpreters:
+            problems.append(
+                f"no {PYODIDE_ROOT / 'pyodide.asm.wasm'} to resolve the wasm "
+                "imports against; set TORCHNATIVE_PYODIDE")
+            return
+        host = wasm_exports(self.interpreters[0].read_bytes())
+        if host is None:
+            problems.append(
+                f"{self.interpreters[0]} has no readable export section -- the "
+                "interpreter side of the linkage check could not be read, "
+                "which is not the same as everything resolving")
+            return
+        checked = 0
+        for member in names:
+            if member.endswith("/"):
+                continue
+            data = zf.read(member)
+            if wasm_info(data) is None:
+                continue
+            records = wasm_import_records(data)
+            if records is None:
+                problems.append(
+                    f"{member} has an unreadable import section -- reported "
+                    "rather than treated as importing nothing")
+                continue
+            wanted = [f for module, f, _kind in records
+                      if module == "env"
+                      and (f.startswith("Py") or f.startswith("_Py"))
+                      and f not in self.LOADER_SUPPLIED]
+            missing = sorted(set(wanted) - set(host))
+            checked += len(wanted)
+            if missing:
+                problems.append(
+                    f"{member} imports {len(missing)} Python C API symbol(s) "
+                    f"{self.interpreters[0].name} does not export, e.g. "
+                    f"{missing[:5]} -- the module would fail to instantiate")
+        print(f"  wasm linkage        {checked} Py* imports all resolved by "
+              f"{self.interpreters[0].name}")
+        print("  ! not checked: non-Py `env` imports. Emscripten's JS library "
+              "supplies some\n"
+              "    of them at load time and sibling side modules supply "
+              "others, and neither\n"
+              "    is visible in any artefact here (shipped Pyodide wheels "
+              "have hundreds)")
+        print("  ! not checked: the abi3 binding. Every wasm import is "
+              "attributed to `env`,\n"
+              "    so the python3.dll-vs-python313.dll test "
+              "WindowsExpectation runs has no\n"
+              "    wasm spelling (docs/WASM.md §9.3)")
+
+
 def _packaging_accepts(exp: Expectation, problems: list[str], **kwargs) -> None:
     """Would pip's own tag generator produce this platform tag?
 
@@ -470,7 +753,7 @@ def _packaging_accepts(exp: Expectation, problems: list[str], **kwargs) -> None:
 
 def _is_binary(data: bytes) -> bool:
     return (macho_info(data) is not None or elf_info(data) is not None
-            or pe_info(data) is not None)
+            or pe_info(data) is not None or wasm_info(data) is not None)
 
 
 def check_record(zf: zipfile.ZipFile, dist_info: str,
@@ -617,6 +900,79 @@ def _wrong_macho_platform(data: bytes) -> bytes:
                      "self-test cannot run")
 
 
+def _wrong_wasm_memory_bits(data: bytes) -> bytes:
+    """Flip the imported memory's index type between wasm32 and wasm64.
+
+    The counterpart of `_wrong_elf_machine`, and the *only* header field a wasm
+    module has that a platform claim can be checked against. Bit 0x04 of the
+    memory type's limits flags is the memory64 bit, so this is a one-byte patch
+    in the import section that leaves every other structure intact -- which is
+    the point: nothing about the size, the exports or the code changes, exactly
+    as with the iphoneos/iphonesimulator flip.
+    """
+    from binfmt import _uleb, _wasm_name
+    # The absolute offset of the import section body, walked here rather than
+    # taken from `_wasm_sections`, which hands back copies and not positions.
+    i = 8
+    while i < len(data):
+        sid = data[i]
+        i += 1
+        size, i = _uleb(data, i)
+        if sid == 2:
+            break
+        i += size
+    else:                                                 # pragma: no cover
+        raise SystemExit("no import section to corrupt -- self-test cannot run")
+    body_at = i
+    body = data[body_at:body_at + size]
+    count, j = _uleb(body, 0)
+    for _ in range(count):
+        _module, j = _wasm_name(body, j)
+        _field, j = _wasm_name(body, j)
+        kind = body[j]
+        j += 1
+        if kind == 2:
+            return _patch(data, body_at + j, bytes([body[j] ^ 0x04]))
+        if kind == 0:
+            _, j = _uleb(body, j)
+        elif kind == 1:
+            j += 1
+            flags = body[j]
+            j += 1
+            _, j = _uleb(body, j)
+            if flags & 0x01:
+                _, j = _uleb(body, j)
+        elif kind == 3:
+            j += 2
+        elif kind == 4:
+            j += 1
+            _, j = _uleb(body, j)
+        else:                                             # pragma: no cover
+            raise SystemExit(f"unknown import kind {kind}")
+    raise SystemExit(                                     # pragma: no cover
+        "the module defines its own memory rather than importing one -- "
+        "self-test cannot run")
+
+
+def _wasm_without_pyinit(data: bytes) -> bytes:
+    """Make `PyInit__C` absent from the export section.
+
+    Renamed to `PyInit__X` rather than deleted, on purpose and for two reasons.
+    It is an in-place patch of the same length, so no section size, no LEB and
+    no index has to be re-encoded and the damaged module stays well-formed --
+    a truncated one would be rejected by `_wasm_sections` returning `None`,
+    which is a *different* check firing and would make this fault mode a lie.
+    And it leaves a near-miss behind, so the report has to name the symbol it
+    could not find rather than only counting the exports it did.
+    """
+    needle = b"\x09PyInit__C"            # the export's length-prefixed name
+    at = data.find(needle)
+    if at < 0:                                            # pragma: no cover
+        raise SystemExit("no PyInit__C export to corrupt -- "
+                         "self-test cannot run")
+    return _patch(data, at + len(needle) - 1, b"X")
+
+
 def _rewrite(src: Path, dst: Path, *, drop=(), replace=None, add=None,
              rename=None, wheel_tag=None) -> Path:
     """Copy a wheel, dropping/replacing/adding members. RECORD is deliberately
@@ -651,6 +1007,7 @@ def self_test(wheel: Path, reference: Path | None) -> int:
         ext_data = zf.read(exp.extension_member)
     is_macho = macho_info(ext_data) is not None
     is_pe = pe_info(ext_data) is not None
+    is_wasm = wasm_info(ext_data) is not None
     is_manylinux = plat.startswith("manylinux")
     name, version = stem.split("-")[0], stem.split("-")[1]
     dist_info = f"{name}-{version}.dist-info"
@@ -663,6 +1020,9 @@ def self_test(wheel: Path, reference: Path | None) -> int:
     elif is_macho:
         damage = _wrong_macho_platform
         expect_platform = "built for"
+    elif is_wasm:
+        damage = _wrong_wasm_memory_bits
+        expect_platform = "but the tag says"
     else:
         damage = _wrong_elf_machine
         expect_platform = "but the tag says"
@@ -694,6 +1054,7 @@ def self_test(wheel: Path, reference: Path | None) -> int:
           "wheel_tag": f"cp313-abi3-{_impossible(plat)}"},
          "below manylinux1's 2.5" if is_manylinux
          else "the only ones pip generates" if plat.startswith("win")
+         else "says Pyodide ABI" if is_wasm
          else "does not yield"),
         ("abi tag downgraded from abi3",
          {"rename": stem.replace("-abi3-", "-cp313-") + ".whl"},
@@ -718,6 +1079,17 @@ def self_test(wheel: Path, reference: Path | None) -> int:
             "a global-deps library on a platform that loads none",
             {"add": {"torch/lib/libtorch_global_deps.dll": exp.extension_member}},
             "returns before looking",
+        ))
+
+    if is_wasm:
+        # The fault this whole family exists to make catchable, and the reason
+        # docs/WASM.md §9.4b put the checker before the target: an extension
+        # with no entry point is a wheel that installs, imports, and raises
+        # ImportError -- no size, tag, architecture or RECORD check sees it.
+        faults.append((
+            "extension exports no PyInit__C",
+            {"replace": {exp.extension_member: _wasm_without_pyinit}},
+            "exports no PyInit__C",
         ))
 
     if exp.shm_manager_required:
@@ -825,6 +1197,13 @@ def _impossible(plat: str) -> str:
         return re.sub(r"^android_\d+", "android_15", plat)
     if plat.startswith("manylinux"):
         return re.sub(r"^manylinux_\d+_\d+", "manylinux_2_1", plat)
+    if plat.startswith("pyemscripten_"):
+        # No floor to go below -- Pyodide's ABI versions are dates, not a range
+        # with a bottom, and `packaging` has no generator to refuse one. So the
+        # impossible tag is an ABI version the Pyodide distribution on this
+        # machine does not have, which is the same source the real tag is
+        # derived from rather than a rule invented here.
+        return re.sub(r"^pyemscripten_\d+_\d+", "pyemscripten_1970_0", plat)
     if plat.startswith("win"):
         # No version to lower, so the impossible tag is an architecture pip has
         # no name for. `WindowsExpectation` refuses it by the same rule that
@@ -983,8 +1362,12 @@ def main() -> None:
         # 4. The archive agrees with itself.
         check_record(zf, dist_info, problems)
 
-        # 5. The interpreter this is for would look for this filename.
+        # 5. The interpreter this is for would look for this filename, and --
+        #    where the format makes it decidable -- would resolve what the
+        #    members ask of it. Only wasm implements the second half; see
+        #    `Expectation.check_linkage`.
         check_suffix_is_searched(exp, problems)
+        exp.check_linkage(zf, names, problems)
 
         # 6. Nothing was lost relative to a wheel that is known to work. The
         #    cross path swaps two members and adds one; anything else differing
