@@ -9212,7 +9212,30 @@ def test_core_ops_and_op_tags_agree():
     # three tags `remainder`'s two overloads already carry. **+2 for one op**,
     # unlike every prior entry in this list, because both overloads landed
     # together.
-    assert r["tag_core_count"] == 110, r["tag_core_count"]
+    #
+    # 112 with docs/INDEXSEL.md's eleven new keys, of which only two are core
+    # upstream, each read off its own `.tags` rather than inferred from a
+    # sibling in the same round:
+    #
+    #     index_select.default  [core, pt2_compliant_tag]                <- counted
+    #     logical_and.default   [core, pointwise, pt2_compliant_tag]     <- counted
+    #     argsort.default       [pt2_compliant_tag]
+    #     argsort.stable        [pt2_compliant_tag]
+    #     where.Scalar          [pt2_compliant_tag]
+    #     new_full.default      [pt2_compliant_tag]
+    #     unflatten.int         [pt2_compliant_tag]
+    #     chunk.default         [pt2_compliant_tag]
+    #     diff.default          [pt2_compliant_tag]
+    #     multiply.Tensor       [pt2_compliant_tag]
+    #     multiply.Scalar       [pt2_compliant_tag]
+    #
+    # `argsort` not being core while `index_select` beside it is, and `chunk`
+    # -- upstream's own composite spelling of what this shim's kernel does --
+    # not being core either, are both upstream's table and not derivable.
+    # `aten.reshape_as.default` is not in this list at all: it has no
+    # `torch.ops.aten` entry to read tags off (docs/INDEXSEL.md), so it is not
+    # in `_aten_implemented()` and cannot be counted here.
+    assert r["tag_core_count"] == 112, r["tag_core_count"]
 
 
 def test_decompose_lowers_the_op_capture_md_named():
@@ -10765,7 +10788,25 @@ def test_schema_text_survives_the_round_trip_through_the_transcribed_tables():
     # left alone -- `Tensor.fmod` was not part of this round's measured gap and
     # is not asserted anywhere, so adding it here would be inventing a check
     # rather than recording one.
-    assert len(keys) == 295, len(keys)
+    #
+    # 306 with docs/INDEXSEL.md's eleven new `(qualname, overload)` pairs,
+    # each appearing in only one of the two tables except `argsort`, whose
+    # `.default` and `.stable` overloads are declared in both `methods.json`
+    # (the bound-method spelling, `x.argsort(...)`) and `overloads.json` (the
+    # free-function spelling, `torch.argsort(...)`) and therefore count once
+    # each rather than twice -- this counts distinct schema identities, per
+    # the module note two paragraphs up:
+    #
+    #     index_select.default, new_full.default, unflatten.int,
+    #     argsort.default, argsort.stable, reshape_as.default,
+    #     multiply.Tensor, multiply.Scalar, logical_and.default,
+    #     diff.default, chunk.default                              -- 11
+    #
+    # `reshape_as.default` is in this list even though it names no genuine
+    # `torch.ops.aten` entry (docs/INDEXSEL.md §2): this fixture parses
+    # schema *text*, transcribed or invented, and does not check the op
+    # exists upstream -- that is `verify_schemas.py`'s job, not this one's.
+    assert len(keys) == 306, len(keys)
     from_tables = sorted(
         k for k in keys
         if report["table"][f"{k[0]}|{k[1]}"]["from"] == "tables"

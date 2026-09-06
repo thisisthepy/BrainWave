@@ -801,5 +801,22 @@
   "fmod": [
     "aten::fmod.Tensor(Tensor self, Tensor other) -> Tensor",
     "aten::fmod.Scalar(Tensor self, Scalar other) -> Tensor"
+  ],
+  "multiply": [
+    "aten::multiply.Tensor(Tensor self, Tensor other) -> Tensor",
+    "aten::multiply.Scalar(Tensor self, Scalar other) -> Tensor"
+  ],
+  "logical_and": [
+    "aten::logical_and(Tensor self, Tensor other) -> Tensor"
+  ],
+  "argsort": [
+    "aten::argsort.stable(Tensor self, *, bool stable, int dim=-1, bool descending=False) -> Tensor",
+    "aten::argsort(Tensor self, int dim=-1, bool descending=False) -> Tensor"
+  ],
+  "diff": [
+    "aten::diff(Tensor self, int n=1, int dim=-1, Tensor? prepend=None, Tensor? append=None) -> Tensor"
+  ],
+  "chunk": [
+    "aten::chunk(Tensor(a -> *) self, int chunks, int dim=0) -> Tensor(a)[]"
   ]
 }

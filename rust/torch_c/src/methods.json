@@ -633,5 +633,21 @@
   ],
   "histc": [
     "aten::histc(Tensor self, int bins=100, Scalar min=0, Scalar max=0) -> Tensor"
+  ],
+  "index_select": [
+    "aten::index_select(Tensor self, int dim, Tensor index) -> Tensor"
+  ],
+  "new_full": [
+    "aten::new_full(Tensor self, SymInt[] size, Scalar fill_value, *, ScalarType? dtype=None, Layout? layout=None, Device? device=None, bool? pin_memory=None) -> Tensor"
+  ],
+  "unflatten": [
+    "aten::unflatten.int(Tensor(a) self, int dim, SymInt[] sizes) -> Tensor(a)"
+  ],
+  "argsort": [
+    "aten::argsort.stable(Tensor self, *, bool stable, int dim=-1, bool descending=False) -> Tensor",
+    "aten::argsort(Tensor self, int dim=-1, bool descending=False) -> Tensor"
+  ],
+  "reshape_as": [
+    "aten::reshape_as(Tensor(a) self, Tensor other) -> Tensor(a)"
   ]
 }
