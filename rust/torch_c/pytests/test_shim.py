@@ -22815,5 +22815,623 @@ def test_capture_refuses_demand8_inplace_names_and_lets_the_others_through():
 
 
 
+_NPU_SERIALISER_SCRIPT = r"""
+import json
+import torch
+
+out = {"is_shim": hasattr(torch._C, "_aten_implemented")}
+
+from torchnative.export import nnapi as N
+from torchnative.export.decompose import DecomposedTrace
+
+
+def capture(fn, *inputs):
+    torch._C._capture_begin(list(inputs))
+    with torch.no_grad():
+        produced = fn(*inputs)
+    produced = produced if isinstance(produced, (list, tuple)) else [produced]
+    trace = torch._C._capture_end(list(produced))
+    return DecomposedTrace(
+        trace.guards, trace.constants, trace.constant_values,
+        trace.nodes, trace.outputs,
+    )
+
+
+torch.manual_seed(0)
+
+# The finding this whole module is arranged around.
+out["jit_graph_available"] = N.jit_graph_is_available()
+module = torch.nn.Linear(2, 2)
+out["jit_trace_is_identity"] = torch.jit.trace(module, torch.zeros(1, 2)) is module
+out["jit_graph_is_placeholder"] = "placeholder" in (torch._C.Graph.__doc__ or "")
+
+# The thirteen methods the serialiser reaches its argument through. Read off
+# the vendored file rather than asserted from memory, so a vendored serializer
+# that grew a fourteenth is caught instead of silently unsupported.
+import os
+import re
+
+here = os.path.dirname(os.path.abspath(N.__file__))
+serializer_path = os.path.join(
+    os.path.dirname(os.path.dirname(here)),
+    "torch", "backends", "_nnapi", "serializer.py",
+)
+source = open(serializer_path, encoding="utf-8").read()
+out["graph_methods"] = sorted(set(re.findall(r"graph\.([a-zA-Z_]+)\(", source)))
+
+# A convolution followed by a ReLU: the smallest graph with a weight, a bias,
+# a spatial shape and two operations.
+conv = torch.nn.Sequential(
+    torch.nn.Conv2d(3, 4, 3, padding=1), torch.nn.ReLU()
+).eval()
+image = torch.randn(1, 3, 8, 8)
+conv_trace = capture(conv, image)
+model = N.serialize(conv_trace)
+parsed = N.parse_model(model)
+out["conv_relu"] = {
+    "captured_ops": [n["op"] for n in conv_trace.nodes],
+    "bytes": len(model.as_bytes()),
+    "operands": len(parsed["operands"]),
+    "opcodes": [op["opcode"] for op in parsed["operations"]],
+    "inputs": parsed["inputs"],
+    "outputs": parsed["outputs"],
+    "weights": [list(w.shape) for w in model.weights],
+    "shapes": N.verify_shapes(model),
+}
+
+# A Linear, which capture records as t + addmm. `aten::t` is not in ADDER_MAP
+# and does not need to be.
+class Mlp(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.layer = torch.nn.Linear(4, 5)
+
+    def forward(self, x):
+        return torch.nn.functional.softmax(self.layer(x), dim=1)
+
+
+mlp_trace = capture(Mlp().eval(), torch.randn(3, 4))
+folded, folded_ops = N.fold_constants(mlp_trace)
+mlp_model = N.serialize(mlp_trace)
+mlp_parsed = N.parse_model(mlp_model)
+out["mlp"] = {
+    "captured_ops": [n["op"] for n in mlp_trace.nodes],
+    "folded_ops": folded_ops,
+    "ops_after_fold": [n["op"] for n in folded.nodes],
+    "opcodes": [op["opcode"] for op in mlp_parsed["operations"]],
+    "shapes": N.verify_shapes(mlp_model),
+    "bytes": len(mlp_model.as_bytes()),
+}
+
+# Folding must not touch a node that depends on an input.
+out["fold_kept_data_ops"] = sorted(
+    {n["op"] for n in folded.nodes}
+)
+
+# Ops with no calling convention are refused by name, not passed through.
+try:
+    N.serialize(capture(lambda a: torch.sin(a), torch.randn(2, 3)))
+    out["unmapped"] = "ACCEPTED"
+except N.JitFacadeRefused as error:
+    out["unmapped"] = str(error)
+
+# The blob decoder must reject a corrupted blob, or it proves nothing.
+raw = bytearray(model.as_bytes())
+import struct
+
+header = list(struct.unpack("iiiiii", bytes(raw[:24])))
+header[1] += 1  # claim one more operand than the tables carry
+raw[:24] = struct.pack("iiiiii", *header)
+try:
+    N.parse_model(bytes(raw))
+    out["corrupt_header"] = "ACCEPTED"
+except ValueError as error:
+    out["corrupt_header"] = str(error)
+
+raw = model.as_bytes() + b"\x00\x00\x00\x00"
+try:
+    N.parse_model(raw)
+    out["trailing_bytes"] = "ACCEPTED"
+except ValueError as error:
+    out["trailing_bytes"] = str(error)
+
+# A mis-wired _SIGNATURES entry must be caught by verify_shapes, or that
+# function is decoration. Swap two arguments of the convolution plan and
+# check the shapes stop agreeing.
+# stride 2, padding 1: swapping them has to *change* the output shape, and
+# on the padding-1 stride-1 convolution above it would not have -- the first
+# version of this injection was silently a no-op and the check "passed".
+strided = torch.nn.Conv2d(3, 4, 3, padding=1, stride=2).eval()
+strided_trace = capture(strided, image)
+out["strided"] = {"shapes": N.verify_shapes(N.serialize(strided_trace))}
+
+plan = N._SIGNATURES["aten.convolution.default"]
+mangled = list(plan[1])
+mangled[3], mangled[4] = mangled[4], mangled[3]  # stride <-> padding
+N._SIGNATURES["aten.convolution.default"] = (plan[0], mangled)
+try:
+    broken = N.serialize(strided_trace)
+    out["mangled_plan"] = N.verify_shapes(broken)
+except Exception as error:
+    out["mangled_plan"] = {"raised": f"{type(error).__name__}: {error}"}
+finally:
+    N._SIGNATURES["aten.convolution.default"] = plan
+
+# supported_ops is a subset of the base names target.nnapi_ops() reports.
+from torchnative.export import target as T
+
+bases = {N._SIGNATURES[op][0].split("::", 1)[1] for op in N.supported_ops()}
+out["supported_base_names"] = sorted(bases)
+out["nnapi_base_names"] = sorted(T.nnapi_ops())
+
+print(json.dumps(out))
+"""
+
+
+_NPU_COREML_SCRIPT = r"""
+import json
+import torch
+
+out = {"is_shim": hasattr(torch._C, "_aten_implemented")}
+
+try:
+    import coremltools  # noqa: F401
+    out["coremltools"] = coremltools.__version__
+except Exception as error:
+    out["coremltools"] = None
+    out["import_error"] = f"{type(error).__name__}: {error}"
+    print(json.dumps(out))
+    raise SystemExit(0)
+
+from torchnative.export import coreml as C
+from torchnative.export.decompose import DecomposedTrace
+
+
+def capture(fn, *inputs):
+    torch._C._capture_begin(list(inputs))
+    with torch.no_grad():
+        produced = fn(*inputs)
+    produced = produced if isinstance(produced, (list, tuple)) else [produced]
+    trace = torch._C._capture_end(list(produced))
+    return DecomposedTrace(
+        trace.guards, trace.constants, trace.constant_values,
+        trace.nodes, trace.outputs,
+    )
+
+
+torch.manual_seed(0)
+out["registry_size"] = len(C.coreml_ops())
+out["registry_has"] = sorted(
+    op for op in ("relu", "conv2d", "gelu", "softmax", "matmul", "layer_norm")
+    if op in C.coreml_ops()
+)
+out["supported_ops"] = sorted(C.supported_ops())
+
+# `target.coreml_ops()` must still refuse: its claim is about *this tree*,
+# which coremltools being installed does not change.
+from torchnative.export import target as T
+
+try:
+    T.coreml_ops()
+    out["tree_coreml_ops"] = "ANSWERED"
+except NotImplementedError as error:
+    out["tree_coreml_ops"] = str(error)
+
+
+class Mlp(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.a = torch.nn.Linear(4, 8)
+        self.b = torch.nn.Linear(8, 3)
+
+    def forward(self, x):
+        return torch.nn.functional.softmax(
+            self.b(torch.nn.functional.gelu(self.a(x))), dim=1
+        )
+
+
+class Cnn(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.conv = torch.nn.Conv2d(3, 8, 3, padding=1)
+        self.pool = torch.nn.AdaptiveAvgPool2d((1, 1))
+
+    def forward(self, x):
+        return torch.relu(self.pool(self.conv(x)))
+
+
+cases = {
+    "mlp_gelu_softmax": (Mlp().eval(), torch.randn(2, 4)),
+    "cnn_conv_pool_relu": (Cnn().eval(), torch.randn(1, 3, 16, 16)),
+    "sigmoid": (torch.nn.Sigmoid(), torch.randn(2, 3)),
+    "scalar_arith": (lambda a: a - a * 2.0, torch.randn(2, 3)),
+}
+executed = {}
+for name, (module, example) in cases.items():
+    trace = capture(module, example)
+    executed[name] = C.verify(trace, [example])
+    executed[name]["ops"] = [n["op"] for n in trace.nodes]
+out["executed"] = executed
+
+# The same MLP at CoreML's *default* precision, to keep on record that the
+# default is float16 and that a numerical claim made under it means something
+# else. Not a failure -- a different question.
+trace = capture(*(Mlp().eval(), torch.randn(2, 4)))
+example = torch.randn(2, 4)
+mlp = Mlp().eval()
+trace = capture(mlp, example)
+out["float16_default"] = C.verify(trace, [example], float32=False, tolerance=1e-2)
+out["float32_same_model"] = C.verify(trace, [example], float32=True)
+
+# An op with no MIL lowering is refused by name.
+try:
+    C.compile_model(capture(lambda a: torch.log(a), torch.rand(2, 3) + 1.0))
+    out["unmapped"] = "ACCEPTED"
+except C.CoreMLRefused as error:
+    out["unmapped"] = str(error)
+
+# The model is a real artefact on disk, not an in-memory object.
+import os
+import tempfile
+
+model, names, _ = C.compile_model(capture(torch.nn.Sigmoid(), torch.randn(2, 3)))
+directory = tempfile.mkdtemp()
+path = os.path.join(directory, "model.mlpackage")
+model.save(path)
+out["saved"] = {
+    "is_dir": os.path.isdir(path),
+    "input_names": names,
+    "bytes": sum(
+        os.path.getsize(os.path.join(root, f))
+        for root, _dirs, files in os.walk(path)
+        for f in files
+    ),
+}
+
+print(json.dumps(out))
+"""
+
+
+def _npu_fixture(script):
+    env = dict(os.environ)
+    env["PYTHONPATH"] = _CKPT_VENDOR_DIR
+    env["TORCH_USE_RTLD_GLOBAL"] = "1"  # VENDOR.md wall 1
+    proc = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=900,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"npu subprocess exited {proc.returncode}\n"
+            f"--- stdout ---\n{proc.stdout}\n--- stderr ---\n{proc.stderr}"
+        )
+    return json.loads(proc.stdout.strip().splitlines()[-1])
+
+
+def _npu_serialiser_fixture():
+    return _npu_fixture(_NPU_SERIALISER_SCRIPT)
+
+
+def _npu_coreml_fixture():
+    return _npu_fixture(_NPU_COREML_SCRIPT)
+
+
+def test_upstreams_nnapi_serialiser_needs_a_jit_graph_this_build_cannot_make():
+    """The finding docs/NPU.md leads with, measured rather than asserted.
+
+    `serialize_model(model, inputs)` starts at `model.graph.inputs()`. This
+    shim has no TorchScript compiler: `torch.jit.trace` hands back the module
+    it was given and `torch._C.Graph` is a placeholder whose own docstring says
+    so. So upstream's *entry point* is not drivable here, and any plan that
+    reads "call ct.convert / serialize_model on a traced module" is dead before
+    it starts.
+
+    This is checked by behaviour, not by a version string, so the day a `jit`
+    frontend lands the test goes red and the conclusion gets revisited instead
+    of being inherited.
+    """
+    if not os.path.isfile(_CKPT_VENDOR_SHIM):
+        print("   (skipped: vendored tree has no _C.abi3.so)")
+        return
+    r = _npu_serialiser_fixture()
+    assert r["is_shim"] is True, r["is_shim"]
+    assert r["jit_graph_available"] is False, r
+    assert r["jit_trace_is_identity"] is True, r
+    assert r["jit_graph_is_placeholder"] is True, r
+
+
+def test_the_serialisers_graph_surface_is_three_methods_and_stays_three():
+    """Why a façade is possible at all, kept honest against the vendored file.
+
+    `serialize_model` touches the graph object through `inputs`, `nodes` and
+    `return_node` and nothing else -- everything deeper goes through `Node` and
+    `Value`, which are duck-typed too. That narrowness is the entire reason
+    this round is "present our graph as one" rather than "write a serialiser",
+    so it is read out of the vendored source on every run. A vendored update
+    that reaches for a fourth method turns this red, which is the point: the
+    façade would then be silently incomplete.
+    """
+    if not os.path.isfile(_CKPT_VENDOR_SHIM):
+        print("   (skipped: vendored tree has no _C.abi3.so)")
+        return
+    r = _npu_serialiser_fixture()
+    assert r["graph_methods"] == ["inputs", "nodes", "return_node"], r["graph_methods"]
+
+
+def test_a_conv_relu_graph_serialises_to_a_blob_that_decodes():
+    """The deliverable, at its smallest: capture -> NNAPI model blob.
+
+    Every operand, immediate and byte of layout is upstream's serialiser
+    running unmodified; what is ours is the graph it was handed. The blob is
+    then decoded back through the layout it was written in -- table lengths
+    against the header, every operand reference in range, no trailing bytes.
+
+    **Structurally validated, not executed.** There is no NNAPI runtime on a
+    Mac. The opcodes below are asserted by value (CONV_2D=3, RELU=19) because
+    an off-by-one in the operation table is exactly the kind of thing a length
+    check would not see.
+    """
+    if not os.path.isfile(_CKPT_VENDOR_SHIM):
+        print("   (skipped: vendored tree has no _C.abi3.so)")
+        return
+    r = _npu_serialiser_fixture()
+    conv = r["conv_relu"]
+    assert conv["captured_ops"] == [
+        "aten.convolution.default", "aten.relu.default"
+    ], conv["captured_ops"]
+    assert conv["opcodes"] == [3, 19], conv["opcodes"]  # CONV_2D, RELU
+    assert conv["bytes"] > 0 and conv["bytes"] % 4 == 0, conv["bytes"]
+    assert len(conv["inputs"]) == 1 and len(conv["outputs"]) == 1, conv
+    # weight [4,3,3,3] and bias [4] become NNAPI weight operands
+    assert sorted(conv["weights"]) == [[4], [4, 3, 3, 3]], conv["weights"]
+    assert conv["shapes"]["mismatches"] == [], conv["shapes"]
+    assert conv["shapes"]["checked"] >= 2, conv["shapes"]
+
+
+def test_serialised_shapes_agree_with_what_capture_recorded():
+    """Two derivations of the same numbers, and a mis-wiring moves only one.
+
+    The serialiser propagates shapes over NNAPI operands from the input table;
+    capture observed them during a real CPU execution. A `_SIGNATURES` entry
+    that puts a recorded argument in the wrong TorchScript position produces a
+    blob that decodes perfectly and computes something else -- so the check
+    that matters is not "does it parse" but "does it still compute the shapes
+    the trace says".
+
+    The second half is the part that makes this a test rather than a
+    formality: it swaps `stride` and `padding` in the convolution plan and
+    requires that the swap be *caught*. A checker that cannot fail is not a
+    checker (CLAUDE.md §5.5).
+    """
+    if not os.path.isfile(_CKPT_VENDOR_SHIM):
+        print("   (skipped: vendored tree has no _C.abi3.so)")
+        return
+    r = _npu_serialiser_fixture()
+    assert r["conv_relu"]["shapes"]["mismatches"] == [], r["conv_relu"]["shapes"]
+    assert r["mlp"]["shapes"]["mismatches"] == [], r["mlp"]["shapes"]
+    assert r["strided"]["shapes"]["mismatches"] == [], r["strided"]["shapes"]
+    assert r["strided"]["shapes"]["checked"] >= 1, r["strided"]["shapes"]
+
+    mangled = r["mangled_plan"]
+    if "raised" in mangled:
+        # Refusing outright is also a catch -- the swapped stride made the
+        # graph unserialisable rather than wrong.
+        assert "raised" in mangled, mangled
+    else:
+        assert mangled["mismatches"], (
+            "swapping stride and padding in the convolution plan changed "
+            "nothing that verify_shapes could see, so verify_shapes is not "
+            "checking the wiring: " + repr(mangled)
+        )
+
+
+def test_constant_folding_is_what_makes_a_linear_layer_serialisable():
+    """`nn.Linear` captures as `t` then `addmm`, and NNAPI has no transpose.
+
+    It does not need one: `add_addmm` requires `mat2` to be a constant weight
+    and transposes it itself, because FULLY_CONNECTED wants `[out, in]`. So the
+    recorded graph is unserialisable while the graph it denotes is entirely
+    serialisable, and the difference is one node over a value known before the
+    model runs. Folding is done by *executing* that node through
+    `_aten_dispatch` -- the door capture recorded at -- rather than by a second
+    implementation of transpose.
+
+    The `_softmax` assertion is not filler. An early version of the fold
+    resolved already-remapped references a second time, and the visible symptom
+    was `_softmax` disappearing into a constant even though its input comes
+    from the model input. A fold that eats a data-dependent op produces a graph
+    that serialises, runs, and returns the same answer for every input.
+    """
+    if not os.path.isfile(_CKPT_VENDOR_SHIM):
+        print("   (skipped: vendored tree has no _C.abi3.so)")
+        return
+    r = _npu_serialiser_fixture()
+    mlp = r["mlp"]
+    assert "aten.t.default" in mlp["captured_ops"], mlp
+    assert mlp["folded_ops"] == ["aten.t.default"], mlp["folded_ops"]
+    assert "aten.t.default" not in mlp["ops_after_fold"], mlp
+    assert "aten.addmm.default" in mlp["ops_after_fold"], mlp
+    assert "aten._softmax.default" in mlp["ops_after_fold"], (
+        "softmax depends on the model input and must survive folding", mlp
+    )
+    assert mlp["opcodes"] == [9, 25], mlp["opcodes"]  # FULLY_CONNECTED, SOFTMAX
+
+
+def test_an_op_with_no_calling_convention_is_refused_by_name():
+    """Absence from `_SIGNATURES` refuses; it does not fall through.
+
+    `ADDER_MAP` is keyed by TorchScript node kind and every adder asserts an
+    exact `inputsSize()`, so an unmapped overload cannot be guessed into place
+    -- and a graph handed on with an op the delegate cannot compile is the
+    failure `decompose.py` already refuses one layer up.
+    """
+    if not os.path.isfile(_CKPT_VENDOR_SHIM):
+        print("   (skipped: vendored tree has no _C.abi3.so)")
+        return
+    r = _npu_serialiser_fixture()
+    assert r["unmapped"] != "ACCEPTED", r["unmapped"]
+    assert "aten.sin.default" in r["unmapped"], r["unmapped"]
+    assert "_SIGNATURES" in r["unmapped"], r["unmapped"]
+
+
+def test_the_blob_decoder_rejects_blobs_that_do_not_decode():
+    """`parse_model` has to be able to say no, or "it parsed" means nothing.
+
+    Two injected faults, both shaped like a real serialiser bug rather than
+    random noise: a header that claims one more operand than the tables carry,
+    and four trailing bytes the layout does not account for. Each must be
+    refused with a message that names what did not line up.
+    """
+    if not os.path.isfile(_CKPT_VENDOR_SHIM):
+        print("   (skipped: vendored tree has no _C.abi3.so)")
+        return
+    r = _npu_serialiser_fixture()
+    assert r["corrupt_header"] != "ACCEPTED", r["corrupt_header"]
+    assert r["trailing_bytes"] != "ACCEPTED", r["trailing_bytes"]
+    assert "trailing" in r["trailing_bytes"], r["trailing_bytes"]
+
+
+def test_what_serialises_is_smaller_than_what_nnapi_nominally_accepts():
+    """`supported_ops()` is a subset of `target.nnapi_ops()`, and says why.
+
+    docs/DECOMP.md §12.2 warned that the 29-name count is an upper bound
+    because `ADDER_MAP` is keyed without overloads. This is that warning turned
+    into a number that cannot drift: what has an actual calling convention here
+    is strictly fewer base names than `ADDER_MAP` carries, and the difference
+    is not a defect -- it is the distance between "NNAPI has an adder for this
+    name" and "a captured overload of it can be handed to that adder".
+    """
+    if not os.path.isfile(_CKPT_VENDOR_SHIM):
+        print("   (skipped: vendored tree has no _C.abi3.so)")
+        return
+    r = _npu_serialiser_fixture()
+    supported = set(r["supported_base_names"])
+    nominal = set(r["nnapi_base_names"])
+    assert supported <= nominal, sorted(supported - nominal)
+    assert len(supported) < len(nominal), (len(supported), len(nominal))
+    for op in ("relu", "sigmoid", "add", "mul", "_convolution", "addmm",
+               "softmax", "cat", "unsqueeze"):
+        assert op in supported, (op, sorted(supported))
+
+
+def test_coremltools_registry_is_read_rather_than_transcribed():
+    """§12.6's successor: the CoreML op set, from coremltools' own registry.
+
+    `torch/backends/_coreml` never had a list, which is why
+    `target.coreml_ops()` refuses -- and it still refuses, because its claim is
+    about *this tree* and installing a package does not change what is in the
+    tree. The registry lives in `coremltools.converters.mil.frontend.torch.ops`
+    and is read there, in the same sense `target.nnapi_ops()` parses
+    `ADDER_MAP`.
+    """
+    if not os.path.isfile(_CKPT_VENDOR_SHIM):
+        print("   (skipped: vendored tree has no _C.abi3.so)")
+        return
+    r = _npu_coreml_fixture()
+    if r["coremltools"] is None:
+        print("   (skipped: coremltools not installed for this interpreter)")
+        return
+    assert r["registry_size"] > 300, r["registry_size"]
+    for op in ("relu", "conv2d", "gelu", "softmax", "matmul", "layer_norm"):
+        assert op in r["registry_has"], (op, r["registry_has"])
+    assert r["tree_coreml_ops"] != "ANSWERED", r["tree_coreml_ops"]
+    assert "coremltools" in r["tree_coreml_ops"], r["tree_coreml_ops"]
+
+
+def test_coreml_models_are_compiled_and_actually_run():
+    """The one **executed** claim in this round.
+
+    Four captured graphs are emitted as MIL, converted by coremltools' full
+    backend pipeline, compiled by the operating system, and *run* -- then
+    compared against `DecomposedTrace.replay`, our own graph back through
+    `_aten_dispatch`. Both sides see the same inputs, so agreement is evidence
+    about the MIL lowering rather than about two libraries implementing an op
+    the same way (docs/CAPTURE.md §3).
+
+    Contrast the NNAPI tests above, which are structural only. docs/NPU.md
+    keeps the two apart and so does this file: nothing here claims a blob ran
+    on an NPU, and nothing there claims a CoreML model was merely inspected.
+    """
+    if not os.path.isfile(_CKPT_VENDOR_SHIM):
+        print("   (skipped: vendored tree has no _C.abi3.so)")
+        return
+    r = _npu_coreml_fixture()
+    if r["coremltools"] is None:
+        print("   (skipped: coremltools not installed for this interpreter)")
+        return
+    executed = r["executed"]
+    assert set(executed) == {
+        "mlp_gelu_softmax", "cnn_conv_pool_relu", "sigmoid", "scalar_arith"
+    }, sorted(executed)
+    for name, result in executed.items():
+        assert result["executed"] is True, (name, result)
+        assert result["within_tolerance"], (name, result)
+        assert result["max_abs_diff"] < 2e-5, (name, result)
+    # The graphs are not trivial: the MLP goes through gelu and softmax, the
+    # CNN through a real convolution.
+    assert "aten.gelu.default" in executed["mlp_gelu_softmax"]["ops"], executed
+    assert "aten.convolution.default" in executed["cnn_conv_pool_relu"]["ops"], executed
+    assert r["saved"]["is_dir"] is True, r["saved"]
+    assert r["saved"]["bytes"] > 0, r["saved"]
+
+
+def test_coremls_default_precision_is_float16_and_that_changes_the_claim():
+    """Pinning float32 is not tidiness; the default answers a different question.
+
+    coremltools defaults `mlprogram` to float16 compute precision. The first
+    run of `verify()` here disagreed with replay by 1.4e-4 on a two-layer MLP,
+    which is far outside float32 tolerance and entirely explained by half
+    precision -- reading it as a lowering error would have sent the search to
+    the wrong place, and waving it through as "close enough" would have hidden
+    a real one behind the same number.
+
+    So both are measured on the *same model and inputs*: the float16 build must
+    be visibly worse than the float32 one. If they ever agree exactly, the
+    precision flag stopped doing anything and the float32 claim is no longer
+    the claim being made.
+    """
+    if not os.path.isfile(_CKPT_VENDOR_SHIM):
+        print("   (skipped: vendored tree has no _C.abi3.so)")
+        return
+    r = _npu_coreml_fixture()
+    if r["coremltools"] is None:
+        print("   (skipped: coremltools not installed for this interpreter)")
+        return
+    half = r["float16_default"]["max_abs_diff"]
+    full = r["float32_same_model"]["max_abs_diff"]
+    assert full < 2e-5, full
+    assert half > full, (half, full)
+    assert r["float32_same_model"]["within_tolerance"], r["float32_same_model"]
+
+
+def test_an_op_with_no_mil_lowering_is_refused_by_name():
+    """`coreml.supported_ops()` and `coreml.coreml_ops()` answer different questions.
+
+    The registry says what coremltools' *frontend* could translate from a jit
+    graph -- which this build cannot produce. What is reachable from here is
+    what has a MIL lowering in `coreml.py`, which is much smaller, and an op
+    outside it is refused by name rather than approximated. Conflating the two
+    would report CoreML coverage this project does not have, which is the
+    §12.6 mistake from the other side.
+    """
+    if not os.path.isfile(_CKPT_VENDOR_SHIM):
+        print("   (skipped: vendored tree has no _C.abi3.so)")
+        return
+    r = _npu_coreml_fixture()
+    if r["coremltools"] is None:
+        print("   (skipped: coremltools not installed for this interpreter)")
+        return
+    assert r["unmapped"] != "ACCEPTED", r["unmapped"]
+    assert "aten.log.default" in r["unmapped"], r["unmapped"]
+    assert set(r["supported_ops"]) != set(), r["supported_ops"]
+    assert len(r["supported_ops"]) < r["registry_size"], (
+        len(r["supported_ops"]), r["registry_size"]
+    )
+
+
+
 if __name__ == "__main__":
     raise SystemExit(_main())
