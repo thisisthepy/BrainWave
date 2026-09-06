@@ -1,252 +1,96 @@
 {
-  "_README": [
-    "Allowlist for tools/golden/reach.py. Every entry is a connection that is",
-    "*absent on purpose*; docs/REACH.md is the inventory and the argument.",
-    "",
-    "Matched exactly, in both directions. An unlisted gap fails the suite, and an",
-    "entry whose gap has since closed fails it too -- so closing a gap deletes its",
-    "entry in the same change and this file always describes the present.",
-    "",
-    "`reason` is prose for the reader. `upstream_absent` / `upstream_present` are",
-    "for the checker: attribute paths on real upstream torch that the reason is",
-    "staking itself on, verified by `reach.py --verify-upstream` (a subprocess",
-    "with PYTHONPATH stripped). A reason nobody can put a question to is how",
-    "docs/SPELLINGS.md's deliberate gaps would otherwise become indistinguishable",
-    "from forgotten ones."
-  ],
-  "shape1_no_dispatch_arm": {},
-  "shape1_dead_overload_keys_ceiling": 110,
-  "shape2_kernel_without_spelling": {
-    "aten.alias.default": {
-      "reason": "Upstream exposes no `torch.alias` and no `Tensor.alias` -- `aten::alias` is a dispatcher-internal view op that upstream's own Python surface never names. Inventing a spelling for it would be exactly what docs/SPELLINGS.md refuses (a door upstream does not have). The kernel is reached, and needs to be, through `_aten_dispatch` from traced/exported graphs and through the vendored `__getitem__`'s view path.",
-      "upstream_absent": [
-        "torch.alias",
-        "torch.Tensor.alias"
-      ]
-    }
-  },
-  "shape3_unexercised_spelling": {
-    "__add__": {
-      "reason": "operator spelling. Tests exercise it as syntax (`a + b`, `a @ b`, `~a`), which this check reads as text and cannot attribute back to the dunder. A grep for `.__add__(` would be a lie in the other direction."
-    },
-    "__and__": {
-      "reason": "operator spelling. Tests exercise it as syntax (`a + b`, `a @ b`, `~a`), which this check reads as text and cannot attribute back to the dunder. A grep for `.__add__(` would be a lie in the other direction."
-    },
-    "__eq__": {
-      "reason": "operator spelling. Tests exercise it as syntax (`a + b`, `a @ b`, `~a`), which this check reads as text and cannot attribute back to the dunder. A grep for `.__add__(` would be a lie in the other direction."
-    },
-    "__gt__": {
-      "reason": "operator spelling. Tests exercise it as syntax (`a + b`, `a @ b`, `~a`), which this check reads as text and cannot attribute back to the dunder. A grep for `.__add__(` would be a lie in the other direction."
-    },
-    "__imul__": {
-      "reason": "operator spelling. Tests exercise it as syntax (`a + b`, `a @ b`, `~a`), which this check reads as text and cannot attribute back to the dunder. A grep for `.__add__(` would be a lie in the other direction."
-    },
-    "__invert__": {
-      "reason": "operator spelling. Tests exercise it as syntax (`a + b`, `a @ b`, `~a`), which this check reads as text and cannot attribute back to the dunder. A grep for `.__add__(` would be a lie in the other direction."
-    },
-    "__isub__": {
-      "reason": "operator spelling. Tests exercise it as syntax (`a + b`, `a @ b`, `~a`), which this check reads as text and cannot attribute back to the dunder. A grep for `.__add__(` would be a lie in the other direction."
-    },
-    "__le__": {
-      "reason": "operator spelling. Tests exercise it as syntax (`a + b`, `a @ b`, `~a`), which this check reads as text and cannot attribute back to the dunder. A grep for `.__add__(` would be a lie in the other direction."
-    },
-    "__lt__": {
-      "reason": "operator spelling. Tests exercise it as syntax (`a + b`, `a @ b`, `~a`), which this check reads as text and cannot attribute back to the dunder. A grep for `.__add__(` would be a lie in the other direction."
-    },
-    "__matmul__": {
-      "reason": "operator spelling. Tests exercise it as syntax (`a + b`, `a @ b`, `~a`), which this check reads as text and cannot attribute back to the dunder. A grep for `.__add__(` would be a lie in the other direction."
-    },
-    "__mod__": {
-      "reason": "operator spelling. Tests exercise it as syntax (`a + b`, `a @ b`, `~a`), which this check reads as text and cannot attribute back to the dunder. A grep for `.__add__(` would be a lie in the other direction."
-    },
-    "__mul__": {
-      "reason": "operator spelling. Tests exercise it as syntax (`a + b`, `a @ b`, `~a`), which this check reads as text and cannot attribute back to the dunder. A grep for `.__add__(` would be a lie in the other direction."
-    },
-    "__ne__": {
-      "reason": "operator spelling. Tests exercise it as syntax (`a + b`, `a @ b`, `~a`), which this check reads as text and cannot attribute back to the dunder. A grep for `.__add__(` would be a lie in the other direction."
-    },
-    "__neg__": {
-      "reason": "operator spelling. Tests exercise it as syntax (`a + b`, `a @ b`, `~a`), which this check reads as text and cannot attribute back to the dunder. A grep for `.__add__(` would be a lie in the other direction."
-    },
-    "__or__": {
-      "reason": "operator spelling. Tests exercise it as syntax (`a + b`, `a @ b`, `~a`), which this check reads as text and cannot attribute back to the dunder. A grep for `.__add__(` would be a lie in the other direction."
-    },
-    "__radd__": {
-      "reason": "operator spelling. Tests exercise it as syntax (`a + b`, `a @ b`, `~a`), which this check reads as text and cannot attribute back to the dunder. A grep for `.__add__(` would be a lie in the other direction."
-    },
-    "__rmul__": {
-      "reason": "operator spelling. Tests exercise it as syntax (`a + b`, `a @ b`, `~a`), which this check reads as text and cannot attribute back to the dunder. A grep for `.__add__(` would be a lie in the other direction."
-    },
-    "__rsub__": {
-      "reason": "operator spelling. Tests exercise it as syntax (`a + b`, `a @ b`, `~a`), which this check reads as text and cannot attribute back to the dunder. A grep for `.__add__(` would be a lie in the other direction."
-    },
-    "__sub__": {
-      "reason": "operator spelling. Tests exercise it as syntax (`a + b`, `a @ b`, `~a`), which this check reads as text and cannot attribute back to the dunder. A grep for `.__add__(` would be a lie in the other direction."
-    },
-    "__truediv__": {
-      "reason": "operator spelling. Tests exercise it as syntax (`a + b`, `a @ b`, `~a`), which this check reads as text and cannot attribute back to the dunder. A grep for `.__add__(` would be a lie in the other direction."
-    },
-    "_grouped_mm": {
-      "reason": "backlog: the kernel is golden-compared by dispatch key, but no test spells the name. docs/REACH.md §3."
-    },
-    "_log_softmax": {
-      "reason": "backlog: the kernel is golden-compared by dispatch key, but no test spells the name. docs/REACH.md §3."
-    },
-    "abs_": {
-      "reason": "backlog: the kernel is golden-compared by dispatch key, but no test spells the name. docs/REACH.md §3."
-    },
-    "adaptive_avg_pool1d": {
-      "reason": "backlog: the kernel is golden-compared by dispatch key, but no test spells the name. docs/REACH.md §3."
-    },
-    "adaptive_avg_pool2d": {
-      "reason": "backlog: the kernel is golden-compared by dispatch key, but no test spells the name. docs/REACH.md §3."
-    },
-    "addmm": {
-      "reason": "backlog: the kernel is golden-compared by dispatch key, but no test spells the name. docs/REACH.md §3."
-    },
-    "baddbmm": {
-      "reason": "backlog: the kernel is golden-compared by dispatch key, but no test spells the name. docs/REACH.md §3."
-    },
-    "bmm": {
-      "reason": "backlog: the kernel is golden-compared by dispatch key, but no test spells the name. docs/REACH.md §3."
-    },
-    "cat": {
-      "reason": "backlog, and found by this check: the only mention of this name in pytests/ is inside a comment or a docstring. Nothing calls it. docs/REACH.md §3."
-    },
-    "ceil_": {
-      "reason": "backlog: the kernel is golden-compared by dispatch key, but no test spells the name. docs/REACH.md §3."
-    },
-    "constant_pad_nd": {
-      "reason": "backlog: the kernel is golden-compared by dispatch key, but no test spells the name. docs/REACH.md §3."
-    },
-    "cos_": {
-      "reason": "backlog: the kernel is golden-compared by dispatch key, but no test spells the name. docs/REACH.md §3."
-    },
-    "cumsum": {
-      "reason": "backlog: the kernel is golden-compared by dispatch key, but no test spells the name. docs/REACH.md §3."
-    },
-    "embedding": {
-      "reason": "backlog: the kernel is golden-compared by dispatch key, but no test spells the name. docs/REACH.md §3."
-    },
-    "empty_like": {
-      "reason": "backlog: the kernel is golden-compared by dispatch key, but no test spells the name. docs/REACH.md §3."
-    },
-    "erf": {
-      "reason": "backlog, and found by this check: the only mention of this name in pytests/ is inside a comment or a docstring. Nothing calls it. docs/REACH.md §3."
-    },
-    "erf_": {
-      "reason": "backlog: the kernel is golden-compared by dispatch key, but no test spells the name. docs/REACH.md §3."
-    },
-    "expand": {
-      "reason": "backlog: the kernel is golden-compared by dispatch key, but no test spells the name. docs/REACH.md §3."
-    },
-    "expm1_": {
-      "reason": "backlog: the kernel is golden-compared by dispatch key, but no test spells the name. docs/REACH.md §3."
-    },
-    "floor_divide": {
-      "reason": "backlog: the kernel is golden-compared by dispatch key, but no test spells the name. docs/REACH.md §3."
-    },
-    "hardtanh": {
-      "reason": "backlog: the kernel is golden-compared by dispatch key, but no test spells the name. docs/REACH.md §3."
-    },
-    "histc": {
-      "reason": "backlog: the kernel is golden-compared by dispatch key, but no test spells the name. docs/REACH.md §3."
-    },
-    "isin": {
-      "reason": "backlog: the kernel is golden-compared by dispatch key, but no test spells the name. docs/REACH.md §3."
-    },
-    "le": {
-      "reason": "backlog: the kernel is golden-compared by dispatch key, but no test spells the name. docs/REACH.md §3."
-    },
-    "linalg_vector_norm": {
-      "reason": "backlog: the kernel is golden-compared by dispatch key, but no test spells the name. docs/REACH.md §3."
-    },
-    "linspace": {
-      "reason": "backlog: the kernel is golden-compared by dispatch key, but no test spells the name. docs/REACH.md §3."
-    },
-    "log2": {
-      "reason": "backlog: the kernel is golden-compared by dispatch key, but no test spells the name. docs/REACH.md §3."
-    },
-    "log2_": {
-      "reason": "backlog: the kernel is golden-compared by dispatch key, but no test spells the name. docs/REACH.md §3."
-    },
-    "log_": {
-      "reason": "backlog: the kernel is golden-compared by dispatch key, but no test spells the name. docs/REACH.md §3."
-    },
-    "lt": {
-      "reason": "backlog: the kernel is golden-compared by dispatch key, but no test spells the name. docs/REACH.md §3."
-    },
-    "masked_select": {
-      "reason": "backlog: the kernel is golden-compared by dispatch key, but no test spells the name. docs/REACH.md §3."
-    },
-    "matmul": {
-      "reason": "backlog: the kernel is golden-compared by dispatch key, but no test spells the name. docs/REACH.md §3."
-    },
-    "max_pool2d": {
-      "reason": "backlog: the kernel is golden-compared by dispatch key, but no test spells the name. docs/REACH.md §3."
-    },
-    "multinomial": {
-      "reason": "backlog: the kernel is golden-compared by dispatch key, but no test spells the name. docs/REACH.md §3."
-    },
-    "neg": {
-      "reason": "backlog: the kernel is golden-compared by dispatch key, but no test spells the name. docs/REACH.md §3."
-    },
-    "new_ones": {
-      "reason": "backlog: the kernel is golden-compared by dispatch key, but no test spells the name. docs/REACH.md §3."
-    },
-    "one_hot": {
-      "reason": "backlog: the kernel is golden-compared by dispatch key, but no test spells the name. docs/REACH.md §3."
-    },
-    "permute": {
-      "reason": "backlog: the kernel is golden-compared by dispatch key, but no test spells the name. docs/REACH.md §3."
-    },
-    "reciprocal_": {
-      "reason": "backlog: the kernel is golden-compared by dispatch key, but no test spells the name. docs/REACH.md §3."
-    },
-    "rsqrt_": {
-      "reason": "backlog: the kernel is golden-compared by dispatch key, but no test spells the name. docs/REACH.md §3."
-    },
-    "rsub": {
-      "reason": "backlog: the kernel is golden-compared by dispatch key, but no test spells the name. docs/REACH.md §3."
-    },
-    "sigmoid": {
-      "reason": "backlog, and found by this check: the only mention of this name in pytests/ is inside a comment or a docstring. Nothing calls it. docs/REACH.md §3."
-    },
-    "sigmoid_": {
-      "reason": "backlog: the kernel is golden-compared by dispatch key, but no test spells the name. docs/REACH.md §3."
-    },
-    "sign": {
-      "reason": "backlog: the kernel is golden-compared by dispatch key, but no test spells the name. docs/REACH.md §3."
-    },
-    "sin_": {
-      "reason": "backlog: the kernel is golden-compared by dispatch key, but no test spells the name. docs/REACH.md §3."
-    },
-    "sort": {
-      "reason": "backlog: the kernel is golden-compared by dispatch key, but no test spells the name. docs/REACH.md §3."
-    },
-    "split_with_sizes": {
-      "reason": "backlog: the kernel is golden-compared by dispatch key, but no test spells the name. docs/REACH.md §3."
-    },
-    "sqrt_": {
-      "reason": "backlog: the kernel is golden-compared by dispatch key, but no test spells the name. docs/REACH.md §3."
-    },
-    "squeeze": {
-      "reason": "backlog: the kernel is golden-compared by dispatch key, but no test spells the name. docs/REACH.md §3."
-    },
-    "tanh": {
-      "reason": "backlog: the kernel is golden-compared by dispatch key, but no test spells the name. docs/REACH.md §3."
-    },
-    "tanh_": {
-      "reason": "backlog: the kernel is golden-compared by dispatch key, but no test spells the name. docs/REACH.md §3."
-    },
-    "topk": {
-      "reason": "backlog: the kernel is golden-compared by dispatch key, but no test spells the name. docs/REACH.md §3."
-    },
-    "where": {
-      "reason": "backlog, and found by this check: the only mention of this name in pytests/ is inside a comment or a docstring. Nothing calls it. docs/REACH.md §3."
-    },
-    "zero_": {
-      "reason": "backlog: the kernel is golden-compared by dispatch key, but no test spells the name. docs/REACH.md §3."
-    }
+ "_README": [
+  "Allowlist for tools/golden/reach.py. Every entry is a connection that is",
+  "*absent on purpose*; docs/REACH.md is the inventory and the argument.",
+  "",
+  "Matched exactly, in both directions. An unlisted gap fails the suite, and an",
+  "entry whose gap has since closed fails it too -- so closing a gap deletes its",
+  "entry in the same change and this file always describes the present.",
+  "",
+  "`reason` is prose for the reader. `upstream_absent` / `upstream_present` are",
+  "for the checker: attribute paths on real upstream torch that the reason is",
+  "staking itself on, verified by `reach.py --verify-upstream` (a subprocess",
+  "with PYTHONPATH stripped). A reason nobody can put a question to is how",
+  "docs/SPELLINGS.md's deliberate gaps would otherwise become indistinguishable",
+  "from forgotten ones."
+ ],
+ "shape1_no_dispatch_arm": {},
+ "shape1_dead_overload_keys_ceiling": 110,
+ "shape2_kernel_without_spelling": {
+  "aten.alias.default": {
+   "reason": "Upstream exposes no `torch.alias` and no `Tensor.alias` -- `aten::alias` is a dispatcher-internal view op that upstream's own Python surface never names. Inventing a spelling for it would be exactly what docs/SPELLINGS.md refuses (a door upstream does not have). The kernel is reached, and needs to be, through `_aten_dispatch` from traced/exported graphs and through the vendored `__getitem__`'s view path.",
+   "upstream_absent": [
+    "torch.alias",
+    "torch.Tensor.alias"
+   ]
   }
+ },
+ "shape3_unexercised_spelling": {
+  "__add__": {
+   "reason": "operator spelling. Tests exercise it as syntax (`a + b`, `a @ b`, `~a`), which this check reads as text and cannot attribute back to the dunder. A grep for `.__add__(` would be a lie in the other direction."
+  },
+  "__and__": {
+   "reason": "operator spelling. Tests exercise it as syntax (`a + b`, `a @ b`, `~a`), which this check reads as text and cannot attribute back to the dunder. A grep for `.__add__(` would be a lie in the other direction."
+  },
+  "__eq__": {
+   "reason": "operator spelling. Tests exercise it as syntax (`a + b`, `a @ b`, `~a`), which this check reads as text and cannot attribute back to the dunder. A grep for `.__add__(` would be a lie in the other direction."
+  },
+  "__gt__": {
+   "reason": "operator spelling. Tests exercise it as syntax (`a + b`, `a @ b`, `~a`), which this check reads as text and cannot attribute back to the dunder. A grep for `.__add__(` would be a lie in the other direction."
+  },
+  "__imul__": {
+   "reason": "operator spelling. Tests exercise it as syntax (`a + b`, `a @ b`, `~a`), which this check reads as text and cannot attribute back to the dunder. A grep for `.__add__(` would be a lie in the other direction."
+  },
+  "__invert__": {
+   "reason": "operator spelling. Tests exercise it as syntax (`a + b`, `a @ b`, `~a`), which this check reads as text and cannot attribute back to the dunder. A grep for `.__add__(` would be a lie in the other direction."
+  },
+  "__isub__": {
+   "reason": "operator spelling. Tests exercise it as syntax (`a + b`, `a @ b`, `~a`), which this check reads as text and cannot attribute back to the dunder. A grep for `.__add__(` would be a lie in the other direction."
+  },
+  "__le__": {
+   "reason": "operator spelling. Tests exercise it as syntax (`a + b`, `a @ b`, `~a`), which this check reads as text and cannot attribute back to the dunder. A grep for `.__add__(` would be a lie in the other direction."
+  },
+  "__lt__": {
+   "reason": "operator spelling. Tests exercise it as syntax (`a + b`, `a @ b`, `~a`), which this check reads as text and cannot attribute back to the dunder. A grep for `.__add__(` would be a lie in the other direction."
+  },
+  "__matmul__": {
+   "reason": "operator spelling. Tests exercise it as syntax (`a + b`, `a @ b`, `~a`), which this check reads as text and cannot attribute back to the dunder. A grep for `.__add__(` would be a lie in the other direction."
+  },
+  "__mod__": {
+   "reason": "operator spelling. Tests exercise it as syntax (`a + b`, `a @ b`, `~a`), which this check reads as text and cannot attribute back to the dunder. A grep for `.__add__(` would be a lie in the other direction."
+  },
+  "__mul__": {
+   "reason": "operator spelling. Tests exercise it as syntax (`a + b`, `a @ b`, `~a`), which this check reads as text and cannot attribute back to the dunder. A grep for `.__add__(` would be a lie in the other direction."
+  },
+  "__ne__": {
+   "reason": "operator spelling. Tests exercise it as syntax (`a + b`, `a @ b`, `~a`), which this check reads as text and cannot attribute back to the dunder. A grep for `.__add__(` would be a lie in the other direction."
+  },
+  "__neg__": {
+   "reason": "operator spelling. Tests exercise it as syntax (`a + b`, `a @ b`, `~a`), which this check reads as text and cannot attribute back to the dunder. A grep for `.__add__(` would be a lie in the other direction."
+  },
+  "__or__": {
+   "reason": "operator spelling. Tests exercise it as syntax (`a + b`, `a @ b`, `~a`), which this check reads as text and cannot attribute back to the dunder. A grep for `.__add__(` would be a lie in the other direction."
+  },
+  "__radd__": {
+   "reason": "operator spelling. Tests exercise it as syntax (`a + b`, `a @ b`, `~a`), which this check reads as text and cannot attribute back to the dunder. A grep for `.__add__(` would be a lie in the other direction."
+  },
+  "__rmul__": {
+   "reason": "operator spelling. Tests exercise it as syntax (`a + b`, `a @ b`, `~a`), which this check reads as text and cannot attribute back to the dunder. A grep for `.__add__(` would be a lie in the other direction."
+  },
+  "__rsub__": {
+   "reason": "operator spelling. Tests exercise it as syntax (`a + b`, `a @ b`, `~a`), which this check reads as text and cannot attribute back to the dunder. A grep for `.__add__(` would be a lie in the other direction."
+  },
+  "__sub__": {
+   "reason": "operator spelling. Tests exercise it as syntax (`a + b`, `a @ b`, `~a`), which this check reads as text and cannot attribute back to the dunder. A grep for `.__add__(` would be a lie in the other direction."
+  },
+  "__truediv__": {
+   "reason": "operator spelling. Tests exercise it as syntax (`a + b`, `a @ b`, `~a`), which this check reads as text and cannot attribute back to the dunder. A grep for `.__add__(` would be a lie in the other direction."
+  },
+  "_grouped_mm": {
+   "reason": "backlog: the kernel is golden-compared by dispatch key, but no test spells the name. docs/REACH.md \u00a73."
+  },
+  "multinomial": {
+   "reason": "backlog: the kernel is golden-compared by dispatch key, but no test spells the name. Deliberately not attempted in this round: `multinomial` is a random sample, and a test asserting a value against upstream on a random op is exactly the shallow-coverage failure mode this file warns against (a fixed seed narrows the risk but does not remove it, since the shim and upstream draw from different RNG implementations even with the same seed). docs/REACH.md \u00a73."
+  }
+ }
 }
