@@ -59,10 +59,18 @@ ValueError: LlamaForCausalLM cannot be instantiated under `dtype=torch.int8`
             as it's not a floating-point dtype
 ```
 
-거절 지점은 `transformers/modeling_utils.py` 의 `_get_dtype` 이고, `hf_quantizer` 가 무엇이든
-그 앞입니다. 열려면 `transformers` 를 고쳐야 하는데, **이 프로젝트가 하지 않기로 한 유일한
-것이 그것입니다**(`docs/DESIGN.md` §1 — 파사드를 만드는 순간 임베디드 CPython 의 존재 이유가
-사라집니다).
+거절 지점은 `transformers/modeling_utils.py` 의 **`local_torch_dtype`** 입니다.
+**이 줄은 원래 `_get_dtype` 이라고 적혀 있었고, 그것은 틀렸습니다** — `docs/INT8B.md` §1.2 가
+고칩니다. `_get_dtype` 은 `torch.int8` 을 그대로 통과시키고 그 안에서
+`hf_quantizer.update_dtype(dtype)` 을 부릅니다. 즉 **`quantization_config` 이 함께 주어지면
+`update_dtype` 이 먼저 도는 자리가 있고**, 그 자리에서 `torch.int8` 을 받는 것이
+`docs/INT8B.md` 가 한 일입니다.
+
+`quantization_config` 없이 `dtype=torch.int8` 만 주는 철자는 여전히 닫혀 있습니다.
+`get_hf_quantizer` 는 `dtype` 을 인자로 받지 않으므로(그 앞에서 이미 `hf_quantizer = None` 이
+확정됩니다) 이 저장소의 코드가 닿을 수 있는 훅이 없습니다. 열려면 `transformers` 를 고쳐야
+하는데, **이 프로젝트가 하지 않기로 한 유일한 것이 그것입니다**(`docs/DESIGN.md` §1 — 파사드를
+만드는 순간 임베디드 CPython 의 존재 이유가 사라집니다).
 
 문 자체가 없는 것도 아닙니다. `docs/QUANT.md` §2.1 이 이미 독립적으로 닫아두었습니다 —
 candle-core 0.11 의 `DType` 에 `I8` 이 없으므로 **`torch.int8` 텐서가 이 스택에 존재하지

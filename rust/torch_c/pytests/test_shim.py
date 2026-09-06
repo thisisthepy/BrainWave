@@ -17684,8 +17684,9 @@ import torchnative.quant as q
 from torchnative.quant import TorchnativeConfig
 
 
-def load(path, **kw):
-    return AutoModelForCausalLM.from_pretrained(path, dtype=torch.float32, **kw)
+def load(path, dtype_override=None, **kw):
+    dtype = torch.float32 if dtype_override is None else dtype_override
+    return AutoModelForCausalLM.from_pretrained(path, dtype=dtype, **kw)
 
 
 if MODE in ("dense", "posthoc", "plugin"):
@@ -17792,6 +17793,73 @@ if MODE == "refuse":
     print(json.dumps(out))
     raise SystemExit(0)
 
+if MODE == "dtype_int8":
+    # docs/INT8B.md. Three things, and the first one decides the other two.
+    #
+    #   1. `dtype=torch.int8` with no quantization_config is refused by
+    #      *transformers*, not by us, and the traceback has to show that --
+    #      otherwise a later round could "fix" it in this repository and be
+    #      fixing the wrong file.
+    #   2. With a torchnative config it loads, and it loads the *same model*
+    #      as `dtype=torch.float32` with the same config: bit-identical
+    #      logits. If those two differed they would be two paths and one of
+    #      them would be wrong.
+    #   3. The model says what it is. `model.dtype` is float32 -- there is no
+    #      int8 tensor on this stack -- so the report has to carry the fact
+    #      that the caller asked for something else.
+    import traceback
+
+    try:
+        load(CKPT_TIED, dtype_override=torch.int8)
+        out["bare_int8"] = "ACCEPTED"
+    except ValueError as exc:
+        out["bare_int8"] = str(exc)
+        out["bare_int8_raised_in"] = [
+            f.name for f in traceback.extract_tb(exc.__traceback__)
+        ]
+        out["bare_int8_raised_in_transformers"] = any(
+            "transformers" in (f.filename or "")
+            for f in traceback.extract_tb(exc.__traceback__)
+        )
+        out["bare_int8_raised_in_torchnative"] = any(
+            "torchnative" in (f.filename or "")
+            for f in traceback.extract_tb(exc.__traceback__)
+        )
+
+    ids = torch.tensor([[3, 7, 1, 19]])
+    a = load(CKPT_TIED, quantization_config=TorchnativeConfig("q8_0"), dtype_override=torch.int8)
+    b = load(CKPT_TIED, quantization_config=TorchnativeConfig("q8_0"))
+    with torch.no_grad():
+        la, lb = a(ids).logits, b(ids).logits
+    out["int8_matches_q8_0"] = bool((la == lb).all().item())
+    # Negative control: a dense load must *not* match, or the line above is
+    # comparing two things that could not have differed.
+    c = load(CKPT_TIED)
+    with torch.no_grad():
+        lc = c(ids).logits
+    out["dense_differs"] = not bool((la == lc).all().item())
+    del b, c
+
+    out["model_dtype"] = str(a.dtype)
+    out["param_dtypes"] = sorted({str(p.dtype) for p in a.parameters()})
+    out["n_quantized"] = sum(1 for x in a.modules() if isinstance(x, q.QuantizedLinear))
+    rep = a.torchnative_quantization
+    out["report"] = str(rep)
+    out["report_widened_from"] = str(rep.widened_from)
+    out["repr_names_format"] = "q8_0" in repr(
+        next(x for x in a.modules() if isinstance(x, q.QuantizedLinear))
+    )
+    # An integer dtype that is *not* what q8_0 stores, and a float one candle
+    # cannot run, both still refuse -- widening is for int8 alone.
+    for name, dt in (("uint8", torch.uint8), ("float64", torch.float64)):
+        try:
+            load(CKPT_TIED, quantization_config=TorchnativeConfig("q8_0"), dtype_override=dt)
+            out[name] = "ACCEPTED"
+        except ValueError as exc:
+            out[name] = str(exc)
+    print(json.dumps(out))
+    raise SystemExit(0)
+
 raise SystemExit("unknown mode " + MODE)
 """
 
@@ -17835,7 +17903,7 @@ def _hfquant_fixture():
         env["TORCH_USE_RTLD_GLOBAL"] = "1"  # VENDOR.md wall 1
         env["HF_HUB_OFFLINE"] = "1"  # the checkpoints are local; never reach out
         results = {}
-        for mode in ("inert", "dense", "posthoc", "plugin", "compare", "refuse"):
+        for mode in ("inert", "dense", "posthoc", "plugin", "compare", "refuse", "dtype_int8"):
             proc = subprocess.run(
                 [sys.executable, "-c", _HFQUANT_SCRIPT, mode, paths["big"], paths["tied"]],
                 capture_output=True,
@@ -17999,6 +18067,69 @@ def test_the_quantizer_registers_a_name_and_changes_nothing_else():
     assert r["config_registered_after_ask"] is True
     assert r["config_class_is_ours"] is True
     assert r["reregister_ok"] is True, "registering twice raised"
+
+
+def test_dtype_int8_is_refused_by_transformers_alone_and_works_with_the_config():
+    """`from_pretrained(dtype=torch.int8)` -- what the caller actually gets.
+
+    docs/INT8B.md. The user's spelling is `dtype=torch.int8` in the slot where
+    `dtype=torch.bfloat16` works. Half of it is not ours to give:
+    `modeling_utils.local_torch_dtype` refuses any non-floating dtype before
+    the model is built, and `get_hf_quantizer` -- which runs earlier -- reads
+    only `quantization_config`, so nothing in transformers is keyed on
+    `dtype`. This test pins **where** that refusal comes from, so that a later
+    round cannot mistake it for something this repository broke.
+
+    The half that is ours is `hf_quantizer.update_dtype`, which `_get_dtype`
+    calls before that guard. With a `TorchnativeConfig` in hand,
+    `dtype=torch.int8` is read as a statement about weights, widened to
+    `float32`, and disclosed. The assertion that makes that honest rather than
+    convenient is the third one: it must produce **bit-identical** logits to
+    the same config loaded at `float32`, because if it did not they would be
+    two paths and only one of them could be right. A dense load is the
+    negative control -- it must differ, or "identical" is measuring nothing.
+    """
+    if not _hfquant_available():
+        return
+    r = _hfquant_fixture()["dtype_int8"]
+
+    # 1. The bare spelling: refused, and refused by transformers.
+    assert r["bare_int8"] != "ACCEPTED", (
+        "dtype=torch.int8 with no quantization_config was accepted; there is no "
+        "int8 tensor on this stack, so something is lying"
+    )
+    assert "not a floating-point dtype" in r["bare_int8"], r["bare_int8"]
+    assert r["bare_int8_raised_in_transformers"] is True, r["bare_int8_raised_in"]
+    assert r["bare_int8_raised_in_torchnative"] is False, (
+        "the refusal came from torchnative; it is supposed to come from "
+        f"transformers' own guard: {r['bare_int8_raised_in']}"
+    )
+    assert "local_torch_dtype" in r["bare_int8_raised_in"], r["bare_int8_raised_in"]
+
+    # 2. With the config it loads, and it is the same model.
+    assert r["int8_matches_q8_0"] is True, (
+        "dtype=torch.int8 and dtype=torch.float32 under the same "
+        "TorchnativeConfig gave different logits -- they are two paths"
+    )
+    assert r["dense_differs"] is True, (
+        "a dense load produced the same logits as the quantised one, so the "
+        "bit-identity above is not evidence of anything"
+    )
+    assert r["n_quantized"] == 14, r["n_quantized"]
+
+    # 3. The model tells the caller what it actually is.
+    assert r["model_dtype"] == "torch.float32", r["model_dtype"]
+    assert r["param_dtypes"] == ["torch.float32"], r["param_dtypes"]
+    assert r["report_widened_from"] == "torch.int8", r["report_widened_from"]
+    assert "torch.int8" in r["report"], r["report"]
+    assert "q8_0" in r["report"], r["report"]
+    assert r["repr_names_format"] is True, "repr(QuantizedLinear) does not name the format"
+
+    # 4. Widening is for int8 alone. `uint8` is not what q8_0 stores and
+    #    `float64` is not something candle's QMatMul runs; both keep refusing.
+    for key in ("uint8", "float64"):
+        assert r[key] != "ACCEPTED", f"{key} was widened; only int8 should be"
+        assert "QMatMul accepts float32 and float16 only" in r[key], r[key]
 
 
 # ---------------------------------------------------------------------------

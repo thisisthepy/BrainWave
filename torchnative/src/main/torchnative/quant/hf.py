@@ -3,18 +3,33 @@
     from torchnative.quant import TorchnativeConfig
     m = AutoModelForCausalLM.from_pretrained(name, quantization_config=TorchnativeConfig("q8_0"))
 
-**Why this spelling and not `dtype=torch.int8`.** The obvious call is closed,
-and not by us. transformers refuses it before any code here runs::
+**`dtype=torch.int8` alone, and `dtype=torch.int8` with this config.** They are
+not the same question, and only the second one is ours.
 
+*Alone* it is closed, and not by us::
+
+    AutoModelForCausalLM.from_pretrained(name, dtype=torch.int8)
     ValueError: LlamaForCausalLM cannot be instantiated under `dtype=torch.int8`
                 as it's not a floating-point dtype
 
-(measured, transformers 5.15.1, `modeling_utils._get_dtype`). Making it work
-means editing transformers, which is the one thing this project does not do --
-`docs/DESIGN.md` §1 exists because a facade defeats the reason an embedded
-CPython is worth having. `docs/QUANT.md` §2.1 closes the other door
-independently: there is no `torch.int8` *tensor* on this stack either, since
-candle-core 0.11's `DType` has no `I8`.
+That is raised by `modeling_utils.local_torch_dtype`, which guards
+`torch.set_default_dtype` and is entered from `from_pretrained` *after*
+`get_hf_quantizer` has already decided there is no quantizer. `get_hf_quantizer`
+reads only `quantization_config` and `config.quantization_config` -- nothing in
+transformers is keyed on `dtype`, so there is no public hook that a bare
+`dtype=torch.int8` could reach. Opening it means editing transformers, which is
+the one thing this project does not do (`docs/DESIGN.md` §1: a facade defeats
+the reason an embedded CPython is worth having). See `docs/INT8B.md` §1.
+
+*With this config* it is ours, because `_get_dtype` calls
+`hf_quantizer.update_dtype(dtype)` before that guard is reached, so a quantizer
+can widen it. `update_dtype` below accepts `torch.int8` there, reads it as a
+statement about weights rather than activations, and says so. It is not honoured
+literally: `docs/QUANT.md` §2.1 and `docs/INT8.md` §1 close that door
+independently -- candle-core 0.11's `DType` has no `I8`, at any version
+including `main`, so there is no `torch.int8` *tensor* on this stack to load
+into. What the caller gets is `q8_0` weights and `float32` activations, and
+`model.torchnative_quantization` records that they asked for something else.
 
 The slot transformers does provide is `quantization_config`, and it is a public
 plugin API -- `transformers.quantizers.auto.register_quantizer` and
@@ -78,6 +93,14 @@ _TIED_WAY_OUT = (
     "Leave it in modules_to_not_convert -- that is what the default does -- or call "
     "torchnative.quant.quantize_ on the loaded model and take both costs knowingly."
 )
+
+# Integer dtypes a caller may reasonably put in `dtype=` meaning "quantise the
+# weights". Only `int8` is here: `q8_0` is a *signed* 8-bit block format, so
+# `torch.uint8` would not be the same request and is left to the refusal below.
+# There is no `torch.int8` tensor on this stack either way (docs/INT8.md §1),
+# which is why this widens rather than honouring the spelling literally.
+_WEIGHT_DTYPES = (torch.int8,)
+
 
 _SHAPE_WAY_OUT = (
     "Either pick a format whose block size divides this width, or name these layers "
@@ -226,6 +249,10 @@ class TorchnativeHfQuantizer(HfQuantizer):
         self.converted = []
         self.skipped = []
         self.adopted = set()
+        # What the caller spelled in `dtype=`, kept only when it was an integer
+        # dtype we widened (see `update_dtype`). `None` means the caller asked
+        # for a float dtype and got it, so there is nothing to disclose.
+        self.widened_from = None
         # Recorded rather than asserted, and published on the report. The
         # claim this plugin makes is that the swap happens *before* the
         # weights exist, and a machine too noisy to measure peak RSS can still
@@ -285,6 +312,19 @@ class TorchnativeHfQuantizer(HfQuantizer):
                 "so the model is being loaded in float32 instead. Every tensor that is "
                 "not replaced -- the embedding above all -- is therefore twice the size "
                 "it would have been. Pass dtype=torch.float16 to avoid that."
+            )
+            return torch.float32
+        if dtype in _WEIGHT_DTYPES:
+            self.widened_from = dtype
+            logger.warning_once(
+                f"dtype={dtype} was read as a request about *weights*, not activations. "
+                f"The weights are being quantised to "
+                f"{self.quantization_config.format} by the quantization_config, which is "
+                "the nearest thing this stack has to it -- there is no torch.int8 tensor "
+                "here at all, because candle-core 0.11 has no I8 dtype (docs/INT8.md §1). "
+                "Activations are loaded in float32, so model.dtype will report "
+                "torch.float32 and not the dtype you passed; model.torchnative_quantization "
+                "records what actually happened."
             )
             return torch.float32
         if dtype not in (torch.float32, torch.float16):
@@ -396,6 +436,7 @@ class TorchnativeHfQuantizer(HfQuantizer):
             modules_to_not_convert=list(self.modules_to_not_convert),
             default_skips=self.quantization_config.modules_to_not_convert is None,
             swapped_before_weights=self.swapped_before_weights,
+            widened_from=self.widened_from,
         )
         return model
 
@@ -429,6 +470,7 @@ class _LoadReport:
         modules_to_not_convert,
         default_skips,
         swapped_before_weights,
+        widened_from=None,
     ):
         self.format = format
         self.converted = converted
@@ -436,6 +478,7 @@ class _LoadReport:
         self.modules_to_not_convert = modules_to_not_convert
         self.default_skips = default_skips
         self.swapped_before_weights = swapped_before_weights
+        self.widened_from = widened_from
 
     def __str__(self):
         origin = (
@@ -452,6 +495,12 @@ class _LoadReport:
             if self.swapped_before_weights
             else "  WARNING: at least one leaf was replaced after its weight existed",
         ]
+        if self.widened_from is not None:
+            lines.append(
+                f"  caller asked for dtype={self.widened_from}; there is no such tensor on "
+                f"this stack, so the weights are {self.format} and the activations are "
+                "torch.float32 (model.dtype says float32)"
+            )
         reasons = {}
         for name, why in self.skipped:
             reasons.setdefault(why, []).append(name)
