@@ -12355,6 +12355,612 @@ def _bilinear_vec_cases(torch_module, c_module) -> list[Case]:
     return cases
 
 
+# --- aten.upsample_bicubic2d.default -----------------------------------------
+#
+# `yolos`' wall, and a second op where the wrong answer is a *plausible image*.
+# Two traps here that `upsample_bilinear2d` does not have, both measured:
+#
+#   * `align_corners=False` **does not clamp the source index at 0** for cubic
+#     (upstream's `area_pixel_compute_source_index` has a `cubic` template
+#     parameter whose only job is to skip that clamp), so the leading edge
+#     overshoots: `arange(16).reshape(1,1,4,4)` -> `(6,6)` starts at `-0.434`,
+#     a value the input does not contain. A clamped implementation cannot
+#     produce it, and every case below with `align_corners=False` on the ramp
+#     separates the two.
+#   * there is **no `out == in` short circuit**, which bilinear does have.
+#     `(1,1,2,3)` -> `[2,3]` with `scales=(0.5, 0.5)` resamples upstream; a
+#     kernel that copied the axis would return the input and look reasonable.
+
+_BICUBIC_DTYPES = ["float64", "float32", "float16", "bfloat16"]
+# A non-symmetric ramp on a non-square input, so an H/W mix-up cannot pass.
+_UC_INPUT = [float(v) for v in range(16)]
+_UC_SHAPE = (1, 1, 4, 4)
+
+
+def _bicubic_case(
+    torch_module, c_module, torch_call, dtype_name, flat, shape, output_size,
+    align_corners, scales_h=None, scales_w=None, expect="match", note="",
+) -> Case:
+    op = "aten.upsample_bicubic2d.default"
+    x_t, x_c = pair_from_flat(torch_module, c_module, flat, shape, dtype_name)
+    return Case(
+        name=(
+            f"upsample_bicubic2d(dtype={dtype_name}, shape={shape}, "
+            f"output_size={output_size}, align_corners={align_corners}, "
+            f"scales=({scales_h}, {scales_w})) [{note}]"
+        ),
+        op=op,
+        run_torch=lambda: torch_call(x_t, output_size, align_corners, scales_h, scales_w),
+        run_c=lambda: c_module._aten_dispatch(
+            op, x_c, output_size, align_corners, scales_h, scales_w),
+        expect=expect,
+        note=note,
+    )
+
+
+def upsample_bicubic2d_cases(torch_module, c_module, torch_call) -> list[Case]:
+    """`aten.upsample_bicubic2d(self, output_size, align_corners, scales_h, scales_w)`.
+
+    The plausible wrong implementations, and what separates each:
+
+      * **clamping the source index at 0** under `align_corners=False`, the
+        way bilinear does. Every ramp case at that flag value separates it --
+        the first output element is negative upstream.
+      * **zero-padding the out-of-range taps** instead of clamping them to the
+        border (`upsample_get_value_bounded`). Darkens every edge; the corner
+        elements are what catch it.
+      * **A = -0.5** instead of `-0.75` in the cubic kernel. The other common
+        choice in the literature, and it produces an entirely plausible image.
+        Any interior case separates it.
+      * **implementing one convention for both flag values** -- every case
+        below runs both, on identical input, so the two must differ.
+      * **ignoring `scales_h`/`scales_w` and using `in/out`** -- identical
+        whenever `out == in * scale`. The `in=3, out=4, scale=1.5` case is the
+        one that separates it.
+      * **copying bilinear's `out == in` short circuit** -- the explicit
+        no-short-circuit case below is the only thing that catches it.
+      * **computing the cubic weights at `opmath_t`** rather than at the
+        input's dtype. Invisible in `float32` (where the two are the same) and
+        past tolerance in both reduced dtypes: 7.8e-03 for `float16` against a
+        5e-03 tolerance, 6.25e-02 for `bfloat16` against 6e-02. The reduced
+        dtype rows are what make that measurable, which is why they are not
+        redundant coverage of the `float32` ones.
+      * **transposing H and W** -- every shape here is non-square.
+    """
+    op = "aten.upsample_bicubic2d.default"
+    cases: list[Case] = []
+
+    for dtype_name in _BICUBIC_DTYPES:
+        for align_corners in (False, True):
+            for output_size, note in (
+                ([6, 6], "upsample past the border -- the -0.434 corner"),
+                ([8, 8], "2x upsample, both axes"),
+                ([5, 7], "different, non-integral ratios per axis"),
+                ([2, 2], "downsample"),
+                ([1, 1], "collapse to a single pixel"),
+                ([4, 4], "out == in on both axes -- still resampled, no short circuit"),
+                ([4, 7], "one axis unchanged, the other upsampled"),
+            ):
+                cases.append(
+                    _bicubic_case(
+                        torch_module, c_module, torch_call, dtype_name,
+                        _UC_INPUT, _UC_SHAPE, output_size, align_corners, note=note,
+                    )
+                )
+        # More than one plane, so a kernel that resamples one (H, W) plane and
+        # repeats it fails.
+        for align_corners in (False, True):
+            cases.append(
+                _bicubic_case(
+                    torch_module, c_module, torch_call, dtype_name,
+                    [float(i) for i in range(24)], (2, 2, 2, 3), [4, 6], align_corners,
+                    note="N=2, C=2: four distinct planes",
+                )
+            )
+
+    # The scales, on the one geometry where `1/scale` and `in/out` differ:
+    # in=3, out=4, scale=1.5 gives 0.667 against 0.75, and upstream answers
+    # [-0.0868, 0.4062, 1.2303, 1.8738] rather than the no-scale
+    # [-0.0718, 0.5298, 1.4702, 2.0718].
+    row = [0.0, 1.0, 2.0]
+    for scales_w, note in (
+        (1.5, "scale 1.5 -> 1/1.5 = 0.667, NOT in/out = 0.75"),
+        (2.0, "scale 2.0 -> 0.5, also not in/out here"),
+        (0.0, "a zero scale is IGNORED, falling back to in/out"),
+        (-1.0, "a negative scale is ignored too"),
+        (None, "the baseline both of the above fall back to"),
+    ):
+        cases.append(
+            _bicubic_case(
+                torch_module, c_module, torch_call, "float32",
+                row, (1, 1, 1, 3), [1, 4], False, scales_w=scales_w, note=note,
+            )
+        )
+    # `align_corners=True` ignores the scales entirely -- checked with a scale
+    # large enough that honouring it would be unmissable.
+    for scales_w in (None, 9.0):
+        cases.append(
+            _bicubic_case(
+                torch_module, c_module, torch_call, "float32",
+                row, (1, 1, 1, 3), [1, 4], True, scales_w=scales_w,
+                note="align_corners=True ignores the scales",
+            )
+        )
+    # The no-short-circuit case, stated on its own because bilinear's kernel
+    # *does* copy here and borrowing that would pass everything else.
+    cases.append(
+        _bicubic_case(
+            torch_module, c_module, torch_call, "float32",
+            [float(v) for v in range(6)], (1, 1, 2, 3), [2, 3], False,
+            scales_h=0.5, scales_w=0.5,
+            note="out == in with scales 0.5: upstream RESAMPLES, it does not copy",
+        )
+    )
+
+    # An empty batch: the answer is empty, not an error. `C == 0` IS an error.
+    cases.append(
+        _bicubic_case(
+            torch_module, c_module, torch_call, "float32",
+            [], (0, 1, 2, 3), [4, 6], False, note="N=0 gives an empty (0,1,4,6)",
+        )
+    )
+    cases.append(
+        _bicubic_case(
+            torch_module, c_module, torch_call, "float32",
+            [], (1, 0, 2, 3), [4, 6], False, expect="both_error",
+            note="C=0 -- 'Non-empty 4D data tensor expected'",
+        )
+    )
+
+    # The refusals, in upstream's order.
+    cases.append(
+        _bicubic_case(
+            torch_module, c_module, torch_call, "float32",
+            _UC_INPUT, _UC_SHAPE, [4], False, expect="both_error",
+            note="output_size must have length 2",
+        )
+    )
+    cases.append(
+        _bicubic_case(
+            torch_module, c_module, torch_call, "float32",
+            [0.0, 1.0, 2.0, 3.0, 4.0, 5.0], (1, 2, 3), [4, 6], False, expect="both_error",
+            note="the input must be rank 4",
+        )
+    )
+    for output_size, note in (([0, 3], "a zero output extent"),
+                              ([-1, 3], "a negative output extent")):
+        cases.append(
+            _bicubic_case(
+                torch_module, c_module, torch_call, "float32",
+                _UC_INPUT, _UC_SHAPE, output_size, False, expect="both_error", note=note,
+            )
+        )
+    for dtype_name in ("int64", "bool"):
+        flat = [1] * 16 if dtype_name == "bool" else [int(v) for v in range(16)]
+        cases.append(
+            _bicubic_case(
+                torch_module, c_module, torch_call, dtype_name,
+                flat, _UC_SHAPE, [6, 6], False, expect="both_error",
+                note='"compute_indices_weights_cubic" not implemented for this dtype',
+            )
+        )
+    # `uint8` is the documented gap, and it is bicubic's own measurement rather
+    # than bilinear's inherited: rounding the float32 answer disagrees with
+    # upstream on 140 of 1840 elements over 40 random shapes at both flags.
+    cases.append(
+        _bicubic_case(
+            torch_module, c_module, torch_call, "uint8",
+            [v * 16 for v in range(16)], _UC_SHAPE, [6, 6], False, expect="c_error",
+            note="documented gap: upstream's uint8 path is not 'bicubic then round'",
+        )
+    )
+
+    # Keyword-argument coverage.
+    kw_t, kw_c = pair_from_flat(torch_module, c_module, _UC_INPUT, _UC_SHAPE, "float32")
+    cases.append(
+        Case(
+            name="upsample_bicubic2d(self=/output_size=/align_corners=/scales_h=/scales_w=)",
+            op=op,
+            run_torch=lambda: torch_call(
+                self=kw_t, output_size=[6, 6], align_corners=False,
+                scales_h=2.0, scales_w=2.0),
+            run_c=lambda: c_module._aten_dispatch(
+                op, self=kw_c, output_size=[6, 6], align_corners=False,
+                scales_h=2.0, scales_w=2.0),
+        )
+    )
+
+    cases.extend(_bicubic_vec_cases(torch_module, c_module))
+    return cases
+
+
+def _bicubic_vec_cases(torch_module, c_module) -> list[Case]:
+    """`torch._C._nn.upsample_bicubic2d(...)` -- both spellings of the binding.
+
+    `yolos` never spells the leaf: `F.interpolate(x, ..., mode="bicubic")`
+    calls the **four-argument `.vec`** form (`torch/nn/functional.py:5286`),
+    which derives the output size and forwards the factors. Golden compares by
+    dispatch key and is blind to that derivation, so it needs its own cases.
+
+    The **five-argument leaf** form is also a real call on upstream's
+    overloaded binding (measured), and is covered here too -- otherwise the
+    shim could accept only one shape and every dispatch-key case would still
+    pass.
+    """
+    op = "aten.upsample_bicubic2d.default"
+    cases: list[Case] = []
+
+    def vec(m, x, *rest):
+        nn = m._nn if hasattr(m, "_nn") else m._C._nn
+        return nn.upsample_bicubic2d(x, *rest)
+
+    for align_corners in (False, True):
+        for rest, label in (
+            ((None, [2.0, 2.0]), "scale_factor=2"),
+            ((None, [1.5, 1.5]), "scale_factor=1.5 -- floors the size, forwards the factor"),
+            ((None, [3.0, 1.0]), "different factors per axis"),
+            (([6, 6], None), "an explicit output_size instead"),
+        ):
+            pair = pair_from_flat(torch_module, c_module, _UC_INPUT, _UC_SHAPE, "float32")
+            cases.append(
+                _member_case(
+                    torch_module, c_module, op,
+                    f"_nn.upsample_bicubic2d({label}, align_corners={align_corners})",
+                    "float32", [pair],
+                    lambda m, x, r=rest, a=align_corners: vec(m, x, r[0], a, r[1]),
+                    note="F.interpolate's own call shape",
+                )
+            )
+    # The five-argument leaf spelling, including the scale that is not `in/out`.
+    for scales, label in (
+        ((None, None), "no scales"),
+        ((2.0, 2.0), "scales_h=scales_w=2.0"),
+        ((None, 1.5), "scales_w=1.5 -- the 1/scale grid"),
+    ):
+        pair = pair_from_flat(torch_module, c_module, _UC_INPUT, _UC_SHAPE, "float32")
+        cases.append(
+            _member_case(
+                torch_module, c_module, op,
+                f"_nn.upsample_bicubic2d(leaf 5-arg, {label})",
+                "float32", [pair],
+                lambda m, x, s=scales: vec(m, x, [6, 6], False, s[0], s[1]),
+                note="upstream's binding is overloaded and takes this shape too",
+            )
+        )
+    # **Both** given is refused, not "output_size wins".
+    for both in ((None, None), ([5, 5], [2.0, 2.0])):
+        pair = pair_from_flat(torch_module, c_module, _UC_INPUT, _UC_SHAPE, "float32")
+        cases.append(
+            _member_case(
+                torch_module, c_module, op,
+                f"_nn.upsample_bicubic2d(output_size={both[0]}, factors={both[1]}) [refused]",
+                "float32", [pair],
+                lambda m, x, o=both[0], f=both[1]: vec(m, x, o, False, f),
+                expect="both_error",
+                note="exactly one of output_size and scale_factors, measured",
+            )
+        )
+    return cases
+
+
+def floor_cases(torch_module, c_module, torch_call) -> list[Case]:
+    """`floor` is `ceil`'s twin and every row was re-measured rather than
+    mirrored. The one that differs is `-0.5`: `ceil(-0.5)` is `-0.0` (sign bit
+    kept) and `floor(-0.5)` is `-1.0`, so a kernel that reached the wrong
+    sibling would pass a case set built only from `[1.2, 2.0]`. `floor(-0.0)`
+    keeps its sign bit, checked upstream with `torch.signbit`."""
+    op = "aten.floor.default"
+    cases: list[Case] = []
+    for dtype_name in _TRIG_DTYPES:
+        cases.append(
+            _unary_case(
+                torch_module, c_module, op, torch_call, dtype_name,
+                [1.2, -1.2, -0.5, 0.5, 2.0, -2.0], (2, 3),
+                "fractional values, including -0.5 -- floor gives -1., where ceil gives -0.",
+            )
+        )
+        cases.append(
+            _unary_case(
+                torch_module, c_module, op, torch_call, dtype_name,
+                [1.0, -1.0, 0.0, 5.0], (2, 2), "already-integral values are a no-op",
+            )
+        )
+        cases.append(
+            _unary_case(
+                torch_module, c_module, op, torch_call, dtype_name,
+                [float("inf"), float("-inf"), float("nan")], (3,),
+                "inf/nan pass through unchanged (measured)",
+            )
+        )
+
+    # Integer dtypes: floor is an identity, not a refusal (measured).
+    for dtype_name in ["int64", "int32", "int16", "uint8"]:
+        flat = [1, 2, 3] if dtype_name == "uint8" else [1, -2, 3]
+        cases.append(
+            _unary_case(torch_module, c_module, op, torch_call, dtype_name, flat, (3,),
+                        "integers: floor is the identity (measured)")
+        )
+
+    cases.append(
+        Case(
+            name="floor(dtype=bool) [torch refuses]",
+            op=op,
+            run_torch=lambda: torch_call(torch_module.tensor([True, False])),
+            run_c=lambda: c_module._aten_dispatch(
+                op, c_module._tensor_from_flat([1, 0], [2], dtype=c_module.bool)),
+            expect="both_error",
+            note='torch: NotImplementedError("floor_vml_cpu" not implemented for \'Bool\') '
+                 "-- a DIFFERENT kernel name from ceil's, measured",
+        )
+    )
+    return cases
+
+
+def floor__cases(torch_module, c_module, torch_call) -> list[Case]:
+    """`floor_`'s dtype rules re-measured in place rather than inherited from
+    `floor_default`: an integral receiver is the identity and only `bool`
+    refuses, with `floor_vml_cpu`. docs/INPLACE.md §2 is why the in-place
+    rules are measured separately at all -- eleven ops in this file have
+    in-place rules that differ from their out-of-place siblings'."""
+    op = "aten.floor_.default"
+    cases: list[Case] = []
+    for dtype_name in ["float64", "float32", "float16", "bfloat16"]:
+        a_t, a_c = pair_from_flat(
+            torch_module, c_module, [1.5, -1.5, -0.5, 0.5, 2.0, -2.0], (6,), dtype_name
+        )
+        cases.append(
+            Case(
+                name=f"floor_(dtype={dtype_name}) [floor(-0.5) is -1.0, not -0.0]",
+                op=op,
+                run_torch=lambda a_t=a_t: torch_call(a_t),
+                run_c=lambda a_c=a_c: c_module._aten_dispatch(op, a_c),
+            )
+        )
+    a_t, a_c = pair_from_flat(
+        torch_module, c_module, [float("nan"), float("inf"), float("-inf")], (3,), "float32"
+    )
+    cases.append(
+        Case(
+            name="floor_(float32, [nan, inf, -inf])",
+            op=op,
+            run_torch=lambda: torch_call(a_t),
+            run_c=lambda: c_module._aten_dispatch(op, a_c),
+        )
+    )
+    for dtype_name in ["int64", "int32"]:
+        a_t, a_c = pair_from_flat(torch_module, c_module, [0, 1, -1, 2], (4,), dtype_name)
+        cases.append(
+            Case(
+                name=f"floor_(dtype={dtype_name}) [identity -- already integral]",
+                op=op,
+                run_torch=lambda a_t=a_t: torch_call(a_t),
+                run_c=lambda a_c=a_c: c_module._aten_dispatch(op, a_c),
+            )
+        )
+    b_t, b_c = pair_from_flat(torch_module, c_module, [1, 0], (2,), "bool")
+    cases.append(
+        Case(
+            name="floor_(dtype=bool) [refused -- \"floor_vml_cpu\" not implemented for 'Bool']",
+            op=op,
+            run_torch=lambda: torch_call(b_t),
+            run_c=lambda: c_module._aten_dispatch(op, b_c),
+            expect="both_error",
+        )
+    )
+    cases.extend(_inplace_member_cases(torch_module, c_module, op, [
+        ("x.floor_()", lambda m, a: a.floor_()),
+    ], operands=1))
+    cases.extend(c for c in _view_write_cases(torch_module, c_module) if c.op == op)
+    return cases
+
+
+def index_add__cases(torch_module, c_module, torch_call) -> list[Case]:
+    """`aten.index_add_(self, dim, index, source, *, alpha=1)`.
+
+    What separates the plausible wrong implementations:
+
+      * **overwriting instead of accumulating** -- indistinguishable on any
+        index without duplicates, which is most hand-written data. The
+        `[1, 1, 1]` duplicate-index cases are the only ones that catch it.
+      * **wrapping a negative index**, which is `index_put_`'s rule and *not*
+        this op's: upstream raises `index out of range in self` for `-1`.
+      * **summing in `f64` and narrowing once** rather than accumulating at
+        the receiver's dtype. The 64-way `bfloat16` accumulation case is the
+        separator: `0.65234375` running, `0.640625` if summed wide.
+      * **rounding `alpha` instead of truncating it** on an integral receiver
+        (`alpha=2.9` behaves as `2`, measured).
+      * **rebinding instead of writing through** -- the view case reads the
+        BASE, not the return value, so a fresh-buffer kernel fails it.
+      * **reporting one shape error for both cases** -- upstream has two, and
+        which fires depends on whether the disagreeing axis is `dim`.
+    """
+    op = "aten.index_add_.default"
+    cases: list[Case] = []
+
+    def case(name, self_flat, self_shape, dtype_name, dim, idx_flat, idx_dtype,
+             src_flat, src_shape, src_dtype=None, alpha=None, expect="match", note=""):
+        s_t, s_c = pair_from_flat(torch_module, c_module, self_flat, self_shape, dtype_name)
+        i_t, i_c = pair_from_flat(torch_module, c_module, idx_flat,
+                                  [len(idx_flat)], idx_dtype)
+        v_t, v_c = pair_from_flat(torch_module, c_module, src_flat, src_shape,
+                                  src_dtype or dtype_name)
+        if alpha is None:
+            run_t = lambda: torch_call(s_t, dim, i_t, v_t)
+            run_c = lambda: c_module._aten_dispatch(op, s_c, dim, i_c, v_c)
+        else:
+            run_t = lambda: torch_call(s_t, dim, i_t, v_t, alpha=alpha)
+            run_c = lambda: c_module._aten_dispatch(op, s_c, dim, i_c, v_c, alpha=alpha)
+        cases.append(Case(name=f"index_add_({name})", op=op, run_torch=run_t,
+                          run_c=run_c, expect=expect, note=note))
+
+    zeros8 = [0.0] * 8
+    for dtype_name in ["float64", "float32", "float16", "bfloat16"]:
+        case(f"dtype={dtype_name}, 2-D, dim=0", zeros8, (4, 2), dtype_name, 0,
+             [0, 2], "int64", [1.0, 2.0, 3.0, 4.0], (2, 2),
+             note="the shape switch_transformers' routing uses")
+        case(f"dtype={dtype_name}, duplicate indices ACCUMULATE", [0.0, 0.0, 0.0], (3,),
+             dtype_name, 0, [1, 1, 1], "int64", [1.0, 2.0, 3.0], (3,),
+             note="[0, 6, 0] -- an overwriting kernel gives [0, 3, 0]")
+        case(f"dtype={dtype_name}, dim=1", zeros8, (2, 4), dtype_name, 1,
+             [0, 3], "int64", [1.0, 2.0, 3.0, 4.0], (2, 2))
+        case(f"dtype={dtype_name}, dim=-1 wraps", zeros8, (2, 4), dtype_name, -1,
+             [0, 3], "int64", [1.0, 2.0, 3.0, 4.0], (2, 2))
+        case(f"dtype={dtype_name}, alpha=3", [0.0, 0.0, 0.0], (3,), dtype_name, 0,
+             [0, 1], "int64", [1.0, 2.0], (2,), alpha=3)
+        case(f"dtype={dtype_name}, alpha=-1.5", [1.0, 1.0, 1.0], (3,), dtype_name, 0,
+             [0, 1], "int64", [1.0, 2.0], (2,), alpha=-1.5)
+        case(f"dtype={dtype_name}, self is not zero to start with",
+             [1.0, -2.0, 3.0], (3,), dtype_name, 0, [0, 2], "int64", [10.0, 20.0], (2,),
+             note="a kernel that ignored `self` passes every zeros case")
+
+    # The running-precision separator. 64 accumulations into one position.
+    for dtype_name, note in (
+        ("bfloat16", "running bf16 sum is 0.65234375; f64-then-narrow gives 0.640625"),
+        ("float16", "running f16 sum, measured"),
+        ("float32", "running f32 sum, measured"),
+    ):
+        case(f"dtype={dtype_name}, 64 accumulations into one position",
+             [0.0, 0.0], (2,), dtype_name, 0, [0] * 64, "int64",
+             [0.01] * 64, (64,), note=note)
+
+    # Integral receivers.
+    case("dtype=int64", [0, 0, 0], (3,), "int64", 0, [0, 0], "int64", [5, 7], (2,),
+         note="accumulates as integers")
+    case("dtype=int64, alpha=2.9 TRUNCATES to 2", [0, 0, 0], (3,), "int64", 0,
+         [0], "int64", [4], (1,), alpha=2.9,
+         note="8, not 12 -- alpha is cast to the receiver's dtype, measured")
+    case("dtype=int32", [0, 0, 0], (3,), "int32", 0, [1, 1], "int32", [5, 7], (2,),
+         note="an int32 index is accepted too")
+    case("dtype=uint8 WRAPS on overflow", [0, 0], (2,), "uint8", 0, [0, 0], "int64",
+         [200, 200], (2,), note="144, measured -- not saturation")
+    case("dtype=bool is a logical OR", [0, 0], (2,), "bool", 0, [0, 0], "int64",
+         [1, 1], (2,), note="True, not a 2 in a bool buffer")
+
+    # An empty index writes nothing, after every check.
+    case("an empty index writes nothing", [1.0, 2.0, 3.0], (3,), "float32", 0,
+         [], "int64", [], (0,), note="self comes back unchanged")
+
+    # The refusals, each with its own message.
+    case("a NEGATIVE index is refused (unlike index_put_, which wraps)",
+         [0.0, 0.0, 0.0], (3,), "float32", 0, [-1], "int64", [5.0], (1,),
+         expect="both_error", note="IndexError: index out of range in self")
+    case("an out-of-range index", [0.0, 0.0, 0.0], (3,), "float32", 0, [5], "int64",
+         [5.0], (1,), expect="both_error", note="the same message, no bounds in it")
+    case("a float index", [0.0, 0.0, 0.0], (3,), "float32", 0, [0.0], "float32",
+         [5.0], (1,), expect="both_error",
+         note="Expected dtype int32/int64 for index but got: Float")
+    case("self and source dtypes must match exactly", [0.0, 0.0, 0.0], (3,), "float32",
+         0, [0], "int64", [5], (1,), src_dtype="int64", expect="both_error",
+         note="no promotion: self (Float) and source (Long)")
+    case("wrong source extent ALONG dim", zeros8, (4, 2), "float32", 0, [0, 2],
+         "int64", [1.0] * 6, (3, 2), expect="both_error",
+         note="'Number of indices (2) should be equal to source.size(dim): (3)'")
+    case("wrong source extent on ANOTHER axis", zeros8, (4, 2), "float32", 0, [0, 2],
+         "int64", [1.0] * 6, (2, 3), expect="both_error",
+         note="the OTHER message: 'source tensor shape must match self tensor shape'")
+    case("a rank mismatch", [0.0, 0.0, 0.0], (3,), "float32", 0, [0], "int64",
+         [1.0], (1, 1), expect="both_error", note="the shape message again")
+    case("dim out of range", [0.0, 0.0, 0.0], (3,), "float32", 1, [0], "int64",
+         [1.0], (1,), expect="both_error",
+         note="Dimension out of range (expected to be in range of [-1, 0], but got 1)")
+
+    # A 2-D index is its own message, and a 0-d one is accepted.
+    # Each of the two below binds its own tensors as lambda defaults: sharing
+    # the names across two `Case`s makes both read whichever pair was assigned
+    # last, and the "2-D index is refused" case then silently ran the 0-d
+    # tensors and passed nothing.
+    d2 = (pair_from_flat(torch_module, c_module, [0.0, 0.0, 0.0], (3,), "float32"),
+          pair_from_flat(torch_module, c_module, [0, 1], (1, 2), "int64"),
+          pair_from_flat(torch_module, c_module, [1.0, 2.0], (2,), "float32"))
+    cases.append(
+        Case(
+            name="index_add_(a 2-D index is refused -- 'Index is supposed to be a vector')",
+            op=op,
+            run_torch=lambda d2=d2: torch_call(d2[0][0], 0, d2[1][0], d2[2][0]),
+            run_c=lambda d2=d2: c_module._aten_dispatch(
+                op, d2[0][1], 0, d2[1][1], d2[2][1]),
+            expect="both_error",
+        )
+    )
+    d0 = (pair_from_flat(torch_module, c_module, [0.0, 0.0, 0.0], (3,), "float32"),
+          pair_from_flat(torch_module, c_module, [0], [], "int64"),
+          pair_from_flat(torch_module, c_module, [1.0], (1,), "float32"))
+    cases.append(
+        Case(
+            name="index_add_(a 0-d index is ACCEPTED)",
+            op=op,
+            run_torch=lambda d0=d0: torch_call(d0[0][0], 0, d0[1][0], d0[2][0]),
+            run_c=lambda d0=d0: c_module._aten_dispatch(
+                op, d0[0][1], 0, d0[1][1], d0[2][1]),
+            note="not every non-vector index is refused -- measured",
+        )
+    )
+
+    # Write-through, read from the BASE of a view rather than from the return
+    # value: an in-place op returns `self` either way, so a return-value case
+    # passes against a kernel that computed into a fresh buffer.
+    def through_view(m, base, index, source):
+        view = m._aten_dispatch("aten.slice.Tensor", base, 0, 1, 4, 1) \
+            if hasattr(m, "_aten_dispatch") else base[1:4]
+        m_call = (lambda: m._aten_dispatch(op, view, 0, index, source)) \
+            if hasattr(m, "_aten_dispatch") else (lambda: view.index_add_(0, index, source))
+        m_call()
+        return base
+    b_pair = pair_from_flat(torch_module, c_module, [0.0] * 6, (6,), "float32")
+    i_pair = pair_from_flat(torch_module, c_module, [0, 2], (2,), "int64")
+    v_pair = pair_from_flat(torch_module, c_module, [7.0, 9.0], (2,), "float32")
+    cases.append(
+        _member_case(
+            torch_module, c_module, op,
+            "base after v[1:4].index_add_(0, [0,2], [7.,9.]) [reads the BASE]",
+            "float32", [b_pair, i_pair, v_pair], through_view,
+            note="write-through, not rebind: [0, 7, 0, 9, 0, 0]",
+        )
+    )
+
+    # An EXPANDED receiver is refused here, where `index_put_` writes. That
+    # asymmetry is in `write_back`'s Overlap table and only a case can hold it.
+    def expanded(m, base, index, source):
+        if hasattr(m, "_aten_dispatch"):
+            view = m._aten_dispatch("aten.expand.default", base, [2, 3])
+            return m._aten_dispatch(op, view, 0, index, source)
+        return base.expand(2, 3).index_add_(0, index, source)
+    e_pair = pair_from_flat(torch_module, c_module, [0.0, 0.0, 0.0], (3,), "float32")
+    ei_pair = pair_from_flat(torch_module, c_module, [0], (1,), "int64")
+    ev_pair = pair_from_flat(torch_module, c_module, [1.0, 1.0, 1.0], (1, 3), "float32")
+    cases.append(
+        _member_case(
+            torch_module, c_module, op,
+            "an expanded receiver is REFUSED (index_put_ writes here)",
+            "float32", [e_pair, ei_pair, ev_pair], expanded, expect="both_error",
+            note="'more than one element of the written-to tensor refers to a single "
+                 "memory location', measured",
+        )
+    )
+
+    # The member spelling, on both sides, checked for `is self` as well as for
+    # value -- a rebind would still return the right numbers.
+    m_pair = pair_from_flat(torch_module, c_module, [0.0, 0.0, 0.0], (3,), "float32")
+    mi_pair = pair_from_flat(torch_module, c_module, [0, 1], (2,), "int64")
+    mv_pair = pair_from_flat(torch_module, c_module, [5.0, 6.0], (2,), "float32")
+
+    def member(m, base, index, source):
+        result = base.index_add_(0, index, source)
+        if result is not base:
+            raise AssertionError("index_add_ rebound instead of writing through")
+        return base
+
+    cases.append(
+        _member_case(
+            torch_module, c_module, op,
+            "x.index_add_(0, [0, 1], [5., 6.]) [the member spelling, and `is x`]",
+            "float32", [m_pair, mi_pair, mv_pair], member,
+            note="TensorBase.index_add_ -- the spelling switch_transformers calls",
+        )
+    )
+    return cases
+
+
 # --- aten.gelu.default -------------------------------------------------------
 #
 # The op with two functions behind one name. `approximate="none"` is the exact
@@ -20591,6 +21197,12 @@ def _view_write_cases(torch_module, c_module) -> list[Case]:
         "ceil_ through a strided view",
         [v + 0.5 for v in signed], (3, 4), "float32",
         lambda call, base: call("aten.ceil_.default", call("aten.select.int", base, 1, 1)))
+    add("aten.floor_.default",
+        "base after x[:,1].floor_() [reads the BASE]",
+        "floor_ through a strided view; the values carry a .5 so the write is "
+        "visible at all",
+        [v + 0.5 for v in signed], (3, 4), "float32",
+        lambda call, base: call("aten.floor_.default", call("aten.select.int", base, 1, 1)))
     add("aten.clamp_min_.default",
         "base after x[:,1].clamp_min_(0.0) [reads the BASE]",
         "clamp_min_ through a strided view; the other three columns of the "
@@ -22944,6 +23556,8 @@ CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
     "aten.native_group_norm.default": native_group_norm_cases,
     # docs/KERNELS26.md §20 -- zoedepth.
     "aten.upsample_bilinear2d.default": upsample_bilinear2d_cases,
+    # docs/DEMAND8.md §2 -- yolos.
+    "aten.upsample_bicubic2d.default": upsample_bicubic2d_cases,
     "aten.split.Tensor": split_cases,
     "aten.tanh.default": tanh_cases,
     # What widening past the Llama/GPT-2 family asks for (docs/ARCH.md).
@@ -23021,6 +23635,8 @@ CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
     # with a TorchDispatchMode logger around torch._tensor_str._str_intern.
     "aten.abs.default": abs_cases,
     "aten.ceil.default": ceil_cases,
+    # docs/DEMAND8.md §2 -- swin and segformer.
+    "aten.floor.default": floor_cases,
     "aten.gt.Tensor": gt_tensor_cases,
     "aten.gt.Scalar": gt_scalar_cases,
     "aten.masked_select.default": masked_select_cases,
@@ -23070,6 +23686,9 @@ CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
     "aten.sigmoid_.default": sigmoid__cases,
     "aten.abs_.default": abs__cases,
     "aten.ceil_.default": ceil__cases,
+    "aten.floor_.default": floor__cases,
+    # docs/DEMAND8.md §2 -- switch_transformers.
+    "aten.index_add_.default": index_add__cases,
     "aten.clamp_min_.default": clamp_min__cases,
     "aten.max_pool2d.default": max_pool2d_cases,
     "aten.hardtanh.default": hardtanh_cases,

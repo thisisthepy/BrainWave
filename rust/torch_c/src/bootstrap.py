@@ -7036,6 +7036,72 @@ def _install_nn(module, dispatch) -> None:
             scale_h, scale_w,
         )
 
+    _LEAF_SENTINEL = object()
+
+    def upsample_bicubic2d(
+        input, output_size, align_corners, scale_factors=None,
+        scales_w=_LEAF_SENTINEL,
+    ):
+        """`torch._C._nn.upsample_bicubic2d` -- `yolos`' wall.
+
+        `torch/nn/functional.py:5286` (`F.interpolate`, `mode="bicubic"`,
+        `antialias=False`) calls this with exactly this four-argument shape,
+        which is the **`.vec`** schema: `output_size` may be `None` and
+        `scale_factors` is a list, where the leaf takes two separate `float?`
+        arguments. `.vec` is `CompositeImplicitAutograd`, so it belongs here
+        rather than in a table, for the reason `upsample_bilinear2d` gives
+        directly above -- and the scale factors are **forwarded**, not merely
+        used to size the output, because `1/scale` and `in/out` are different
+        grids as soon as the product is not integral.
+
+        `antialias=True` reaches `_upsample_bicubic2d_aa`, a different op with
+        no kernel here; it stays a raising stub naming itself rather than being
+        silently aliased to this one, which would return a plausible image at
+        the wrong sharpness.
+
+        The **five-argument leaf spelling** (`scales_h`, `scales_w` as two
+        separate floats) is accepted too, because upstream's binding is
+        overloaded and accepts it -- measured. A fifth argument is the only
+        thing that distinguishes the two shapes, so it is the discriminator.
+        """
+        _leaf = scales_w is not _LEAF_SENTINEL
+        if _leaf and output_size is None:
+            raise RuntimeError(
+                "It is expected output_size equals to 2, but got size 0"
+            )
+        sizes = list(input.shape)
+        if _leaf:
+            # The five-argument leaf spelling. Upstream's binding is
+            # overloaded and accepts both; measured, `torch._C._nn.
+            # upsample_bicubic2d(x, [1, 4], False, None, 1.5)` is a real call
+            # and answers on the `1/scale` grid, so refusing it here would be
+            # a surface this shim invented a hole in.
+            return dispatch(
+                "aten.upsample_bicubic2d.default", input,
+                [int(v) for v in output_size], align_corners,
+                scale_factors, scales_w,
+            )
+        if output_size is not None and scale_factors is not None:
+            raise RuntimeError(
+                "Must specify exactly one of output_size and scale_factors"
+            )
+        if output_size is not None:
+            osize = [int(v) for v in output_size]
+            scale_h = scale_w = None
+        else:
+            if scale_factors is None:
+                raise RuntimeError(
+                    "Must specify exactly one of output_size and scale_factors"
+                )
+            factors = list(scale_factors)
+            osize = [int(sizes[i + 2] * factors[i]) for i in range(len(factors))]
+            scale_h = float(factors[0]) if len(factors) > 0 else None
+            scale_w = float(factors[1]) if len(factors) > 1 else None
+        return dispatch(
+            "aten.upsample_bicubic2d.default", input, osize, align_corners,
+            scale_h, scale_w,
+        )
+
     def leaky_relu(input, negative_slope=0.01):
         """`torch._C._nn.leaky_relu` -- `vits`' wall after the `IntTensor`
         constructor.
@@ -7166,6 +7232,7 @@ def _install_nn(module, dispatch) -> None:
         (pad, "pad"),
         (softplus, "softplus"),
         (upsample_bilinear2d, "upsample_bilinear2d"),
+        (upsample_bicubic2d, "upsample_bicubic2d"),
         (leaky_relu, "leaky_relu"),
         (adaptive_avg_pool2d, "adaptive_avg_pool2d"),
         (hardtanh, "hardtanh"),
@@ -7183,7 +7250,7 @@ def _install_nn(module, dispatch) -> None:
     module._shim_nn_implemented = [
         "adaptive_avg_pool2d", "cross_entropy_loss", "gelu", "hardtanh", "leaky_relu", "linear", "nll_loss",
         "nll_loss_nd", "one_hot", "pad", "scaled_dot_product_attention", "silu",
-        "softplus", "upsample_bilinear2d",
+        "softplus", "upsample_bicubic2d", "upsample_bilinear2d",
     ]
 
 

@@ -115,6 +115,8 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.fill_.Scalar",
     "aten.fill_.Tensor",
     "aten.flip.default",
+    "aten.floor.default",
+    "aten.floor_.default",
     "aten.floor_divide.default",
     "aten.floor_divide.Scalar",
     "aten.full.default",
@@ -128,6 +130,7 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.gt.Tensor",
     "aten.histc.default",
     "aten.index.Tensor",
+    "aten.index_add_.default",
     "aten.index_put_.default",
     "aten.is_floating_point.default",
     "aten.isin.Tensor_Tensor",
@@ -231,6 +234,7 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.unbind.int",
     "aten.uniform_.default",
     "aten.unsqueeze.default",
+    "aten.upsample_bicubic2d.default",
     "aten.upsample_bilinear2d.default",
     "aten.view.default",
     "aten.view.dtype",
@@ -437,6 +441,8 @@ static FLOAT8_E4M3FN_REFUSALS: &[(&str, &str)] = &[
     ("aten.bmm.default", "bmm"),
     ("aten.ceil.default", "ceil_vml_cpu"),
     ("aten.ceil_.default", "ceil_vml_cpu"),
+    ("aten.floor.default", "floor_vml_cpu"),
+    ("aten.floor_.default", "floor_vml_cpu"),
     ("aten.clamp.default", "clamp_scalar_cpu"),
     ("aten.clamp_.default", "clamp_scalar_cpu"),
     ("aten.clamp_min.default", "clamp_min_scalar_cpu"),
@@ -1830,6 +1836,7 @@ fn aten_dispatch_inner(
         "aten.roll.default" => roll_default(py, args, kwargs),
         "aten.where.ScalarSelf" => where_scalar_self(py, args, kwargs),
         "aten.ceil.default" => ceil_default(py, args, kwargs),
+        "aten.floor.default" => floor_default(py, args, kwargs),
         "aten.gt.Tensor" => compare_tensor(py, args, kwargs, "aten.gt.Tensor", Cmp::Gt),
         "aten.gt.Scalar" => compare_scalar(py, args, kwargs, "aten.gt.Scalar", Cmp::Gt),
         "aten.masked_select.default" => masked_select_default(py, args, kwargs),
@@ -1843,6 +1850,7 @@ fn aten_dispatch_inner(
         // -- the four docs/GPT2.md measured a 2-layer GPT-2 stopping on -----
         "aten.native_group_norm.default" => native_group_norm_default(py, args, kwargs),
         "aten.upsample_bilinear2d.default" => upsample_bilinear2d_default(py, args, kwargs),
+        "aten.upsample_bicubic2d.default" => upsample_bicubic2d_default(py, args, kwargs),
         "aten.avg_pool2d.default" => avg_pool2d_default(py, args, kwargs),
         "aten.max_pool2d.default" => max_pool2d_default(py, args, kwargs),
         "aten.native_layer_norm.default" => native_layer_norm_default(py, args, kwargs),
@@ -2048,6 +2056,7 @@ fn aten_dispatch_inner(
         "aten.bernoulli_.float" => bernoulli_inplace_float(py, args, kwargs),
         "aten.masked_fill_.Scalar" => masked_fill_inplace(py, args, kwargs, "aten.masked_fill_.Scalar"),
         "aten.index_put_.default" => index_put_inplace(py, args, kwargs),
+        "aten.index_add_.default" => index_add_inplace(py, args, kwargs),
 
         // -- the rest of the in-place arithmetic family (docs/ARCH20.md §8) --
         //
@@ -2099,6 +2108,7 @@ fn aten_dispatch_inner(
         "aten.sigmoid_.default" => sigmoid_inplace(py, args, kwargs),
         "aten.abs_.default" => abs_inplace(py, args, kwargs),
         "aten.ceil_.default" => ceil_inplace(py, args, kwargs),
+        "aten.floor_.default" => floor_inplace(py, args, kwargs),
         "aten.clamp_min_.default" => clamp_min_inplace(py, args, kwargs),
         "aten.detach_.default" => detach_inplace_refusal(py, args, kwargs),
 
@@ -16262,6 +16272,651 @@ fn upsample_bilinear2d_default(
 
     let out = write_flat(OP, Flat::Float(out), out_dims, &device, tag)?;
     finish(py, out, tag)
+}
+
+/// `aten::floor(Tensor self) -> Tensor`
+///
+/// `swin`'s and `segformer`'s wall (docs/DEMAND7.md §3 rank 1). The twin of
+/// `ceil_default` directly above, and every rule was re-measured on 2.13.0
+/// rather than mirrored from it, because the two differ in exactly one place
+/// that matters and agreeing everywhere else is not a reason to skip the
+/// check:
+///
+/// ```text
+/// floor(-0.5)   -1.0        (ceil gives -0.0, and the sign bit is the point there)
+/// floor(-0.0)   -0.0        signbit kept -- measured with torch.signbit
+/// floor(inf)    inf
+/// floor(nan)    nan
+/// arange(3)     [0, 1, 2]   integral dtypes are the identity, not a refusal
+/// bool          "floor_vml_cpu" not implemented for 'Bool'
+/// ```
+///
+/// The kernel name in the `bool` refusal is **`floor_vml_cpu`**, not
+/// `ceil_vml_cpu` -- read off a real `NotImplementedError`, because upstream
+/// reaches a different kernel and copying the sibling's string would send a
+/// reader to the wrong place.
+///
+/// `aten::floor.out` is declared in `overloads.json` beside the bare form (as
+/// `ceil`'s is) and has no kernel here: `torch.floor(x, out=y)` refuses with
+/// `aten.floor.out`, naming the overload it wanted. That is the same honest
+/// half-coverage `ceil` already ships, not a new gap.
+fn floor_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.floor.default";
+    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let tag = input.tag();
+    if tag == TorchDType::Bool {
+        return Err(pyo3::exceptions::PyNotImplementedError::new_err(
+            "\"floor_vml_cpu\" not implemented for 'Bool'",
+        ));
+    }
+    if !tag.is_floating_point() {
+        // Already integral: upstream hands the tensor straight back.
+        let out = input.tensor()?.clone();
+        return finish(py, out, tag);
+    }
+    let out = input.tensor()?.floor().map_err(|e| candle_err(OP, e))?;
+    finish(py, out, tag)
+}
+
+/// `aten::floor_(Tensor(a!) self) -> Tensor(a!)`
+///
+/// `ceil_inplace`'s shape: compute into a fresh tensor and hand it to
+/// `write_back`, so a view taken before the call sees the write and
+/// `t.floor_() is t` holds. The dtype rules are `floor_default`'s,
+/// re-measured in place (an integral receiver is the identity, `bool`
+/// refuses with `floor_vml_cpu`) rather than inherited by analogy -- in-place
+/// dtype rules diverge from their out-of-place siblings often enough in this
+/// file (docs/INPLACE.md §2) that the analogy is not evidence.
+fn floor_inplace(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.floor_.default";
+    let receiver = tensor_receiver(OP, args, kwargs)?;
+    let tag = receiver.borrow().tag();
+    if tag == TorchDType::Bool {
+        return Err(pyo3::exceptions::PyNotImplementedError::new_err(
+            "\"floor_vml_cpu\" not implemented for 'Bool'",
+        ));
+    }
+    let out = if tag.is_floating_point() {
+        receiver.borrow().tensor()?.floor().map_err(|e| candle_err(OP, e))?
+    } else {
+        receiver.borrow().tensor()?.clone()
+    };
+    write_back(OP, &receiver, PyTensorBase::new(out)?)?;
+    let _ = py;
+    Ok(receiver.into_any().unbind())
+}
+
+/// `aten::index_add_(Tensor(a!) self, int dim, Tensor index, Tensor source,
+///     *, Scalar alpha=1) -> Tensor(a!)`
+///
+/// `switch_transformers`' wall: MoE expert routing scatters each expert's
+/// output back into the flat token buffer with `out.index_add_(0, top_x, y)`.
+///
+/// **Everything below was measured on torch 2.13.0, not derived.**
+///
+///   * **It accumulates, it does not overwrite.** A repeated index gets the
+///     *sum*: `zeros(3).index_add_(0, [1,1,1], [1.,2.,3.])` is `[0., 6., 0.]`.
+///     That is the whole reason routing uses it, and an `index_put_`-style
+///     last-write-wins implementation is right for every case where the index
+///     has no duplicates -- which is most hand-written tests.
+///   * **`alpha` is keyword-only.** `index_add_(0, idx, src, 3)` raises
+///     `TypeError: index_add_() takes 3 positional arguments but 4 were
+///     given`; only `alpha=3` binds. The schema's `*` is load-bearing.
+///   * **Negative indices do NOT wrap.** Unlike `index_put_`, which wraps,
+///     this raises `IndexError: index out of range in self` for `-1` -- the
+///     same message an out-of-range positive index gets, with no index or
+///     extent in it.
+///   * **`index` must be `int32`/`int64`** (`index_add_(): Expected dtype
+///     int32/int64 for index but got: Float`) and may be 0-d or 1-d; a 2-d
+///     index raises `index_add_(): Index is supposed to be a vector, but got
+///     dim: 2 with type: Long and size: [1, 2]`.
+///   * **`self` and `source` must share a dtype exactly** -- no promotion:
+///     `index_add_(): self (Float) and source (Long) must have the same
+///     scalar type`.
+///   * **Two different shape errors**, and which one fires depends on which
+///     axis disagrees. A wrong extent *along `dim`* is
+///     `index_add_(): Number of indices (2) should be equal to
+///     source.size(dim): (3), for dim: 0`; a wrong extent on any *other* axis
+///     (or a rank mismatch, or a 0-d `self`) is `source tensor shape must
+///     match self tensor shape, excluding the specified dimension. Got
+///     self.shape = [...] source.shape = [...]`.
+///   * **An empty index writes nothing** and returns `self` unchanged.
+///   * **`dim` is range-checked with the ordinary rule** and wraps:
+///     `index_add_(-1, ...)` on a 2-d receiver is axis 1; `dim=1` on a 1-d
+///     receiver is `IndexError: Dimension out of range (expected to be in
+///     range of [-1, 0], but got 1)`.
+///
+/// # Precision, and the two places the obvious spelling is wrong
+///
+///   * **The addition runs at the receiver's dtype, per step**, not in the
+///     `f64` `read_flat` hands over. Measured: 64 accumulations of
+///     `bfloat16(0.01)` into one position give `0.65234375` (the `bfloat16`
+///     running sum); summing in `f64` and narrowing once gives `0.640625`.
+///     Same finding, same `float_narrower`, as `index_put_`'s `accumulate`.
+///   * **`alpha` is cast to the receiver's dtype before it multiplies.** On an
+///     `int64` receiver, `alpha=2.5` and `alpha=2.9` both give the same answer
+///     as `alpha=2` (measured: `4` accumulated with either is `8`), and
+///     `alpha=-1.5` gives `-4` -- truncation toward zero, not rounding and not
+///     a refusal.
+///   * **Integral overflow wraps**: `uint8` `200 + 200` is `144`.
+///   * **`bool` is a logical or**, for `index_put_`'s reason: upstream's
+///     `*dst += *src` on a C++ `bool` promotes and converts back, so two
+///     `True`s into one position stay `True` rather than becoming a `2` in a
+///     bool buffer.
+///
+/// # Write-through and aliasing
+///
+/// The result goes back through `write_back`, so a view taken before the call
+/// sees it (`v = zeros(6); v[1:4].index_add_(...)` writes into `v`, measured
+/// on both sides) and `x.index_add_(...) is x`. `write_back`'s `Overlap` stays
+/// at the default `Refuse`, which is measured rather than defaulted-into:
+/// upstream refuses an expanded receiver here with `unsupported operation:
+/// more than one element of the written-to tensor refers to a single memory
+/// location`, unlike `index_put_`, which is on the `Allow` list.
+///
+/// Capture refuses it automatically -- `capture.rs::is_mutating` reads the
+/// trailing `_` off the op segment -- and that is checked rather than assumed
+/// in `pytests/test_shim.py`.
+fn index_add_inplace(
+    _py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.index_add_.default";
+    let receiver = tensor_receiver(OP, args, kwargs)?;
+    let dim_raw = dim_arg(args, kwargs, 1, "dim")?.ok_or_else(|| missing(OP, "dim"))?;
+    let index = tensor_arg(OP, args, kwargs, 2, "index")?;
+    let source = tensor_arg(OP, args, kwargs, 3, "source")?;
+    let alpha = scalar_arg(OP, args, kwargs, 4, "alpha")?;
+
+    let (tag, dims, device) = {
+        let borrowed = receiver.borrow();
+        (
+            borrowed.tag(),
+            borrowed.tensor()?.dims().to_vec(),
+            borrowed.tensor()?.device().clone(),
+        )
+    };
+    let rank = dims.len();
+    // Upstream's own range, with a 0-d receiver treated as rank 1.
+    let limit = rank.max(1) as isize;
+    if dim_raw < -limit || dim_raw >= limit {
+        return Err(pyo3::exceptions::PyIndexError::new_err(format!(
+            "Dimension out of range (expected to be in range of [{}, {}], but got {dim_raw})",
+            -limit,
+            limit - 1
+        )));
+    }
+    let dim = if dim_raw < 0 { (dim_raw + limit) as usize } else { dim_raw as usize };
+
+    match index.tag() {
+        TorchDType::Int32 | TorchDType::Int64 => {}
+        other => {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "index_add_(): Expected dtype int32/int64 for index but got: {}",
+                scalar_type_name(other)
+            )))
+        }
+    }
+    let index_dims = index.tensor()?.dims().to_vec();
+    if index_dims.len() > 1 {
+        return Err(pyo3::exceptions::PyIndexError::new_err(format!(
+            "index_add_(): Index is supposed to be a vector, but got dim: {} with type: {} \
+             and size: {:?}",
+            index_dims.len(),
+            scalar_type_name(index.tag()),
+            index_dims
+        )));
+    }
+    if source.tag() != tag {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "index_add_(): self ({}) and source ({}) must have the same scalar type",
+            scalar_type_name(tag),
+            scalar_type_name(source.tag())
+        )));
+    }
+
+    let source_dims = source.tensor()?.dims().to_vec();
+    let shape_mismatch = || {
+        pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "source tensor shape must match self tensor shape, excluding the specified \
+             dimension. Got self.shape = {dims:?} source.shape = {source_dims:?}"
+        ))
+    };
+    if source_dims.len() != rank {
+        return Err(shape_mismatch());
+    }
+    // The "number of indices" message is the one that fires for `dim` itself;
+    // every other axis reports the shape message. Measured in both directions.
+    let count = index.tensor()?.elem_count();
+    if rank > 0 && source_dims[dim] != count {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "index_add_(): Number of indices ({count}) should be equal to source.size(dim): \
+             ({}), for dim: {dim}",
+            source_dims[dim]
+        )));
+    }
+    for axis in 0..rank {
+        if axis != dim && source_dims[axis] != dims[axis] {
+            return Err(shape_mismatch());
+        }
+    }
+
+    let extent = if rank == 0 { 1 } else { dims[dim] } as i64;
+    let raw = match read_flat(OP, index.tensor()?, index.tag())? {
+        Flat::Int(values) => values,
+        Flat::Float(_) => unreachable!("the index dtype was matched above"),
+    };
+    for value in &raw {
+        // No negative wrap here -- upstream raises for `-1`, unlike
+        // `index_put_`. The message carries neither the index nor the extent.
+        if *value < 0 || *value >= extent {
+            return Err(pyo3::exceptions::PyIndexError::new_err(
+                "index out of range in self",
+            ));
+        }
+    }
+
+    if raw.is_empty() || dims.iter().product::<usize>() == 0 {
+        // Nothing to write; `self` comes back unchanged, after every check.
+        return Ok(receiver.into_any().unbind());
+    }
+
+    let self_strides = contiguous_strides(&dims);
+    let source_strides = contiguous_strides(&source_dims);
+    let mut out = {
+        let borrowed = receiver.borrow();
+        read_flat(OP, borrowed.tensor()?, tag)?
+    };
+    let src = read_flat(OP, source.tensor()?, tag)?;
+
+    let narrow = float_narrower(tag);
+    let is_bool = tag == TorchDType::Bool;
+    // `alpha` at the receiver's own dtype: truncated toward zero for an
+    // integral receiver (2.5 and 2.9 both behave as 2, measured), narrowed
+    // for a floating one.
+    let alpha_f = alpha.map(|s| narrow(s.as_f64())).unwrap_or(1.0);
+    let alpha_i = alpha.map(|s| s.as_f64() as i64).unwrap_or(1);
+
+    // Walk the *source*: every element of it lands somewhere, and the index
+    // only redirects its `dim` coordinate.
+    let total: usize = source_dims.iter().product();
+    let mut coord = vec![0usize; rank];
+    for _ in 0..total {
+        let mut from = 0usize;
+        let mut to = 0usize;
+        for axis in 0..rank {
+            from += coord[axis] * source_strides[axis];
+            to += if axis == dim {
+                raw[coord[axis]] as usize * self_strides[axis]
+            } else {
+                coord[axis] * self_strides[axis]
+            };
+        }
+        match (&src, &mut out) {
+            (Flat::Float(s), Flat::Float(o)) => {
+                o[to] = narrow(o[to] + narrow(alpha_f * s[from]));
+            }
+            (Flat::Int(s), Flat::Int(o)) => {
+                o[to] = if is_bool {
+                    i64::from(o[to] != 0 || (s[from] != 0 && alpha_i != 0))
+                } else {
+                    o[to].wrapping_add(alpha_i.wrapping_mul(s[from]))
+                };
+            }
+            _ => unreachable!("self and source share a dtype, checked above"),
+        }
+        for axis in (0..rank).rev() {
+            coord[axis] += 1;
+            if coord[axis] < source_dims[axis] {
+                break;
+            }
+            coord[axis] = 0;
+        }
+    }
+
+    let tensor = write_flat(OP, out, dims, &device, tag)?;
+    let replacement = if tag == TorchDType::Bool {
+        PyTensorBase::boolean(tensor)?
+    } else {
+        PyTensorBase::new(tensor)?
+    };
+    write_back(OP, &receiver, replacement)?;
+    Ok(receiver.into_any().unbind())
+}
+
+/// `aten::upsample_bicubic2d(Tensor self, SymInt[2] output_size,
+///     bool align_corners, float? scales_h=None, float? scales_w=None)
+///     -> Tensor`
+///
+/// `yolos`' wall. `F.interpolate(x, ..., mode="bicubic")` ->
+/// `torch._C._nn.upsample_bicubic2d`, whose `.vec` signature is
+/// `CompositeImplicitAutograd` and therefore lives in `bootstrap.py`'s
+/// `_install_nn` beside `upsample_bilinear2d`'s; this is the leaf.
+///
+/// # The grid, and the `align_corners` trap
+///
+/// The source-index rule is `upsample_bilinear2d_default`'s, with **one
+/// difference that is easy to miss and impossible to see from the docs**:
+///
+/// ```text
+/// align_corners=true    scale = (in-1)/(out-1)   [0 if out == 1]
+///                       src   = scale * d
+/// align_corners=false   scale = 1/scale_arg  if given and > 0, else in/out
+///                       src   = scale * (d + 0.5) - 0.5        <- NOT clamped to 0
+/// ```
+///
+/// Bilinear clamps that last expression at zero; **bicubic does not**
+/// (upstream's `area_pixel_compute_source_index` takes a `cubic` template
+/// parameter whose only job is to skip the clamp). The clamp is invisible
+/// almost everywhere and shows up exactly at the leading edge, where the
+/// negative source index reaches out past the border. Measured on
+/// `arange(16).reshape(1,1,4,4)` upsampled to `(6,6)`, upstream's first
+/// element is **`-0.434`** -- a value the input does not contain and a clamped
+/// implementation cannot produce, because a cubic kernel with a negative `t`
+/// overshoots. That one number is what separates the two implementations.
+///
+/// The two flag values, on the same input:
+///
+/// ```text
+/// align_corners=false   -0.4340  0.0590  0.8657  1.4398  2.2465  2.7396 ...
+/// align_corners=true     0.0000  0.5040  1.2480  1.7520  2.4960  3.0000 ...
+/// ```
+///
+/// They agree at the four corners -- which is what `align_corners` means -- so
+/// a corner-only or symmetric case cannot tell them apart, the same warning
+/// `upsample_bilinear2d`'s cases carry.
+///
+/// **There is no `out == in` short circuit here, and that is measured rather
+/// than carried over from bilinear**, which does have one. `upsample_bicubic2d(
+/// arange(6).reshape(1,1,2,3), [2,3], False, 0.5, 0.5)` returns
+/// `[[1.9062, 3.5938, 3.5000], [3.4062, 5.0938, 5.0000]]` -- it resamples on a
+/// grid the scales chose. Copying bilinear's short circuit would have returned
+/// the input and looked entirely reasonable.
+///
+/// Scales otherwise behave as bilinear's do, re-measured here: a supplied
+/// positive scale means `1/scale` and not `in/out` (`in=3, out=4,
+/// scales_w=1.5` gives `[-0.0868, 0.4062, 1.2303, 1.8738]` where the no-scale
+/// answer is `[-0.0718, 0.5298, 1.4702, 2.0718]`); a zero or negative scale is
+/// ignored; and `align_corners=true` ignores the scales entirely (checked with
+/// `scales_w=9.0`).
+///
+/// # The kernel
+///
+/// Cubic convolution with **A = -0.75**, upstream's
+/// `get_cubic_upsample_coefficients`, separably: four cubic interpolations
+/// along W feeding one along H. Out-of-range taps are **clamped to the
+/// border** (`upsample_get_value_bounded`), not zero-padded -- zero padding
+/// would darken every edge and is the other classic error here.
+///
+/// # Precision -- and the weights are **not** at `opmath_t`
+///
+/// The accumulator is `opmath_t` (`f32` for `float16`/`bfloat16`/`float32`,
+/// `f64` for `float64`), the same *narrowing*-for-`float32` finding
+/// `upsample_bilinear2d`'s doc comment records. The four cubic weights are
+/// **not**: upstream's separable CPU path stores them in a `scalar_t` tensor
+/// (`compute_indices_weights_cubic<scalar_t>`, the kernel the `int64` refusal
+/// below is named after), so they are narrowed to the input's dtype before
+/// they multiply anything. Measured, and it is the difference between passing
+/// and failing:
+///
+/// ```text
+///            weights at f32          weights narrowed to the input dtype
+/// float16    7.812e-03  (tol 5e-3)   0.000e+00   bit-exact
+/// bfloat16   6.250e-02  (tol 6e-2)   0.000e+00   bit-exact
+/// float32    unchanged -- f32 narrowed to f32 is the identity
+/// ```
+///
+/// `float32` retains a residual **max relative 5.7e-07** against upstream
+/// (6.7e-06 absolute at magnitude 15), which is accumulation order inside
+/// upstream's vectorised `f32` kernel and not a model disagreement: the
+/// weights themselves were extracted from upstream by running 16 one-hot
+/// basis inputs through it in `float64`, and this file's model reproduces
+/// that 6x6x4x4 weight tensor to **1.6e-15**. That is 3-4 ulp and well inside
+/// the harness's 1e-05 `float32` tolerance; the `float64` path agrees to
+/// 1e-09.
+///
+/// # Refusals, in upstream's order
+///
+/// ```text
+/// output_size.len() != 2   It is expected output_size equals to 2, but got size N
+/// input rank != 4          It is expected input_size equals to 4, but got size N
+/// any extent <= 0          Input and output sizes should be greater than 0, but got ...
+/// a zero non-batch dim     Non-empty 4D data tensor expected but got a tensor with sizes [...]
+/// int64 / bool             "compute_indices_weights_cubic" not implemented for 'Long'
+/// ```
+///
+/// The kernel name in the last one is **`compute_indices_weights_cubic`**, a
+/// different string from bilinear's `upsample_bilinear2d_channels_last`,
+/// because upstream reaches a different kernel.
+///
+/// **Not implemented: `uint8`**, for exactly bilinear's reason and with its
+/// own measurement: over 40 random shapes at both flag values (1840 elements),
+/// rounding the `float32` answer disagrees with upstream's `uint8` answer on
+/// **140** of them, so upstream is running a separate fixed-point kernel there.
+/// Refused by name, with a `c_error` case watching it, rather than shipping
+/// the 92%-correct rule.
+fn upsample_bicubic2d_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.upsample_bicubic2d.default";
+    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let output_size = shape_arg(OP, args, kwargs, 1, "output_size")?;
+    let align_corners =
+        bool_arg(args, kwargs, 2, "align_corners")?.ok_or_else(|| missing(OP, "align_corners"))?;
+    let scales_h = scalar_arg(OP, args, kwargs, 3, "scales_h")?.map(|s| s.as_f64());
+    let scales_w = scalar_arg(OP, args, kwargs, 4, "scales_w")?.map(|s| s.as_f64());
+
+    if output_size.len() != 2 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "It is expected output_size equals to 2, but got size {}",
+            output_size.len()
+        )));
+    }
+    let dims = input.tensor()?.dims().to_vec();
+    if dims.len() != 4 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "It is expected input_size equals to 4, but got size {}",
+            dims.len()
+        )));
+    }
+    let (in_h, in_w) = (dims[2] as i64, dims[3] as i64);
+    let (out_h, out_w) = (output_size[0] as i64, output_size[1] as i64);
+    if in_h <= 0 || in_w <= 0 || out_h <= 0 || out_w <= 0 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "Input and output sizes should be greater than 0, but got input (H: {in_h}, \
+             W: {in_w}) output (H: {out_h}, W: {out_w})"
+        )));
+    }
+    if dims[1..].iter().product::<usize>() == 0 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "Non-empty 4D data tensor expected but got a tensor with sizes {dims:?}"
+        )));
+    }
+
+    let tag = input.tag();
+    if tag == TorchDType::UInt8 {
+        return Err(not_implemented(format!(
+            "{OP}: a uint8 input is not implemented in torch._C shim -- upstream computes \
+             it with a separate fixed-point kernel, not by rounding the float answer \
+             (measured: rounding the float32 result disagrees with upstream on 140 of 1840 \
+             elements over 40 random shapes at both align_corners values), and reproducing \
+             that kernel is its own measurement round"
+        )));
+    }
+    if !tag.is_floating_point() {
+        return Err(pyo3::exceptions::PyNotImplementedError::new_err(format!(
+            "\"compute_indices_weights_cubic\" not implemented for '{}'",
+            scalar_type_name(tag)
+        )));
+    }
+
+    let out_dims = vec![dims[0], dims[1], out_h as usize, out_w as usize];
+    let device = input.tensor()?.device().clone();
+    if dims[0] == 0 {
+        let out = Tensor::zeros(out_dims, PyDtype::new(tag).storage(OP)?, &device)
+            .map_err(|e| candle_err(OP, e))?;
+        return finish(py, out, tag);
+    }
+
+    let acc32 = tag != TorchDType::Float64;
+
+    // `area_pixel_compute_scale`, per axis -- bilinear's, unchanged.
+    let scale_of = |in_size: i64, out_size: i64, given: Option<f64>| -> f64 {
+        if align_corners {
+            if out_size > 1 {
+                if acc32 {
+                    ((in_size - 1) as f32 / (out_size - 1) as f32) as f64
+                } else {
+                    (in_size - 1) as f64 / (out_size - 1) as f64
+                }
+            } else {
+                0.0
+            }
+        } else {
+            match given {
+                Some(scale) if scale > 0.0 => {
+                    if acc32 {
+                        (1.0 / scale) as f32 as f64
+                    } else {
+                        1.0 / scale
+                    }
+                }
+                _ => {
+                    if acc32 {
+                        (in_size as f32 / out_size as f32) as f64
+                    } else {
+                        in_size as f64 / out_size as f64
+                    }
+                }
+            }
+        }
+    };
+
+    // The four cubic weights are stored at the **input's own dtype**, not at
+    // `opmath_t` -- upstream's separable CPU path builds a `scalar_t` weight
+    // tensor in `compute_indices_weights_cubic<scalar_t>`, which is the kernel
+    // the `int64` refusal above is named after. Measured, and it is the
+    // difference between agreeing with upstream and not: with `float32`
+    // weights and an `f32` accumulator, `float16` disagrees by 7.8e-03 (past
+    // this repository's 5e-03 `float16` tolerance) and `bfloat16` by 6.25e-02
+    // (past its 6e-02); narrowing the weights first makes both **bit-exact**,
+    // 0 of 36 elements differing at either `align_corners`.
+    let narrow = float_narrower(tag);
+
+    // `area_pixel_compute_source_index` with `cubic=true`: **no clamp at 0**.
+    // Returns the base tap index and the four cubic weights for one output
+    // coordinate.
+    let grid = |out_size: i64, scale: f64| -> Vec<(i64, [f64; 4])> {
+        (0..out_size)
+            .map(|index| {
+                let real = if align_corners {
+                    if acc32 {
+                        (scale as f32 * index as f32) as f64
+                    } else {
+                        scale * index as f64
+                    }
+                } else if acc32 {
+                    (scale as f32 * (index as f32 + 0.5) - 0.5) as f64
+                } else {
+                    scale * (index as f64 + 0.5) - 0.5
+                };
+                let base = real.floor();
+                let t = if acc32 { (real as f32 - base as f32) as f64 } else { real - base };
+                (base as i64, cubic_upsample_coefficients(t, acc32, narrow))
+            })
+            .collect()
+    };
+
+    let h_grid = grid(out_h, scale_of(in_h, out_h, scales_h));
+    let w_grid = grid(out_w, scale_of(in_w, out_w, scales_w));
+
+    let source = match read_flat(OP, input.tensor()?, tag)? {
+        Flat::Float(values) => values,
+        // Unreachable: every non-floating tag is refused above.
+        Flat::Int(values) => values.into_iter().map(|v| v as f64).collect(),
+    };
+    let plane = (in_h * in_w) as usize;
+    let planes = dims[0] * dims[1];
+    let mut out = vec![0.0f64; planes * (out_h * out_w) as usize];
+    // `upsample_get_value_bounded`: taps outside the image clamp to the
+    // border, they are not zero.
+    let clamp = |v: i64, limit: i64| -> usize { v.max(0).min(limit - 1) as usize };
+    let mut at = 0usize;
+    for p in 0..planes {
+        let base = p * plane;
+        for &(hy, ref hc) in &h_grid {
+            for &(wx, ref wc) in &w_grid {
+                if acc32 {
+                    let mut acc = 0.0f32;
+                    for k in 0..4 {
+                        let row = base + clamp(hy - 1 + k as i64, in_h) * in_w as usize;
+                        let mut inner = 0.0f32;
+                        for j in 0..4 {
+                            inner += wc[j] as f32
+                                * source[row + clamp(wx - 1 + j as i64, in_w)] as f32;
+                        }
+                        acc += hc[k] as f32 * inner;
+                    }
+                    out[at] = acc as f64;
+                } else {
+                    let mut acc = 0.0f64;
+                    for k in 0..4 {
+                        let row = base + clamp(hy - 1 + k as i64, in_h) * in_w as usize;
+                        let mut inner = 0.0f64;
+                        for j in 0..4 {
+                            inner += wc[j] * source[row + clamp(wx - 1 + j as i64, in_w)];
+                        }
+                        acc += hc[k] * inner;
+                    }
+                    out[at] = acc;
+                }
+                at += 1;
+            }
+        }
+    }
+
+    let out = write_flat(OP, Flat::Float(out), out_dims, &device, tag)?;
+    finish(py, out, tag)
+}
+
+/// Upstream's `get_cubic_upsample_coefficients` with `A = -0.75`, the constant
+/// torch fixes for every `mode="bicubic"` call (it is not exposed as an
+/// argument anywhere in the Python surface). `A = -0.5` is the other common
+/// choice in the literature and produces a visibly different, entirely
+/// plausible image -- which is why the constant is written once, here, rather
+/// than inlined at the call site.
+fn cubic_upsample_coefficients(t: f64, acc32: bool, narrow: fn(f64) -> f64) -> [f64; 4] {
+    const A: f64 = -0.75;
+    let out = if acc32 {
+        let t = t as f32;
+        let a = A as f32;
+        // `((A + 2) x - (A + 3)) x^2 + 1`
+        let c1 = |x: f32| ((a + 2.0) * x - (a + 3.0)) * x * x + 1.0;
+        // `((A x - 5A) x + 8A) x - 4A`
+        let c2 = |x: f32| ((a * x - 5.0 * a) * x + 8.0 * a) * x - 4.0 * a;
+        [
+            c2(t + 1.0) as f64,
+            c1(t) as f64,
+            c1(1.0 - t) as f64,
+            c2(2.0 - t) as f64,
+        ]
+    } else {
+        let c1 = |x: f64| ((A + 2.0) * x - (A + 3.0)) * x * x + 1.0;
+        let c2 = |x: f64| ((A * x - 5.0 * A) * x + 8.0 * A) * x - 4.0 * A;
+        [c2(t + 1.0), c1(t), c1(1.0 - t), c2(2.0 - t)]
+    };
+    [narrow(out[0]), narrow(out[1]), narrow(out[2]), narrow(out[3])]
 }
 
 /// `aten::_softmax(Tensor self, int dim, bool half_to_float) -> Tensor`

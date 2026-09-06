@@ -596,6 +596,13 @@
   "ceil_": [
     "aten::ceil_(Tensor(a!) self) -> Tensor(a!)"
   ],
+  "floor": [
+    "aten::floor.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)",
+    "aten::floor(Tensor self) -> Tensor"
+  ],
+  "floor_": [
+    "aten::floor_(Tensor(a!) self) -> Tensor(a!)"
+  ],
   "masked_select": [
     "aten::masked_select.out(Tensor self, Tensor mask, *, Tensor(a!) out) -> Tensor(a!)",
     "aten::masked_select(Tensor self, Tensor mask) -> Tensor"
