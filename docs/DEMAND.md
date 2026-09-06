@@ -274,11 +274,22 @@ a marker to watch yet.
 
 ### Found while closing rank 1, and not ranked because no model asked for it yet
 
-`Tensor.shape` returns a plain `tuple`, not `torch.Size`, for every tensor —
+`Tensor.shape` returned a plain `tuple`, not `torch.Size`, for every tensor —
 pre-existing, not from any round in this pair. `torch.Size` is a tuple subclass,
-so indexing and unpacking are unaffected and nothing in the eighteen models
+so indexing and unpacking were unaffected and nothing in the eighteen models
 noticed; what would notice is `isinstance(x.shape, torch.Size)` or a call to
 `Size.numel()`. Recorded here rather than ranked, because this file ranks by how
-many models want a thing and the answer today is none.
+many models want a thing and the answer was none.
+
+**Closed anyway — docs/SCALAR2.md §5.** It was ranked at nothing and cost
+almost nothing, which turned out to be the same fact: the `Size` class already
+existed in `bootstrap.py` with its `numel()`, and the only missing piece was
+that `TensorBase.shape` never constructed it. A registration (`_set_size_class`,
+the same shape as `_set_tensor_class` beside it) rather than a new type. Four
+things that were *not* obvious came out of measuring the rest of the surface:
+`repr` is `torch.Size([2, 3])` and not the tuple's own spelling, the type is
+closed under slicing / `+` / reflected `+` / `*`, `__qualname__` had to be set
+or the class was unpicklable, and `stride()` is a plain tuple upstream and had
+to be left one. `ops covered` is unchanged at 203 — no kernel.
 
 <!-- DOCWATCH: symbol-in-file rust/torch_c/src/bootstrap.py _install_autograd_shape present -->

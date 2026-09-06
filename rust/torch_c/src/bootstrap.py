@@ -2631,8 +2631,28 @@ def install(module, surface_json: str, overloads_json: str, methods_json: str) -
 
     # `torch.Size` is a real tuple subclass upstream and the tree relies on it
     # being one (`isinstance(x.shape, tuple)`, unpacking, slicing).
+    #
+    # Every member below was **measured** against torch 2.13.0 rather than
+    # assumed, and two of the measurements were surprises worth writing down:
+    #
+    #   * `repr` is `torch.Size([2, 3])` -- square brackets inside the call,
+    #     not the tuple's own `(2, 3)`. It is not cosmetic. Thirty-odd
+    #     `transformers` docstrings print exactly that string, and so does
+    #     every `print(x.shape)` a user writes.
+    #   * the type is **closed** under slicing, `+`, reflected `+` and `*`:
+    #     `torch.Size([2,3])[1:]` is a `Size`, and `(5,) + size` is a `Size`
+    #     too. A subclass of `tuple` gets none of that for free -- `tuple`'s
+    #     own slots return plain tuples -- so each one is written out.
+    #
+    # `numel()` of the empty size is `1`, not `0`: it is the product over no
+    # dimensions, which is what a zero-dim tensor's element count is.
     class Size(tuple):
         __module__ = "torch"
+        # Without this the qualname is `install.<locals>.Size`, which shows up
+        # in `repr(torch.Size)` and -- the part that is not cosmetic -- makes
+        # the class unpicklable, because pickle resolves a class by looking up
+        # `__module__`.`__qualname__`. `torch.Size` pickles upstream.
+        __qualname__ = "Size"
 
         def numel(self):
             n = 1
@@ -2640,8 +2660,36 @@ def install(module, surface_json: str, overloads_json: str, methods_json: str) -
                 n *= d
             return n
 
+        def __repr__(self):
+            return "torch.Size([" + ", ".join(repr(d) for d in self) + "])"
+
+        __str__ = __repr__
+
+        def __getitem__(self, index):
+            item = tuple.__getitem__(self, index)
+            return Size(item) if isinstance(index, slice) else item
+
+        def __add__(self, other):
+            result = tuple.__add__(self, other)
+            return result if result is NotImplemented else Size(result)
+
+        def __radd__(self, other):
+            return Size(tuple(other) + tuple(self))
+
+        def __mul__(self, other):
+            result = tuple.__mul__(self, other)
+            return result if result is NotImplemented else Size(result)
+
+        __rmul__ = __mul__
+
     module.Size = Size
     resolved["Size"] = Size
+
+    # `TensorBase.shape` (and `size()` with no `dim`, which goes through it)
+    # answers with this class from here on. Registered rather than imported,
+    # because `_C` runs without a `torch` package under the golden loader --
+    # see `SIZE_CLASS` in `tensor.rs`.
+    module._set_size_class(Size)
 
     # -- TensorBase members ----------------------------------------------
     #
@@ -4971,6 +5019,15 @@ _GRAD_FN_NAMES = {
     #     (both bounds, min only, and the `Tensor.clamp` spelling).
     "aten.matmul.default": "MmBackward0",
     "aten.clamp.default": "ClampBackward1",
+    # docs/SCALAR2.md §4, measured the same way. Both are overload indices the
+    # rule cannot derive, and both are reached by an ordinary Python operator:
+    #   aten.rsub.Scalar -> RsubBackward1   `2 - x`
+    #   aten.pow.Scalar  -> PowBackward2    `2 ** x`
+    # Neither is a dispatch divergence -- upstream runs the same aten key for
+    # these two spellings that this build does -- which is what separates them
+    # from the add/sub/mul/div rows §2 records and does not change.
+    "aten.rsub.Scalar": "RsubBackward1",
+    "aten.pow.Scalar": "PowBackward2",
     "aten.linear.default": "AddmmBackward0",
     "aten.to.dtype": "ToCopyBackward0",
     "aten._to_copy.default": "ToCopyBackward0",

@@ -434,4 +434,18 @@ in the trace, and a user reading `torch.ops.aten.mul.Scalar` directly would see 
 name upstream does not give it. Recorded here so the next round that touches
 scalar dispatch knows the printed name moves with it.
 
+**Followed up in docs/SCALAR2.md**, which enumerated the whole family by
+running it. Two things there change how this row reads. First, `mul` is not one
+operator's problem: upstream wraps for `add`, `sub`, `mul`, `div` and
+`floor_divide` and dispatches `.Scalar` for everything else, so five families
+diverge here and nothing singles `mul` out. Second — and this is the part §8
+could not have known — **`add`, `sub` and `div` already take the trade this row
+declined.** Measured at the raw key, upstream's `aten.add.Scalar` is
+`AddBackward1` and this build's is `AddBackward0`; the same for `sub` and `div`.
+They fall through the naive rule, which happens to name the *expression*
+correctly and the *key* incorrectly. `mul` is the only one of the four faithful
+to its key, which is why it is the only one this section caught. SCALAR2.md §4
+has the table and leaves the inconsistency standing rather than smoothing it in
+either direction; §3 there says why the dispatch itself was not changed.
+
 After the two fixes, 32 of 33 agree.
