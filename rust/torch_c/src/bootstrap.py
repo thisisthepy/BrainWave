@@ -2856,6 +2856,56 @@ def install(module, surface_json: str, overloads_json: str, methods_json: str) -
         "linalg_vector_norm", dispatch, overloads
     )
 
+    # `torch._C._fft.fft_fftn` -- `fnet`'s wall (docs/ARCH200.md,
+    # docs/BIND3.md §6, docs/COMPLEX3.md §6). `torch/fft/__init__.py` is
+    # `fftn = _add_docstr(_fft.fft_fftn, ...)`, so upstream needs this exact
+    # spelling to be a real function; `_fft` has no stub data (`_linalg`'s
+    # reason directly above), so the generic submodule loop had left every
+    # name on it as the catch-all `_Unimplemented`. There is no decomposition
+    # engine on this path -- `aten::fft_fftn` being `CompositeImplicitAutograd`
+    # does not help a name upstream never routes through `torch.ops.aten`.
+    #
+    # The decomposition below is upstream's own, read off a `TorchDispatchMode`
+    # logger (docs/COMPLEX3.md §6.1): widen to complex, optionally slice/pad
+    # each transformed axis to match `s`, then `_fft_c2c`. Verified from
+    # outside this file, in a probe process supplying these same lines: a full
+    # two-layer `FNetModel` forward agrees with upstream element-wise, max
+    # absolute difference 7.15e-07 over 256 outputs. That verification needs
+    # `_to_copy(dtype=complex64)` reachable, which is a `bootstrap.py`-level
+    # dtype gate this round did not touch -- so on THIS worktree, cut before
+    # that gate opened, the numeric path still refuses; what is checked here
+    # is that the name resolves to this function and no longer to the
+    # catch-all, which does not need the gate open.
+    #
+    # `norm` maps to `_fft_c2c`'s integer `normalization` argument as
+    # `{backward: 0, ortho: 1, forward: 2}`, read off the same trace, not off
+    # the C++.
+    _FFT_NORM = {None: 0, "backward": 0, "ortho": 1, "forward": 2}
+
+    def fft_fftn(self, s=None, dim=None, norm=None, *, out=None):
+        rank = self.dim()
+        if dim is None:
+            dim = list(range(rank)) if s is None else list(range(rank - len(s), rank))
+        dim = [d + rank if d < 0 else d for d in dim]
+        c = dispatch(
+            "aten._to_copy.default", self,
+            dtype=module.complex128 if self.dtype == module.float64
+            else module.complex64,
+        )
+        if s is not None:
+            for d, want in zip(dim, s):
+                have = c.shape[d]
+                if want < have:
+                    c = dispatch("aten.slice.Tensor", c, d, 0, want)
+                elif want > have:
+                    pad = [0] * (2 * (c.dim() - d))
+                    pad[-1] = want - have
+                    c = dispatch("aten.constant_pad_nd.default", c, pad)
+        return dispatch("aten._fft_c2c.default", c, dim, _FFT_NORM[norm], True)
+
+    fft_fftn.__name__ = fft_fftn.__qualname__ = "fft_fftn"
+    module._fft.fft_fftn = fft_fftn
+
     # `torch._C._linalg.linalg_qr` -- `rwkv`'s *construction* wall.
     #
     # `torch/linalg/__init__.py:2823` is `qr = _add_docstr(_linalg.linalg_qr,
@@ -3246,6 +3296,64 @@ def install(module, surface_json: str, overloads_json: str, methods_json: str) -
 
     div.__name__ = div.__qualname__ = "div"
     varfns.div = div
+
+    # `torch.zeros((..., 0-dim int Tensor, ...), dtype=..., device=...)` --
+    # `fastspeech2_conformer`'s wall (docs/TAIL4.md §8.2, docs/BIND4.md).
+    # `FeatureProjection`/the length-regulator forward builds `max_len =
+    # torch.sum(duration_labels, dim=1).max()`, a 0-dim Tensor, and then
+    # writes `torch.zeros((batch, max_len, dim), dtype=..., device=...)`
+    # straight from it -- upstream never narrows it to a Python int first.
+    #
+    # Measured against real torch 2.13.0, in a separate process: upstream's
+    # `SymInt[]` argument parser accepts a 0-dim integral Tensor as a list
+    # element and takes its value, exactly the way it already accepts a bare
+    # Python int there. This is NOT a `zeros`-specific accident -- the same
+    # call shape was measured to work for `torch.ones`, `torch.empty` and
+    # `Tensor.view`, which all take the same `SymInt[]`/`SymInt[]` position --
+    # so it is upstream's general size-list parsing rule. It is still written
+    # only for `zeros`, the same way `div`'s wrapped-number rule directly
+    # above is scoped to `div` alone rather than folded into `_TypeChecker`:
+    # that would accept a Tensor in *every* `SymInt[]` position table-wide
+    # without a matching measurement for each of them, which is exactly the
+    # silent-divergence trap docs/ARGFORM.md §2 names.
+    #
+    # A multi-element Tensor in the list is left to fail on its own `__int__`
+    # (single-element only) rather than special-cased, which is close enough
+    # to upstream's own refusal (`must be tuple of ints, but found element of
+    # type Tensor`) that inventing a nicer message here is not worth a new
+    # surface.
+    _table_zeros = varfns.zeros
+
+    def _coerce_symint_size_tensors(size):
+        if isinstance(size, (list, tuple)) and any(
+            isinstance(item, module.TensorBase) for item in size
+        ):
+            return [
+                int(item) if isinstance(item, module.TensorBase) else item
+                for item in size
+            ]
+        return size
+
+    def zeros(size, *args, **kwargs):
+        # `_torch_level_function`'s own guard, reproduced rather than
+        # inherited: `torch.zeros` is one of the 36 names
+        # `DeviceContext.__torch_function__` matches by object identity
+        # (`func in _device_constructors()`, `torch/utils/_device.py`), read
+        # fresh off the `torch` module at call time -- which is now THIS
+        # closure, not the table-driven one `_table_zeros` closes over. If
+        # `zeros` skipped straight to `_table_zeros`, that inner closure's own
+        # `_MODE_STACK` check would fire with *itself* as `func`, which is no
+        # longer the object `_device_constructors()` finds at `torch.zeros`,
+        # and `with torch.device("meta"): torch.zeros(2)` would silently go
+        # back to returning a CPU tensor -- docs/DEVICE_ABS.md §7.2's exact
+        # failure, caught by `test_meta_road_through_the_vendored_tree` the
+        # first time this wrapper was written without the guard.
+        if _MODE_STACK:
+            return _through_torch_function_modes(zeros, (size,) + args, kwargs)
+        return _table_zeros(_coerce_symint_size_tensors(size), *args, **kwargs)
+
+    zeros.__name__ = zeros.__qualname__ = "zeros"
+    varfns.zeros = zeros
 
     # `torch.tensor` is the one name on this object that is not an overload set
     # -- see `_tensor_factory`.
@@ -4232,11 +4340,31 @@ def _install_tensor_T(tensorbase) -> None:
     tensorbase.T = property(getter)
 
 
+def _install_tensor_complex_parts(tensorbase, dispatch) -> None:
+    """`Tensor.real` / `Tensor.imag` -- `fnet`'s other wall (docs/COMPLEX3.md
+    §6.2), and the reason it is not in `methods.json` alongside everything
+    else `_install_tensor_methods` harvests: upstream exposes both as
+    **properties** (`torch._C.TensorBase.real`, a `getset_descriptor`), not as
+    callables, so a table-driven entry could never carry them -- `methods.json`
+    is keyed on names called with `()`. Before this, both fell through to the
+    raising stub the surface list installs for every name it does not
+    recognise.
+
+    Both aten keys (`aten.real.default`, `aten.imag.default`) are implemented
+    and proven element-wise against upstream in `pytests/test_complex.py`; this
+    adds nothing to their arithmetic, only the property that reaches them --
+    checked before writing it, the way docs/BINDINGS.md's `mish` was not.
+    """
+    tensorbase.real = property(lambda self: dispatch("aten.real.default", self))
+    tensorbase.imag = property(lambda self: dispatch("aten.imag.default", self))
+
+
 def _install_tensor_methods(module, tensorbase, dispatch, methods) -> None:
     for name, entry in methods.items():
         setattr(tensorbase, name, _tensor_method(name, dispatch, entry))
 
     _install_tensor_T(tensorbase)
+    _install_tensor_complex_parts(tensorbase, dispatch)
     _install_tensor_conversions(module, tensorbase, dispatch)
     _install_tensor_scalars(tensorbase, dispatch)
     _install_tensor_indexing(module, tensorbase, dispatch)
@@ -7981,6 +8109,72 @@ def _install_nn(module, dispatch) -> None:
             [int(v) for v in output_size], float(scale_factors),
         )
 
+    def upsample_linear1d(input, output_size, align_corners, scale_factors=None):
+        """`torch._C._nn.upsample_linear1d` -- `sam_vision_model` /
+        `sam_hq_vision_model`'s wall (docs/ARCH200.md §2, docs/RNN.md §3).
+        `F.interpolate(x_3d, mode="linear")` calls this and only this; the
+        kernel (`aten.upsample_linear1d.default`) has been implemented,
+        golden-compared and bit-compared against upstream since docs/RNN.md,
+        which is what this binding was checked against before being written
+        (docs/BINDINGS.md's `mish` is what happens when that check is
+        skipped).
+
+        `torch/nn/functional.py`'s `interpolate` calls this with exactly
+        `(input, output_size, align_corners, scale_factors)`, which is the
+        **`.vec`** schema (`aten::upsample_linear1d.vec(Tensor input,
+        SymInt[]? output_size, bool align_corners, float[]? scale_factors)`).
+        `.vec` is `CompositeImplicitAutograd` and lowers to the leaf,
+        `aten::upsample_linear1d(Tensor self, SymInt[1] output_size, bool
+        align_corners, float? scales=None)`.
+
+        **The discriminator is the fourth argument's TYPE, not the arity**,
+        docs/BIND3.md §3.1's exact trap for `upsample_nearest1d` one line
+        above this in `torch._C._nn`: both schemas take four arguments here
+        (`.vec`'s `output_size` may be `None`; the leaf's may not), so a
+        sequence fourth argument is `.vec`'s `scale_factors` and a float is
+        the leaf's `scales`. Measured on 2.13.0:
+
+            _nn.upsample_linear1d(x, [9], False, None)     -> .default(x, [9], False)
+            _nn.upsample_linear1d(x, None, True, [1.5])    -> .default(x, [9], True, 1.5)
+            _nn.upsample_linear1d(x, [9], True, 1.5)       -> .default(x, [9], True, 1.5)
+            _nn.upsample_linear1d(x, [9], False)           -> .default(x, [9], False)
+
+        `output_size` and `scale_factors` are mutually exclusive in the
+        `.vec` shape; giving both or neither refuses with upstream's own
+        message, `Must specify exactly one of output_size and
+        scale_factors`, measured directly rather than assumed from
+        `upsample_nearest1d`/`upsample_bilinear2d`'s copy of it.
+
+        **The scale factor is forwarded, not merely used to size the
+        output**, for the same reason `upsample_bilinear2d` and
+        `upsample_nearest1d` forward theirs: `1/scale` and `in/out` coincide
+        only when the product is integral.
+        """
+        if isinstance(scale_factors, (list, tuple)) or scale_factors is None:
+            if (output_size is None) == (scale_factors is None):
+                raise RuntimeError(
+                    "Must specify exactly one of output_size and scale_factors"
+                )
+            if output_size is not None:
+                return dispatch(
+                    "aten.upsample_linear1d.default", input,
+                    [int(v) for v in output_size], align_corners,
+                )
+            factor = float(scale_factors[0])
+            osize = [int(list(input.shape)[2] * factor)]
+            return dispatch(
+                "aten.upsample_linear1d.default", input, osize,
+                align_corners, factor,
+            )
+        if output_size is None:
+            raise RuntimeError(
+                "It is expected output_size equals to 1, but got size 0"
+            )
+        return dispatch(
+            "aten.upsample_linear1d.default", input,
+            [int(v) for v in output_size], align_corners, float(scale_factors),
+        )
+
     def leaky_relu(input, negative_slope=0.01):
         """`torch._C._nn.leaky_relu` -- `vits`' wall after the `IntTensor`
         constructor.
@@ -8139,6 +8333,7 @@ def _install_nn(module, dispatch) -> None:
         (upsample_bicubic2d, "upsample_bicubic2d"),
         (upsample_nearest2d, "upsample_nearest2d"),
         (upsample_nearest1d, "upsample_nearest1d"),
+        (upsample_linear1d, "upsample_linear1d"),
         (im2col, "im2col"),
         (col2im, "col2im"),
         (leaky_relu, "leaky_relu"),
@@ -8162,7 +8357,7 @@ def _install_nn(module, dispatch) -> None:
         "gelu", "glu", "hardtanh", "im2col", "leaky_relu", "linear", "nll_loss",
         "nll_loss_nd", "one_hot", "pad", "scaled_dot_product_attention", "silu",
         "softplus", "upsample_bicubic2d", "upsample_bilinear2d",
-        "upsample_nearest1d", "upsample_nearest2d",
+        "upsample_linear1d", "upsample_nearest1d", "upsample_nearest2d",
     ]
 
 
@@ -9037,12 +9232,13 @@ def _install_composites(module, varfns, dispatch) -> None:
 
         `padding` accepts upstream's two string spellings as well as a number.
         `"valid"` is zero. `"same"` is `dilation * (kernel - 1) // 2`, which is
-        only the whole answer when that product is *even* -- upstream pads the
-        input asymmetrically when it is odd, and that path is refused by name
-        here rather than rounded, since rounding it would silently shift the
-        output by one sample. Measured: `padding="same"` with a 3-tap kernel
-        and dilation 1 reaches `convolution(..., [1], ...)`, which is the even
-        case. Non-unit stride with `"same"` is upstream's own refusal.
+        only the whole answer when that product is *even* -- when it is odd,
+        upstream pads the input asymmetrically (one extra zero on the right)
+        with `aten::constant_pad_nd` before convolving symmetrically with
+        `total // 2` (docs/RNN.md §1.2). Measured: `padding="same"` with a
+        3-tap kernel and dilation 1 reaches `convolution(..., [1], ...)`,
+        which is the even case. Non-unit stride with `"same"` is upstream's
+        own refusal.
         """
         def _as_list(value):
             return list(value) if isinstance(value, (list, tuple)) else [value]
@@ -9060,13 +9256,16 @@ def _install_composites(module, varfns, dispatch) -> None:
                 kernel = weight.shape[-1]
                 total = dilation[0] * (kernel - 1)
                 if total % 2 != 0:
-                    raise NotImplementedError(
-                        "not implemented in torch._C shim: torch.conv1d("
-                        "padding='same') where dilation*(kernel-1) is odd -- "
-                        "upstream pads the input asymmetrically with "
-                        "aten::constant_pad_nd before convolving, and picking "
-                        "either half of the split here would shift the output "
-                        "by one sample"
+                    # docs/RNN.md §1.2, measured with a `TorchDispatchMode`
+                    # logger on upstream 2.13.0:
+                    #   aten.constant_pad_nd.default(x, [0, 1])
+                    #   aten.convolution.default(..., padding=[total // 2], ...)
+                    # i.e. one extra element of zero padding on the RIGHT,
+                    # then the ordinary symmetric convolution. Padding the
+                    # left instead gives a different answer -- pinned by
+                    # test_bind4.py against upstream, not asserted in prose.
+                    input = dispatch(
+                        "aten.constant_pad_nd.default", input, [0, 1], 0.0
                     )
                 padding = [total // 2]
             else:

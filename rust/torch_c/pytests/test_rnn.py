@@ -691,7 +691,7 @@ def test_conv1d_forms_that_already_work():
         _agree(name, atol=1e-5, rtol=1e-5)
 
 
-def test_conv1d_same_with_odd_total_padding_is_still_refused():
+def test_conv1d_same_with_odd_total_padding_now_agrees():
     """`lasr_ctc` and `lasr_encoder`'s ACTUAL wall (docs/RNN.md §1): not the
     name `torch.conv1d`, which exists, but this one branch of its composite.
     `LasrEncoderConvolutionModule` uses `padding="same"` with
@@ -699,20 +699,12 @@ def test_conv1d_same_with_odd_total_padding_is_still_refused():
     odd), so `dilation * (kernel - 1)` is odd and upstream pads
     asymmetrically.
 
-    Left as a refusal, not weakened: `bootstrap.py` is where the fix goes and
-    is not this round's territory. When it lands, this test flips to
-    `_agree` -- and the next two tests are what makes that a transcription
-    rather than a re-derivation."""
-    pair = _both("conv1d_same_odd_total")
-    if pair == "skip":
-        return
-    got, want = pair
-    assert "raised" not in want, "upstream refuses -- the fixture is wrong"
-    assert got.get("raised") == "NotImplementedError", (
-        "the shim now computes conv1d(padding='same') with an odd total. If "
-        "bootstrap.py gained the lowering, change this test to _agree(...) "
-        "rather than deleting it -- docs/RNN.md §1"
-    )
+    docs/BIND4.md landed the four-line fix in `bootstrap.py` (pad one zero on
+    the RIGHT with `aten.constant_pad_nd.default`, then convolve symmetrically
+    with `total // 2`) -- both kernels this shim already had. This test is
+    the flip the previous docstring called for, not a re-derivation: the next
+    two tests are what makes the flip a transcription rather than a guess."""
+    _agree("conv1d_same_odd_total", atol=1e-5, rtol=1e-5)
 
 
 def test_conv1d_same_odd_lowers_to_pad_right_then_convolve():
