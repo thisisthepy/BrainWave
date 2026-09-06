@@ -276,6 +276,7 @@ class Adapted(torch.nn.Module):
         self._online = False
         self._history = []
         self._steps = 0
+        self._grad_hooks = []
 
     # -- state -------------------------------------------------------------
 
@@ -334,6 +335,49 @@ class Adapted(torch.nn.Module):
     def history(self):
         """The objective at every step taken, in order. The curve."""
         return list(self._history)
+
+    # -- gradient hooks ----------------------------------------------------
+
+    def add_grad_hook(self, hook):
+        """Call ``hook(adapted, params, names)`` after backward, before the step.
+
+        The one place a *federated* method can change the local objective
+        without this class knowing what federation is.  ``FedProx``'s
+        difference from ``FedAvg`` is entirely here -- the server step of the
+        two is the same weighted mean, and what FedProx adds is
+        ``mu * (w - w_global)`` on the gradient of every adapted parameter
+        (Li et al. 2020, §3).  Without a hook there is nowhere to put it, and
+        an aggregator that called itself FedProx while doing FedAvg's
+        arithmetic would report success -- docs/DESIGN.md §6 puts that below a
+        refusal, so :class:`torchnative.nn.federated.FedProx` refuses to
+        aggregate at all unless it has installed one of these.
+
+        ``params`` is ``{name: Parameter}`` for the whole model and ``names``
+        the parameters this step has gradients for; a hook writes into
+        ``params[name].grad`` in place.  It runs *after* the gradients are
+        assigned and *before* ``optimizer.step()``, which is the only point at
+        which "the gradient this step will apply" exists as an object.
+
+        Returns a callable that removes the hook again, so that installing one
+        is reversible without reaching into the list.
+        """
+        if not callable(hook):
+            raise TypeError(
+                "torchnative.adapt.Adapted.add_grad_hook: %r is not callable"
+                % (hook,)
+            )
+        self._grad_hooks.append(hook)
+
+        def remove():
+            if hook in self._grad_hooks:
+                self._grad_hooks.remove(hook)
+
+        return remove
+
+    @property
+    def grad_hooks(self):
+        """The installed gradient hooks, in call order."""
+        return tuple(self._grad_hooks)
 
     def revert(self):
         """Put the base weights back byte for byte, keeping the delta."""
@@ -417,6 +461,12 @@ class Adapted(torch.nn.Module):
                 "'nodes_on_a_gradient_path' is 0 when nothing connects."
                 % (len(slots),)
             )
+
+        # After the gradients are on the parameters and before they are
+        # applied: the only moment at which "what this step will apply" is an
+        # object. `FedProx` puts its proximal term here -- see add_grad_hook.
+        for hook in self._grad_hooks:
+            hook(self, params, sorted(slots))
 
         self._optimizer.step()
         self._optimizer.zero_grad(set_to_none=True)

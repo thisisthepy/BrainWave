@@ -235,6 +235,9 @@ refusal says what it would take.
 | secure aggregation, differential privacy, gradient compression | **Not offered at all.** No surface here takes a key, an epsilon or a codec |
 | aggregators other than `FedAvg` | FedProx, FedAdam, SCAFFOLD: none. `Engine` takes any object with `.aggregate`, so a fourth is a class and not a change here |
 
+
+> **Correction (2026-09-06, `docs/FEDERATED3.md`).** Three rows of the table above are no longer true, and are left in place rather than edited away for the reason §6 gives. `Engine(select=...)` no longer refuses at construction: `federated.cohort` agrees the participant set across the ranks and only a *proper subset* refuses. `Engine(allow_missing=...)` has become `on_missing=`, whose `'refuse'` policy is implemented — a lost peer raises `federated.RankDropped` and the round is undone. And there are now two aggregators besides `FedAvg`: `FedAvgM` and `FedProx`. Secure aggregation and differential privacy are still not offered, and now refuse by name.
+
 **Also not done, and not refused because there is nothing to refuse:** no
 device other than CPU (`docs/DESIGN.md` §11.1's fourth layer), no measurement
 of what a round costs on a real model, and no run on a phone. Every number here
