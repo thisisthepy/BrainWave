@@ -719,17 +719,20 @@ def test_overload_resolution_refuses_rather_than_guessing():
         raise AssertionError("full(2, 3) must not resolve")
 
     # An op with no table entry keeps the old refusal rather than guessing
-    # `.default`. `cumprod` has no kernel and so no table entry either --
+    # `.default`. `stft` has no kernel and so no table entry either --
     # `relu` used to be this example until docs/SPELLINGS.md §6 gave it one,
-    # and `flatten` was it until docs/ARCH20.md §5 gave `cohere` a composite.
+    # `flatten` was it until docs/ARCH20.md §5 gave `cohere` a composite, and
+    # `cumprod` was it until docs/VOICE.md gave Spark-TTS BiCodec one.
     #
     # The example keeps having to move, and that is the point rather than an
     # annoyance: it can only be a name that is *still* unreachable, so choosing
     # one is choosing a claim that gets falsified the day someone implements
-    # it. `cumprod` is `cumsum`'s sibling and this shim has `cumsum`, which
-    # makes it exactly the kind of name a future round is likely to reach for.
+    # it. `stft` is the one this round *could not* reach and said why
+    # (docs/VOICE.md §3): it returns a complex tensor, candle 0.11.0 has no
+    # complex `DType` at all, so falsifying this line means a candle-level
+    # change has landed rather than another kernel.
     try:
-        _vf("cumprod")(1)
+        _vf("stft")(1)
     except NotImplementedError as e:
         assert "no table entry" in str(e)
     else:
@@ -27739,6 +27742,114 @@ def test_the_arch_sweep_classifier_maps_real_refusals_to_the_operator_they_name(
     kind, _ = arch_sweep.classify("ModuleNotFoundError: No module named 'sentencepiece'")
     assert kind == "missing_dependency", kind
 
+
+
+
+
+# --- docs/VOICE.md: the four spellings the speech round added ---------------
+#
+# docs/REACH.md shape 3 -- a kernel that golden compares but nothing spells is
+# reachable only by `_aten_dispatch`, and the voicestudio models reach these
+# four by name (`torch.hann_window` in four of the five `__init__`s,
+# `torch.sinc` in BigVGAN's resampler, `torch.clip` in Vocos, `torch.cumprod`
+# in Spark-TTS BiCodec's quantiser). Every expected value below is transcribed
+# from upstream torch 2.13.0 run on this same script with
+# `env -u PYTHONPATH -u TORCH_USE_RTLD_GLOBAL`, not read off this shim.
+
+_VOICE_SPELLINGS_SCRIPT = """
+import json, torch
+out = {}
+out["hann_periodic"] = torch.hann_window(8).tolist()
+out["hann_symmetric"] = torch.hann_window(8, False).tolist()
+out["hann_one"] = torch.hann_window(1).tolist()
+out["hann_f64"] = torch.hann_window(5, dtype=torch.float64).tolist()
+out["sinc_fn"] = torch.sinc(torch.tensor([0.0, 0.5, 2.0])).tolist()
+out["sinc_member"] = torch.tensor([0.0, 0.5, 2.0]).sinc().tolist()
+out["sinc_int_dtype"] = str(torch.sinc(torch.tensor([0, 1, 2])).dtype)
+out["clip_fn"] = torch.clip(torch.tensor([-2.0, 0.0, 5.0]), -1.0, 1.0).tolist()
+out["clip_member"] = torch.tensor([-2.0, 0.0, 5.0]).clip(min=0.0).tolist()
+out["cumprod_fn"] = torch.cumprod(torch.tensor([1.0, 2.0, 3.0, 4.0]), 0).tolist()
+out["cumprod_member"] = torch.tensor([[1, 2, 3], [4, 5, 6]]).cumprod(1).tolist()
+out["cumprod_int_dtype"] = str(torch.cumprod(torch.tensor([1, 2, 3]), 0).dtype)
+print(json.dumps(out))
+"""
+
+
+def _voice_spellings_fixture():
+    env = dict(os.environ)
+    env["PYTHONPATH"] = _CKPT_VENDOR_DIR
+    env["TORCH_USE_RTLD_GLOBAL"] = "1"  # VENDOR.md wall 1
+    proc = subprocess.run(
+        [sys.executable, "-c", _VOICE_SPELLINGS_SCRIPT],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=180,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"voice-spellings subprocess exited {proc.returncode}\n"
+            f"--- stdout ---\n{proc.stdout}\n--- stderr ---\n{proc.stderr}"
+        )
+    return json.loads(proc.stdout)
+
+
+def test_the_voice_round_spellings_reach_their_kernels_and_match_upstream():
+    """`torch.hann_window`, `torch.sinc`, `torch.clip`, `torch.cumprod`.
+
+    Two of the assertions are the ones a plausible implementation gets wrong,
+    and they are here rather than only in the golden suite because they are
+    facts about the *spelling*:
+
+    * `hann_window(8)` and `hann_window(8, False)` are both eight long and
+      agree only on their first element -- `periodic` moves the divisor, not
+      the length -- and `hann_window(1)` is `[1.0]`, an early return taken
+      before any division.
+    * `cumprod` on an integral input answers `int64`, not the input dtype and
+      not `bool` for a bool input.
+    """
+    if not os.path.isfile(_CKPT_VENDOR_SHIM):
+        return  # vendor tree not installed -- see vendor/install_shim.sh
+    out = _voice_spellings_fixture()
+
+    def eq(key, expected):
+        got = out.get(key, "<missing>")
+        assert got == expected, f"{key}: expected {expected!r}, got {got!r}"
+
+    def close(key, expected, tol=1e-6):
+        got = out.get(key, "<missing>")
+        assert isinstance(got, list) and len(got) == len(expected), f"{key}: got {got!r}"
+        for g, e in zip(got, expected):
+            assert abs(g - e) < tol, f"{key}: expected {expected!r}, got {got!r}"
+
+    close(
+        "hann_periodic",
+        [0.0, 0.1464466154575348, 0.5, 0.8535534143447876,
+         1.0, 0.853553295135498, 0.5, 0.14644649624824524],
+    )
+    close(
+        "hann_symmetric",
+        [0.0, 0.18825510144233704, 0.6112604737281799, 0.9504844546318054,
+         0.9504843950271606, 0.6112605333328247, 0.18825498223304749, 0.0],
+    )
+    eq("hann_one", [1.0])
+    close(
+        "hann_f64",
+        [0.0, 0.3454915028125263, 0.9045084971874737,
+         0.9045084971874737, 0.3454915028125264],
+        tol=1e-15,
+    )
+
+    close("sinc_fn", [1.0, 0.6366197466850281, 2.7827534054836178e-08])
+    close("sinc_member", [1.0, 0.6366197466850281, 2.7827534054836178e-08])
+    eq("sinc_int_dtype", "torch.float32")
+
+    eq("clip_fn", [-1.0, 0.0, 1.0])
+    eq("clip_member", [0.0, 0.0, 5.0])
+
+    eq("cumprod_fn", [1.0, 2.0, 6.0, 24.0])
+    eq("cumprod_member", [[1, 2, 6], [4, 20, 120]])
+    eq("cumprod_int_dtype", "torch.int64")
 
 
 

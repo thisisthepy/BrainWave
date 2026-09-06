@@ -95,12 +95,14 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.clamp_.default",
     "aten.clamp_min.default",
     "aten.clamp_min_.default",
+    "aten.clip.default",
     "aten.clone.default",
     "aten.constant_pad_nd.default",
     "aten.convolution.default",
     "aten.copy_.default",
     "aten.cos.default",
     "aten.cos_.default",
+    "aten.cumprod.default",
     "aten.cumsum.default",
     "aten.detach.default",
     "aten.diff.default",
@@ -133,6 +135,8 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.full.default",
     "aten.full_like.default",
     "aten.gather.default",
+    "aten.hann_window.default",
+    "aten.hann_window.periodic",
     "aten.hardtanh.default",
     "aten.ge.Scalar",
     "aten.ge.Tensor",
@@ -229,6 +233,7 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.silu.default",
     "aten.sin.default",
     "aten.sin_.default",
+    "aten.sinc.default",
     "aten.slice.Tensor",
     "aten.softplus.default",
     "aten.sort.default",
@@ -1544,6 +1549,7 @@ fn meta_dispatch(
         | "aten.log.default"
         | "aten.expm1.default"
         | "aten.rsqrt.default"
+        | "aten.sinc.default"
         | "aten.sqrt.default" => {
             let input = tensor_arg(op, args, kwargs, 0, "self")?;
             meta_result(py, input.dims().to_vec(), unary_float_tag(input.tag()))
@@ -1583,7 +1589,7 @@ fn meta_dispatch(
         // That table is the one the golden cases had to correct once
         // (out-of-place promotes where in-place refuses), which is the
         // argument for calling it rather than writing a second copy.
-        "aten.clamp.default" => {
+        "aten.clamp.default" | "aten.clip.default" => {
             let input = tensor_arg(op, args, kwargs, 0, "self")?;
             let min = scalar_arg(op, args, kwargs, 1, "min")?;
             let max = scalar_arg(op, args, kwargs, 2, "max")?;
@@ -1998,6 +2004,7 @@ fn aten_dispatch_inner(
         "aten.cos.default" => unary_float(py, args, kwargs, "aten.cos.default", Unary::Cos),
         "aten.acos.default" => acos_default(py, args, kwargs),
         "aten.sin.default" => unary_float(py, args, kwargs, "aten.sin.default", Unary::Sin),
+        "aten.sinc.default" => sinc_default(py, args, kwargs),
         "aten.reciprocal.default" => {
             unary_float(py, args, kwargs, "aten.reciprocal.default", Unary::Reciprocal)
         }
@@ -2017,6 +2024,7 @@ fn aten_dispatch_inner(
         "aten.mean.default" => sum_or_mean(py, args, kwargs, "aten.mean.default", Reduce::Mean, false),
         "aten.mean.dim" => sum_or_mean(py, args, kwargs, "aten.mean.dim", Reduce::Mean, true),
         "aten.cumsum.default" => cumsum_default(py, args, kwargs),
+        "aten.cumprod.default" => cumprod_default(py, args, kwargs),
         "aten.max.default" => extremum_default(py, args, kwargs, Extremum::Max),
         "aten.min.default" => extremum_default(py, args, kwargs, Extremum::Min),
         "aten.max.dim" => extremum_dim(py, args, kwargs, Extremum::Max),
@@ -2173,6 +2181,9 @@ fn aten_dispatch_inner(
         "aten.log2.default" => log2_default(py, args, kwargs),
         "aten.leaky_relu.default" => leaky_relu_default(py, args, kwargs),
         "aten.linspace.default" => linspace_default(py, args, kwargs),
+        "aten.hann_window.default" | "aten.hann_window.periodic" => {
+            hann_window_default(py, args, kwargs, op)
+        }
         "aten.expm1.default" => expm1_default(py, args, kwargs),
         // `bert`'s wall: `F.pad` on a bias while the model is being built.
         "aten.constant_pad_nd.default" => constant_pad_nd(py, args, kwargs),
@@ -2195,7 +2206,7 @@ fn aten_dispatch_inner(
         "aten.fmod.Tensor" => fmod_op(py, args, kwargs, "aten.fmod.Tensor", false),
         "aten.clamp_.default" => clamp_inplace_default(py, args, kwargs),
         // `mamba` clamps out of place; only the in-place sibling had a kernel.
-        "aten.clamp.default" => clamp_default(py, args, kwargs),
+        "aten.clamp.default" | "aten.clip.default" => clamp_default(py, args, kwargs),
         "aten.clamp_min.default" => clamp_min_default(py, args, kwargs),
         "aten.div_.Tensor" => div_inplace_tensor(py, args, kwargs),
         // `noise.div_(1 - p)`, the scale step of upstream's dropout
@@ -8088,6 +8099,249 @@ fn cumsum_default(
         Tensor::from_vec(flat, dims, input.tensor()?.device())
     }
     .and_then(|t| t.fast_to(storage))
+    .map_err(|e| candle_err(OP, e))?;
+    finish(py, out, tag)
+}
+
+/// `aten::sinc(Tensor self) -> Tensor` -- the normalised cardinal sine,
+/// `sin(pi*x) / (pi*x)`, with `sinc(0) == 1`.
+///
+/// BigVGAN's anti-aliased resampler builds its low-pass filter out of this
+/// (docs/VOICE.md rank 6): `kaiser_sinc_filter1d` multiplies a `sinc` ramp by
+/// a Kaiser window, so it is a *construction*-time wall, not a forward one.
+///
+/// It follows `unary_float_tag`'s promotion -- measured `sinc(int64)` is
+/// `float32` and each float dtype keeps its own -- which is why the meta arm
+/// lists it beside `sin` and `cos`.
+///
+/// **The arithmetic is done in the output precision, not in `f64`, and that is
+/// the whole reason this is not a `Unary` variant.** Measured on 2.13.0,
+/// `torch.sinc(tensor([1.0]))` is `-2.7827534e-08` at `float32`, which is
+/// `sin(f32(pi)) / f32(pi)` -- the residue of `pi` not being representable.
+/// Computing in `f64` and narrowing gives `0.0` instead, so a wider
+/// accumulator is *less* faithful here rather than more. `float16` and
+/// `bfloat16` are the exception upstream itself makes: their arithmetic
+/// promotes to `f32` and narrows once, which is what `acc` below reproduces.
+fn sinc_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.sinc.default";
+    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let tag = unary_float_tag(input.tag());
+    let storage = PyDtype::new(tag).storage(OP)?;
+    let acc = match storage {
+        candle_core::DType::F16 | candle_core::DType::BF16 => candle_core::DType::F32,
+        other => other,
+    };
+    let x = input.tensor()?.fast_to(acc).map_err(|e| candle_err(OP, e))?;
+    let scaled = x
+        .affine(std::f64::consts::PI, 0.0)
+        .map_err(|e| candle_err(OP, e))?;
+    let zeros = scaled.zeros_like().map_err(|e| candle_err(OP, e))?;
+    let ones = scaled.ones_like().map_err(|e| candle_err(OP, e))?;
+    // `x == 0` is the removable singularity; the division is still evaluated on
+    // every element (it is a whole-tensor op), so the denominator is patched to
+    // one first and the selected branch discards the result.
+    let safe = scaled
+        .eq(&zeros)
+        .and_then(|at_zero| at_zero.where_cond(&ones, &scaled))
+        .map_err(|e| candle_err(OP, e))?;
+    let out = safe
+        .sin()
+        .and_then(|num| num.div(&safe))
+        .and_then(|ratio| {
+            scaled
+                .eq(&zeros)
+                .and_then(|at_zero| at_zero.where_cond(&ones, &ratio))
+        })
+        .and_then(|t| t.fast_to(storage))
+        .map_err(|e| candle_err(OP, e))?;
+    finish(py, out, tag)
+}
+
+/// `aten::hann_window(int window_length, *, ScalarType? dtype=None, ...)` and
+/// `aten::hann_window.periodic(int window_length, bool periodic, *, ...)`.
+///
+/// Rank 1 of docs/VOICE.md: four of the five speech models build this in
+/// `__init__` as the analysis window of an STFT, so it is what turns them back
+/// from "refuses at construction" into "refuses in the forward, at `stft`" --
+/// a strictly more informative failure even while `stft` itself stays out of
+/// reach.
+///
+/// Upstream is `hamming_window(window_length, periodic, alpha=0.5, beta=0.5)`,
+/// and the two details worth pinning are both measured on 2.13.0:
+///
+/// * **`periodic` changes the denominator, not the length.** Upstream adds one
+///   to `window_length`, builds the symmetric window of that length -- so the
+///   divisor is the *original* `window_length` -- and narrows the last element
+///   off. `hann_window(5)` is therefore `0.5 * (1 - cos(2*pi*n/5))` while
+///   `hann_window(5, False)` is `0.5 * (1 - cos(2*pi*n/4))`; the outputs are
+///   both five long and share only their first element.
+/// * **`window_length` 0 and 1 are answers, not errors.** `hann_window(0)` is
+///   the empty tensor and `hann_window(1)` is `[1.0]` for both values of
+///   `periodic` -- the `n == 1` case never divides. A negative length is
+///   upstream's own `"hann_window requires non-negative window_length"`.
+///
+/// A non-floating `dtype` is refused rather than promoted, which is the
+/// opposite of `linspace`'s rule and so was measured rather than carried
+/// over: `hann_window(4, dtype=torch.int64)` raises `"hann_window expects
+/// floating point dtypes"`.
+fn hann_window_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+    op: &str,
+) -> PyResult<Py<PyAny>> {
+    let periodic_form = op == "aten.hann_window.periodic";
+    let length =
+        int_arg(args, kwargs, 0, "window_length")?.ok_or_else(|| missing(op, "window_length"))?;
+    let periodic = if periodic_form {
+        bool_arg(args, kwargs, 1, "periodic")?.ok_or_else(|| missing(op, "periodic"))?
+    } else {
+        true
+    };
+    let first_kwarg = if periodic_form { 2 } else { 1 };
+    let dtype = dtype_arg(args, kwargs, first_kwarg, "dtype")?.unwrap_or_else(default_float);
+    reject_unsupported(
+        op,
+        args,
+        kwargs,
+        &[(first_kwarg + 1, "layout"), (first_kwarg + 3, "pin_memory")],
+    )?;
+    let label = device_arg_or_label(args, kwargs, first_kwarg + 2, "device", &PyDevice::cpu())?;
+
+    if length < 0 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "hann_window requires non-negative window_length, got window_length={length}"
+        )));
+    }
+    if !dtype.is_floating_point() {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "hann_window expects floating point dtypes, got: {}",
+            scalar_type_name(dtype)
+        )));
+    }
+    let n = length as usize;
+    if label.is_meta() {
+        return meta_result(py, vec![n], dtype);
+    }
+    let device = label.resolve()?;
+    let storage = PyDtype::new(dtype).storage(op)?;
+
+    // `window_length == 1` is upstream's own early return of `ones(1)`, taken
+    // before any arithmetic -- without it the periodic form would divide by
+    // one and answer `[0.0]`, which is what a first draft of this did.
+    if n == 1 {
+        let tensor = Tensor::ones(1, storage, &device).map_err(|err| candle_err(op, err))?;
+        return finish(py, tensor, dtype);
+    }
+
+    // The symmetric window upstream actually builds is `window_length + 1`
+    // long when `periodic`, so the divisor is `window_length` either way once
+    // the extra sample is narrowed back off.
+    let divisor = if periodic { n } else { n - 1 };
+
+    // Upstream is four in-place ops on an `arange` of the *output* dtype --
+    // `mul_(2*pi/divisor)`, `cos_()`, `mul_(-0.5)`, `add_(0.5)` -- and each
+    // one rounds to that dtype before the next reads it. Computing the closed
+    // form in `f64` and narrowing once at the end is the plausible shortcut
+    // and it disagrees: measured on 2.13.0, `hann_window(5)` at `float32` is
+    // *not* symmetric (`0.9045085310935974` against `0.9045084714889526`)
+    // because the multiply carries `float32` error that grows with `i`, and
+    // at `float16` the second element is `0.345703125` where the correctly
+    // rounded value of the exact answer is `0.345458984375`. `float_narrower`
+    // is the same device `linspace_default` uses for the same reason.
+    let narrow = float_narrower(dtype);
+    let step = narrow(std::f64::consts::TAU / divisor as f64);
+    let values: Vec<f64> = (0..n)
+        .map(|i| {
+            let angle = narrow(narrow(i as f64) * step);
+            let cosine = narrow(angle.cos());
+            narrow(narrow(cosine * -0.5) + 0.5)
+        })
+        .collect();
+    let tensor = Tensor::from_vec(values, n, &device)
+        .and_then(|t| t.fast_to(storage))
+        .map_err(|err| candle_err(op, err))?;
+    finish(py, tensor, dtype)
+}
+
+/// `aten::cumprod(Tensor self, int dim, *, ScalarType? dtype=None)`.
+///
+/// Spark-TTS BiCodec's wall (docs/VOICE.md rank 5): the factorised vector
+/// quantiser derives its per-level strides with a `cumprod` over the codebook
+/// sizes while the module is being *constructed*, so this is a `from_config`
+/// wall like `linspace`'s and not a forward one.
+///
+/// The dtype rule is `cumsum`'s, re-measured rather than assumed from the
+/// shared shape: an integral or boolean input becomes `int64` (`cumprod(bool)`
+/// is `int64`, not `bool`) and a floating input keeps its own dtype.
+///
+/// The accumulation mirrors `cumsum_default`'s -- a written-out loop rather
+/// than a candle op, floats accumulated in `f64` and integers multiplied with
+/// wrapping semantics like torch's integer kernels. See `cumsum_default` for
+/// why the candle primitive is not used (it is a triangular matmul, and so
+/// exists only for the dtypes candle's gemm covers).
+fn cumprod_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.cumprod.default";
+    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let dim = normalise_dim(
+        OP,
+        dim_arg(args, kwargs, 1, "dim")?.ok_or_else(|| missing(OP, "dim"))?,
+        input.tensor()?.rank(),
+    )?;
+    let natural = if input.tag().is_floating_point() {
+        input.tag()
+    } else {
+        TorchDType::Int64
+    };
+    let tag = dtype_arg(args, kwargs, 2, "dtype")?.unwrap_or(natural);
+    let storage = PyDtype::new(tag).storage(OP)?;
+
+    // Accumulated with `narrow`/`mul`/`cat` rather than by pulling the buffer
+    // to the host the way `cumsum_default` does. That is not a style choice:
+    // a kernel that reads device bytes back has to be declared as one in
+    // `device.rs`'s mps readback list, and a `cumprod` written as `n - 1`
+    // tensor multiplies needs no such declaration because it never leaves the
+    // device. The suite has a check for exactly this
+    // (`test_the_mps_readback_list_is_what_the_kernels_actually_do`), and it
+    // is what caught the first draft here.
+    //
+    // The accumulator is upstream's `acc_type`: `float` for the reduced floats
+    // (so `float16` does not accumulate a product in `float16`), the storage
+    // type otherwise, and `int64` for everything integral -- which is also
+    // where the integral-to-`int64` promotion lands the result anyway.
+    let accumulate = match storage {
+        candle_core::DType::F16 | candle_core::DType::BF16 => candle_core::DType::F32,
+        other => other,
+    };
+    let source = input
+        .tensor()?
+        .fast_to(accumulate)
+        .and_then(|t| t.contiguous())
+        .map_err(|e| candle_err(OP, e))?;
+    let n = source.dims()[dim];
+
+    let out = if n == 0 {
+        source
+    } else {
+        let mut running = source.narrow(dim, 0, 1).map_err(|e| candle_err(OP, e))?;
+        let mut prefixes = Vec::with_capacity(n);
+        prefixes.push(running.clone());
+        for i in 1..n {
+            let next = source.narrow(dim, i, 1).map_err(|e| candle_err(OP, e))?;
+            running = running.mul(&next).map_err(|e| candle_err(OP, e))?;
+            prefixes.push(running.clone());
+        }
+        Tensor::cat(&prefixes, dim).map_err(|e| candle_err(OP, e))?
+    }
+    .fast_to(storage)
     .map_err(|e| candle_err(OP, e))?;
     finish(py, out, tag)
 }

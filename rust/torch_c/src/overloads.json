@@ -830,5 +830,18 @@
   ],
   "_is_all_true": [
     "aten::_is_all_true(Tensor self) -> Tensor"
+  ],
+  "hann_window": [
+    "aten::hann_window.periodic(int window_length, bool periodic, *, ScalarType? dtype=None, Layout? layout=None, Device? device=None, bool? pin_memory=None) -> Tensor",
+    "aten::hann_window(int window_length, *, ScalarType? dtype=None, Layout? layout=None, Device? device=None, bool? pin_memory=None) -> Tensor"
+  ],
+  "sinc": [
+    "aten::sinc(Tensor self) -> Tensor"
+  ],
+  "clip": [
+    "aten::clip(Tensor self, Scalar? min=None, Scalar? max=None) -> Tensor"
+  ],
+  "cumprod": [
+    "aten::cumprod(Tensor self, int dim, *, ScalarType? dtype=None) -> Tensor"
   ]
 }
