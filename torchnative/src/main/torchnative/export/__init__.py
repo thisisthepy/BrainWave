@@ -7,6 +7,15 @@ is not hypothetical -- the smallest example in that document, an
 `nn.Sequential` of two `Linear` layers, records `aten.t.default`, which is not
 Core ATen.
 
+Serialising is the step after that, and it has its own module per device --
+`torchnative.export.nnapi` and `torchnative.export.coreml`. Neither is imported
+here: `coreml` needs coremltools installed and `nnapi` reaches into the
+vendored `torch.backends`, and making a bare `import torchnative.export` depend
+on either would turn a missing optional package into an import error for the
+lowering passes that do not need it. docs/NPU.md says which of the two produces
+an artefact that has been *executed* and which one has only been structurally
+validated; they are different claims.
+
 So a pass has to stand between the two, and `decompose` is it. The rules it
 applies are upstream's, read out of the vendored tree rather than restated
 here: see `torchnative.export.decompose` for which table, and for the list of
