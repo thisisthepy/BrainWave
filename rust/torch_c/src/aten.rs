@@ -256,6 +256,8 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.squeeze.dim",
     "aten.squeeze.dims",
     "aten.stack.default",
+    "aten.stft.center",
+    "aten.stft.default",
     "aten.sub.Scalar",
     "aten.sub.Tensor",
     "aten.sub_.Scalar",
@@ -376,6 +378,17 @@ pub const IMPLEMENTED_AWAITING_GOLDEN: &[&str] = &[
     // `aten.mul.Tensor` is deliberately NOT here: its dense path is unchanged
     // and stays golden-compared. Only the complex branch is new, and that
     // branch is unreachable without one of the four constructors above it.
+    // The three `_fft_*` ops (docs/FFT.md). Parked for the same reason as the
+    // five above: `_fft_r2c` and `_fft_c2c` RETURN a complex tensor and
+    // `_fft_c2r` TAKES one, so on at least one side of every comparison there
+    // is no dense storage for the golden harness to read. They are proven
+    // element-wise against a live upstream in `pytests/test_fft.py` instead --
+    // and `aten.stft.default`, which is built on `_fft_r2c` and whose
+    // `return_complex=False` form is real on both sides, IS golden-compared,
+    // so the transform is not unmeasured by the harness, only unnamed by it.
+    "aten._fft_c2c.default",
+    "aten._fft_c2r.default",
+    "aten._fft_r2c.default",
     "aten.imag.default",
     "aten.polar.default",
     "aten.real.default",
@@ -2370,6 +2383,13 @@ fn aten_dispatch_inner(
         "aten.replication_pad3d.default" => {
             pad_nd(py, args, kwargs, "aten.replication_pad3d.default", 3, PadMode::Replicate)
         }
+        // docs/FFT.md: the third of docs/COMPLEX.md's three walls. The
+        // transform itself; `aten.stft.*` above it is the framing.
+        "aten.stft.default" => stft_kernel(py, args, kwargs, "aten.stft.default", false),
+        "aten.stft.center" => stft_kernel(py, args, kwargs, "aten.stft.center", true),
+        "aten._fft_r2c.default" => fft_r2c_default(py, args, kwargs),
+        "aten._fft_c2c.default" => fft_c2c_default(py, args, kwargs),
+        "aten._fft_c2r.default" => fft_c2r_default(py, args, kwargs),
         "aten.softplus.default" => softplus_default(py, args, kwargs),
         "aten.convolution.default" => convolution_default(py, args, kwargs),
         "aten.zeros_like.default" => zeros_or_empty_like(py, args, kwargs, "aten.zeros_like.default"),
@@ -21834,6 +21854,15 @@ pub(crate) fn scalar_type_name(dtype: TorchDType) -> &'static str {
         Int64 => "Long",
         Bool => "Bool",
         Float8E4M3FN => "Float8_e4m3fn",
+        // The three complex tags, added by docs/FFT.md and read off real
+        // errors: `_fft_r2c` on each of `complex32`/`complex64`/`complex128`
+        // reports `ComplexHalf`/`ComplexFloat`/`ComplexDouble`. They fall
+        // through to `name()` otherwise, which answers `complex64` -- a
+        // plausible-looking dtype name that upstream never puts in this
+        // position, so a caller matching on the message would not match.
+        Complex32 => "ComplexHalf",
+        Complex64 => "ComplexFloat",
+        Complex128 => "ComplexDouble",
         other => other.name(),
     }
 }
@@ -24450,3 +24479,1004 @@ fn prod(
 }
 
 
+
+// ===========================================================================
+// The FFT -- docs/FFT.md
+// ===========================================================================
+//
+// `docs/COMPLEX.md` set an ordering -- reflect pad, then `Repr::Complex`, then
+// the transform -- and `docs/PAD.md` §4 and `docs/COMPLEX2.md` cleared the
+// first two. This is the third. `docs/VOICE.md` §3 established that
+// `candle-core` 0.11.0 has **no FFT of any kind** (the only "fft" hits are a
+// comment in `conv.rs` and a commented-out row in `npy.rs`), so unlike almost
+// everything else in this file there is no candle call to reach for: the
+// arithmetic is written here.
+//
+// **It runs on the host, in `f64`, and that is a deliberate choice with a
+// cost.** Every other kernel in this file keeps its data on the device and
+// hands candle a shape; this one reads the input back, transforms it in
+// double precision on the CPU, and uploads the two halves. The reason is that
+// the alternatives are worse rather than that this one is good:
+//
+//   * a DFT **matrix multiply** stays on-device and is one `matmul`, but it is
+//     O(n^2) and -- more importantly -- accumulates 1024 `f32` products per
+//     output bin, which diverges from upstream's `f32` FFT by ~1e-4 relative.
+//     The bar for this round is element-wise agreement with upstream, and a
+//     uniform ~1e-4 is exactly the size of error that a loose tolerance hides.
+//   * a device-side radix-2 would need a scatter/gather kernel per stage, and
+//     candle has no primitive that expresses a butterfly.
+//
+// `f64` on the host costs a round trip and buys agreement with upstream to
+// ~1e-7 relative on `f32` data -- i.e. the shim is *more* accurate than the
+// thing it is compared against, so the residual is upstream's rounding and not
+// this code's. **A kernel that reads its input back to the host belongs in
+// `MPS_HOST_READBACK_OPS` in `device.rs`; that file was not this round's, so
+// see docs/FFT.md §7.**
+
+/// One in-place radix-2 decimation-in-time Cooley--Tukey pass over a complex
+/// array whose length is a power of two.
+///
+/// `inverse` selects the sign of the exponent only -- **it does not scale.**
+/// Every scaling in this file is applied once, at the end, from the
+/// `normalization` code, because upstream's `_fft_*` ops take that code as an
+/// argument and apply it themselves rather than baking `1/n` into the
+/// direction (measured: `torch.fft.ifft(x)` reaches
+/// `aten._fft_c2c.default(x, [0], 2, False)` -- direction and normalisation
+/// are two separate arguments).
+///
+/// The twiddles are computed with `sin_cos` per stage rather than by the
+/// usual recurrence `w *= w_step`. The recurrence is faster and drifts: its
+/// error grows like the stage length, which for `n_fft = 1024` is the
+/// difference between agreeing with upstream at 1e-7 and at 1e-5. There are
+/// `n - 1` transcendental calls in total across all stages, not `n log n`,
+/// because each stage's table is built once and reused across that stage's
+/// blocks.
+fn fft_radix2(re: &mut [f64], im: &mut [f64], inverse: bool) {
+    let n = re.len();
+    debug_assert!(n.is_power_of_two(), "fft_radix2 called with n = {n}");
+    if n <= 1 {
+        return;
+    }
+    // Bit-reversal permutation, incremental form.
+    let mut j = 0usize;
+    for i in 1..n {
+        let mut bit = n >> 1;
+        while j & bit != 0 {
+            j ^= bit;
+            bit >>= 1;
+        }
+        j |= bit;
+        if i < j {
+            re.swap(i, j);
+            im.swap(i, j);
+        }
+    }
+    let sign = if inverse { 1.0 } else { -1.0 };
+    let mut len = 2usize;
+    while len <= n {
+        let half = len / 2;
+        let step = sign * 2.0 * std::f64::consts::PI / len as f64;
+        let mut tw: Vec<(f64, f64)> = Vec::with_capacity(half);
+        for k in 0..half {
+            let (s, c) = (step * k as f64).sin_cos();
+            tw.push((c, s));
+        }
+        let mut base = 0usize;
+        while base < n {
+            for k in 0..half {
+                let (wc, ws) = tw[k];
+                let a = base + k;
+                let b = a + half;
+                let tr = re[b] * wc - im[b] * ws;
+                let ti = re[b] * ws + im[b] * wc;
+                re[b] = re[a] - tr;
+                im[b] = im[a] - ti;
+                re[a] += tr;
+                im[a] += ti;
+            }
+            base += len;
+        }
+        len <<= 1;
+    }
+}
+
+/// Bluestein's chirp-z algorithm: a DFT of **any** length, expressed as a
+/// convolution that `fft_radix2` can do.
+///
+/// **This exists because the "n_fft is always a power of two" claim is false,
+/// and it was measured rather than assumed.** Scanning every
+/// `transformers` feature extractor for an `n_fft`/`filter_length` default
+/// (docs/FFT.md §4) finds `whisper` at **400**, `qwen3_asr` at 400 and
+/// `voxtral_realtime` at 400, alongside 512 (six models), 1024 (`clvp`,
+/// `univnet`) and 16384 (`musicgen_melody`). Refusing non-powers of two by
+/// name -- the shape this round was scoped to consider -- would have refused
+/// the mel front-end of the single most-used speech model in the tree.
+///
+/// The identity is `n k = (n^2 + k^2 - (k - n)^2) / 2`, so
+///
+/// ```text
+/// X[k] = conj(chirp[k]) * sum_n (x[n] * conj(chirp[n])) * chirp[k - n]
+/// ```
+///
+/// with `chirp[m] = exp(-sign * i * pi * m^2 / N)`, and the sum is a linear
+/// convolution, padded to the next power of two at least `2N - 1` long.
+///
+/// `m * m % (2 * N)` rather than `m * m` keeps the angle small: `m^2` for
+/// `N = 16384` overflows an `f64`'s exact-integer range at `m` around 2^26,
+/// and long before that the argument reduction inside `sin_cos` is throwing
+/// away the low bits that this function's accuracy depends on. The residue is
+/// exact because `exp(-i pi m^2 / N)` has period `2N` in `m^2`.
+fn fft_bluestein(re: &mut Vec<f64>, im: &mut Vec<f64>, inverse: bool) {
+    let n = re.len();
+    let sign = if inverse { 1.0 } else { -1.0 };
+    // `chirp[m] = W^(m^2/2) = exp(sign * i * pi * m^2 / n)`, with `sign` the
+    // SAME sign the direct transform uses.
+    //
+    // **The minus sign that is not here was here, and it made every
+    // non-power-of-two transform the conjugate of upstream's.** It survived
+    // the power-of-two cases untouched (they never reach this function) and it
+    // survived a real *symmetric* input, whose spectrum is its own conjugate.
+    // `test_fft.py` uses `[1, 2, 4, 8, 3]` -- deliberately asymmetric and
+    // deliberately of length 5 -- for exactly this reason.
+    let chirp: Vec<(f64, f64)> = (0..n)
+        .map(|m| {
+            let r = (m as u128 * m as u128 % (2 * n as u128)) as f64;
+            let (s, c) = (sign * std::f64::consts::PI * r / n as f64).sin_cos();
+            (c, s)
+        })
+        .collect();
+
+    let mut m = 1usize;
+    while m < 2 * n - 1 {
+        m <<= 1;
+    }
+    let mut ar = vec![0.0f64; m];
+    let mut ai = vec![0.0f64; m];
+    for k in 0..n {
+        // a[k] = x[k] * chirp[k]
+        ar[k] = re[k] * chirp[k].0 - im[k] * chirp[k].1;
+        ai[k] = re[k] * chirp[k].1 + im[k] * chirp[k].0;
+    }
+    let mut br = vec![0.0f64; m];
+    let mut bi = vec![0.0f64; m];
+    // b is the conjugate chirp, laid out circularly so that the cyclic
+    // convolution of length m reproduces the linear one.
+    br[0] = chirp[0].0;
+    bi[0] = -chirp[0].1;
+    for k in 1..n {
+        br[k] = chirp[k].0;
+        bi[k] = -chirp[k].1;
+        br[m - k] = chirp[k].0;
+        bi[m - k] = -chirp[k].1;
+    }
+
+    fft_radix2(&mut ar, &mut ai, false);
+    fft_radix2(&mut br, &mut bi, false);
+    for k in 0..m {
+        let cr = ar[k] * br[k] - ai[k] * bi[k];
+        let ci = ar[k] * bi[k] + ai[k] * br[k];
+        ar[k] = cr;
+        ai[k] = ci;
+    }
+    fft_radix2(&mut ar, &mut ai, true);
+    let scale = 1.0 / m as f64;
+    for k in 0..n {
+        let (cr, ci) = (ar[k] * scale, ai[k] * scale);
+        re[k] = cr * chirp[k].0 - ci * chirp[k].1;
+        im[k] = cr * chirp[k].1 + ci * chirp[k].0;
+    }
+}
+
+/// A DFT of any length, unscaled. Radix-2 where it applies, Bluestein
+/// otherwise -- **no size is refused**, and §4 of docs/FFT.md is why.
+fn dft_in_place(re: &mut Vec<f64>, im: &mut Vec<f64>, inverse: bool) {
+    let n = re.len();
+    if n <= 1 {
+        return;
+    }
+    if n.is_power_of_two() {
+        fft_radix2(re, im, inverse);
+    } else {
+        fft_bluestein(re, im, inverse);
+    }
+}
+
+/// The scale factor for upstream's `normalization` code.
+///
+/// **Measured, in both directions, rather than read off the enum name.**
+/// `torch.fft.rfft(x, norm=...)` reaches `_fft_r2c` with `0` for `backward`
+/// (which is its default), `1` for `ortho` and `2` for `forward`; and
+/// `torch.fft.ifft(X, norm=...)` reaches `_fft_c2c(..., forward=False)` with
+/// `2` for `backward` (its default), `1` for `ortho` and `0` for `forward`.
+/// So the code does **not** mean a `norm=` string -- it means the factor
+/// itself, and the same three codes serve both directions:
+///
+/// ```text
+/// 0 -> 1        1 -> 1/sqrt(n)        2 -> 1/n
+/// ```
+///
+/// Getting this wrong scales every output by `n` or `sqrt(n)`, which is a
+/// uniform factor and therefore the kind of error that still looks like a
+/// spectrum. `pytests/test_fft.py` pins all three codes in both directions
+/// against a live upstream.
+fn fft_norm_factor(op: &str, code: i64, n: usize) -> PyResult<f64> {
+    let n = n.max(1) as f64;
+    match code {
+        0 => Ok(1.0),
+        1 => Ok(1.0 / n.sqrt()),
+        2 => Ok(1.0 / n),
+        other => Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "{op}: unknown normalization code {other} (upstream uses 0 = none, \
+             1 = 1/sqrt(n), 2 = 1/n)"
+        ))),
+    }
+}
+
+/// Move `dim` to the end, and give back the permutation that undoes it.
+fn fft_perm(rank: usize, dim: usize) -> (Vec<usize>, Vec<usize>) {
+    let mut perm: Vec<usize> = (0..rank).filter(|&i| i != dim).collect();
+    perm.push(dim);
+    let mut inv = vec![0usize; rank];
+    for (i, &p) in perm.iter().enumerate() {
+        inv[p] = i;
+    }
+    (perm, inv)
+}
+
+/// Put rows of `f64` back into a tensor, undoing the `fft_perm` move.
+fn fft_unrows(
+    op: &str,
+    values: Vec<f64>,
+    dims_perm: &[usize],
+    inv: &[usize],
+    dtype: candle_core::DType,
+    device: &candle_core::Device,
+) -> PyResult<Tensor> {
+    Tensor::from_vec(values, dims_perm, device)
+        .and_then(|t| t.to_dtype(dtype))
+        .and_then(|t| t.permute(inv))
+        .and_then(|t| t.contiguous())
+        .map_err(|e| candle_err(op, e))
+}
+
+/// `aten::_fft_r2c(Tensor self, int[] dim, int normalization, bool onesided)`
+///
+/// Real in, **complex out** -- the transform `torch.stft` is built on, and the
+/// one that matters for speech. `torch.fft.rfft` and `torch.fft.fft` on a real
+/// input both land here directly (traced with a `TorchDispatchMode`); there is
+/// no separate `fft_rfft` kernel above it.
+///
+/// **`onesided` returns `n // 2 + 1` bins, not `n`.** A full-length output
+/// would be internally consistent, would have the right dtype, and would be
+/// wrong -- the caller's next op is a `transpose` that does not care about the
+/// extent. `torch.fft.rfft(randn(8))` has 5 bins; the golden cases and
+/// `test_fft.py` both check the count and the values.
+///
+/// **`dim` may name more than one axis.** Upstream does a `c2c` over every
+/// axis except the last named one and an `r2c` over that one; measured,
+/// `_fft_r2c(randn(4,8), [0,1], 0, True)` is `(4, 5)` -- the `onesided`
+/// truncation applies to the **last** entry of `dim` only. That is
+/// `torch.fft.rfft2`/`fft_fftn`'s shape, so the multi-axis path is here rather
+/// than refused (docs/COMPLEX.md §3.3 step 5).
+///
+/// **The refusals are upstream's, transcribed from a run.** `float16` and
+/// `bfloat16` are refused with `expected scalar type Double but found Half` --
+/// which reads like a defect and is reproduced anyway, because a caller
+/// diagnosing a dtype problem matches on the message it actually gets.
+/// Integral and complex inputs get `Only supports floating-point dtypes, but
+/// found: Long` / `... ComplexFloat`.
+fn fft_r2c_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten._fft_r2c.default";
+    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let dims_arg: Vec<i64> = required(OP, args, kwargs, 1, "dim")?.extract()?;
+    let normalization: i64 = required(OP, args, kwargs, 2, "normalization")?.extract()?;
+    let onesided: bool = required(OP, args, kwargs, 3, "onesided")?.extract()?;
+
+    let tag = input.tag();
+    if input.is_complex_repr() || tag.is_complex() {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "Only supports floating-point dtypes, but found: {}",
+            scalar_type_name(tag)
+        )));
+    }
+    if !tag.is_floating_point() {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "Only supports floating-point dtypes, but found: {}",
+            scalar_type_name(tag)
+        )));
+    }
+    let storage = PyDtype::new(tag).storage(OP)?;
+    if !matches!(storage, candle_core::DType::F32 | candle_core::DType::F64) {
+        // Upstream's own wording, which names `Double` rather than the dtype
+        // it can accept. Transcribed, not tidied (docs/CKPT2.md §4).
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "expected scalar type Double but found {}",
+            scalar_type_name(tag)
+        )));
+    }
+    if dims_arg.is_empty() {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "{OP}: dim must name at least one axis"
+        )));
+    }
+
+    let t = input.tensor()?;
+    let device = t.device().clone();
+    let rank = t.dims().len();
+    let mut axes = Vec::with_capacity(dims_arg.len());
+    for d in &dims_arg {
+        axes.push(normalise_dim(OP, *d as isize, rank)?);
+    }
+    let last = *axes.last().unwrap();
+
+    // **The host readback, written out here rather than in a shared helper.**
+    // `test_shim.py`'s mps gate derives "this op computes on the CPU" by
+    // scanning each dispatched kernel's own body for `.to_vec*`, following
+    // helper calls exactly one level and only for a hand-listed set of helper
+    // names. A two-level chain through a new helper is invisible to it, and
+    // the op would go on quietly reading device bytes on the CPU. So the read
+    // is written in the body of every kernel that does one, and all five keys
+    // are in `MPS_HOST_READBACK_OPS` (docs/FFT.md section 7).
+    let read = |t: &Tensor, perm: &[usize]| -> PyResult<Vec<f64>> {
+        t.permute(perm)
+            .and_then(|t| t.contiguous())
+            .and_then(|t| t.to_dtype(candle_core::DType::F64))
+            .and_then(|t| t.flatten_all())
+            .and_then(|t| t.to_vec1::<f64>())
+            .map_err(|e| candle_err(OP, e))
+    };
+
+    // The r2c leg, over the last named axis.
+    let dims = t.dims().to_vec();
+    let (perm, _) = fft_perm(rank, last);
+    let flat = read(t, &perm)?;
+    let (re, im) =
+        fft_one_axis_r2c(OP, &dims, last, flat, onesided, normalization, storage, &device)?;
+    // ...then a c2c leg over each of the others, in upstream's order.
+    let mut re = re;
+    let mut im = im;
+    for &axis in &axes[..axes.len() - 1] {
+        let dims = re.dims().to_vec();
+        let (perm, _) = fft_perm(rank, axis);
+        let (fr, fi) = (read(&re, &perm)?, read(&im, &perm)?);
+        let (r, i) =
+            fft_one_axis_c2c(OP, &dims, axis, fr, fi, true, normalization, storage, &device)?;
+        re = r;
+        im = i;
+    }
+    PyTensorBase::complex(re, im)?
+        .into_pyobject(py)
+        .map(|b| b.into_any().unbind())
+}
+
+/// The real-to-complex leg: one axis, `n // 2 + 1` bins when `onesided`.
+#[allow(clippy::too_many_arguments)]
+fn fft_one_axis_r2c(
+    op: &'static str,
+    dims: &[usize],
+    axis: usize,
+    flat: Vec<f64>,
+    onesided: bool,
+    normalization: i64,
+    storage: candle_core::DType,
+    device: &candle_core::Device,
+) -> PyResult<(Tensor, Tensor)> {
+    let n = dims[axis];
+    let (perm, inv) = fft_perm(dims.len(), axis);
+    // `n == 0` is not an error upstream: `_fft_r2c(randn(0), [0], 0, True)`
+    // returns a length-1 tensor, because `0 // 2 + 1 == 1`. The single bin is
+    // the DC term, and the sum of no elements is zero. Measured, not reasoned.
+    let out_n = if onesided { n / 2 + 1 } else { n.max(1) };
+    let rows: usize = dims.iter().enumerate().filter(|(i, _)| *i != axis).map(|(_, d)| *d).product();
+    let scale = fft_norm_factor(op, normalization, n)?;
+
+    let mut out_re = vec![0.0f64; rows * out_n];
+    let mut out_im = vec![0.0f64; rows * out_n];
+    let mut re = vec![0.0f64; n];
+    let mut im = vec![0.0f64; n];
+    for r in 0..rows {
+        if n > 0 {
+            re.copy_from_slice(&flat[r * n..(r + 1) * n]);
+            im.iter_mut().for_each(|v| *v = 0.0);
+            dft_in_place(&mut re, &mut im, false);
+            for k in 0..out_n {
+                out_re[r * out_n + k] = re[k] * scale;
+                out_im[r * out_n + k] = im[k] * scale;
+            }
+        }
+    }
+    let mut dims_perm: Vec<usize> = perm.iter().map(|&i| dims[i]).collect();
+    *dims_perm.last_mut().unwrap() = out_n;
+    Ok((
+        fft_unrows(op, out_re, &dims_perm, &inv, storage, device)?,
+        fft_unrows(op, out_im, &dims_perm, &inv, storage, device)?,
+    ))
+}
+
+/// The complex-to-complex leg: one axis, same length in and out.
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
+fn fft_one_axis_c2c(
+    op: &'static str,
+    dims: &[usize],
+    axis: usize,
+    flat_re: Vec<f64>,
+    flat_im: Vec<f64>,
+    forward: bool,
+    normalization: i64,
+    storage: candle_core::DType,
+    device: &candle_core::Device,
+) -> PyResult<(Tensor, Tensor)> {
+    let n = dims[axis];
+    let (perm, inv) = fft_perm(dims.len(), axis);
+    let rows = if n == 0 { 0 } else { flat_re.len() / n };
+    let scale = fft_norm_factor(op, normalization, n)?;
+
+    let mut out_re = vec![0.0f64; flat_re.len()];
+    let mut out_im = vec![0.0f64; flat_im.len()];
+    let mut re = vec![0.0f64; n];
+    let mut im = vec![0.0f64; n];
+    for r in 0..rows {
+        re.copy_from_slice(&flat_re[r * n..(r + 1) * n]);
+        im.copy_from_slice(&flat_im[r * n..(r + 1) * n]);
+        dft_in_place(&mut re, &mut im, !forward);
+        for k in 0..n {
+            out_re[r * n + k] = re[k] * scale;
+            out_im[r * n + k] = im[k] * scale;
+        }
+    }
+    let dims_perm: Vec<usize> = perm.iter().map(|&i| dims[i]).collect();
+    Ok((
+        fft_unrows(op, out_re, &dims_perm, &inv, storage, device)?,
+        fft_unrows(op, out_im, &dims_perm, &inv, storage, device)?,
+    ))
+}
+
+/// `aten::_fft_c2c(Tensor self, SymInt[] dim, int normalization, bool forward)`
+///
+/// Complex in, complex out. It falls out of `_fft_r2c` -- the same
+/// `dft_in_place` with the imaginary part read from the pair instead of being
+/// zeroed -- which is the only reason it is here: `docs/COMPLEX2.md` §5's rule
+/// is that surface costs a comparison, and this one costs nothing extra
+/// because `test_fft.py` has to pin the direction and normalisation codes
+/// anyway.
+///
+/// `forward` selects the sign of the exponent and **nothing else**; the scale
+/// comes from `normalization`, which is why `torch.fft.ifft`'s default reaches
+/// this op as `(..., 2, False)` and not `(..., 0, False)`.
+fn fft_c2c_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten._fft_c2c.default";
+    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let dims_arg: Vec<i64> = required(OP, args, kwargs, 1, "dim")?.extract()?;
+    let normalization: i64 = required(OP, args, kwargs, 2, "normalization")?.extract()?;
+    let forward: bool = required(OP, args, kwargs, 3, "forward")?.extract()?;
+
+    if !input.is_complex_repr() {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "Only supports complex dtypes, but found: {}",
+            scalar_type_name(input.tag())
+        )));
+    }
+    let (re0, im0) = input.complex_parts(OP)?;
+    let storage = re0.dtype();
+    let device = re0.device().clone();
+    let rank = re0.dims().len();
+    if dims_arg.is_empty() {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "{OP}: dim must name at least one axis"
+        )));
+    }
+    // **The host readback, written out here rather than in a shared helper.**
+    // `test_shim.py`'s mps gate derives "this op computes on the CPU" by
+    // scanning each dispatched kernel's own body for `.to_vec*`, following
+    // helper calls exactly one level and only for a hand-listed set of helper
+    // names. A two-level chain through a new helper is invisible to it, and
+    // the op would go on quietly reading device bytes on the CPU. So the read
+    // is written in the body of every kernel that does one, and all five keys
+    // are in `MPS_HOST_READBACK_OPS` (docs/FFT.md section 7).
+    let read = |t: &Tensor, perm: &[usize]| -> PyResult<Vec<f64>> {
+        t.permute(perm)
+            .and_then(|t| t.contiguous())
+            .and_then(|t| t.to_dtype(candle_core::DType::F64))
+            .and_then(|t| t.flatten_all())
+            .and_then(|t| t.to_vec1::<f64>())
+            .map_err(|e| candle_err(OP, e))
+    };
+
+    let mut re = re0.clone();
+    let mut im = im0.clone();
+    for d in &dims_arg {
+        let axis = normalise_dim(OP, *d as isize, rank)?;
+        let dims = re.dims().to_vec();
+        let (perm, _) = fft_perm(rank, axis);
+        let (fr, fi) = (read(&re, &perm)?, read(&im, &perm)?);
+        let (r, i) =
+            fft_one_axis_c2c(OP, &dims, axis, fr, fi, forward, normalization, storage, &device)?;
+        re = r;
+        im = i;
+    }
+    PyTensorBase::complex(re, im)?
+        .into_pyobject(py)
+        .map(|b| b.into_any().unbind())
+}
+
+/// `aten::_fft_c2r(Tensor self, int[] dim, int normalization, SymInt last_dim_size)`
+///
+/// Complex in, **real out** -- `torch.fft.irfft`, and the half of
+/// `torch.istft` that is a transform rather than an overlap-add.
+///
+/// **`last_dim_size` is authoritative, not the input's bin count.** Measured:
+/// a 5-bin input with `last_dim_size = 9` returns a length-9 tensor, and one
+/// with `last_dim_size = 7` returns a length-7 tensor. So the full spectrum is
+/// rebuilt to `last_dim_size` by Hermitian symmetry, taking `X[k]` where the
+/// input has it, `conj(X[L - k])` where the mirror does, and zero where
+/// neither does -- rather than by assuming `L = 2 * (bins - 1)`.
+fn fft_c2r_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten._fft_c2r.default";
+    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let dims_arg: Vec<i64> = required(OP, args, kwargs, 1, "dim")?.extract()?;
+    let normalization: i64 = required(OP, args, kwargs, 2, "normalization")?.extract()?;
+    let last_dim_size: i64 = required(OP, args, kwargs, 3, "last_dim_size")?.extract()?;
+
+    if !input.is_complex_repr() {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "Only supports complex dtypes, but found: {}",
+            scalar_type_name(input.tag())
+        )));
+    }
+    if dims_arg.len() != 1 {
+        return Err(not_implemented(format!(
+            "{OP}: only a single transformed axis is implemented, got dim={dims_arg:?} \
+             -- upstream does a c2c over the leading axes first; call _fft_c2c on those \
+             and _fft_c2r on the last (docs/FFT.md §3)"
+        )));
+    }
+    if last_dim_size <= 0 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "Invalid number of data points ({last_dim_size}) specified"
+        )));
+    }
+    let (re0, im0) = input.complex_parts(OP)?;
+    let storage = re0.dtype();
+    let device = re0.device().clone();
+    let dims = re0.dims().to_vec();
+    let axis = normalise_dim(OP, dims_arg[0] as isize, dims.len())?;
+    let bins = dims[axis];
+    let l = last_dim_size as usize;
+    // **The host readback, written out here rather than in a shared helper.**
+    // `test_shim.py`'s mps gate derives "this op computes on the CPU" by
+    // scanning each dispatched kernel's own body for `.to_vec*`, following
+    // helper calls exactly one level and only for a hand-listed set of helper
+    // names. A two-level chain through a new helper is invisible to it, and
+    // the op would go on quietly reading device bytes on the CPU. So the read
+    // is written in the body of every kernel that does one, and all five keys
+    // are in `MPS_HOST_READBACK_OPS` (docs/FFT.md section 7).
+    let read = |t: &Tensor, perm: &[usize]| -> PyResult<Vec<f64>> {
+        t.permute(perm)
+            .and_then(|t| t.contiguous())
+            .and_then(|t| t.to_dtype(candle_core::DType::F64))
+            .and_then(|t| t.flatten_all())
+            .and_then(|t| t.to_vec1::<f64>())
+            .map_err(|e| candle_err(OP, e))
+    };
+    let (perm, inv) = fft_perm(dims.len(), axis);
+    let flat_re = read(re0, &perm)?;
+    let flat_im = read(im0, &perm)?;
+    let rows = if bins == 0 { 0 } else { flat_re.len() / bins };
+    let scale = fft_norm_factor(OP, normalization, l)?;
+    // **Only the first `l / 2 + 1` bins are read, even when more are
+    // supplied.** Measured: `_fft_c2r` on a 5-bin input with
+    // `last_dim_size = 7` uses bins 0..3 and mirrors 1..3, and it disagrees
+    // with a reconstruction that also uses bin 4 -- which is what this line
+    // was doing before, and it was wrong by 0.58 on an input whose values are
+    // order 10. Bin 4 is simply not part of a 7-point Hermitian spectrum, and
+    // an implementation that reads it produces a plausible signal of the right
+    // length and the wrong values.
+    let used = (l / 2 + 1).min(bins);
+
+    let mut out = vec![0.0f64; rows * l];
+    let mut re = vec![0.0f64; l];
+    let mut im = vec![0.0f64; l];
+    for r in 0..rows {
+        for k in 0..l {
+            if k < used {
+                re[k] = flat_re[r * bins + k];
+                im[k] = flat_im[r * bins + k];
+            } else if l - k < used {
+                re[k] = flat_re[r * bins + (l - k)];
+                im[k] = -flat_im[r * bins + (l - k)];
+            } else {
+                re[k] = 0.0;
+                im[k] = 0.0;
+            }
+        }
+        dft_in_place(&mut re, &mut im, true);
+        for k in 0..l {
+            out[r * l + k] = re[k] * scale;
+        }
+    }
+    let mut dims_perm: Vec<usize> = perm.iter().map(|&i| dims[i]).collect();
+    *dims_perm.last_mut().unwrap() = l;
+    let tensor = fft_unrows(OP, out, &dims_perm, &inv, storage, &device)?;
+    let tag = TorchDType::from_storage(storage).unwrap_or(TorchDType::Float32);
+    finish(py, tensor, tag)
+}
+
+/// A padded copy of one axis, using `pad_source_index`'s gather.
+///
+/// `pad_nd` above is the dispatched kernel and reads its arguments from
+/// Python; `aten.stft.center` needs the same gather from inside Rust, on one
+/// axis, with the width upstream chose (`n_fft // 2`). Sharing the index
+/// function rather than the kernel is deliberate: the kernel's value is its
+/// six transcribed refusals, and none of them can fire here -- `stft.center`
+/// has already checked `n_fft <= len`, so `pad < extent` holds by
+/// construction.
+fn pad_axis_gather(
+    op: &'static str,
+    t: &Tensor,
+    axis: usize,
+    left: i64,
+    right: i64,
+    mode: PadMode,
+) -> PyResult<Tensor> {
+    let w = t.dims()[axis] as i64;
+    let out = w + left + right;
+    let idx: Vec<u32> = (0..out)
+        .map(|j| pad_source_index(mode, j, left, w) as u32)
+        .collect();
+    let index = Tensor::from_vec(idx, out as usize, t.device()).map_err(|e| candle_err(op, e))?;
+    t.index_select(&index, axis).map_err(|e| candle_err(op, e))
+}
+
+/// How `aten::stft` names its arguments back to you when it refuses.
+///
+/// Upstream prefixes **every** `stft` refusal with the whole call, resolved
+/// defaults included, and the reason after a ` : `. Transcribed from runs of
+/// each branch rather than reconstructed from the source, because the details
+/// are not guessable: the tensor is `torch.FloatTensor[64]` with square
+/// brackets while the window is `torch.FloatTensor{[16]}` with braces around
+/// the brackets; `normalized` prints as `0`/`1` and `onesided` as
+/// `None`/`0`/`1`; and `win_length` shows the *resolved* default, so
+/// `n_fft=0` prints `win_length=0`.
+#[allow(clippy::too_many_arguments)]
+fn stft_call_desc(
+    input: &PyTensorBase,
+    n_fft: i64,
+    hop: i64,
+    win: i64,
+    window: &Option<PyTensorBase>,
+    normalized: bool,
+    onesided: Option<bool>,
+    return_complex: Option<bool>,
+    align_to_window: Option<bool>,
+) -> String {
+    fn tri(v: Option<bool>) -> String {
+        match v {
+            None => "None".to_string(),
+            Some(b) => (b as i32).to_string(),
+        }
+    }
+    let dims = input.dims();
+    let shape: Vec<String> = dims.iter().map(|d| d.to_string()).collect();
+    let self_desc = format!(
+        "torch.{}Tensor[{}]",
+        scalar_type_name(input.tag()),
+        shape.join(", ")
+    );
+    let window_desc = match window {
+        None => "None".to_string(),
+        Some(w) => {
+            let wd: Vec<String> = w.dims().iter().map(|d| d.to_string()).collect();
+            format!(
+                "torch.{}Tensor{{[{}]}}",
+                scalar_type_name(w.tag()),
+                wd.join(", ")
+            )
+        }
+    };
+    format!(
+        "stft({self_desc}, n_fft={n_fft}, hop_length={hop}, win_length={win}, \
+         window={window_desc}, normalized={}, onesided={}, return_complex={}, \
+         align_to_window={})",
+        normalized as i32,
+        tri(onesided),
+        tri(return_complex),
+        tri(align_to_window)
+    )
+}
+
+/// `aten::stft` and `aten::stft.center` -- **the deliverable of docs/FFT.md.**
+///
+/// ```text
+/// aten::stft(Tensor self, int n_fft, int? hop_length=None, int? win_length=None,
+///            Tensor? window=None, bool normalized=False, bool? onesided=None,
+///            bool? return_complex=None, bool? align_to_window=None) -> Tensor
+/// aten::stft.center(Tensor self, int n_fft, int? hop_length=None,
+///            int? win_length=None, Tensor? window=None, bool center=True,
+///            str pad_mode="reflect", bool normalized=False, bool? onesided=None,
+///            bool? return_complex=None, bool? align_to_window=None) -> Tensor
+/// ```
+///
+/// **`torch.stft` reaches the `default` overload, not `center`.**
+/// `torch/functional.py:672-680` does the centring *in Python* -- `input.view`,
+/// `F.pad(..., pad_mode)`, `input.view` -- and then calls `_VF.stft` with the
+/// nine-argument form. So `aten::stft.center` is not on `torch.stft`'s path at
+/// all; it is here because it is a real upstream overload with a real schema,
+/// and because implementing it lets the centred transform be exercised at the
+/// aten level while `torch._C._nn.pad`'s `reflect` branch is still missing from
+/// `bootstrap.py` (docs/PAD.md §5, docs/FFT.md §6).
+///
+/// The framing, which is the half of this op that is not the transform:
+///
+/// ```text
+/// hop_length  defaults to n_fft // 4       win_length defaults to n_fft
+/// n_frames    1 + (len - n_fft) / hop
+/// frames      (batch, n_frames, n_fft), frame f starting at f * hop
+/// window      centred inside n_fft when win_length < n_fft: left = (n_fft - win_length) / 2
+/// transform   _fft_r2c(frames, dim=[-1], normalization = normalized ? 1 : 0, onesided)
+/// layout      transpose to (batch, n_freq, n_frames), squeeze the batch if the input was 1-D
+/// ```
+///
+/// Two of those are the kind that produce a plausible wrong answer rather than
+/// an error, and both are measured rather than assumed:
+///
+/// * **`normalized=True` is normalisation code `1` (`1 / sqrt(n_fft)`), not
+///   `2`.** Traced: `torch.stft(..., normalized=True)` reaches
+///   `aten._fft_r2c.default(frames, [2], 1, True)`. Code `2` would scale every
+///   bin by `1 / n_fft` -- a uniform factor, and therefore an error that still
+///   looks like a spectrum.
+/// * **`onesided` defaults to `True`** for a real input, giving `n_fft / 2 + 1`
+///   rows. A full-length output has the right rank and the right dtype.
+///
+/// **This shim's frame extraction is a gather, where upstream's is
+/// `as_strided`.** Upstream's frames alias the input's storage; these are
+/// copied. That is a narrowing in the same family as
+/// `view_as_complex`'s (docs/COMPLEX2.md §6.1) and it is unobservable for the
+/// same reason: the next thing that happens to the frames is `mul` by the
+/// window, and nothing in this shim can write through them in between. It is
+/// also why `aten.as_strided.default` is still unimplemented after this round
+/// -- `stft` was the caller that wanted it, and it does not need it here.
+fn stft_kernel(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+    op: &'static str,
+    has_center: bool,
+) -> PyResult<Py<PyAny>> {
+    let input = tensor_arg(op, args, kwargs, 0, "self")?;
+    let n_fft: i64 = required(op, args, kwargs, 1, "n_fft")?.extract()?;
+    let hop = int_arg(args, kwargs, 2, "hop_length")?.unwrap_or(n_fft / 4);
+    let win = int_arg(args, kwargs, 3, "win_length")?.unwrap_or(n_fft);
+    let window = optional_tensor_arg(op, args, kwargs, 4, "window")?;
+    let (center, pad_mode, base) = if has_center {
+        (
+            bool_arg(args, kwargs, 5, "center")?.unwrap_or(true),
+            match optional(args, kwargs, 6, "pad_mode")? {
+                Some(v) if !v.is_none() => v.extract::<String>()?,
+                _ => "reflect".to_string(),
+            },
+            7usize,
+        )
+    } else {
+        (false, "reflect".to_string(), 5usize)
+    };
+    let normalized = bool_arg(args, kwargs, base, "normalized")?.unwrap_or(false);
+    let onesided = bool_arg(args, kwargs, base + 1, "onesided")?;
+    let return_complex = bool_arg(args, kwargs, base + 2, "return_complex")?;
+    let align_to_window = bool_arg(args, kwargs, base + 3, "align_to_window")?;
+
+    // **First, and before anything else looks at the tensor.** Measured: an
+    // 8-element signal with `n_fft=16` and an integral input BOTH report this
+    // rather than their own defect, so this check is ahead of the shape and
+    // dtype ones and not merely near them.
+    if return_complex.is_none() && !input.is_complex_repr() {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "stft requires the return_complex parameter be given for real inputs, \
+             and will further require that return_complex=True in a future PyTorch \
+             release.",
+        ));
+    }
+    let desc = || {
+        stft_call_desc(
+            &input, n_fft, hop, win, &window, normalized, onesided, return_complex,
+            align_to_window,
+        )
+    };
+    if center && align_to_window.is_some() {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "stft align_to_window should only be set when center = false.",
+        ));
+    }
+    let tag = input.tag();
+    if input.is_complex_repr() || tag.is_complex() {
+        return Err(not_implemented(format!(
+            "{op}: a complex input routes to aten::_fft_c2c upstream and this shim's \
+             stft is built on _fft_r2c only (docs/FFT.md §5). Real inputs are \
+             implemented."
+        )));
+    }
+    if !tag.is_floating_point() {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "{} : expected a tensor of floating point or complex values",
+            desc()
+        )));
+    }
+    let dims = input.tensor()?.dims().to_vec();
+    if dims.len() != 1 && dims.len() != 2 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "{} : expected a 1D or 2D tensor",
+            desc()
+        )));
+    }
+    let storage = PyDtype::new(tag).storage(op)?;
+    if !matches!(storage, candle_core::DType::F32 | candle_core::DType::F64) {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "expected scalar type Double but found {}",
+            scalar_type_name(tag)
+        )));
+    }
+
+    let device = input.tensor()?.device().clone();
+    let batch = if dims.len() == 2 { dims[0] } else { 1 };
+    let mut signal = input
+        .tensor()?
+        .reshape((batch, dims[dims.len() - 1]))
+        .map_err(|e| candle_err(op, e))?;
+
+    if center {
+        let pad = n_fft / 2;
+        let mode = match pad_mode.as_str() {
+            "reflect" => PadMode::Reflect,
+            "replicate" => PadMode::Replicate,
+            other => {
+                return Err(not_implemented(format!(
+                    "{op}: pad_mode={other:?} -- 'reflect' and 'replicate' are \
+                     implemented; 'circular' is a new_empty/slice/copy_ composite \
+                     upstream (docs/PAD.md §3) and 'constant' has no aten kernel on \
+                     this path"
+                )));
+            }
+        };
+        if pad > 0 {
+            signal = pad_axis_gather(op, &signal, 1, pad, pad, mode)?;
+        }
+    }
+    let len = signal.dims()[1] as i64;
+
+    // The four refusals, in upstream's order, each transcribed from a run.
+    // **`0 < n_fft < len` is what the message says and `n_fft <= len` is what
+    // it enforces** -- `stft(randn(16), n_fft=16)` computes and returns a
+    // single frame. The message is reproduced with its own bound rather than
+    // corrected, because a caller matching on the text gets upstream's text.
+    if n_fft <= 0 || n_fft > len {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "{} : expected 0 < n_fft < {len}, but got n_fft={n_fft}",
+            desc()
+        )));
+    }
+    if hop <= 0 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "{} : expected hop_length > 0, but got hop_length={hop}",
+            desc()
+        )));
+    }
+    if win <= 0 || win > n_fft {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "{} : expected 0 < win_length <= n_fft, but got win_length={win}",
+            desc()
+        )));
+    }
+    if let Some(w) = &window {
+        let wd = w.tensor()?.dims().to_vec();
+        if wd.len() != 1 || wd[0] as i64 != win {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "{} : expected a 1D window tensor of size equal to win_length={win}, \
+                 but got window with size {wd:?}",
+                desc()
+            )));
+        }
+    }
+
+    let n_fft_u = n_fft as usize;
+    let n_frames = (1 + (len - n_fft) / hop) as usize;
+
+    // The frames. Upstream is `as_strided`; this is the same index arithmetic
+    // written as a gather (see the doc comment).
+    let idx: Vec<u32> = (0..n_frames)
+        .flat_map(|f| (0..n_fft_u).map(move |k| (f as i64 * hop) as u32 + k as u32))
+        .collect();
+    let index =
+        Tensor::from_vec(idx, n_frames * n_fft_u, &device).map_err(|e| candle_err(op, e))?;
+    let mut frames = signal
+        .index_select(&index, 1)
+        .and_then(|t| t.reshape((batch, n_frames, n_fft_u)))
+        .map_err(|e| candle_err(op, e))?;
+
+    if let Some(w) = &window {
+        // `win_length < n_fft` centres the window inside the frame, with the
+        // odd element going to the RIGHT (`left = (n_fft - win) / 2`, floor).
+        let wt = w
+            .tensor()?
+            .to_dtype(storage)
+            .and_then(|t| t.contiguous())
+            .map_err(|e| candle_err(op, e))?;
+        let wt = if (win as usize) < n_fft_u {
+            let left = (n_fft_u - win as usize) / 2;
+            let right = n_fft_u - win as usize - left;
+            let mut parts = Vec::new();
+            if left > 0 {
+                parts.push(Tensor::zeros(left, storage, &device).map_err(|e| candle_err(op, e))?);
+            }
+            parts.push(wt);
+            if right > 0 {
+                parts.push(Tensor::zeros(right, storage, &device).map_err(|e| candle_err(op, e))?);
+            }
+            Tensor::cat(&parts, 0).map_err(|e| candle_err(op, e))?
+        } else {
+            wt
+        };
+        frames = frames
+            .broadcast_mul(&wt)
+            .map_err(|e| candle_err(op, e))?;
+    }
+
+    // `normalized` is normalisation code 1 (1/sqrt(n)), traced -- not code 2.
+    let onesided = onesided.unwrap_or(true);
+    // The host readback, written out here rather than behind a helper -- see
+    // `fft_r2c_default`'s note. `frames` is already contiguous with the
+    // transformed axis last, so the permutation is the identity.
+    let frame_dims = frames.dims().to_vec();
+    let flat = frames
+        .contiguous()
+        .and_then(|t| t.to_dtype(candle_core::DType::F64))
+        .and_then(|t| t.flatten_all())
+        .and_then(|t| t.to_vec1::<f64>())
+        .map_err(|e| candle_err(op, e))?;
+    let (re, im) = fft_one_axis_r2c(
+        op,
+        &frame_dims,
+        2,
+        flat,
+        onesided,
+        if normalized { 1 } else { 0 },
+        storage,
+        &device,
+    )?;
+    // (batch, n_frames, n_freq) -> (batch, n_freq, n_frames), and drop the
+    // batch axis the 1-D form invented.
+    let shape_fix = |t: &Tensor| -> PyResult<Tensor> {
+        let t = t.transpose(1, 2).and_then(|t| t.contiguous());
+        let t = if dims.len() == 1 {
+            t.and_then(|t| t.squeeze(0))
+        } else {
+            t
+        };
+        t.map_err(|e| candle_err(op, e))
+    };
+    let re = shape_fix(&re)?;
+    let im = shape_fix(&im)?;
+
+    if return_complex == Some(true) {
+        PyTensorBase::complex(re, im)?
+            .into_pyobject(py)
+            .map(|b| b.into_any().unbind())
+    } else {
+        // `return_complex=False` is `view_as_real` of the complex answer: a
+        // trailing axis of 2. This is the form the golden harness can compare,
+        // because it is real on both sides (docs/FFT.md §3).
+        let stacked = Tensor::stack(&[&re, &im], re.dims().len()).map_err(|e| candle_err(op, e))?;
+        finish(py, stacked, tag)
+    }
+}

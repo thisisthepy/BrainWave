@@ -23515,6 +23515,160 @@ def _pad_nd_cases(op: str, mode: str, ndim: int):
     return build
 
 
+def _stft_cases(op: str, centred: bool):
+    """`aten.stft.default` / `aten.stft.center` -- docs/FFT.md.
+
+    **These are golden-comparable only in the `return_complex=False` form**, and
+    that is the whole reason `stft` is on this list while the three `_fft_*`
+    kernels under it are parked. `return_complex=False` is `view_as_real` of the
+    complex answer: a real tensor with a trailing axis of 2, dense on both
+    sides, which is exactly what the harness reads. `return_complex=True`
+    returns a `Repr::Complex` here and a `complex64` upstream, and there is no
+    dense storage on either side for a comparison to look at.
+
+    So every case below passes `return_complex=False`. The transform is not
+    unmeasured by that -- the trailing 2 carries both halves, so a dropped or
+    conjugated imaginary part fails these cases exactly as it fails
+    `pytests/test_fft.py`.
+
+    The signal is asymmetric and non-periodic on purpose. A symmetric input has
+    a real spectrum, and a conjugation error is invisible in one.
+    """
+    def build(torch_module, c_module, torch_call) -> list[Case]:
+        cases: list[Case] = []
+        n = 64
+        sig = [
+            round(2.0 * (((i * 37) % 71) / 71.0 - 0.5) + 0.01 * i, 6)
+            for i in range(n)
+        ]
+
+        def hann(m):
+            import math
+            return [round(0.5 - 0.5 * math.cos(2.0 * math.pi * i / m), 6)
+                    for i in range(m)]
+
+        def case(name, flat, shape, dtype_name, rest, note, expect="match",
+                 window=None, window_len=None):
+            a_t, a_c = pair_from_flat(torch_module, c_module, flat, shape, dtype_name)
+            if window is None:
+                w_t = w_c = None
+            else:
+                w_t, w_c = pair_from_flat(torch_module, c_module, window,
+                                          (window_len,), dtype_name)
+            cases.append(
+                Case(
+                    name=f"{op} {name}",
+                    op=op,
+                    run_torch=lambda a=a_t, w=w_t, r=rest: torch_call(a, *_stft_args(r, w, centred)),
+                    run_c=lambda a=a_c, w=w_c, r=rest: c_module._aten_dispatch(
+                        op, a, *_stft_args(r, w, centred)),
+                    expect=expect,
+                    note=note,
+                )
+            )
+
+        w16 = hann(16)
+        # (n_fft, hop, win_length, normalized, onesided)
+        case("n_fft=16 hop=4 hann, onesided", sig, (n,), "float32",
+             (16, 4, 16, False, True), "the ordinary case: 9 bins x 13 frames, "
+             "reported as a trailing axis of 2", window=w16, window_len=16)
+        case("normalized=True is 1/sqrt(n_fft)", sig, (n,), "float32",
+             (16, 4, 16, True, True),
+             "normalisation code 1, not 2 -- code 2 would divide by 16 rather "
+             "than 4, a uniform factor that still looks like a spectrum",
+             window=w16, window_len=16)
+        case("onesided=False keeps all n_fft bins", sig, (n,), "float32",
+             (16, 4, 16, False, False),
+             "16 rows rather than 9; a onesided kernel that ignored the flag "
+             "would return a self-consistent half", window=w16, window_len=16)
+        case("no window (rectangular)", sig, (n,), "float32",
+             (16, 4, 16, False, True),
+             "upstream warns and applies a rectangular window; the frames are "
+             "unmultiplied")
+        case("win_length 8 < n_fft 16, centred in the frame", sig, (n,),
+             "float32", (16, 4, 8, False, True),
+             "left = (16 - 8) // 2 = 4; a window placed at offset 0 gives a "
+             "different spectrum of the same shape", window=hann(8), window_len=8)
+        case("win_length 7, odd padding goes RIGHT", sig, (n,), "float32",
+             (16, 4, 7, False, True),
+             "left = 4, right = 5. Either split has the same shape",
+             window=hann(7), window_len=7)
+        case("hop=1, maximal overlap", sig, (n,), "float32",
+             (16, 1, 16, False, True), "49 frames; an off-by-one in "
+             "1 + (len - n_fft) / hop shows up here first",
+             window=w16, window_len=16)
+        case("hop=16, no overlap", sig, (n,), "float32",
+             (16, 16, 16, False, True), "4 frames, disjoint",
+             window=w16, window_len=16)
+        case("n_fft=20 is not a power of two (Bluestein)", sig, (n,), "float32",
+             (20, 5, 20, False, True),
+             "whisper's n_fft is 400 and also not a power of two (docs/FFT.md "
+             "§4); this is the same path at a size the harness can afford",
+             window=hann(20), window_len=20)
+        case("float64", sig, (n,), "float64", (16, 4, 16, False, True),
+             "components come out float64, so the trailing-2 tensor does too",
+             window=hann(16), window_len=16)
+        case("batched (2, 64)", sig + [round(v * 0.5 + 1.0, 6) for v in sig],
+             (2, n), "float32", (16, 4, 16, False, True),
+             "the leading axis is kept; the 1-D form squeezes one that was "
+             "invented", window=w16, window_len=16)
+        case("n_fft == the signal length: one frame", sig, (n,), "float32",
+             (64, 4, 64, False, True),
+             "upstream's message says `0 < n_fft < 64` and upstream computes "
+             "this anyway -- the bound it enforces is `<=`",
+             window=hann(64), window_len=64)
+
+        # Refusals, each transcribed from a run of upstream.
+        case("n_fft > the signal length", sig[:8], (8,), "float32",
+             (16, 4, 16, False, True),
+             "expected 0 < n_fft < 8, but got n_fft=16", expect="both_error",
+             window=w16, window_len=16)
+        case("hop_length = 0", sig, (n,), "float32", (16, 0, 16, False, True),
+             "expected hop_length > 0", expect="both_error",
+             window=w16, window_len=16)
+        case("win_length > n_fft", sig, (n,), "float32",
+             (16, 4, 20, False, True), "expected 0 < win_length <= n_fft",
+             expect="both_error", window=hann(20), window_len=20)
+        case("window is not win_length long", sig, (n,), "float32",
+             (16, 4, 16, False, True),
+             "expected a 1D window tensor of size equal to win_length=16",
+             expect="both_error", window=hann(8), window_len=8)
+        case("rank 3 input", sig + sig + sig + sig, (2, 2, n), "float32",
+             (16, 4, 16, False, True), "expected a 1D or 2D tensor",
+             expect="both_error", window=w16, window_len=16)
+        case("integral input", [float(v) for v in range(n)], (n,), "int64",
+             (16, 4, 16, False, True),
+             "expected a tensor of floating point or complex values",
+             expect="both_error", window=w16, window_len=16)
+        case("float16 input", sig, (n,), "float16", (16, 4, 16, False, True),
+             "expected scalar type Double but found Half -- upstream's own "
+             "wording, which names Double rather than what it can take",
+             expect="both_error", window=hann(16), window_len=16)
+        return cases
+
+    return build
+
+
+def _stft_args(rest, window, centred):
+    """Positional arguments after `self`, for whichever overload is in play.
+
+    The two overloads differ by `center` and `pad_mode` sitting between
+    `window` and `normalized`, which is exactly the kind of shift that makes
+    `normalized` arrive where `center` was expected -- a `bool` in a `bool`
+    slot, silently.
+    """
+    n_fft, hop, win, normalized, onesided = rest
+    head = [n_fft, hop, win, window]
+    tail = [normalized, onesided, False, None]   # return_complex=False
+    if centred:
+        # `center=False`: the centring itself is `torch.stft`'s own Python
+        # pad, not this overload's, and the golden harness has no reflect pad
+        # binding to reach (docs/PAD.md §5). What this exercises is the
+        # ARGUMENT SHIFT, which is what distinguishes the two overloads.
+        return head + [False, "reflect"] + tail
+    return head + tail
+
+
 def rms_norm_cases(torch_module, c_module, torch_call) -> list[Case]:
     """`aten.rms_norm.default` -- `nn.RMSNorm`, docs/VOICE.md §1 rank 16 (f5).
 
@@ -28044,6 +28198,8 @@ CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
     "aten.expm1.default": expm1_cases,
     "aten.constant_pad_nd.default": constant_pad_nd_cases,
     "aten.rms_norm.default": rms_norm_cases,
+    "aten.stft.default": _stft_cases("aten.stft.default", False),
+    "aten.stft.center": _stft_cases("aten.stft.center", True),
     "aten.reflection_pad1d.default": _pad_nd_cases("aten.reflection_pad1d.default", "reflect", 1),
     "aten.reflection_pad2d.default": _pad_nd_cases("aten.reflection_pad2d.default", "reflect", 2),
     "aten.reflection_pad3d.default": _pad_nd_cases("aten.reflection_pad3d.default", "reflect", 3),

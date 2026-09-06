@@ -25,6 +25,24 @@
   },
   "shape1_dead_overload_keys_ceiling": 110,
   "shape2_kernel_without_spelling": {
+    "aten._fft_c2c.default": {
+      "reason": "Upstream has `torch._fft_c2c` (it is a `_VariableFunctions` member) but no `Tensor._fft_c2c`, and this shim deliberately does NOT put a row in `overloads.json` for it. The reason is not that upstream lacks the door -- it is that the door nobody uses is not the one that reaches this kernel: `torch.fft.rfft`/`fft`/`ifft`/`irfft` are C++-level composites that land on `aten::_fft_c2c` through the dispatcher, and `torch.stft` reaches it through `aten::stft`, which IS spelled and IS exercised. Adding `torch._fft_c2c` would add a spelling with no measured caller, which docs/SPELLINGS.md prices as surface. The kernel is proven element-wise against a live upstream in `pytests/test_fft.py` and, through `aten.stft.*`, by the golden harness. Delete this entry if a caller for the bare spelling is found.",
+      "upstream_absent": [
+        "torch.Tensor._fft_c2c"
+      ]
+    },
+    "aten._fft_c2r.default": {
+      "reason": "Upstream has `torch._fft_c2r` (it is a `_VariableFunctions` member) but no `Tensor._fft_c2r`, and this shim deliberately does NOT put a row in `overloads.json` for it. The reason is not that upstream lacks the door -- it is that the door nobody uses is not the one that reaches this kernel: `torch.fft.rfft`/`fft`/`ifft`/`irfft` are C++-level composites that land on `aten::_fft_c2r` through the dispatcher, and `torch.stft` reaches it through `aten::stft`, which IS spelled and IS exercised. Adding `torch._fft_c2r` would add a spelling with no measured caller, which docs/SPELLINGS.md prices as surface. The kernel is proven element-wise against a live upstream in `pytests/test_fft.py` and, through `aten.stft.*`, by the golden harness. Delete this entry if a caller for the bare spelling is found.",
+      "upstream_absent": [
+        "torch.Tensor._fft_c2r"
+      ]
+    },
+    "aten._fft_r2c.default": {
+      "reason": "Upstream has `torch._fft_r2c` (it is a `_VariableFunctions` member) but no `Tensor._fft_r2c`, and this shim deliberately does NOT put a row in `overloads.json` for it. The reason is not that upstream lacks the door -- it is that the door nobody uses is not the one that reaches this kernel: `torch.fft.rfft`/`fft`/`ifft`/`irfft` are C++-level composites that land on `aten::_fft_r2c` through the dispatcher, and `torch.stft` reaches it through `aten::stft`, which IS spelled and IS exercised. Adding `torch._fft_r2c` would add a spelling with no measured caller, which docs/SPELLINGS.md prices as surface. The kernel is proven element-wise against a live upstream in `pytests/test_fft.py` and, through `aten.stft.*`, by the golden harness. Delete this entry if a caller for the bare spelling is found.",
+      "upstream_absent": [
+        "torch.Tensor._fft_r2c"
+      ]
+    },
     "aten.alias.default": {
       "reason": "Upstream exposes no `torch.alias` and no `Tensor.alias` -- `aten::alias` is a dispatcher-internal view op that upstream's own Python surface never names. Inventing a spelling for it would be exactly what docs/SPELLINGS.md refuses (a door upstream does not have). The kernel is reached, and needs to be, through `_aten_dispatch` from traced/exported graphs and through the vendored `__getitem__`'s view path.",
       "upstream_absent": [
