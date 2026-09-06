@@ -137,9 +137,6 @@
     "erf_": {
       "reason": "backlog: the kernel is golden-compared by dispatch key, but no test spells the name. docs/REACH.md §3."
     },
-    "expand": {
-      "reason": "backlog: the kernel is golden-compared by dispatch key, but no test spells the name. docs/REACH.md §3."
-    },
     "expm1_": {
       "reason": "backlog: the kernel is golden-compared by dispatch key, but no test spells the name. docs/REACH.md §3."
     },
@@ -195,9 +192,6 @@
       "reason": "backlog: the kernel is golden-compared by dispatch key, but no test spells the name. docs/REACH.md §3."
     },
     "one_hot": {
-      "reason": "backlog: the kernel is golden-compared by dispatch key, but no test spells the name. docs/REACH.md §3."
-    },
-    "permute": {
       "reason": "backlog: the kernel is golden-compared by dispatch key, but no test spells the name. docs/REACH.md §3."
     },
     "reciprocal_": {

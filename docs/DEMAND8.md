@@ -305,6 +305,14 @@ is a real numeric one rather than a shape check.
 **Four newly pass; `rwkv` moved rather than passed.** `ndimension` closed and the next name in
 `rwkv`'s path is `TensorBase.new_empty` — an open gap for a following round, not a regression.
 
+> **Closed in the following round — docs/PRIMS.md §6.** `new_empty` had a second name behind it
+> (`torch.maximum`), which nothing could see until the first was closed. Both landed, and `rwkv`
+> now forwards and matches upstream: 256 elements, max abs diff 7.15e-07 at scale 2.17. The row
+> above is left as it was measured; the qualification that round added is that the two sides are
+> given the *same* weights rather than initialised alike, because `_init_weights` calls
+> `nn.init.orthogonal_` and this shim has no `torch.linalg.qr`. That is the next wall, and it is
+> in construction rather than in the forward.
+
 That each op is genuinely on its model's path was **counted, not inferred from the refusal
 disappearing**: with the four names wrapped in counters, one shim run recorded
 `_nn.upsample_bicubic2d` 2 calls (`yolos`), `TensorBase.index_add_` 11 calls

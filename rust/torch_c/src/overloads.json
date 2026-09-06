@@ -734,6 +734,9 @@
   "max_pool2d": [
     "aten::max_pool2d(Tensor self, int[2] kernel_size, int[2] stride=[], int[2] padding=0, int[2] dilation=1, bool ceil_mode=False) -> Tensor"
   ],
+  "maximum": [
+    "aten::maximum(Tensor self, Tensor other) -> Tensor"
+  ],
   "max": [
     "aten::max(Tensor self) -> Tensor",
     "aten::max.other(Tensor self, Tensor other) -> Tensor",
