@@ -669,6 +669,19 @@
     "aten::erf.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)",
     "aten::erf(Tensor self) -> Tensor"
   ],
+  "erfinv": [
+    "aten::erfinv(Tensor self) -> Tensor"
+  ],
+  "eye": [
+    "aten::eye.m(SymInt n, SymInt m, *, ScalarType? dtype=None, Layout? layout=None, Device? device=None, bool? pin_memory=None) -> Tensor",
+    "aten::eye(SymInt n, *, ScalarType? dtype=None, Layout? layout=None, Device? device=None, bool? pin_memory=None) -> Tensor"
+  ],
+  "index_add": [
+    "aten::index_add(Tensor self, int dim, Tensor index, Tensor source, *, Scalar alpha=1) -> Tensor"
+  ],
+  "scatter_reduce": [
+    "aten::scatter_reduce.two(Tensor self, int dim, Tensor index, Tensor src, str reduce, *, bool include_self=True) -> Tensor"
+  ],
   "erf_": [
     "aten::erf_(Tensor(a!) self) -> Tensor(a!)"
   ],
@@ -789,6 +802,10 @@
   "bitwise_and": [
     "aten::bitwise_and.Tensor(Tensor self, Tensor other) -> Tensor",
     "aten::bitwise_and.Scalar(Tensor self, Scalar other) -> Tensor"
+  ],
+  "bitwise_xor": [
+    "aten::bitwise_xor.Tensor(Tensor self, Tensor other) -> Tensor",
+    "aten::bitwise_xor.Scalar(Tensor self, Scalar other) -> Tensor"
   ],
   "bitwise_or": [
     "aten::bitwise_or.Tensor(Tensor self, Tensor other) -> Tensor",

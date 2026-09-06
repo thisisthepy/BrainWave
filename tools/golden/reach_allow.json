@@ -14,7 +14,15 @@
     "docs/SPELLINGS.md's deliberate gaps would otherwise become indistinguishable",
     "from forgotten ones."
   ],
-  "shape1_no_dispatch_arm": {},
+  "shape1_no_dispatch_arm": {
+    "methods:as_strided": {
+      "reason": "Listed in methods.json with NO kernel, on purpose, so that `x.as_strided(size, stride)` refuses by the name of the aten overload it resolved to (`aten.as_strided.default`) rather than by 'no matching signature' -- `clamp.Tensor`'s pattern, one level up. The absent thing is not effort but a constructor: `as_strided` is by definition a VIEW over raw strides, and candle 0.11.0 exposes no way to build a Tensor over an existing storage with arbitrary strides. `Layout::new(shape, stride, offset)` is public, but the only public path that reaches it is `Tensor::from_storage`, which takes an OWNED `Storage` and documents 'this uses contiguous strides'; `Tensor { storage: Arc<RwLock<Storage>>, layout }` is private and `same_storage` is `pub(crate)`. So the aliasing the op promises cannot be produced. A materialising gather would return the right values for `longformer`'s read-only `_chunk` (modeling_longformer.py:719) and silently wrong ones for any writer -- the divergence shape docs/VULKAN2.md says must be unrepresentable rather than merely unused, and the one docs/VIEWS.md 6.4 already carries for `slice.Tensor` step>1 and `view.dtype`. Sizing it properly means the same work those two need: a stride-carrying tensor wrapper in this crate, or a candle patch exposing a storage-sharing constructor. docs/TAIL3.md 6. Delete this entry the day either lands.",
+      "upstream_present": [
+        "torch.Tensor.as_strided",
+        "torch.as_strided"
+      ]
+    }
+  },
   "shape1_dead_overload_keys_ceiling": 110,
   "shape2_kernel_without_spelling": {
     "aten.alias.default": {
