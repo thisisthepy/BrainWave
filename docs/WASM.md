@@ -1522,3 +1522,213 @@ EM_CACHE=/Volumes/macMini/caches/emcc-scratch and cargo-target-emcc-torchc absor
 | §7's implicit scope | only `rust/wasm_probe` was ever run under emscripten | `rust/torch_c` itself now builds for `wasm32-unknown-emscripten` unmodified (§8.3) — a question §7 never asked |
 | this section's own §8.3, first draft | "blocked at dependency resolution" for `rust/torch_c` | **wrong, corrected in place** (§8.3) — it built on the first real attempt; the guess was never run before being written, which is exactly the CLAUDE.md §5.5 mistake this document otherwise tries to avoid |
 | §5b's suggested README rows | "extension builds: emscripten builds, loads and runs under Node" | should now read **loads into a real CPython, and reaches `import torch` with a real forward pass** — a materially stronger claim than "runs under Node" |
+
+---
+
+# 9. A wheel — built, installed, and imported
+
+§8 ended with `import torch` and two computed ops inside real Pyodide, and with the sentence
+"there is still no WASM wheel". That sentence is now wrong. **A `pyemscripten` wheel of this
+distribution was built, installed into a real Pyodide 3.14.2, and `import torch` came up out of
+it and computed.** The artefact under test was `rust/torch_c` built from this worktree's HEAD, not
+§8's month-old one.
+
+The question this section was opened to answer was "which loader — Pyodide or a statically linked
+wasi CPython". §8 had already answered *loader*. What was left was **distribution**, and the
+surprise is how little of it was missing.
+
+## 9.1 The result, stated first
+
+```
+wheel   torchnative-0.0.12a0-cp313-abi3-pyemscripten_2026_0_wasm32.whl      13,161,912 B
+host    Pyodide 314.0.6 · CPython 3.14.2 · Emscripten 5.0.3 · Node 24.19.0
+run     TORCH 2.13.0
+        MM      [[3.0, 3.0, 3.0, 3.0], [3.0, 3.0, 3.0, 3.0]]        torch.ones(2,3) @ torch.ones(3,4)
+        LINEAR  (1, 2)  [[-0.18123117089271545, -0.034667909145355225]]     manual_seed(0)
+        FILE    /lib/python3.14/site-packages/torch/_C.abi3.so
+```
+
+The `LINEAR` value is bit-identical to the one produced by the **8-30** `_C.wasm` of §8 through the
+same seed, so two independently built wasm artefacts a week apart agree. `_C.wasm` grew
+3,261,949 → 4,724,414 B over that week; the crate did, not the target.
+
+## 9.2 The four things the wheel had to carry, and only one of them was new
+
+Assembled member by member against the vendored tree, each wall found by running into it:
+
+| # | wall | what fixed it | size |
+|---|---|---|---|
+| 1 | `ModuleNotFoundError: typing_extensions` | the six `pyproject.toml` dependencies; five are in Pyodide's index | none — `micropip` resolves them |
+| 2 | `OSError: could not load dynamic lib .../torch/lib/libtorch_global_deps.so` | an **empty side module built by `emcc`** | one `cc()` — see §9.4 |
+| 3 | `RuntimeError: Unable to find torch_shm_manager` | the empty marker `vendor/install_shim.sh:52` already places | none |
+| 4 | `ModuleNotFoundError: _multiprocessing` | §8.3c's stub, still diagnostic, still not landed | **unsolved — §9.5** |
+
+Wall 2 is the one that is genuinely target-specific and the one a wheel *must* solve, because
+`_load_global_deps()` runs at `torch/__init__.py:444` before anything else. §8 got past it a
+different way — `TORCH_USE_RTLD_GLOBAL=1`, an environment variable the caller sets. **A wheel does
+not get to set an environment variable in its consumer's process.** Carrying a real
+`torch/lib/libtorch_global_deps.so` removes that off-switch from the recipe entirely; the §9.1 run
+sets no `TORCH_USE_RTLD_GLOBAL` at all. That is a strict improvement on §8's recipe and it is the
+reason the wheel shape is worth more than the scratch-tree shape it replaces.
+
+The stub that worked:
+
+```sh
+export EM_CACHE=/tmp/em-cache-wasm      # never the shared emsdk cache
+echo 'int torchnative_global_deps_stub(void){return 0;}' > empty.c
+emcc -shared -fPIC -fwasm-exceptions -sSIDE_MODULE=2 -o libtorch_global_deps.so empty.c
+```
+
+293 bytes. `-fwasm-exceptions` because §7.4a made it mandatory for *every* module in the process,
+side modules included; `-sSIDE_MODULE=2` because `ctypes.CDLL` on Emscripten is `dlopen` on a side
+module and a main-module link is not loadable.
+
+## 9.3 The finding that inverts §3c and §7.7: **`abi3` needs no change at all**
+
+§3c and §7.7 concluded that Emscripten voids `abi3-py313`, and the natural reading of that — the
+one this section started with — is that a wasm wheel must be tagged `cp314-cp314` and must rename
+its member to Pyodide's `EXT_SUFFIX`. **Both halves are false, and `packaging` on the target says
+so.** Read off the real interpreter:
+
+```
+sysconfig.get_platform()        emscripten-5.0.3-wasm32
+EXT_SUFFIX                      .cpython-314-wasm32-emscripten.so
+importlib EXTENSION_SUFFIXES    ['.cpython-314-wasm32-emscripten.so', '.abi3.so', '.so']
+packaging.tags.sys_tags()       110 tags, including
+                                  cp314-cp314-pyemscripten_2026_0_wasm32
+                                  cp314-abi3-pyemscripten_2026_0_wasm32
+                                  cp313-abi3-pyemscripten_2026_0_wasm32   <-- ours
+```
+
+- `.abi3.so` **is** in the target's suffix table, so `torch/_C.abi3.so` — `Target.extension_member`
+  exactly as it stands — is found. No `extension_member` override, unlike Windows.
+- `cp313-abi3-pyemscripten_2026_0_wasm32` **is** a tag this interpreter accepts, so `setup.py`'s
+  `py_limited_api = "cp313"` needs no per-target exception.
+
+Both were verified by building the wheel that way and importing it (§9.1), after first building
+the `cp314-cp314` + `EXT_SUFFIX`-named variant and finding it works too. Two spellings, one result.
+
+**§7.7 is still right about what it actually claimed** and this does not overturn it: the platform
+tag `pyemscripten_2026_0` pins CPython 3.14 *and* Emscripten 5.0.3 together, so the wheel is
+single-platform whatever the ABI field says. The correction is narrower and worth having: `abi3`
+here is **inert, not harmful**. It buys nothing, it costs nothing, and — this is the part that
+matters for `tools/wheel/` — it means the wasm wheel is the *only* one of the seven targets that
+needs no ABI-tag machinery, because the pin it would have needed is already carried by the
+platform tag beside it.
+
+## 9.4 What `tools/wheel/build.py` would need — sized
+
+Nothing was landed there. §4a guessed "the same shape of work as the two that exist"; having built
+the wheel by hand, that guess is right, and here is the itemised version. A `PyEmscriptenTarget`
+needs the three answers `Target` asks for and no fourth:
+
+| `Target` member | for wasm | size |
+|---|---|---|
+| `artefact` | `wasm32-unknown-emscripten/release/_C.wasm` — note `.wasm`, not `.so`; cargo does not apply the Emscripten convention | one string |
+| `extension_member` | **inherit** `torch/_C.abi3.so` (§9.3) | zero |
+| `global_deps_name` | inherit `libtorch_global_deps.so` | zero |
+| `cc()` | `[emcc, "-shared", "-fPIC", "-fwasm-exceptions", "-sSIDE_MODULE=2"]` — the two extra flags are the whole difference from `AndroidTarget.cc()` | ~10 lines |
+| `platform_tag()` | **`pyemscripten_{abi_version}_wasm32`** — see the trap below | ~15 lines |
+| `check_image()` | wasm magic `b"\0asm"` + version word. `tools/wheel/binfmt.py` has Mach-O, ELF and PE readers and **no wasm reader**; this is the only genuinely new code | ~20 lines in `binfmt.py`, ~10 here |
+| `sysconfig()` / `python_root` | see the trap below | ~5 lines, plus an unzip step |
+
+### 9.4a The trap: the tag is *not* derivable from the target's `_sysconfigdata`
+
+This is the dependency that is not the one anyone names, and it is a design-premise collision
+rather than a missing file. `build.py`'s stated principle, in its own header at line 55, is that
+
+> the tag [is] derived from the *target CPython distribution* rather than written down here
+
+and `Target.sysconfig()` implements that by `exec`-ing the target's `_sysconfigdata_*.py`. For
+Emscripten that file exists — it is `_sysconfigdata__emscripten_wasm32-emscripten.py`, inside
+Pyodide's `python_stdlib.zip` rather than loose on disk, so `target_sysconfig()`'s
+`root.glob("lib/python3.*/_sysconfigdata_*.py")` finds nothing until it is extracted. That part is
+a five-line fix.
+
+The part that is not a five-line fix: **the file does not contain the tag, and cannot.**
+`sysconfig.get_platform()` on the target answers `emscripten-5.0.3-wasm32`, which normalises to
+`emscripten_5_0_3_wasm32` — a *real* accepted tag (it is in `sys_tags()`, above) but the wrong one
+to publish, because it pins the compiler rather than the platform and nothing on PyPI is tagged
+that way. The tag to publish is `pyemscripten_2026_0_wasm32`, and `2026_0` is **Pyodide's**
+`PYODIDE_ABI_VERSION`, a number CPython's build never sees. It lives in exactly one machine-readable
+place in a distribution:
+
+```
+pyodide-lock.json  ->  info.abi_version = "2026_0"
+                       info.platform    = "emscripten_5_0_3"
+                       info.python      = "3.14.2"
+```
+
+So `PyEmscriptenTarget.platform_tag()` has to read `pyodide-lock.json`, not `_sysconfigdata`. It is
+still derived-from-the-distribution rather than written-down — the principle survives — but the
+distribution it derives from is Pyodide's, not CPython's, and that is a new *kind* of input to a
+file whose every existing target reads a CPython. Anyone who sets out to add this target by copying
+`AndroidTarget` will reach for `self.sysconfig()` first, find `emscripten_5_0_3_wasm32`, and it will
+work well enough to be believed.
+
+### 9.4b `verify_cross.py` is the larger half
+
+`build.py` is ~60 lines of new code. `tools/wheel/verify_cross.py` is 1043 lines built on ELF/Mach-O
+symbol tables (`elf_dynamic`, `elf_symbols`, `macho_info`) and its mutation suite at line 725
+drops members and asserts the checker notices. **A wasm module has none of those structures** — its
+imports and exports live in the wasm import/export sections, a different format from all three
+readers in `binfmt.py`. Sizing this honestly: a wasm import/export section reader is the piece of
+work, and it is bigger than the target itself. Until it exists a wasm wheel can be *built* by this
+repo but not *checked* by it, which is the condition every other target was deliberately not
+shipped in.
+
+## 9.5 What still blocks shipping, in order
+
+1. **`_multiprocessing` — unchanged from §8.3c, and a wheel makes it sharper, not softer.** Walls
+   1–3 all turned out to be things a wheel can carry. This one is not: the fix has to run *before*
+   `torch/__init__.py:2298`, so a wheel can only supply it by shipping a top-level `_multiprocessing`
+   module (which would shadow the real one on the other six platforms) or by patching vendored
+   upstream source. Both are decisions for whoever owns `docs/VENDOR.md`; neither was taken here,
+   and §9.1's run still used the harness stub. **This is the one thing standing between "a wheel
+   that works when the caller cooperates" and "a wheel".**
+2. `filelock` — one of the seven `pyproject.toml` dependencies, and the only one **absent from
+   Pyodide's package index entirely** (checked against all of `pyodide-lock.json`, not just the
+   `pyodide-core` subset). It is a pure-Python `py3-none-any` wheel, so `micropip` can take it from
+   PyPI; it just means a wasm install is not satisfiable from the Pyodide index alone. Small, but it
+   is the kind of thing found at install time by a user rather than here.
+3. `verify_cross.py` cannot inspect a wasm module (§9.4b).
+4. §1d's `simd128` remains off and upstream.
+
+Nothing on that list is `dlopen`, and nothing on it is CPython-shaped. The README's platform table
+still reads `wheel builds ❌ *WASI has no dlopen*`, which was true of the WASI column and was never
+true of the Emscripten one; that cell is now measurably wrong and belongs to whoever owns the README.
+
+## 9.6 Reproducing §9, and what was left where
+
+```sh
+export PATH="/Volumes/macMini/caches/emsdk/upstream/emscripten:\
+/Volumes/macMini/caches/emsdk/node/24.19.0_64bit/bin:$HOME/.cargo/bin:$PATH"
+export EM_CACHE=/tmp/em-cache-wasm                      # not the shared emsdk cache
+export CARGO_TARGET_DIR=/Volumes/macMini/caches/cargo-target-wasm-wheel
+
+cd rust/torch_c && cargo build --release --target wasm32-unknown-emscripten   # _C.wasm, 4,724,414 B
+# global-deps stub, as in §9.2
+# assemble the wheel: the four package roots from torchnative/src/main, plus
+#   torch/_C.abi3.so                       <- _C.wasm
+#   torch/lib/libtorch_global_deps.so      <- the emcc stub
+#   torch/bin/torch_shm_manager            <- empty
+#   dist-info WHEEL Tag: cp313-abi3-pyemscripten_2026_0_wasm32
+# then in Node: loadPyodide({indexURL}), loadPackage the five index deps,
+#   zipfile.extractall into /lib/python3.14/site-packages, install the §8.3c
+#   sys.modules stubs, import torch.
+```
+
+Scratch only, as §8 was: the wheel and the stub live in `/tmp`, the Node drivers are not committed,
+and nothing under `tools/wheel/` was modified — §9.4 sizes that work rather than starting it, because
+a `PyEmscriptenTarget` that `verify_cross.py` cannot check would read as progress it is not.
+
+`torchnative/src/main/torch/` was only ever *read* and copied. The shared emsdk was not written to:
+`EM_CACHE` absorbed the one `emcc` invocation, and the sysroot stamp it generated landed in
+`/tmp/em-cache-wasm`.
+
+## 9.7 Correction to §8.4
+
+The ladder's five rungs are unchanged, but rung 4's parenthetical — "needed the documented
+`TORCH_USE_RTLD_GLOBAL` off-switch" — is now avoidable rather than required. A wheel that carries
+`torch/lib/libtorch_global_deps.so` satisfies `_load_global_deps()` directly, and §9.1 ran with the
+variable unset. The stdlib stub for `multiprocessing` is still needed and is still the last wall.
