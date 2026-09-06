@@ -18348,9 +18348,29 @@ def test_the_quantizer_plugin_replaces_the_leaves_before_the_weights_land():
 
     assert r["plugin"]["shim"] and r["posthoc"]["shim"], "measured upstream, not the shim"
     saved = posthoc - plugin
+    # `peak_rss_MB` is a whole-process high-water mark, so it is the one number
+    # in this suite that other work on the machine can move. Measured: this
+    # assertion failed at load 5 with `saved` 27.1 of 68.0 MB, and passed twice
+    # in a row at load 3 immediately afterwards with nothing rebuilt. CLAUDE.md
+    # already says measurement runs must be solitary; the cost of ignoring that
+    # here is a gate that reddens during a merge and cannot be told apart from
+    # a real regression.
+    #
+    # So the failure names the load rather than only the megabytes, and a run
+    # above 4 says so first. The threshold is unchanged -- this is not a
+    # loosening, it is the message telling the reader which of the two things
+    # they are looking at.
+    try:
+        _load1m = os.getloadavg()[0]
+    except (AttributeError, OSError):
+        _load1m = None
+    _busy = _load1m is not None and _load1m > 4.0
     assert saved > 0.40 * dense_MB, (
         f"plugin peak {plugin:.1f} MB vs post-hoc {posthoc:.1f} MB: saved {saved:.1f} MB of "
         f"{dense_MB:.1f} MB of dense weight. The pre-load swap is not saving memory."
+        + (f" NOTE: 1-minute load average is {_load1m:.1f}. This is a peak-RSS"
+           " comparison and concurrent work moves it -- re-run this test alone"
+           " before treating it as a regression." if _busy else "")
     )
     # Below the *dense* load too, which is the stronger of the two: it says the
     # dense model was never assembled, not merely that it was taken apart.
