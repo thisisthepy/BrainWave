@@ -9269,7 +9269,26 @@ def test_core_ops_and_op_tags_agree():
     # landing the same day. This number is their sum, re-measured on the merged
     # tree rather than carried from any one branch, because each branch's count
     # was correct only against its own base.
-    assert r["tag_core_count"] == 117, r["tag_core_count"]
+    #
+    # 120 with docs/TAIL3.md. **+3 across six new keys**, and the three that
+    # do not appear are again the check that each was read rather than
+    # inferred from the round:
+    #
+    #     bitwise_xor.Tensor  ['core', 'pointwise', 'pt2_compliant_tag'] <- counted
+    #     bitwise_xor.Scalar  ['core', 'pointwise', 'pt2_compliant_tag'] <- counted
+    #     scatter_reduce.two  ['core', 'pt2_compliant_tag']              <- counted
+    #     erfinv.default      ['pointwise', 'pt2_compliant_tag']
+    #     index_add.default   ['pt2_compliant_tag']
+    #     view_as.default     ['pt2_compliant_tag']
+    #
+    # `scatter_reduce.two` being core while `scatter.src` beside it is not,
+    # and `erfinv` being pointwise-but-not-core while `bitwise_xor` is both,
+    # are upstream's table. `as_strided.default` IS core upstream and is
+    # deliberately absent: docs/TAIL3.md lists it in `methods.json` with no
+    # kernel, so it is not in `_aten_implemented()` and cannot be counted --
+    # the same reason `reshape_as.default` is absent two paragraphs up, from
+    # the other direction.
+    assert r["tag_core_count"] == 120, r["tag_core_count"]
 
 
 def test_decompose_lowers_the_op_capture_md_named():
@@ -10853,7 +10872,29 @@ def test_schema_text_survives_the_round_trip_through_the_transcribed_tables():
     # 310 on the merged tree. Same reason as `tag_core_count` above: four
     # rounds added schema identities in parallel and no branch could see the
     # others' totals, so this is measured here rather than summed from reports.
-    assert len(keys) == 322, len(keys)
+    # 329 with docs/TAIL3.md. **+7 across six implemented ops**, and the two
+    # halves of that arithmetic are separate checks:
+    #
+    #     bitwise_xor.Tensor, bitwise_xor.Scalar   both tables, 1 identity each
+    #     erfinv.default                           both tables, 1 identity
+    #     index_add.default                        both tables, 1 identity
+    #     scatter_reduce.two                       both tables, 1 identity
+    #     view_as.default                          methods.json only
+    #     as_strided.default                       methods.json only, NO kernel
+    #                                                                    -- 7
+    #
+    # `__xor__` adds none: it is a second spelling of `bitwise_xor.Tensor`/
+    # `.Scalar`, exactly as `__and__` and `__iadd__` before it, and this
+    # counts distinct `(qualname, overload)` pairs rather than table keys.
+    # `as_strided.default` DOES count even though nothing dispatches it, for
+    # `reshape_as.default`'s reason above: this fixture parses schema text and
+    # does not ask whether a kernel exists behind it.
+    #
+    # 331 with `eye.default` and `eye.m` -- the wall four lines behind the
+    # matmul fold in the same round (docs/TAIL3.md 1). +2 and not +4: both
+    # overloads are `overloads.json` only, there being no `Tensor.eye`
+    # upstream to put in `methods.json`.
+    assert len(keys) == 331, len(keys)
     from_tables = sorted(
         k for k in keys
         if report["table"][f"{k[0]}|{k[1]}"]["from"] == "tables"

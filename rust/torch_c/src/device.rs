@@ -609,7 +609,7 @@ fn shim_same_device(left: PyDevice, right: PyDevice) -> bool {
 /// `aten.rs` holding a readback marker is either a kernel on this list, one of
 /// the six helpers, or on a named exemption list -- so a new readback anywhere
 /// in the file has to be classified by a human before the suite goes green.
-pub const MPS_HOST_READBACK_OPS: [&str; 66] = [
+pub const MPS_HOST_READBACK_OPS: [&str; 71] = [
     "aten._grouped_mm.default",
     "aten._log_softmax.default",
     "aten._safe_softmax.default",
@@ -626,11 +626,14 @@ pub const MPS_HOST_READBACK_OPS: [&str; 66] = [
     "aten.bitwise_not.default",
     "aten.bitwise_or.Scalar",
     "aten.bitwise_or.Tensor",
+    "aten.bitwise_xor.Scalar",
+    "aten.bitwise_xor.Tensor",
     "aten.bucketize.Scalar",
     "aten.bucketize.Tensor",
     "aten.cumsum.default",
     "aten.div.Scalar_mode",
     "aten.div.Tensor_mode",
+    "aten.erfinv.default",
     "aten.expm1.default",
     "aten.expm1_.default",
     "aten.fmod.Scalar",
@@ -638,6 +641,7 @@ pub const MPS_HOST_READBACK_OPS: [&str; 66] = [
     "aten.gather.default",
     "aten.histc.default",
     "aten.index.Tensor",
+    "aten.index_add.default",
     "aten.index_add_.default",
     "aten.index_put_.default",
     "aten.isin.Tensor_Tensor",
@@ -670,6 +674,7 @@ pub const MPS_HOST_READBACK_OPS: [&str; 66] = [
     "aten.remainder.Tensor",
     "aten.scatter.src",
     "aten.scatter.value",
+    "aten.scatter_reduce.two",
     "aten.softplus.default",
     "aten.upsample_bicubic2d.default",
     "aten.upsample_bilinear2d.default",

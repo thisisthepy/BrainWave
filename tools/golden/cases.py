@@ -1124,6 +1124,45 @@ def matmul_cases(torch_module, c_module, torch_call) -> list[Case]:
                                 "own batch size")
     )
 
+    # -- THREE batch axes (rank 5), which candle refused outright until
+    # `fold_batch_axes_matmul` landed (docs/TAIL3.md). `MatMul::ab_skip`
+    # recognises zero, one or two batch axes and rejects everything above,
+    # *whatever the strides are* -- so these operands are fully contiguous and
+    # were still refused, which is why `.contiguous()` was not the fix. Five
+    # architectures sat behind this one shape.
+    #
+    # The broadcast rows are the ones a fold could get wrong in a way the
+    # equal-batch rows cannot see: a fold that flattens without expanding
+    # first computes the wrong number of GEMMs.
+    for a_shape, b_shape, note in [
+        ((1, 2, 3, 4, 5), (1, 2, 3, 5, 6), "rank 5, batch axes agree -- hiera/qwen3_next's shape"),
+        ((2, 3, 2, 4, 3), (2, 3, 2, 3, 2), "rank 5, larger batch"),
+        ((1, 2, 3, 4, 5), (1, 1, 3, 5, 6), "rank 5, a batch axis BROADCASTS on the right"),
+        ((1, 1, 3, 4, 5), (2, 2, 3, 5, 6), "rank 5, two batch axes broadcast on the left"),
+        ((2, 2, 2, 2, 3, 2), (2, 2, 2, 2, 2, 4), "rank 6 -- four batch axes"),
+    ]:
+        a_n = 1
+        for d in a_shape:
+            a_n *= d
+        b_n = 1
+        for d in b_shape:
+            b_n *= d
+        cases.append(
+            _matmul_case(torch_module, c_module, torch_call, "float32",
+                        [((i * 7) % 13) - 6.0 for i in range(a_n)], a_shape,
+                        [((i * 5) % 11) - 5.0 for i in range(b_n)], b_shape,
+                        note=note)
+        )
+    # A rank-5 shape that is NOT broadcastable stays a refusal on both sides:
+    # the fold must not invent an answer where candle had a real complaint.
+    cases.append(
+        _matmul_case(torch_module, c_module, torch_call, "float32",
+                    [1.0] * (2 * 3 * 2 * 4 * 3), (2, 3, 2, 4, 3),
+                    [1.0] * (2 * 5 * 2 * 3 * 2), (2, 5, 2, 3, 2), expect="both_error",
+                    note="batch axes 3 and 5 do not broadcast -- the fold declines and "
+                         "candle's own refusal stands")
+    )
+
     return cases
 
 
@@ -26928,6 +26967,632 @@ def cumprod_cases(torch_module, c_module, torch_call) -> list[Case]:
 
     # docs/VOICE.md -- the voicestudio speech round.
 
+# --- docs/TAIL3.md: the walls behind the walls -----------------------------
+#
+# Six builders, and the split they were written to record: only ONE of the six
+# ops underneath is a new kernel.
+#
+#   aten.bitwise_xor.{Tensor,Scalar}   a third arm on `Bitwise` -- table row
+#   aten.index_add.default             `index_add_`'s body, minus write_back
+#   aten.view_as.default               `aten.view.default`'s body
+#   aten.erfinv.default                NEW ARITHMETIC (AS 241)
+#   aten.scatter_reduce.two            NEW KERNEL (include_self, amin/amax)
+#
+# Each builder below leads with the input that separates the right answer from
+# the plausible wrong one, because on the happy path five of these six are
+# indistinguishable from an implementation that guessed.
+
+
+def bitwise_xor_tensor_cases(torch_module, c_module, torch_call) -> list[Case]:
+    """`aten.bitwise_xor.Tensor` -- `gpt_neo`'s CONSTRUCTION wall.
+
+    `modeling_gpt_neo.py:66` builds the local-attention mask as
+    `bitwise_xor(bias, tril(bias, -window))`, so this fires before any
+    forward pass runs.
+
+    The separator from `bitwise_and`/`bitwise_or` is the operand pair where
+    all three agree -- `x & x`, `x | x` and `x ^ x` differ only when the
+    inputs differ, and `[0b1100, 0b1010]` against `[0b1010, 0b0110]` gives
+    `and=[8, 2]`, `or=[14, 14]`, `xor=[6, 12]`: three distinct answers.
+    """
+    op = "aten.bitwise_xor.Tensor"
+    cases: list[Case] = []
+    for dtype_name in _BITWISE_INT_DTYPES:
+        cases.append(
+            _binary_tensor_case(
+                torch_module, c_module, op, torch_call, dtype_name,
+                [0b1100, 0b1010, 0b1111, 0], (2, 2),
+                [0b1010, 0b0110, 0b1111, 0b1111], (2, 2),
+                "elementwise XOR -- [6, 12, 0, 15], distinct from AND and OR on every element",
+            )
+        )
+    # `x ^ x == 0` for every bit pattern: the one identity XOR has and the
+    # other two do not.
+    for dtype_name in _BITWISE_INT_DTYPES:
+        cases.append(
+            _binary_tensor_case(
+                torch_module, c_module, op, torch_call, dtype_name,
+                [1, 2, 3, 127], (4,), [1, 2, 3, 127], (4,),
+                "x ^ x is all zeros -- AND gives x back, OR gives x back",
+            )
+        )
+    # Two's complement on the signed dtypes: -1 ^ 3 == -4.
+    for dtype_name in ["int64", "int32", "int16"]:
+        cases.append(
+            _binary_tensor_case(
+                torch_module, c_module, op, torch_call, dtype_name,
+                [-1, -2, -128, 0], (4,), [3, 3, 1, -1], (4,),
+                "negative operands: [-4, -3, -127, -1], measured",
+            )
+        )
+    # uint8 stays in range rather than promoting: 200 ^ 100 == 172.
+    cases.append(
+        _binary_tensor_case(
+            torch_module, c_module, op, torch_call, "uint8",
+            [200, 255, 0], (3,), [100, 255, 255], (3,),
+            "[172, 0, 255] -- no widening",
+        )
+    )
+    # Float has no kernel on either side, for the same reason and by the same
+    # name: `"bitwise_xor_cpu" not implemented for 'Float'`.
+    for dtype_name in ["float32", "float64"]:
+        fa_t, fa_c = pair_from_flat(torch_module, c_module, [1.0, 2.0], (2,), dtype_name)
+        fb_t, fb_c = pair_from_flat(torch_module, c_module, [1.0, 2.0], (2,), dtype_name)
+        cases.append(
+            Case(
+                name=f"bitwise_xor.Tensor(dtype={dtype_name} refused by both)",
+                op=op,
+                run_torch=lambda fa_t=fa_t, fb_t=fb_t: torch_call(fa_t, fb_t),
+                run_c=lambda fa_c=fa_c, fb_c=fb_c: c_module._aten_dispatch(op, fa_c, fb_c),
+                expect="both_error",
+                note='"bitwise_xor_cpu" not implemented for a float dtype, both sides',
+            )
+        )
+    # Promotion, the case gpt_neo does not reach but `bitwise_and` measured a
+    # caller for: `int64 ^ int32` promotes to `int64`.
+    a_t, a_c = pair_from_flat(torch_module, c_module, [5, 6], (2,), "int64")
+    b_t, b_c = pair_from_flat(torch_module, c_module, [3, 3], (2,), "int32")
+    cases.append(
+        Case(
+            name="bitwise_xor.Tensor(promote int64 x int32)",
+            op=op,
+            run_torch=lambda: torch_call(a_t, b_t),
+            run_c=lambda: c_module._aten_dispatch(op, a_c, b_c),
+            note="[6, 5] at int64 -- the same promotion table bitwise_and uses",
+        )
+    )
+    # Broadcasting, which the mask construction in gpt_neo does not need but
+    # the shared `bitwise_binary` performs for all three arms.
+    w_t, w_c = pair_from_flat(torch_module, c_module, [0b1100, 0b1010], (2, 1), "int64")
+    x_t, x_c = pair_from_flat(torch_module, c_module, [0b1010, 0b0110], (1, 2), "int64")
+    cases.append(
+        Case(
+            name="bitwise_xor.Tensor(broadcast (2,1) x (1,2))",
+            op=op,
+            run_torch=lambda: torch_call(w_t, x_t),
+            run_c=lambda: c_module._aten_dispatch(op, w_c, x_c),
+            note="a 2x2 result, not a shape error",
+        )
+    )
+    return cases
+
+
+def bitwise_xor_scalar_cases(torch_module, c_module, torch_call) -> list[Case]:
+    """`aten.bitwise_xor.Scalar` -- `x ^ 3` keeps the Python int as a Scalar,
+    the same probe result `bitwise_and.Scalar`'s note records, so the two
+    overloads are separately reachable and separately checked.
+
+    The asymmetry worth pinning is that a Python int does NOT widen the
+    tensor: `uint8 ^ 300` is not an int64 op.
+    """
+    op = "aten.bitwise_xor.Scalar"
+    cases: list[Case] = []
+    for dtype_name in _BITWISE_INT_DTYPES:
+        t_t, t_c = pair_from_flat(torch_module, c_module,
+                                  [0b1100, 0b1010, 0b0001, 0], (4,), dtype_name)
+        cases.append(
+            Case(
+                name=f"bitwise_xor.Scalar(dtype={dtype_name}, other=0b1010)",
+                op=op,
+                run_torch=lambda t_t=t_t: torch_call(t_t, 0b1010),
+                run_c=lambda t_c=t_c: c_module._aten_dispatch(op, t_c, 0b1010),
+                note="result keeps the tensor's dtype -- the int does not widen it",
+            )
+        )
+    for dtype_name in ["int64", "int32"]:
+        t_t, t_c = pair_from_flat(torch_module, c_module, [-1, 0, 7], (3,), dtype_name)
+        cases.append(
+            Case(
+                name=f"bitwise_xor.Scalar(dtype={dtype_name}, other=-1) is a bit flip",
+                op=op,
+                run_torch=lambda t_t=t_t: torch_call(t_t, -1),
+                run_c=lambda t_c=t_c: c_module._aten_dispatch(op, t_c, -1),
+                note="[0, -1, -8] -- `x ^ -1 == ~x`, which AND and OR cannot produce",
+            )
+        )
+    f_t, f_c = pair_from_flat(torch_module, c_module, [1.0, 2.0], (2,), "float32")
+    cases.append(
+        Case(
+            name="bitwise_xor.Scalar(float32 refused by both)",
+            op=op,
+            run_torch=lambda: torch_call(f_t, 1),
+            run_c=lambda: c_module._aten_dispatch(op, f_c, 1),
+            expect="both_error",
+            note='"bitwise_xor_cpu" not implemented for \'Float\'',
+        )
+    )
+    return cases
+
+
+def erfinv_default_cases(torch_module, c_module, torch_call) -> list[Case]:
+    """`aten.erfinv.default` -- `gemma3n_text`'s wall, reached through the
+    VENDORED `torch/distributions/normal.py::icdf`, not through a model file.
+
+    This is the one op in docs/TAIL3.md's list with no kernel anywhere to
+    alias: candle has no `erfinv`, there is no closed form, and the shim
+    computes AS 241 in `f64`. So the cases below are about *arithmetic*, and
+    they are chosen where a wrong series shows:
+
+      * **the ends.** `erfinv(+-1)` is `+-inf` and NOT an error; a Newton
+        iteration diverges there and a naive series returns a large finite
+        number. `|y| > 1` is `nan`, again not an error.
+      * **the branch seam at 0.85**, where AS 241 switches from the central
+        rational to the tail one. An implementation that used the central
+        branch everywhere agrees below it and drifts above.
+      * **the tail**, `0.99` to `0.99999999`, where the low-order
+        single-precision approximations that are usually reached for lose
+        their last digits.
+      * **near zero**, where `erfinv(y) ~ y * sqrt(pi)/2` and a branch that
+        divided by something small would blow up.
+
+    The `float64` rows stop at `1 - 1e-9`. Beyond that the two sides diverge
+    by up to 5.5e-05 and **upstream is the one that is wrong** -- `erfc` of
+    the shim's answer round-trips to twelve digits and `erfc` of torch's to
+    four. That is pinned in `pytests/test_tail3.py` by the round trip rather
+    than here by agreement, because agreeing there would mean being wrong.
+    The whole region is unreachable at `float32`, whose largest value below
+    one is `1 - 6e-8`.
+    """
+    op = "aten.erfinv.default"
+    cases: list[Case] = []
+
+    def case(name, flat, dtype_name, expect="match", note=""):
+        t_t, t_c = pair_from_flat(torch_module, c_module, flat, (len(flat),), dtype_name)
+        cases.append(
+            Case(
+                name=f"erfinv({name}) [{dtype_name}]",
+                op=op,
+                run_torch=lambda t_t=t_t: torch_call(t_t),
+                run_c=lambda t_c=t_c: c_module._aten_dispatch(op, t_c),
+                expect=expect,
+                note=note,
+            )
+        )
+
+    central = [0.0, 0.1, -0.1, 0.25, -0.25, 0.5, -0.5, 0.7, -0.7, 0.84, -0.84]
+    seam = [0.85, -0.85, 0.8500001, -0.8500001, 0.86, -0.86]
+    tail = [0.9, -0.9, 0.99, -0.99, 0.999, 0.9999, 0.999999, -0.999999]
+    for dtype_name in ["float64", "float32"]:
+        case("central branch", central, dtype_name,
+             note="|y| <= 0.85, AS 241's rational in (0.180625 - q^2)")
+        case("the branch seam at 0.85", seam, dtype_name,
+             note="a single-branch implementation agrees below and drifts above")
+        case("the tail", tail, dtype_name,
+             note="0.9 .. 0.999999, where a low-order approximation loses digits")
+        case("near zero", [1e-3, -1e-3, 1e-6, -1e-6, 1e-8, -1e-8], dtype_name,
+             note="erfinv(y) ~ y*sqrt(pi)/2; 1e-8 gives 8.8623e-09")
+        case("the ends are infinities, not errors", [1.0, -1.0], dtype_name,
+             note="+inf / -inf; a Newton iteration would not terminate here")
+        case("outside the domain is nan, not an error", [1.5, -1.5, 2.0], dtype_name,
+             note="nan on both sides, and NO exception")
+
+    # The reduced floats keep their own dtype (`unary_float`'s rule).
+    for dtype_name in ["float16", "bfloat16"]:
+        case("central branch", [0.0, 0.5, -0.5, 0.25], dtype_name,
+             note="float in, same float out -- not widened to float32")
+
+    # Integral and bool inputs promote to the default float. `erfinv(1)` is
+    # `inf` even from an integer, which is the row that catches a kernel that
+    # refused integral inputs instead of promoting.
+    for dtype_name in ["int64", "int32", "uint8"]:
+        case("integral promotes to the default float", [0, 1], dtype_name,
+             note="float32 [0., inf]")
+    return cases
+
+
+def index_add_default_cases(torch_module, c_module, torch_call) -> list[Case]:
+    """`aten.index_add.default` -- `jetmoe`'s wall
+    (`modeling_jetmoe.py:324`, `zeros.index_add(0, index_sorted_experts,
+    expert_outputs)`).
+
+    **A binding, not a kernel**: it is `index_add_`'s body with `write_back`
+    swapped for `finish`. So the cases that would merely re-run
+    `index_add__cases` are not repeated; what is here is the part that is
+    genuinely different, plus the two rules a fresh out-of-place
+    implementation would most plausibly get wrong.
+
+      * **`self` is not modified**, and the result is a different tensor --
+        including when the index is EMPTY, where the temptation is to return
+        `self` itself.
+      * **negative indices still do not wrap.** `index_put_`'s do; this op's
+        do not (docs/DEMAND8.md), and sharing the body is what keeps that
+        true rather than a second transcription of the rule.
+      * **`self` may be non-contiguous**, which the in-place form refuses
+        (its `write_back` overlap check) and this one does not.
+    """
+    op = "aten.index_add.default"
+    cases: list[Case] = []
+
+    def case(name, self_flat, self_shape, dtype_name, dim, idx_flat, idx_dtype,
+             src_flat, src_shape, src_dtype=None, alpha=None, expect="match", note=""):
+        s_t, s_c = pair_from_flat(torch_module, c_module, self_flat, self_shape, dtype_name)
+        i_t, i_c = pair_from_flat(torch_module, c_module, idx_flat, [len(idx_flat)], idx_dtype)
+        v_t, v_c = pair_from_flat(torch_module, c_module, src_flat, src_shape,
+                                  src_dtype or dtype_name)
+        if alpha is None:
+            run_t = lambda: torch_call(s_t, dim, i_t, v_t)
+            run_c = lambda: c_module._aten_dispatch(op, s_c, dim, i_c, v_c)
+        else:
+            run_t = lambda: torch_call(s_t, dim, i_t, v_t, alpha=alpha)
+            run_c = lambda: c_module._aten_dispatch(op, s_c, dim, i_c, v_c, alpha=alpha)
+        cases.append(Case(name=f"index_add({name})", op=op, run_torch=run_t,
+                          run_c=run_c, expect=expect, note=note))
+
+    zeros8 = [0.0] * 8
+    for dtype_name in ["float64", "float32", "float16", "bfloat16"]:
+        case(f"dtype={dtype_name}, duplicate indices ACCUMULATE", [0.0, 0.0, 0.0], (3,),
+             dtype_name, 0, [1, 1, 1], "int64", [1.0, 2.0, 3.0], (3,),
+             note="[0, 6, 0] -- an overwriting kernel gives [0, 3, 0]")
+        case(f"dtype={dtype_name}, self is not zero to start with",
+             [1.0, -2.0, 3.0], (3,), dtype_name, 0, [0, 2], "int64", [10.0, 20.0], (2,),
+             note="a kernel that ignored `self` passes every zeros case")
+        case(f"dtype={dtype_name}, 2-D, dim=0", zeros8, (4, 2), dtype_name, 0,
+             [0, 2], "int64", [1.0, 2.0, 3.0, 4.0], (2, 2),
+             note="jetmoe's own shape: a scatter of expert outputs into a token buffer")
+        case(f"dtype={dtype_name}, dim=-1 wraps", zeros8, (2, 4), dtype_name, -1,
+             [0, 3], "int64", [1.0, 2.0, 3.0, 4.0], (2, 2))
+        case(f"dtype={dtype_name}, alpha=-1.5", [1.0, 1.0, 1.0], (3,), dtype_name, 0,
+             [0, 1], "int64", [1.0, 2.0], (2,), alpha=-1.5)
+
+    # The running-precision separator, re-run here rather than assumed from
+    # the in-place form: the two share a body TODAY, and this is the case that
+    # notices if they ever stop.
+    case("dtype=bfloat16, 64 accumulations into one position", [0.0, 0.0], (2,),
+         "bfloat16", 0, [0] * 64, "int64", [0.01] * 64, (64,),
+         note="0.65234375, the running bf16 sum -- NOT scatter_reduce's 0.6406")
+
+    case("dtype=int64, alpha=2.9 TRUNCATES to 2", [0, 0, 0], (3,), "int64", 0,
+         [0], "int64", [4], (1,), alpha=2.9,
+         note="8, not 12 -- alpha is cast to the receiver's dtype")
+    case("dtype=uint8 WRAPS on overflow", [0, 0], (2,), "uint8", 0, [0, 0], "int64",
+         [200, 200], (2,), note="144, not saturation")
+    case("dtype=bool is a logical OR", [0, 0], (2,), "bool", 0, [0, 0], "int64",
+         [1, 1], (2,), note="True, not a 2 in a bool buffer")
+
+    case("an empty index writes nothing", [1.0, 2.0, 3.0], (3,), "float32", 0,
+         [], "int64", [], (0,),
+         note="the values come back unchanged -- as a NEW tensor, not `self`")
+
+    case("a NEGATIVE index is refused (unlike index_put_, which wraps)",
+         [0.0, 0.0, 0.0], (3,), "float32", 0, [-1], "int64", [5.0], (1,),
+         expect="both_error", note="IndexError: index out of range in self")
+    case("an out-of-range index", [0.0, 0.0, 0.0], (3,), "float32", 0, [5], "int64",
+         [5.0], (1,), expect="both_error", note="the same message, no bounds in it")
+    case("a float index", [0.0, 0.0, 0.0], (3,), "float32", 0, [0.0], "float32",
+         [5.0], (1,), expect="both_error",
+         note="Expected dtype int32/int64 for index but got: Float")
+    case("self and source dtypes must match exactly", [0.0, 0.0, 0.0], (3,), "float32",
+         0, [0], "int64", [5], (1,), src_dtype="int64", expect="both_error",
+         note="no promotion, and the message still says index_add_()")
+    case("wrong source extent ALONG dim", zeros8, (4, 2), "float32", 0, [0, 2],
+         "int64", [1.0] * 6, (3, 2), expect="both_error",
+         note="'Number of indices (2) should be equal to source.size(dim): (3)'")
+    case("dim out of range", [0.0, 0.0, 0.0], (3,), "float32", 1, [0], "int64",
+         [1.0], (1,), expect="both_error",
+         note="Dimension out of range (expected to be in range of [-1, 0], but got 1)")
+    return cases
+
+
+def scatter_reduce_two_cases(torch_module, c_module, torch_call) -> list[Case]:
+    """`aten.scatter_reduce.two` -- `tapas`' wall, and a REAL kernel.
+
+    docs/SCATTER.md already recorded that this is not `aten.scatter.reduce`:
+    that op's `reduce` is `"add"`/`"multiply"` only and it has no
+    `include_self`, so implementing it would not have moved `tapas`, which
+    calls `scatter_reduce(..., reduce="amin", include_self=False)`.
+
+    The separators, each of which a plausible implementation gets wrong:
+
+      * **`include_self=False` seeds only the positions an index names.** A
+        kernel that seeded the whole tensor turns every untouched position
+        into the identity (`-inf` for `amax`); a kernel that ignored the flag
+        keeps `self` in the fold. The `full((3,), 9.)` rows separate all
+        three answers.
+      * **`sum` accumulates WIDE and narrows once** -- the opposite of
+        `index_add_`, whose adjacent 64-way `bfloat16` case in this same file
+        gives `0.6523` where this gives `0.6406`. This is the single most
+        surprising row in the set.
+      * **`mean` counts `self` when `include_self=True`**: `(10+1+2+3)/4`,
+        not `(1+2+3)/3` and not `(10+1+2+3)/3`.
+      * **integer `mean` truncates toward zero**, `7/4 == 1`.
+      * **`nan` wins in `amin`/`amax`**, which `f64::min` in Rust does not do.
+    """
+    op = "aten.scatter_reduce.two"
+    cases: list[Case] = []
+
+    def case(name, self_flat, self_shape, dtype_name, dim, idx_flat, idx_shape,
+             src_flat, src_shape, reduce, include_self=True, idx_dtype="int64",
+             src_dtype=None, expect="match", note=""):
+        s_t, s_c = pair_from_flat(torch_module, c_module, self_flat, self_shape, dtype_name)
+        i_t, i_c = pair_from_flat(torch_module, c_module, idx_flat, idx_shape, idx_dtype)
+        v_t, v_c = pair_from_flat(torch_module, c_module, src_flat, src_shape,
+                                  src_dtype or dtype_name)
+        cases.append(
+            Case(
+                name=f"scatter_reduce.two({name})",
+                op=op,
+                run_torch=lambda: torch_call(s_t, dim, i_t, v_t, reduce,
+                                             include_self=include_self),
+                run_c=lambda: c_module._aten_dispatch(op, s_c, dim, i_c, v_c, reduce,
+                                                      include_self=include_self),
+                expect=expect,
+                note=note,
+            )
+        )
+
+    # The five reductions x both `include_self` values, on data where all ten
+    # answers differ: self [0, 0, 0], indices [0, 0, 1], src [2, 3, 4].
+    expected = {
+        ("sum", True): "[5, 4, 0]", ("sum", False): "[5, 4, 0]",
+        ("prod", True): "[0, 0, 0]", ("prod", False): "[6, 4, 0]",
+        ("mean", True): "[1.6667, 2, 0]", ("mean", False): "[2.5, 4, 0]",
+        ("amax", True): "[3, 4, 0]", ("amax", False): "[3, 4, 0]",
+        ("amin", True): "[0, 0, 0]", ("amin", False): "[2, 4, 0]",
+    }
+    for dtype_name in ["float64", "float32"]:
+        for reduce in ["sum", "prod", "mean", "amax", "amin"]:
+            for include_self in [True, False]:
+                case(f"dtype={dtype_name}, reduce={reduce}, include_self={include_self}",
+                     [0.0, 0.0, 0.0], (3,), dtype_name, 0, [0, 0, 1], (3,),
+                     [2.0, 3.0, 4.0], (3,), reduce, include_self=include_self,
+                     note=f"upstream: {expected[(reduce, include_self)]}")
+
+    # `include_self=False` must NOT seed the positions nothing writes.
+    for reduce, note in [
+        ("amax", "[1, 9, 9] -- not [1, -inf, -inf] and not [9, 9, 9]"),
+        ("amin", "[1, 9, 9] -- same, from the other identity"),
+        ("prod", "[1, 9, 9]"),
+        ("sum", "[1, 9, 9]"),
+    ]:
+        case(f"include_self=False seeds only what is written (reduce={reduce})",
+             [9.0, 9.0, 9.0], (3,), "float32", 0, [0], (1,), [1.0], (1,),
+             reduce, include_self=False, note=note)
+
+    # `mean`'s divisor, both ways round.
+    case("mean counts self when include_self=True", [10.0, 10.0], (2,), "float32", 0,
+         [0, 0, 0], (3,), [1.0, 2.0, 3.0], (3,), "mean",
+         note="(10+1+2+3)/4 = 4 -- not 2 and not 5.333")
+    case("mean does not count self when include_self=False", [10.0, 10.0], (2,),
+         "float32", 0, [0, 0, 0], (3,), [1.0, 2.0, 3.0], (3,), "mean",
+         include_self=False, note="(1+2+3)/3 = 2, and position 1 keeps its 10")
+
+    # The accumulation-width separator. `index_add_`'s identical probe gives
+    # 0.6523; this gives 0.6406.
+    case("bfloat16, 64 accumulations, reduce=sum", [0.0, 0.0], (2,), "bfloat16", 0,
+         [0] * 64, (64,), [0.01] * 64, (64,), "sum",
+         note="0.6406 -- WIDE accumulation, narrowed once. index_add_ gives 0.6523.")
+    case("bfloat16, 64 accumulations, reduce=mean", [0.0, 0.0], (2,), "bfloat16", 0,
+         [0] * 64, (64,), [0.01] * 64, (64,), "mean",
+         note="0.0098 = 0.6406 / 65 -- one division at the end")
+
+    # Integers.
+    case("int64 mean TRUNCATES toward zero", [0, 0], (2,), "int64", 0, [0, 0, 0], (3,),
+         [1, 2, 4], (3,), "mean", note="7/4 = 1, not 1.75 rounded")
+    case("int64 mean, include_self=False", [0, 0], (2,), "int64", 0, [0, 0, 0], (3,),
+         [1, 2, 4], (3,), "mean", include_self=False, note="7/3 = 2")
+    case("int64 prod", [2, 3], (2,), "int64", 0, [0, 0], (2,), [5, 7], (2,), "prod",
+         note="70, and position 1 keeps its 3")
+    case("uint8 sum WRAPS", [0, 0], (2,), "uint8", 0, [0, 0], (2,), [200, 200], (2,),
+         "sum", note="144, matching index_add_'s answer for the same overflow")
+    case("bool sum is a logical OR", [0, 0], (2,), "bool", 0, [0, 0], (2,), [1, 1], (2,),
+         "sum", src_dtype="bool", note="True, not 2")
+
+    # nan wins both ways -- `f64::max`/`min` in Rust would discard it.
+    for reduce in ["amax", "amin"]:
+        case(f"nan wins in {reduce}", [0.0, 0.0], (2,), "float32", 0, [0], (1,),
+             [float("nan")], (1,), reduce, note="nan, not 0.0")
+
+    # Rank and axis coverage.
+    case("2-D along dim=1", [0.0] * 6, (2, 3), "float32", 1, [0, 0, 1, 2, 2, 2], (2, 3),
+         [0.0, 1.0, 2.0, 3.0, 4.0, 5.0], (2, 3), "sum",
+         note="[[1, 2, 0], [0, 0, 12]]")
+    case("2-D along dim=1, include_self=False, amin", [1.0] * 6, (2, 3), "float32", 1,
+         [0, 0, 1, 1], (2, 2), [1.0, 2.0, 3.0, 4.0], (2, 2), "amin", include_self=False,
+         note="[[1, 1, 1], [1, 3, 1]] -- untouched columns keep their 1")
+    case("a 0-d self is accepted (scatter.src refuses one)", [5.0], (), "float32", 0,
+         [0], (), [1.0], (), "sum", note="tensor(6.)")
+    case("dim=-1 wraps", [0.0] * 4, (2, 2), "float32", -1, [0, 0], (2, 1),
+         [1.0, 2.0], (2, 1), "sum", note="axis 1")
+
+    # The deprecated spellings upstream still accepts.
+    for reduce in ["max", "min"]:
+        case(f"reduce={reduce!r} is still accepted as an alias", [0.0, 0.0], (2,),
+             "float32", 0, [0], (1,), [1.0], (1,), reduce,
+             note=f"upstream has not removed it; behaves as a{reduce}")
+
+    # Refusals.
+    case("an unknown reduce", [0.0, 0.0], (2,), "float32", 0, [0], (1,), [1.0], (1,),
+         "banana", expect="both_error",
+         note="reduce argument must be either sum, prod, mean, amax or amin, got banana")
+    case("self and src dtypes must match", [0.0, 0.0], (2,), "float32", 0, [0], (1,),
+         [1], (1,), "sum", src_dtype="int64", expect="both_error",
+         note="scatter(): Expected self.dtype to be equal to src.dtype")
+    case("a float index", [0.0, 0.0], (2,), "float32", 0, [0.0], (1,), [1.0], (1,),
+         "sum", idx_dtype="float32", expect="both_error",
+         note="scatter(): Expected dtype int32/int64 for index -- no ', got' tail")
+    case("an int32 index is accepted", [0.0, 0.0], (2,), "float32", 0, [0], (1,),
+         [1.0], (1,), "sum", idx_dtype="int32", note="not a refusal")
+    case("an out-of-range index", [0.0, 0.0], (2,), "float32", 0, [5], (1,), [1.0], (1,),
+         "sum", expect="both_error",
+         note="index 5 is out of bounds for dimension 0 with size 2")
+    case("a NEGATIVE index does not wrap", [0.0, 0.0, 0.0], (3,), "float32", 0, [-1],
+         (1,), [5.0], (1,), "sum", expect="both_error",
+         note="index -1 is out of bounds for dimension 0 with size 3")
+    case("index rank must match self rank", [0.0] * 4, (2, 2), "float32", 0, [0], (1,),
+         [1.0], (1,), "sum", expect="both_error",
+         note="Index tensor must have the same number of dimensions as self tensor")
+    case("index may not be larger than src", [0.0] * 3, (3,), "float32", 0, [0, 1, 2],
+         (3,), [1.0, 2.0], (2,), "sum", expect="both_error",
+         note="Expected index [3] ... to be no larger size than src [2]")
+    case("dim out of range", [0.0, 0.0], (2,), "float32", 3, [0], (1,), [1.0], (1,),
+         "sum", expect="both_error",
+         note="Dimension out of range (expected to be in range of [-1, 0], but got 3)")
+    return cases
+
+
+def view_as_default_cases(torch_module, c_module, torch_call) -> list[Case]:
+    """`aten.view_as.default` -- two architectures on docs/SETITEM.md's list.
+
+    A binding: the body is `aten.view.default`'s. What is checked here is
+    that it is `view`'s and not `reshape_as`'s, because **upstream's two are
+    not the same op** -- `view_as` refuses a receiver whose strides cannot
+    express the target shape and `reshape_as` copies instead.
+
+    That divergence is a `torch_error` row below rather than a silent pass:
+    this shim's `view` has always accepted those layouts, so `view_as`
+    inherits the laxity rather than adding it, and the row fails loudly if
+    `view` is ever tightened -- which is when someone should look at this
+    again.
+    """
+    op = "aten.view_as.default"
+    cases: list[Case] = []
+
+    def case(name, flat, shape, other_shape, dtype_name, expect="match", note=""):
+        other_n = 1
+        for d in other_shape:
+            other_n *= d
+        a_t, a_c = pair_from_flat(torch_module, c_module, flat, shape, dtype_name)
+        b_t, b_c = pair_from_flat(torch_module, c_module, [0.0] * other_n, other_shape,
+                                  dtype_name)
+        cases.append(
+            Case(
+                name=f"view_as({name}) [{dtype_name}]",
+                op=op,
+                run_torch=lambda: torch_call(a_t, b_t),
+                run_c=lambda: c_module._aten_dispatch(op, a_c, b_c),
+                expect=expect,
+                note=note,
+            )
+        )
+
+    for dtype_name in ["float32", "float64", "float16", "bfloat16", "int64", "int32",
+                       "uint8"]:
+        case("(6,) -> (2, 3)", [1.0, 2.0, 3.0, 4.0, 5.0, 6.0], (6,), (2, 3), dtype_name,
+             note="the values keep row-major order")
+        case("(2, 3) -> (3, 2)", [1.0, 2.0, 3.0, 4.0, 5.0, 6.0], (2, 3), (3, 2),
+             dtype_name, note="NOT a transpose -- [[1,2],[3,4],[5,6]]")
+        case("(6,) -> (6,) is a no-op shape", [1.0, 2.0, 3.0, 4.0, 5.0, 6.0], (6,), (6,),
+             dtype_name)
+    case("(2, 3) -> (1, 6, 1)", [1.0] * 6, (2, 3), (1, 6, 1), "float32",
+         note="rank can go up as well as down")
+    case("(1,) -> () -- a 0-d target", [7.0], (1,), (), "float32",
+         note="the scalar comes back as a 0-d tensor, not a Python float")
+    case("a shape that does not divide", [1.0] * 6, (6,), (4,), "float32",
+         expect="both_error",
+         note="both refuse; the wording differs (see the kernel's doc comment)")
+
+    # `view_as` vs `reshape_as` -- the row that says which op this is.
+    src_t, src_c = pair_from_flat(torch_module, c_module,
+                                  [0.0, 1.0, 2.0, 3.0, 4.0, 5.0], (2, 3), "float32")
+    tgt_t, tgt_c = pair_from_flat(torch_module, c_module, [0.0] * 6, (6,), "float32")
+    cases.append(
+        Case(
+            name="view_as(a TRANSPOSED receiver -- upstream refuses, this shim does not)",
+            op=op,
+            run_torch=lambda: torch_call(
+                torch_module.ops.aten.transpose.int(src_t, 0, 1), tgt_t),
+            run_c=lambda: c_module._aten_dispatch(
+                op, c_module._aten_dispatch("aten.transpose.int", src_c, 0, 1), tgt_c),
+            expect="torch_error",
+            note="upstream: 'view size is not compatible with input tensor's size and "
+                 "stride'. This shim's aten.view.default has always reshaped instead, "
+                 "and view_as inherits that rather than adding a second rule. If this "
+                 "row starts failing, `view` was tightened and this op must follow.",
+        )
+    )
+    return cases
+
+
+def _eye_cases(torch_module, c_module, torch_call, op, with_m) -> list[Case]:
+    """`aten.eye.default` / `aten.eye.m` -- the wall BEHIND the matmul fold.
+
+    `torch_chunk_gated_delta_rule` stops on `attn + torch.eye(chunk_size,
+    dtype=attn.dtype, device=attn.device)` four lines after the
+    `MatMulUnexpectedStriding` this round removed, so landing the fold without
+    this would have moved zero architectures (docs/TAIL3.md).
+
+    What separates a right implementation from a plausible one:
+
+      * **`eye(2, 3)` vs `eye(3, 2)`** -- a kernel that wrote the diagonal
+        with one stride gets one of the two rectangular cases wrong.
+      * **`n == 0`** is `(0, 0)` and not an error.
+      * **`dtype=torch.bool`** is a boolean identity, which a `Tensor::ones`
+        masked with a comparison would produce as the wrong tag.
+      * **the default dtype is the default FLOAT**, even though every value is
+        an integer -- the obvious wrong guess is `int64`.
+    """
+    cases: list[Case] = []
+
+    def case(name, sizes, dtype_name=None, expect="match", note=""):
+        kw = {} if dtype_name is None else {
+            "dtype": dt.torch_dtype(torch_module, dtype_name)
+        }
+        kw_c = {} if dtype_name is None else {
+            "dtype": dt.c_dtype(c_module, dtype_name)
+        }
+        cases.append(
+            Case(
+                name=f"eye({name})",
+                op=op,
+                run_torch=lambda: torch_call(*sizes, **kw),
+                run_c=lambda: c_module._aten_dispatch(op, *sizes, **kw_c),
+                expect=expect,
+                note=note,
+            )
+        )
+
+    sizes = (lambda n, m=None: (n, m) if with_m else (n,))
+    if with_m:
+        case("2, 3 -- wider than tall", (2, 3), note="[[1,0,0],[0,1,0]]")
+        case("3, 2 -- taller than wide", (3, 2), note="[[1,0],[0,1],[0,0]]")
+        case("3, 3 -- square through the .m overload", (3, 3))
+        case("1, 0 -- an empty second axis", (1, 0), note="shape (1, 0), not an error")
+        case("0, 3", (0, 3))
+        case("2, -1 is refused", (2, -1), expect="both_error",
+             note="m must be greater or equal to 0, got -1")
+    else:
+        case("3", (3,), note="the plain identity")
+        case("1", (1,))
+        case("0 is a (0, 0) tensor, not an error", (0,))
+        case("5", (5,))
+        case("-1 is refused", (-1,), expect="both_error",
+             note="n must be greater or equal to 0, got -1")
+    for dtype_name in ["float64", "float32", "float16", "bfloat16", "int64", "int32",
+                       "uint8"]:
+        case(f"3 at dtype={dtype_name}", sizes(3, 3), dtype_name)
+    case("3 with no dtype is the DEFAULT FLOAT", sizes(3, 3),
+         note="float32, not int64 -- every value is an integer and the dtype is not")
+    return cases
+
+
+def eye_default_cases(torch_module, c_module, torch_call) -> list[Case]:
+    return _eye_cases(torch_module, c_module, torch_call, "aten.eye.default", False)
+
+
+def eye_m_cases(torch_module, c_module, torch_call) -> list[Case]:
+    return _eye_cases(torch_module, c_module, torch_call, "aten.eye.m", True)
+
+
 CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
     "aten.adaptive_avg_pool2d.default": adaptive_avg_pool2d_cases,
     "aten.where.ScalarSelf": where_scalar_self_cases,
@@ -26941,6 +27606,18 @@ CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
     "aten.native_batch_norm.default": native_batch_norm_cases,
     "aten._grouped_mm.default": grouped_mm_cases,
     "aten.full.default": full_cases,
+
+    # docs/TAIL3.md -- the walls behind the walls. One new kernel
+    # (`scatter_reduce.two`), one new piece of arithmetic (`erfinv`), and
+    # three bindings over bodies that already existed.
+    "aten.bitwise_xor.Tensor": bitwise_xor_tensor_cases,
+    "aten.bitwise_xor.Scalar": bitwise_xor_scalar_cases,
+    "aten.erfinv.default": erfinv_default_cases,
+    "aten.index_add.default": index_add_default_cases,
+    "aten.scatter_reduce.two": scatter_reduce_two_cases,
+    "aten.view_as.default": view_as_default_cases,
+    "aten.eye.default": eye_default_cases,
+    "aten.eye.m": eye_m_cases,
     "aten.add.Tensor": add_cases,
     "aten.mm.default": mm_cases,
     # Pre-seeded ahead of implementation -- see the module note above.

@@ -293,6 +293,14 @@
     "aten::bitwise_or.Tensor(Tensor self, Tensor other) -> Tensor",
     "aten::bitwise_or.Scalar(Tensor self, Scalar other) -> Tensor"
   ],
+  "bitwise_xor": [
+    "aten::bitwise_xor.Tensor(Tensor self, Tensor other) -> Tensor",
+    "aten::bitwise_xor.Scalar(Tensor self, Scalar other) -> Tensor"
+  ],
+  "__xor__": [
+    "aten::bitwise_xor.Tensor(Tensor self, Tensor other) -> Tensor",
+    "aten::bitwise_xor.Scalar(Tensor self, Scalar other) -> Tensor"
+  ],
   "__or__": [
     "aten::bitwise_or.Tensor(Tensor self, Tensor other) -> Tensor",
     "aten::bitwise_or.Scalar(Tensor self, Scalar other) -> Tensor"
@@ -345,6 +353,9 @@
   ],
   "index_add_": [
     "aten::index_add_(Tensor(a!) self, int dim, Tensor index, Tensor source, *, Scalar alpha=1) -> Tensor(a!)"
+  ],
+  "index_add": [
+    "aten::index_add(Tensor self, int dim, Tensor index, Tensor source, *, Scalar alpha=1) -> Tensor"
   ],
   "unbind": [
     "aten::unbind.int(Tensor(a -> *) self, int dim=0) -> Tensor(a)[]"
@@ -433,6 +444,9 @@
   "erf_": [
     "aten::erf_(Tensor(a!) self) -> Tensor(a!)"
   ],
+  "erfinv": [
+    "aten::erfinv(Tensor self) -> Tensor"
+  ],
   "log2": [
     "aten::log2(Tensor self) -> Tensor"
   ],
@@ -494,6 +508,12 @@
   ],
   "gather": [
     "aten::gather(Tensor self, int dim, Tensor index, *, bool sparse_grad=False) -> Tensor"
+  ],
+  "scatter_reduce": [
+    "aten::scatter_reduce.two(Tensor self, int dim, Tensor index, Tensor src, str reduce, *, bool include_self=True) -> Tensor"
+  ],
+  "as_strided": [
+    "aten::as_strided(Tensor(a) self, SymInt[] size, SymInt[] stride, SymInt? storage_offset=None) -> Tensor(a)"
   ],
   "scatter": [
     "aten::scatter.src(Tensor self, int dim, Tensor index, Tensor src) -> Tensor",
@@ -660,6 +680,9 @@
   ],
   "reshape_as": [
     "aten::reshape_as(Tensor(a) self, Tensor other) -> Tensor(a)"
+  ],
+  "view_as": [
+    "aten::view_as(Tensor(a) self, Tensor other) -> Tensor(a)"
   ],
   "acos": [
     "aten::acos(Tensor self) -> Tensor"
