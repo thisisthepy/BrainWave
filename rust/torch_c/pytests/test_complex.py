@@ -382,7 +382,6 @@ PROBES = {
     "matmul": lambda: z @ z,
     "reshape": lambda: z.reshape(2, 1),
     "to_float32": lambda: z.to(torch.float32),
-    "slice": lambda: z[0:1],
     "select": lambda: z[0],
     "cat": lambda: torch.cat([z, z]),
 }
@@ -407,10 +406,20 @@ def test_every_untaught_op_refuses_rather_than_dropping_the_imaginary_part():
     refusal. That is `docs/VULKAN2.md`'s standard -- the wrong answer is
     unrepresentable, not merely avoided.
 
-    Ten ops are sampled here, chosen because each one would return a
+    Nine ops are sampled here, chosen because each one would return a
     *plausible* answer from `re` alone: `sum`, `abs` and `matmul` would be
-    numerically wrong with no shape to give it away, and `reshape`/`slice`
-    would be right in shape and silently half the data.
+    numerically wrong with no shape to give it away, and `reshape` would be
+    right in shape and silently half the data.
+
+    **`slice` was the tenth and has been inverted out of this list**, not
+    deleted from the suite. docs/COMPLEX3.md taught `aten.slice.Tensor` the
+    complex arm because `docs/BIND3.md` §6 measured it as one of the two ops
+    that put `fft_fftn`'s `s=` argument out of reach, and it is now proven
+    element-wise against upstream on *both* components -- including two strided
+    forms -- in `pytests/test_cplx2.py::test_slice_keeps_the_imaginary_part_on_every_form`.
+    `reshape` and `select` stay here deliberately: they are the untaught
+    neighbours of the two ops that round taught (`view` and `slice`), so they
+    are what would go red if a guard had been written at the wrong level.
 
     **Nullified and confirmed red**: changing `tensor()`'s complex arm to
     `Ok(re)` in `tensor.rs` makes the sampled ops return values instead of

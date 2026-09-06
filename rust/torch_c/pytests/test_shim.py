@@ -10988,7 +10988,18 @@ def test_schema_text_survives_the_round_trip_through_the_transcribed_tables():
     # branch's figure was right against its own base and wrong once merged.
     # Measured where the branches meet, which is the only place the total
     # exists.
-    assert len(keys) == 362, len(keys)
+    # 363 with docs/COMPLEX3.md's `complex`. **+1**, and which table it comes
+    # from is the check: `overloads.json`-only, because upstream has
+    # `torch.complex` and **no** `Tensor.complex` (measured on 2.13.0:
+    # `hasattr(torch.Tensor, "complex")` is False), so `aten::complex|default`
+    # is a new identity rather than a second spelling of a `methods.json` row.
+    # Getting +2 would mean a `methods.json` row had been added for a door
+    # upstream does not have -- the same trap the six pad kernels and the three
+    # `_fft_*` kernels are recorded above for avoiding. The round's other four
+    # ops contribute **zero**: `_to_copy`, `slice`, `constant_pad_nd` and
+    # `view` were all already in the tables, and what this round gave them is a
+    # complex arm on an existing kernel, not a new spelling.
+    assert len(keys) == 363, len(keys)
     from_tables = sorted(
         k for k in keys
         if report["table"][f"{k[0]}|{k[1]}"]["from"] == "tables"

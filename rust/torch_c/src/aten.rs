@@ -416,6 +416,12 @@ pub const IMPLEMENTED_AWAITING_GOLDEN: &[&str] = &[
     "aten._fft_c2c.default",
     "aten._fft_c2r.default",
     "aten._fft_r2c.default",
+    // docs/COMPLEX3.md. Parked for the same reason as the five below it: it
+    // RETURNS a complex tensor, so the golden harness -- which compares by
+    // reading both sides as dense tensors -- has nothing to read on this
+    // side. Proven element-wise against a live upstream in
+    // `pytests/test_cplx2.py` instead, on both components.
+    "aten.complex.default",
     "aten.imag.default",
     "aten.polar.default",
     "aten.real.default",
@@ -2321,6 +2327,45 @@ fn aten_dispatch_inner(
             let other = required("aten.mul.Scalar", args, kwargs, 1, "other")?;
             crate::tensor::complex_ops::mul_scalar(py, &input, other.extract::<f64>()?)
         }
+        // -- docs/COMPLEX3.md: the four walls docs/BIND3.md §6 measured -----
+        //
+        // One contiguous run, guarded exactly as the six above are and for the
+        // same reason: each of these keys already has a dense kernel that
+        // golden compares, and what is new is only that a *complex* receiver
+        // has to move **both** halves instead of refusing at `tensor()`. The
+        // guard is a discriminant test on an already-parsed wrapper and is
+        // `false` for every real tensor, so no dense path changes and no key
+        // moves between `IMPLEMENTED` and `IMPLEMENTED_AWAITING_GOLDEN`.
+        //
+        // `_to_copy`'s guard is the one that is not `first_arg_is_complex`:
+        // its new case is a real *input* with a complex `dtype=`, which is the
+        // first op of every `fft_fftn` decomposition and the reason nothing
+        // downstream of it was reachable at all.
+        //
+        // **The bodies are at the end of this file, in one block**, and each
+        // one applies its shape change to `re` and to `im` separately.
+        // Applying it to `re` alone would compile, would return the right
+        // shape and the right dtype, and would be wrong -- so each has an
+        // element-wise both-components test in `pytests/test_cplx2.py` on an
+        // input whose `re` and `im` differ.
+        "aten._to_copy.default" if to_copy_reaches_complex(args, kwargs) => {
+            complex_to_copy(py, args, kwargs)
+        }
+        "aten.slice.Tensor" if first_arg_is_complex(args, kwargs) => {
+            complex_slice(py, args, kwargs)
+        }
+        "aten.constant_pad_nd.default" if first_arg_is_complex(args, kwargs) => {
+            complex_constant_pad_nd(py, args, kwargs)
+        }
+        "aten.view.default" if first_arg_is_complex(args, kwargs) => {
+            complex_view(py, args, kwargs, "aten.view.default")
+        }
+        "aten._unsafe_view.default" if first_arg_is_complex(args, kwargs) => {
+            complex_view(py, args, kwargs, "aten._unsafe_view.default")
+        }
+        // The one new key rather than a new arm on an existing one: there is
+        // no dense `aten.complex.default` for it to guard.
+        "aten.complex.default" => complex_default(py, args, kwargs),
         "aten.add.Tensor" => add_tensor(py, args, kwargs),
         "aten.addmm.default" => addmm_default(py, args, kwargs),
         "aten.alias.default" => alias_default(py, args, kwargs),
@@ -28636,4 +28681,427 @@ fn logical_not_default(
         .eq(0f64)
         .map_err(|e| candle_err(OP, e))?;
     finish(py, out, TorchDType::Bool)
+}
+
+// ===========================================================================
+// The complex shape ops -- docs/COMPLEX3.md
+// ===========================================================================
+//
+// Five kernels, one block, all guarded from the contiguous run near the top of
+// `dispatch_impl`. They are here rather than in `tensor::complex_ops` because
+// each is a *variant of an existing kernel in this file* -- it re-uses this
+// file's argument readers and this file's clamping and shape rules, and
+// putting the complex arm next to the dense arm it mirrors is what makes
+// "these two agree on the shape rule" checkable by reading. `complex_ops` in
+// `tensor.rs` keeps the ops that are arithmetic over the representation
+// (`polar`, `mul`, `view_as_real`); these are ops that move data around
+// without looking at it.
+//
+// **The invariant every one of them has to satisfy: `im` gets the same
+// treatment as `re`.** That is not a stylistic point. A shape op written as
+// "do it to `re`, hand back a `Dense`" returns the right shape, the right
+// element count and a plausible magnitude, and `docs/COMPLEX2.md` §2.3
+// measured what that class of mistake costs -- six of ten sampled ops
+// computing silently. So none of these builds its result from one half: each
+// ends at `PyTensorBase::complex(re, im)`, whose four invariants (same dims,
+// same candle dtype, same device, a dtype with a complex partner) fail loudly
+// if the two halves were treated differently.
+//
+// **None of these reads its input back to the host.** They are candle shape
+// calls on two tensors, so none belongs in `MPS_HOST_READBACK_OPS`
+// (`device.rs`); the only kernels in this file that do are the FFT ones, and
+// they were classified by docs/FFT.md §7.
+//
+// **All five are narrowings against upstream in the same one way**, and it is
+// the narrowing `view_as_complex` already carries (docs/COMPLEX2.md §6):
+// upstream's `slice` and `view` return *aliases* of their base, and these
+// return copies. A pair-of-tensors representation cannot alias an interleaved
+// buffer, and `view_as_complex` allocates unconditionally, so **no complex
+// tensor in this shim ever shares storage with anything** -- which means no
+// view exists that could observe the difference. It is asserted as a
+// narrowing in `pytests/test_cplx2.py` rather than left to be discovered.
+
+/// Wrap two finished halves. The single exit of every kernel below, so that
+/// "the result was built from both halves" is structural rather than
+/// remembered.
+fn finish_complex(py: Python<'_>, re: Tensor, im: Tensor) -> PyResult<Py<PyAny>> {
+    Ok(PyTensorBase::complex(re, im)?
+        .into_pyobject(py)?
+        .into_any()
+        .unbind())
+}
+
+/// The guard for `aten._to_copy.default`.
+///
+/// Two ways in, and they are different directions of the same edge:
+/// a complex receiver (`z.to(torch.float32)`, which must keep refusing), and a
+/// real receiver with a complex `dtype=` (`x.to(torch.complex64)`, which is
+/// what was missing). Errors answer `false` -- the guard only chooses which
+/// kernel runs, and the dense kernel produces the better message for a
+/// malformed argument.
+fn to_copy_reaches_complex(args: &Bound<'_, PyTuple>, kwargs: Option<&Bound<'_, PyDict>>) -> bool {
+    if first_arg_is_complex(args, kwargs) {
+        return true;
+    }
+    matches!(
+        dtype_arg(args, kwargs, 1, "dtype"),
+        Ok(Some(tag)) if tag.is_complex_tag()
+    )
+}
+
+/// `aten::_to_copy(Tensor self, *, ScalarType? dtype=None, ...)` where either
+/// side of the conversion is complex.
+///
+/// **This is the op that made `fft_fftn` unreachable.** `torch.fft.fftn`
+/// decomposes to `_to_copy(x, dtype=complex64)` followed by `_fft_c2c`, and
+/// the dense kernel refused the first of those with "dtype not storable by the
+/// candle backend" -- correctly, since there is no complex candle dtype, but
+/// the *representation* can hold the result even though the backend cannot
+/// store it. That is exactly the gap `Repr::Complex` exists to fill, and this
+/// is the only constructor that reaches it from ordinary real data.
+///
+/// Three cases, and only two of them build anything:
+///
+///   * **real -> complex.** `re` is the input converted to the component
+///     dtype, `im` is zeros of the same shape, dtype and device. Measured
+///     against upstream: `torch.arange(3.).to(torch.complex64)` is
+///     `[0j, 1+0j, 2+0j]`, and `torch.tensor([True]).to(torch.complex64)` is
+///     `[1+0j]` -- so a bool input converts through its 0/1 storage rather
+///     than being refused.
+///   * **complex -> complex.** Both halves change component dtype and/or
+///     device together. `complex64 -> complex128` widens both, which is the
+///     case that would silently half-work if only `re` were converted:
+///     `PyTensorBase::complex` refuses a mismatched pair, so it cannot.
+///   * **complex -> real.** Refused, through `tensor()` itself rather than
+///     through a message written here, so the reader gets the one refusal that
+///     names the dtype and says which half would have been lost. Upstream
+///     *does* answer this one (it discards the imaginary part with a warning);
+///     this shim does not, and that is the same rule `docs/COMPLEX2.md` §2.1
+///     set for every untaught op. `z.to(torch.float32)` is one of the ten
+///     probes in `test_complex.py`'s refusal sweep and stays there.
+fn complex_to_copy(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten._to_copy.default";
+    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let tag = dtype_arg(args, kwargs, 1, "dtype")?.unwrap_or(input.tag());
+    reject_unsupported(OP, args, kwargs, &[(2, "layout"), (4, "pin_memory")])?;
+    reject_memory_format(OP, args, kwargs, 6)?;
+    let label = device_arg_or_label(args, kwargs, 3, "device", &input.device_label())?;
+
+    let component = match tag.complex_component() {
+        Some(dtype) => dtype,
+        None => {
+            // complex -> real. `tensor()` is the refusal, and calling it is
+            // what makes the message the canonical one rather than a second
+            // wording of it. It cannot succeed: the guard only routes here
+            // when the receiver is complex or the target is, and the target
+            // is not.
+            input.tensor()?;
+            return Err(not_implemented(format!(
+                "{OP}: reached the complex kernel with a real tensor and a real dtype"
+            )));
+        }
+    };
+
+    // cpu -> meta is a discard rather than a copy, exactly as the dense kernel
+    // has it, and the meta arm carries the complex *tag* -- `Repr::Meta`
+    // already holds a tag with no storage behind it, so `complex64` on a meta
+    // tensor needs nothing new.
+    if label.is_meta() {
+        return meta_result(py, input.dims().to_vec(), tag);
+    }
+    let device = label.resolve()?;
+
+    let convert = |t: &Tensor| -> PyResult<Tensor> {
+        t.to_device(&device)
+            .and_then(|t| t.to_dtype(component))
+            // `copy()` unconditionally, for `_to_copy`'s own reason
+            // (docs/VIEWS.md §6.3) and for this representation's: a complex
+            // tensor in this shim never shares storage with anything, and
+            // `to_device`/`to_dtype` both return an `Arc` clone when there is
+            // nothing to do.
+            .and_then(|t| t.copy())
+            .map_err(|e| candle_err(OP, e))
+    };
+
+    let (re, im) = if input.is_complex_repr() {
+        let (r, i) = input.complex_parts(OP)?;
+        (convert(r)?, convert(i)?)
+    } else {
+        let re = convert(input.tensor()?)?;
+        // Zeros of `re`'s own dtype/shape/device, so the pair agrees by
+        // construction rather than by three separate arguments matching.
+        let im = re.zeros_like().map_err(|e| candle_err(OP, e))?;
+        (re, im)
+    };
+    finish_complex(py, re, im)
+}
+
+/// `aten::slice.Tensor(Tensor(a) self, int dim=0, SymInt? start=None,
+///     SymInt? end=None, SymInt step=1) -> Tensor(a)`, on a complex receiver.
+///
+/// The clamping is `slice_tensor`'s, line for line, because it has to be: the
+/// two kernels must agree about what `start=-1`, `end=sys.maxsize` and an
+/// empty result mean, and the way to make that checkable is for the complex
+/// arm to be the dense arm with `re` and `im` in place of one tensor.
+///
+/// `docs/BIND3.md` §6 measured this refusing on a genuine shim complex tensor
+/// (an `stft` output), which is what puts `fft_fftn`'s `s=` argument out of
+/// reach independently of `_to_copy`: trimming an axis is a slice.
+///
+/// **Upstream returns a view and this returns a copy.** See the block comment
+/// above; `pytests/test_cplx2.py::test_slice_is_a_copy_where_upstream_aliases`
+/// asserts it as a narrowing.
+fn complex_slice(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.slice.Tensor";
+    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let (re, im) = input.complex_parts(OP)?;
+    let rank = re.rank();
+    let dim = normalise_dim(OP, dim_arg(args, kwargs, 1, "dim")?.unwrap_or(0), rank)?;
+    let extent = re.dims()[dim] as i64;
+    let step = int_arg(args, kwargs, 4, "step")?.unwrap_or(1);
+    if step <= 0 {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "step must be greater than zero, got {step}"
+        )));
+    }
+    let clamp = |value: i64| -> i64 {
+        let shifted = if value < 0 { value + extent } else { value };
+        shifted.clamp(0, extent)
+    };
+    let start = clamp(int_arg(args, kwargs, 2, "start")?.unwrap_or(0));
+    let end = match int_arg(args, kwargs, 3, "end")? {
+        Some(value) if value >= extent => extent,
+        Some(value) => clamp(value),
+        None => extent,
+    };
+    let length = (end - start).max(0) as usize;
+
+    // Built once and shared by both halves, so a strided slice cannot pick
+    // different elements out of `re` and out of `im`.
+    let index = if step == 1 {
+        None
+    } else {
+        let picks: Vec<i64> = (0..length as i64).step_by(step as usize).collect();
+        let count = picks.len();
+        Some(Tensor::from_vec(picks, count, re.device()).map_err(|e| candle_err(OP, e))?)
+    };
+    let cut = |t: &Tensor| -> PyResult<Tensor> {
+        let narrowed = t
+            .narrow(dim, start as usize, length)
+            .map_err(|e| candle_err(OP, e))?;
+        match &index {
+            None => narrowed.contiguous().map_err(|e| candle_err(OP, e)),
+            Some(index) => narrowed
+                .contiguous()
+                .and_then(|t| t.index_select(index, dim))
+                .map_err(|e| candle_err(OP, e)),
+        }
+    };
+    finish_complex(py, cut(re)?, cut(im)?)
+}
+
+/// `aten::constant_pad_nd(Tensor self, SymInt[] pad, Scalar value=0) -> Tensor`,
+/// on a complex receiver.
+///
+/// The second op `docs/BIND3.md` §6 measured refusing on a genuine complex
+/// tensor, and the other half of why `fft_fftn`'s `s=` was unreachable:
+/// growing an axis is a pad.
+///
+/// **The fill splits.** A real scalar `value` fills `re` with `value` and `im`
+/// with **zero** -- upstream pads a complex tensor with `complex(value, 0)`,
+/// measured on 2.13.0, and filling both halves with `value` would put
+/// `value + value*i` in the pad, which is the mistake that looks right in a
+/// magnitude check. The default `value=0` makes the two identical, which is
+/// precisely why the test uses a *non-zero* fill.
+///
+/// A complex `value` refuses by name. Nothing measured passes one, and
+/// inventing the conversion would be a second rule to keep in step with
+/// `checked_convert`.
+fn complex_constant_pad_nd(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.constant_pad_nd.default";
+    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let pad: Vec<i64> = required(OP, args, kwargs, 1, "pad")?.extract()?;
+    let value: f64 = match optional(args, kwargs, 2, "value")? {
+        Some(v) if !v.is_none() => v.extract::<f64>().map_err(|_| {
+            not_implemented(format!(
+                "{OP}: a non-real pad value is not implemented in torch._C shim (got {v})"
+            ))
+        })?,
+        _ => 0.0,
+    };
+    let (re, im) = input.complex_parts(OP)?;
+    let rank = re.rank();
+    if pad.len() % 2 != 0 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "Length of pad must be even but instead it equals {}",
+            pad.len()
+        )));
+    }
+    if pad.len() / 2 > rank {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "Length of pad should be no more than twice the number of \
+             dimensions of the input. Pad length is {}while the input has \
+             {rank}dimensions.",
+            pad.len()
+        )));
+    }
+
+    // One closure, run twice with different fills. Same crop-then-pad order
+    // and same axis rule as `constant_pad_nd`: `pad[0..2]` is the LAST
+    // dimension, so `axis = rank - 1 - pair`.
+    let pad_half = |t: &Tensor, fill: f64| -> PyResult<Tensor> {
+        let device = t.device().clone();
+        let dtype = t.dtype();
+        let mut out = t.contiguous().map_err(|e| candle_err(OP, e))?;
+        for (pair, chunk) in pad.chunks(2).enumerate() {
+            let (left, right) = (chunk[0], chunk[1]);
+            let axis = rank - 1 - pair;
+            let drop_front = (-left).max(0) as usize;
+            let drop_back = (-right).max(0) as usize;
+            if drop_front != 0 || drop_back != 0 {
+                let extent = out.dims()[axis];
+                let kept = extent as i64 - drop_front as i64 - drop_back as i64;
+                if kept < 0 {
+                    return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                        "narrow(): length must be non-negative.",
+                    ));
+                }
+                out = out
+                    .narrow(axis, drop_front, kept as usize)
+                    .map_err(|e| candle_err(OP, e))?;
+            }
+            for (amount, before) in [(left.max(0), true), (right.max(0), false)] {
+                if amount == 0 {
+                    continue;
+                }
+                let mut shape = out.dims().to_vec();
+                shape[axis] = amount as usize;
+                // `zeros` then `affine(0, fill)` rather than a typed `full`:
+                // the block has to carry the *component* dtype, which is a
+                // runtime value here, and `affine` keeps it without a match
+                // over every candle dtype.
+                let block = Tensor::zeros(shape, dtype, &device)
+                    .and_then(|z| z.affine(0.0, fill))
+                    .map_err(|e| candle_err(OP, e))?;
+                let pieces: Vec<&Tensor> = if before {
+                    vec![&block, &out]
+                } else {
+                    vec![&out, &block]
+                };
+                out = Tensor::cat(&pieces, axis)
+                    .and_then(|t| t.contiguous())
+                    .map_err(|e| candle_err(OP, e))?;
+            }
+        }
+        Ok(out)
+    };
+    finish_complex(py, pad_half(re, value)?, pad_half(im, 0.0)?)
+}
+
+/// `aten::view(Tensor(a) self, SymInt[] size) -> Tensor(a)` and
+/// `aten::_unsafe_view`, on a complex receiver.
+///
+/// **`llama4`'s vision tower stops here.** `docs/BIND3.md` §5 got the patch
+/// embedding agreeing with upstream to the last digit and then stopped past
+/// `im2col`, in `Llama4VisionRotaryEmbedding`'s `reshape_for_broadcast`, at
+/// `freqs_ci.view(*shape)` -- refused because `view` was not among the ops
+/// taught the representation. It is the only op that tower needed that
+/// `docs/COMPLEX2.md` had not already taught.
+///
+/// `re.elem_count()` is the element count `-1` is resolved against, and that
+/// is the *complex* element count -- `Repr::Complex`'s shape is `re`'s shape
+/// (docs/COMPLEX2.md §1.2), so there is no trailing 2 to hide and no factor of
+/// two to correct for. Resolving against `re.elem_count() * 2` would put the
+/// wrong wildcard in without ever failing a shape check on `re` alone.
+///
+/// **Upstream this aliases and here it copies**, the same narrowing as
+/// `slice` above.
+fn complex_view(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+    op: &str,
+) -> PyResult<Py<PyAny>> {
+    let input = tensor_arg(op, args, kwargs, 0, "self")?;
+    let requested = shape_arg(op, args, kwargs, 1, "size")?;
+    let (re, im) = input.complex_parts(op)?;
+    let target = resolve_shape(op, &requested, re.elem_count())?;
+    let cast = |t: &Tensor| -> PyResult<Tensor> {
+        t.contiguous()
+            .and_then(|t| t.reshape(target.clone()))
+            .and_then(|t| t.contiguous())
+            .map_err(|e| candle_err(op, e))
+    };
+    finish_complex(py, cast(re)?, cast(im)?)
+}
+
+/// `aten::complex(Tensor real, Tensor imag) -> Tensor` -- the direct
+/// constructor, and the third row of `docs/BIND3.md` §6's gap table.
+///
+/// `view_as_complex` and `polar` were the only two entrances the
+/// representation had, and neither is what a caller reaches for when they
+/// already hold two real tensors: `view_as_complex` demands an interleaved
+/// trailing 2 and `polar` demands magnitude and angle. This one is the pair
+/// itself, so it is one `PyTensorBase::complex` call plus upstream's two
+/// refusals, transcribed from a live upstream rather than from the C++:
+///
+/// ```text
+/// torch.complex(f32, f64)   Expected object of scalar type Float but got scalar type Double for second argument
+/// torch.complex(i64, i64)   Expected both inputs to be Half, Float or Double tensors but got Long and Long
+/// ```
+///
+/// The two arguments broadcast against each other (measured: `(2,)` with
+/// `(2,1)` gives `(2,2)`), and the broadcast is done by adding each half to a
+/// zero of the *other* half's shape -- one candle call that produces both the
+/// broadcast and the unconditional copy this representation requires, rather
+/// than a shape computation written here that would have to agree with
+/// candle's.
+fn complex_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.complex.default";
+    let real = tensor_arg(OP, args, kwargs, 0, "real")?;
+    let imag = tensor_arg(OP, args, kwargs, 1, "imag")?;
+    if real.tag() != imag.tag() {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "Expected object of scalar type {} but got scalar type {} for second argument",
+            scalar_type_name(real.tag()),
+            scalar_type_name(imag.tag())
+        )));
+    }
+    // `real.tensor()?` refuses first if either argument is itself complex,
+    // which is upstream's answer too (`torch.complex` takes real parts).
+    if TorchDType::complex_for_component(real.tensor()?.dtype()).is_none() {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "Expected both inputs to be Half, Float or Double tensors but got {} and {}",
+            scalar_type_name(real.tag()),
+            scalar_type_name(imag.tag())
+        )));
+    }
+    let (r, i) = (real.tensor()?, imag.tensor()?);
+    let re = i
+        .zeros_like()
+        .and_then(|z| r.broadcast_add(&z))
+        .and_then(|t| t.contiguous())
+        .map_err(|e| candle_err(OP, e))?;
+    let im = r
+        .zeros_like()
+        .and_then(|z| i.broadcast_add(&z))
+        .and_then(|t| t.contiguous())
+        .map_err(|e| candle_err(OP, e))?;
+    finish_complex(py, re, im)
 }
