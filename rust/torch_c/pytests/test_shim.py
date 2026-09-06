@@ -19310,9 +19310,15 @@ refuses("engine_rounds_negative",
         lambda: federated.Engine(build(), method=adapt.Tent(), rounds=-1))
 refuses("engine_rounds_string",
         lambda: federated.Engine(build(), method=adapt.Tent(), rounds="two"))
+# `select=` no longer refuses at construction -- agreeing a cohort across the
+# ranks is a collective and needs the world size, so the door moved into
+# `participate`. This exercises it where it now is, and a proper subset is
+# still what it refuses. Both ranks run the same collective, so the group
+# stays in step (docs/FEDERATED3.md §5).
 refuses("engine_select",
-        lambda: federated.Engine(build(), method=adapt.Tent(),
-                                 select=lambda m: []))
+        lambda: federated.Engine(build(), method=adapt.Tent(), lr=LR,
+                                 select=lambda world: [0]).participate(
+                                     [{"input_ids": ids}], weight=WEIGHT))
 refuses("engine_allow_missing",
         lambda: federated.Engine(build(), method=adapt.Tent(),
                                  allow_missing=True))
@@ -19740,7 +19746,11 @@ def test_federated_refuses_the_round_shapes_it_does_not_implement():
         r0["engine_rounds_string"]
 
     assert r0["engine_select"].startswith("NotImplementedError:"), r0["engine_select"]
-    assert "participant selection" in r0["engine_select"], r0["engine_select"]
+    assert "Participant selection over a proper subset" in r0["engine_select"], \
+        r0["engine_select"]
+    # And it names what it would take, rather than only that it does not.
+    assert "new_group" in r0["engine_select"], r0["engine_select"]
+    assert "world_size N" in r0["engine_select"], r0["engine_select"]
 
     assert r0["engine_allow_missing"].startswith("NotImplementedError:"), \
         r0["engine_allow_missing"]
@@ -20972,6 +20982,662 @@ def test_float8_to_float64_terminates():
     widened = _C._aten_dispatch("aten._to_copy.default", _f8(), dtype=_C.float64)
     assert str(widened.dtype) == "torch.float64", widened.dtype
     assert widened.tolist() == [1.0, 2.0], widened.tolist()
+
+
+# ---------------------------------------------------------------------------
+# Aggregators beyond FedAvg, cohort agreement, and the dropout policy
+# (docs/FEDERATED3.md)
+#
+# The trap of docs/FEDERATED.md is unchanged and applies twice as hard here:
+# `FedAvg` at `world_size = 1` is the identity, and so is every aggregator
+# built on it -- `FedAvgM`'s velocity over one delta is that delta's running
+# sum, and `FedProx`'s server step *is* FedAvg. So every test below runs in two
+# `subprocess.Popen`s that share nothing but a TCP socket, and every assertion
+# is against a central computation done in this process on upstream torch from
+# the JSON those ranks dumped.
+#
+# What each new thing is checked against:
+#
+#   FedAvgM   three rounds, and `v_k = beta*v_(k-1) + mean_k` computed
+#             centrally at every one of them, `torch.equal`. The control is
+#             `momentum=0`, which has to be FedAvg bit for bit, and round 2 of
+#             `momentum=0.9`, which has to *not* be the mean.
+#   FedProx   the first local step has to be bit-identical to the
+#             unregularised one (`w == w_global`, so `mu*(w - w_global)` is
+#             exactly zero) and the third has to differ. That pair is what
+#             shows the term is the stated function of `w - w_global` rather
+#             than any constant nudge -- and an unarmed FedProx refuses to
+#             aggregate, because it would be FedAvg reporting success.
+#   cohort    the two ranks must *agree* on the participant set. Nothing
+#             downstream notices if they do not: two ranks holding different
+#             cohorts still complete every collective and still produce a
+#             weighted mean.
+#   dropout   rank 1 exits after the group is live. Rank 0 must raise
+#             `RankDropped`, naming the rank, and must end the round holding
+#             the weights it started it with -- no partial average, and no
+#             local update kept that no other rank has.
+# ---------------------------------------------------------------------------
+
+_FED3_WEIGHTS = {0: 3.0, 1: 7.0}
+_FED3_MOMENTUM = 0.9
+_FED3_MU = 0.05
+
+_FED3_WORKER_SRC = (
+    "import json, os, sys\n"
+    "import torch\n"
+    "import torch.nn as nn\n"
+    + _ADAPT_MODEL_SRC
+    + r'''
+out = {"shim": hasattr(torch._C, "_aten_implemented")}
+print("shim" if out["shim"] else "upstream", file=sys.stderr, flush=True)
+assert out["shim"], "this subprocess loaded upstream torch, not the shim"
+
+import torch.distributed as dist
+import torchnative.distributed  # noqa: F401 -- registers backend="local"
+from torchnative import adapt
+from torchnative.delta import Delta
+from torchnative.nn import federated
+
+rank, port, dest = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3]
+WEIGHT = {0: 3.0, 1: 7.0}[rank]
+LOCAL_IDS = {0: [[3, 7, 1, 19, 5]], 1: [[11, 2, 23, 0, 14]]}[rank]
+MOMENTUM, MU = 0.9, 0.05
+
+dist.init_process_group(backend="local", init_method="tcp://127.0.0.1:%d" % port,
+                        rank=rank, world_size=2)
+out["rank"], out["world"] = dist.get_rank(), dist.get_world_size()
+out["weight"] = WEIGHT
+ids = torch.tensor(LOCAL_IDS)
+
+def tab(d):
+    return {n: t.tolist() for n, t in d.items()}
+
+def refuses(key, fn):
+    try:
+        fn()
+    except Exception as e:
+        out[key] = "%s: %s" % (type(e).__name__, str(e))
+    else:
+        out[key] = "ACCEPTED"
+
+# --- A. FedAvgM: three rounds of server momentum --------------------------
+m = build()
+w = adapt.wrap(m, method=adapt.Tent(), lr=LR)
+aggm = federated.FedAvgM(momentum=MOMENTUM)
+out["fedavgm"] = []
+for _ in range(3):
+    w.online()
+    for _ in range(3):
+        w.step(input_ids=ids)
+    d = w.adapted
+    local = tab(d.value)
+    agg = d.publish(group=None, weight=WEIGHT, aggregator=aggm)
+    out["fedavgm"].append({"local": local, "aggregate": tab(agg),
+                           "velocity": tab(aggm.velocity)})
+    d.value = dict(agg)
+    d.apply(m)
+    d.re_snapshot(m)
+out["fedavgm_rounds_seen"] = aggm.rounds_seen
+out["fedavgm_repr"] = repr(aggm)
+
+# --- B. the control: momentum=0 is FedAvg, bit for bit --------------------
+# The *same* table through both, so the only difference is the class.
+probe = {n: torch.tensor(v) for n, v in out["fedavgm"][0]["local"].items()}
+out["m0"] = tab(federated.FedAvgM(momentum=0.0).aggregate(
+    dict(probe), weight=WEIGHT))
+out["plain"] = tab(federated.FedAvg().aggregate(dict(probe), weight=WEIGHT))
+
+# --- C. FedProx: the proximal term on the local objective ----------------
+# Two runs from the same base on the same data: one plain, one with the
+# proximal term armed. Per-step deltas, so "the first step is unaffected"
+# is checkable rather than only the end state.
+def local_run(prox):
+    mm = build()
+    ww = adapt.wrap(mm, method=adapt.Tent(), lr=LR)
+    agg = federated.FedProx(mu=MU) if prox else federated.FedAvg()
+    if prox:
+        agg.arm(ww)
+    ww.online()
+    steps = []
+    for _ in range(3):
+        ww.step(input_ids=ids)
+        steps.append(tab(ww.adapted.value))
+    return mm, ww, agg, steps
+
+_, w_plain, agg_plain, steps_plain = local_run(False)
+m_prox, w_prox, agg_prox, steps_prox = local_run(True)
+out["prox_steps"], out["plain_steps"] = steps_prox, steps_plain
+out["prox_norm"] = w_prox.adapted.norm()
+out["plain_norm"] = w_plain.adapted.norm()
+out["prox_hooks"] = len(w_prox.grad_hooks)
+out["plain_hooks"] = len(w_plain.grad_hooks)
+out["prox_base"] = tab(w_prox.adapted.base)
+out["prox_aggregate"] = tab(
+    w_prox.adapted.publish(group=None, weight=WEIGHT, aggregator=agg_prox))
+out["prox_repr"] = repr(agg_prox)
+
+# An unarmed FedProx would be FedAvg wearing a name. It refuses before any
+# collective, so both ranks stay in step.
+refuses("prox_unarmed", lambda: federated.FedProx(mu=MU).aggregate(
+    dict(probe), weight=WEIGHT))
+
+# --- D. cohort agreement -------------------------------------------------
+# Every arm here is symmetric across the ranks: both run the same collective,
+# so a refusal leaves the group usable.
+out["cohort_all"] = list(federated.cohort(lambda world: range(world)))
+refuses("cohort_disagree",
+        lambda: federated.cohort([0, 1] if rank == 0 else [0]))
+refuses("cohort_subset", lambda: federated.cohort([0]))
+
+eng = federated.Engine(build(), method=adapt.Tent(), lr=LR,
+                       aggregator=federated.FedAvg(),
+                       select=lambda world: list(range(world)))
+[rep] = eng.participate([{"input_ids": ids}] * 3, weight=WEIGHT)
+out["select_round"] = {"cohort": list(rep.cohort), "rank": rep.rank,
+                       "world": rep.world, "aggregate_norm": rep.aggregate_norm}
+
+# --- E. refusals that need no collective ---------------------------------
+refuses("momentum_one", lambda: federated.FedAvgM(momentum=1.0))
+refuses("momentum_negative", lambda: federated.FedAvgM(momentum=-0.1))
+refuses("server_lr_zero", lambda: federated.FedAvgM(server_lr=0.0))
+refuses("mu_zero", lambda: federated.FedProx(mu=0.0))
+refuses("on_missing_average",
+        lambda: federated.Engine(build(), method=adapt.Tent(),
+                                 on_missing="average_arrived"))
+refuses("on_missing_bogus",
+        lambda: federated.Engine(build(), method=adapt.Tent(),
+                                 on_missing="whoever_shows_up"))
+refuses("allow_missing",
+        lambda: federated.Engine(build(), method=adapt.Tent(),
+                                 allow_missing=True))
+refuses("secure_aggregation",
+        lambda: federated.Engine(build(), method=adapt.Tent(),
+                                 secure_aggregation=True))
+refuses("differential_privacy",
+        lambda: federated.Engine(build(), method=adapt.Tent(),
+                                 differential_privacy=(1.0, 1e-5)))
+refuses("empty_cohort", lambda: federated.cohort([]))
+refuses("cohort_out_of_range", lambda: federated.cohort([0, 5]))
+
+# A velocity built over one schema, handed another. Symmetric: both ranks
+# aggregate the same two schemas in the same order.
+schema_shift = federated.FedAvgM(momentum=MOMENTUM)
+schema_shift.aggregate(dict(probe), weight=WEIGHT)
+refuses("velocity_schema",
+        lambda: schema_shift.aggregate({"other.weight": torch.ones(4)},
+                                       weight=WEIGHT))
+
+# The group survived all of it: this reproduces the aggregate from the top.
+out["again"] = tab(federated.FedAvg().aggregate(dict(probe), weight=WEIGHT))
+
+with open(dest, "w") as handle:
+    json.dump(out, handle)
+'''
+)
+
+
+_FED3_DROP_SRC = (
+    "import json, os, sys\n"
+    "import torch\n"
+    "import torch.nn as nn\n"
+    + _ADAPT_MODEL_SRC
+    + r'''
+out = {"shim": hasattr(torch._C, "_aten_implemented")}
+print("shim" if out["shim"] else "upstream", file=sys.stderr, flush=True)
+assert out["shim"], "this subprocess loaded upstream torch, not the shim"
+
+import torch.distributed as dist
+import torchnative.distributed  # noqa: F401
+from torchnative import adapt
+from torchnative.nn import federated
+
+rank, port, dest = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3]
+dist.init_process_group(backend="local", init_method="tcp://127.0.0.1:%d" % port,
+                        rank=rank, world_size=2)
+
+# One collective that *works*, so that what follows is a rank leaving a live
+# group rather than a rendezvous that never completed. Without this the test
+# could pass on a group that never formed.
+live = torch.tensor([float(rank) + 1.0])
+dist.all_reduce(live, op=dist.ReduceOp.SUM)
+out["live_sum"] = float(live[0].item())
+
+if rank == 1:
+    # The dropout. `os._exit` rather than `sys.exit`: no atexit, no flush, no
+    # orderly shutdown -- a device that lost power, not one that said goodbye.
+    with open(dest, "w") as handle:
+        json.dump(out, handle)
+    handle = None
+    os._exit(0)
+
+ids = torch.tensor(IDS)
+model = build()
+engine = federated.Engine(model, method=adapt.Tent(), lr=LR,
+                          aggregator=federated.FedAvg())
+covers = adapt.Tent().select(model)
+out["before"] = {n: dict(model.named_parameters())[n].tolist() for n in covers}
+out["policy"] = engine.on_missing
+try:
+    engine.participate([{"input_ids": ids}] * 3, weight=3.0)
+except Exception as e:
+    out["error"] = "%s: %s" % (type(e).__name__, str(e))
+    out["is_rank_dropped"] = isinstance(e, federated.RankDropped)
+    out["missing"] = list(getattr(e, "missing", ()))
+    out["during"] = getattr(e, "during", None)
+else:
+    out["error"] = "ACCEPTED -- a partial average was returned"
+    out["is_rank_dropped"] = False
+out["after"] = {n: dict(model.named_parameters())[n].tolist() for n in covers}
+
+with open(dest, "w") as handle:
+    json.dump(out, handle)
+'''
+)
+
+
+def _fed3_spawn(source, timeout=600, what="fed3"):
+    """Run `source` as rank 0 and rank 1, two OS processes. Returns both JSONs.
+
+    The same shape as `_fed_two_process_round`, and for the same reasons: a
+    free port taken by binding to 0 so concurrent worktrees do not collide, a
+    stagger so the master half of `TCPStore` binds before the client half
+    retries, and a timeout on every peer so a hang ends the test rather than
+    the run.
+    """
+    import socket
+    import time
+
+    tmp = tempfile.mkdtemp(prefix="%s-" % what)
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    sock.close()
+
+    env = dict(os.environ)
+    env["PYTHONPATH"] = _CKPT_VENDOR_DIR
+    env["TORCH_USE_RTLD_GLOBAL"] = "1"
+
+    procs = []
+    for rank in (0, 1):
+        procs.append(subprocess.Popen(
+            [sys.executable, "-c", source, str(rank), str(port),
+             os.path.join(tmp, "rank-%d.json" % rank)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env,
+        ))
+        time.sleep(0.3)
+
+    reports = []
+    for rank, proc in enumerate(procs):
+        try:
+            _, err = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            for other in procs:
+                other.kill()
+            proc.communicate()
+            raise RuntimeError(
+                "%s: rank %d never finished. A two-process collective that "
+                "hangs is what this timeout exists for." % (what, rank))
+        if proc.returncode != 0:
+            for other in procs:
+                other.kill()
+            raise RuntimeError("%s: rank %d exited %d\n--- stderr ---\n%s"
+                               % (what, rank, proc.returncode, err[-6000:]))
+        with open(os.path.join(tmp, "rank-%d.json" % rank)) as handle:
+            reports.append(json.load(handle))
+    return reports
+
+
+@functools.cache
+def _fed3_round():
+    """The aggregator/cohort round, in two OS processes."""
+    return _fed3_spawn(_FED3_WORKER_SRC, what="fed3-round")
+
+
+@functools.cache
+def _fed3_dropout():
+    """A round in which rank 1 leaves a live group without saying goodbye."""
+    return _fed3_spawn(_FED3_DROP_SRC, timeout=300, what="fed3-drop")
+
+
+def _fed3_central_mean(r0, r1, name, source):
+    """`(3*d0 + 7*d1)/10` for one parameter, upstream, from the ranks' JSON."""
+    t = _upstream_torch
+    d0 = _fed_tensor(r0[source][name])
+    d1 = _fed_tensor(r1[source][name])
+    return ((d0 * t.tensor(3.0, dtype=t.float32)
+             + d1 * t.tensor(7.0, dtype=t.float32))
+            / t.tensor(10.0, dtype=t.float32))
+
+
+def test_fedavgm_over_two_processes_equals_the_server_momentum_computed_centrally():
+    """Three rounds of `v <- beta v + mean`, against the same recursion centrally.
+
+    `FedAvgM` is the first aggregator here whose output at round *k* depends on
+    rounds before it, so one round cannot distinguish it from `FedAvg` and this
+    does not try: it runs three, and at each one asserts
+
+        aggregate_k == v_k        where  v_k = 0.9 * v_(k-1) + (3*d0 + 7*d1)/10
+
+    with the right-hand side computed in this process, on upstream torch, from
+    the two ranks' local deltas. `torch.equal`: every operation on both sides
+    is a correctly-rounded float32 multiply, add or divide over the same
+    inputs, and the scale is applied as a 0-dim tensor of the table's dtype on
+    both sides so there is one rounding and not a promotion rule.
+
+    Both ranks must also hold the *same* velocity without ever reducing it --
+    the mean is identical on both by `all_reduce`, and the update applied to it
+    is deterministic. That is asserted rather than argued, because a server
+    state that drifted would still return a table and still report success.
+    """
+    if not _ckpt_shim_available():
+        return
+    r0, r1 = _fed3_round()
+    t = _upstream_torch
+    assert r0["shim"] is True and r1["shim"] is True
+    assert (r0["rank"], r1["rank"]) == (0, 1), (r0["rank"], r1["rank"])
+    assert r0["world"] == r1["world"] == 2, r0["world"]
+    assert r0["fedavgm_rounds_seen"] == 3, r0["fedavgm_rounds_seen"]
+    assert "momentum=0.9" in r0["fedavgm_repr"], r0["fedavgm_repr"]
+
+    velocity = {}
+    beta = t.tensor(_FED3_MOMENTUM, dtype=t.float32)
+    for k, (a0, a1) in enumerate(zip(r0["fedavgm"], r1["fedavgm"])):
+        assert a0["local"] != a1["local"], (
+            "round %d: the two ranks produced the same delta, so no average "
+            "of them is distinguishable" % k)
+        for name in sorted(a0["local"]):
+            mean = _fed3_central_mean({"m": a0["local"]}, {"m": a1["local"]},
+                                      name, "m")
+            previous = velocity.get(name)
+            v = mean.clone() if previous is None else previous * beta + mean
+            velocity[name] = v
+            got0 = _fed_tensor(a0["aggregate"][name])
+            got1 = _fed_tensor(a1["aggregate"][name])
+            assert t.equal(got0, v), (k, name, got0[:4].tolist(), v[:4].tolist())
+            assert t.equal(got1, v), (k, name, got1[:4].tolist(), v[:4].tolist())
+            # ... and it is neither operand.
+            assert not t.equal(got0, _fed_tensor(a0["local"][name])), (k, name)
+            assert not t.equal(got0, _fed_tensor(a1["local"][name])), (k, name)
+            if k > 0:
+                # The whole point of momentum: from round 2 the aggregate is
+                # *not* the round's mean, because it carries the ones before.
+                assert not t.equal(got0, mean), (
+                    "round %d: FedAvgM returned this round's mean, so the "
+                    "velocity is not carrying" % k)
+        assert a0["velocity"] == a1["velocity"], (
+            "round %d: the two ranks' server velocities diverged" % k)
+
+
+def test_fedavgm_with_zero_momentum_is_fedavg_bit_for_bit():
+    """The control that makes the test above able to fail for the right reason.
+
+    Every way `FedAvgM` can go quietly wrong produces *an* average: dropping
+    the velocity, applying it before the mean, restarting it each round. So the
+    two ends are pinned. At `momentum=0` it has to be `FedAvg` exactly -- the
+    same table through both classes, `torch.equal` -- and above zero it has to
+    differ from `FedAvg` by more than float noise, which is measured here
+    rather than assumed.
+    """
+    if not _ckpt_shim_available():
+        return
+    r0, r1 = _fed3_round()
+    t = _upstream_torch
+    assert r0["m0"] == r0["plain"], (
+        "FedAvgM(momentum=0) is not FedAvg, so one of them is not the "
+        "weighted mean")
+    assert r1["m0"] == r1["plain"], "same, on rank 1"
+    # Both ranks agree on the mean, which is what makes the velocity agree.
+    assert r0["plain"] == r1["plain"], "the ranks disagree about the mean"
+
+    gaps = []
+    for name in sorted(r0["fedavgm"][1]["aggregate"]):
+        mean = _fed3_central_mean({"m": r0["fedavgm"][1]["local"]},
+                                  {"m": r1["fedavgm"][1]["local"]}, name, "m")
+        with_momentum = _fed_tensor(r0["fedavgm"][1]["aggregate"][name])
+        gaps.append(float((with_momentum - mean).abs().max()))
+    assert min(gaps) > 1e-3, gaps
+
+
+def test_fedprox_leaves_its_first_local_step_untouched_and_moves_the_rest():
+    """FedProx's difference is `mu*(w - w_global)` on the gradient, and nowhere else.
+
+    The server step of FedProx *is* FedAvg's, so an aggregator that only
+    overrode `aggregate` would be indistinguishable from FedAvg at every world
+    size for ever. What is asserted here is the shape of the term rather than
+    the fact of a difference:
+
+      * at the **first** local step `w == w_global`, so the term is exactly
+        zero and the delta has to be bit-identical to the unregularised run --
+        a constant nudge, a sign error, or a term computed against the wrong
+        tensor all break this half;
+      * by the **third** step it has to differ by more than float noise, and
+        the delta has to be *smaller*, because the term pulls back toward the
+        weights the round started from.
+
+    The aggregate over the two ranks is still checked against the central
+    weighted mean of the two prox deltas -- FedProx changed what was
+    contributed, not how it was combined.
+    """
+    if not _ckpt_shim_available():
+        return
+    r0, r1 = _fed3_round()
+    t = _upstream_torch
+    for r in (r0, r1):
+        assert r["prox_hooks"] == 1 and r["plain_hooks"] == 0, (
+            r["prox_hooks"], r["plain_hooks"])
+        assert r["prox_steps"][0] == r["plain_steps"][0], (
+            "the proximal term moved the first step, where w == w_global and "
+            "mu*(w - w_global) is exactly zero")
+        gaps = [float((_fed_tensor(r["prox_steps"][2][n])
+                       - _fed_tensor(r["plain_steps"][2][n])).abs().max())
+                for n in sorted(r["prox_steps"][2])]
+        assert min(gaps) > 1e-3, gaps
+        assert r["prox_norm"] < r["plain_norm"], (
+            r["prox_norm"], r["plain_norm"])
+        assert "mu=0.05" in r["prox_repr"], r["prox_repr"]
+
+    assert r0["prox_base"] == r1["prox_base"], "the ranks did not share a base"
+    assert r0["prox_steps"] != r1["prox_steps"], "the ranks trained alike"
+    for name in sorted(r0["prox_aggregate"]):
+        central = _fed3_central_mean({"m": r0["prox_steps"][2]},
+                                     {"m": r1["prox_steps"][2]}, name, "m")
+        for r in (r0, r1):
+            got = _fed_tensor(r["prox_aggregate"][name])
+            assert t.equal(got, central), (name, got[:4].tolist(),
+                                           central[:4].tolist())
+
+
+def test_fedprox_refuses_to_aggregate_when_its_proximal_term_was_never_installed():
+    """A FedProx that never armed is FedAvg, and it would report success.
+
+    This is the refusal that keeps the class honest: `Delta.publish` hands any
+    aggregator the table and takes back the average, so a `FedProx` reached
+    that way would compute FedAvg's weighted mean and be reported as FedProx by
+    every caller downstream. `docs/DESIGN.md` §6: name it rather than
+    approximate it.
+    """
+    if not _ckpt_shim_available():
+        return
+    for r in _fed3_round():
+        msg = r["prox_unarmed"]
+        assert msg.startswith("RuntimeError:"), msg
+        assert "never" in msg and "installed" in msg, msg
+        assert "would compute FedAvg" in msg, msg
+        assert "Check: federated.Engine" in msg, msg
+        assert r["mu_zero"].startswith("ValueError:"), r["mu_zero"]
+        assert "at mu=0 *is* FedAvg" in r["mu_zero"], r["mu_zero"]
+
+
+def test_participant_selection_is_agreed_across_the_ranks_and_a_subset_refuses():
+    """The half of selection that does not need a bigger world, and the half that does.
+
+    Two ranks that disagree about who is participating still complete every
+    collective and still produce a weighted mean -- over a cohort neither of
+    them chose. A selection rule as ordinary as "sample half the clients"
+    disagrees whenever the ranks seed differently, which is the default. So the
+    cohort is agreed over the same digest collective the schema and the base
+    use, and a disagreement refuses by name.
+
+    A **proper subset** is refused, and the message says what it would take:
+    the collective would have to run on a sub-group (`new_group`), and the
+    transport implements only worlds of 1 and 2. At two ranks the only subsets
+    have one member, where FedAvg is the identity -- so this cannot be served
+    here even approximately.
+    """
+    if not _ckpt_shim_available():
+        return
+    r0, r1 = _fed3_round()
+    for r in (r0, r1):
+        assert r["cohort_all"] == [0, 1], r["cohort_all"]
+        assert r["select_round"]["cohort"] == [0, 1], r["select_round"]
+
+        msg = r["cohort_disagree"]
+        assert msg.startswith("ValueError:"), msg
+        assert "which ranks this round selected" in msg, msg
+        assert "would sum to" in msg, msg
+
+        sub = r["cohort_subset"]
+        assert sub.startswith("NotImplementedError:"), sub
+        assert "new_group" in sub and "world but 1 and 2" in sub, sub
+        assert "identity" in sub, sub
+        assert "Next: ProcessGroupLocal at world_size N" in sub, sub
+
+        assert r["empty_cohort"].startswith("ValueError:"), r["empty_cohort"]
+        assert r["cohort_out_of_range"].startswith("ValueError:"), \
+            r["cohort_out_of_range"]
+
+    # Both ranks ran the same collectives through every refusal, so the group
+    # is still usable and still gives the aggregate pinned at the top.
+    assert r0["again"] == r0["plain"], "the group did not survive a refusal"
+    assert r1["again"] == r1["plain"], "the group did not survive a refusal"
+    # A selected round is a real round: both ranks end it agreeing.
+    assert r0["select_round"]["aggregate_norm"] == \
+        r1["select_round"]["aggregate_norm"], (r0["select_round"],
+                                               r1["select_round"])
+
+
+def test_a_dropped_rank_refuses_by_name_and_leaves_the_round_uncontributed():
+    """Rank 1 leaves a live group. Rank 0 must refuse, not average what arrived.
+
+    The failure being guarded against is an aggregator that divides by however
+    many ranks reported: it returns a table, of the right names and shapes,
+    and every caller downstream sees success. So this kills a rank *after* a
+    collective has completed -- `live_sum == 3.0` proves the group was real --
+    and asserts three things about rank 0:
+
+      * it raises `federated.RankDropped`, and the message names which rank
+        did not report and says no partial average was produced;
+      * the model it holds afterwards is the one it started the round with,
+        byte for byte. The local epochs had already moved it, and keeping that
+        update would leave the two ranks silently holding different weights --
+        the one property that makes this federated learning rather than two
+        devices training alone;
+      * `on_missing` was `'refuse'`, the default, so this is the policy and
+        not an accident of the socket.
+    """
+    if not _ckpt_shim_available():
+        return
+    r0, r1 = _fed3_dropout()
+    assert r0["shim"] is True and r1["shim"] is True
+    assert r0["live_sum"] == r1["live_sum"] == 3.0, (
+        "the group was never live, so nothing was dropped from it",
+        r0["live_sum"], r1["live_sum"])
+    assert r0["policy"] == "refuse", r0["policy"]
+    assert r0["is_rank_dropped"] is True, r0["error"]
+    assert r0["error"].startswith("RankDropped:"), r0["error"]
+    assert "rank 1 did not report" in r0["error"], r0["error"]
+    assert "no partial average was produced" in r0["error"], r0["error"]
+    assert "on_missing" in r0["error"], r0["error"]
+    assert r0["missing"] == [1], r0["missing"]
+    assert r0["during"], r0["during"]
+    assert r0["before"] == r0["after"], (
+        "the round was left half-applied: rank 0 kept a local update that no "
+        "other rank has")
+
+
+def test_the_partial_average_a_dropout_would_have_produced_is_a_different_model():
+    """What "divide by whoever arrived" would have returned, measured.
+
+    The refusal above is only worth having if the thing it refuses is wrong,
+    and "it returned some average" is the failure mode. So the quantity a
+    silently-partial FedAvg would produce is computed here, centrally, from the
+    two ranks' own deltas: with only rank 0 reporting, `sum(w_k d_k) /
+    sum_arrived(w_k)` is `3*d0/3`, which is `d0`. That is the *identity* -- the
+    same degenerate answer `world_size = 1` gives, arrived at by a socket
+    timeout instead of by a decision.
+
+    Measured against the true two-rank aggregate, so the gap is a number and
+    not an argument.
+    """
+    if not _ckpt_shim_available():
+        return
+    r0, r1 = _fed3_round()
+    t = _upstream_torch
+    gaps = []
+    for name in sorted(r0["fedavgm"][0]["local"]):
+        d0 = _fed_tensor(r0["fedavgm"][0]["local"][name])
+        true = _fed3_central_mean({"m": r0["fedavgm"][0]["local"]},
+                                  {"m": r1["fedavgm"][0]["local"]}, name, "m")
+        # The divisor a dropout would have chosen: 3, not 10.
+        partial = (d0 * t.tensor(3.0, dtype=t.float32)) / t.tensor(
+            3.0, dtype=t.float32)
+        # It is rank 0's own delta, up to the scale-and-divide round trip:
+        # `x*3/3` is not `x` in float32, which is worth one line of its own --
+        # the degenerate answer is not even *exactly* the operand, so a test
+        # that expected `torch.equal` here would fail for a reason that has
+        # nothing to do with aggregation. Measured max difference 6e-8.
+        assert float((partial - d0).abs().max()) < 1e-6, name
+        assert not t.equal(partial, true), (
+            name, "a partial average equalled the true one, so this control "
+                  "cannot show a dropout mattering")
+        gaps.append(float((partial - true).abs().max()))
+    assert min(gaps) > 1e-3, gaps
+
+
+def test_federated_refuses_secure_aggregation_and_differential_privacy_by_name():
+    """The two that are a round of their own, refusing with the chain they need.
+
+    Neither is a flag. Masked aggregation needs pairwise secrets between
+    clients, which needs point-to-point `send`/`recv` -- both refused by the
+    transport -- plus threshold secret sharing so that a dropout does not
+    destroy the sum, which is the same problem `on_missing=` names. A
+    differential privacy guarantee is a *number*, and producing one needs
+    per-example gradient clipping (this stack's backward produces one gradient
+    per parameter over the batch) and an accountant over a sampling rate that
+    participant selection defines -- which `cohort` refuses above.
+
+    Adding either without the rest would produce a model that is worse and a
+    guarantee that is absent, and report both as success.
+    """
+    if not _ckpt_shim_available():
+        return
+    for r in _fed3_round():
+        sec = r["secure_aggregation"]
+        assert sec.startswith("NotImplementedError:"), sec
+        assert "point-to-point send/recv" in sec, sec
+        assert "threshold secret-sharing" in sec, sec
+        assert "56 bits" in sec, sec
+
+        dp = r["differential_privacy"]
+        assert dp.startswith("NotImplementedError:"), dp
+        assert "per-example" in dp, dp
+        assert "accountant" in dp, dp
+        assert "round of its own" in dp, dp
+
+        for key in ("on_missing_average", "allow_missing"):
+            msg = r[key]
+            assert msg.startswith("NotImplementedError:"), (key, msg)
+            assert "divisor nobody chose" in msg or "on_missing=" in msg, \
+                (key, msg)
+        assert "world_size N" in r["on_missing_average"], r["on_missing_average"]
+        assert r["on_missing_bogus"].startswith("ValueError:"), \
+            r["on_missing_bogus"]
+        for key in ("momentum_one", "momentum_negative", "server_lr_zero"):
+            assert r[key].startswith("ValueError:"), (key, r[key])
+        assert r["velocity_schema"].startswith("ValueError:"), \
+            r["velocity_schema"]
+        assert "momentum buffer that restarted at zero" in r["velocity_schema"], \
+            r["velocity_schema"]
 
 
 if __name__ == "__main__":
