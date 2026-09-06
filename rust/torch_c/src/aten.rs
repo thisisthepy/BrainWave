@@ -455,6 +455,272 @@ pub fn all_implemented() -> Vec<&'static str> {
 // gives the default float") call it rather than reading a copy, which is the
 // whole of what makes the setter load-bearing rather than decorative.
 
+// ---------------------------------------------------------------------------
+// The torch-dispatch mode stack (docs/DISPATCH3.md)
+// ---------------------------------------------------------------------------
+//
+// `docs/EXPORT.md` §4.2 measured the gap this closes: a `TorchDispatchMode`
+// entered, `_len_torch_dispatch_stack()` reported 1 inside the block, and
+// `__torch_dispatch__` was never called, because the single door did not read
+// the stack. The capture hook in `aten_dispatch` runs *after* the kernel, so
+// it can record a result and cannot replace one -- and replacing the result is
+// the whole of what `FakeTensorMode` and `ProxyTorchDispatchMode` need.
+//
+// The consult is here, in the Python door, and **not** in `aten_dispatch`.
+// That is deliberate: `capture.rs` replays a recorded graph by calling
+// `aten_dispatch` from Rust, and a replay is below the dispatcher rather than
+// through it. Everything Python calls -- `torch.<op>`, `torch.ops.aten.<op>`,
+// a tensor method, `bootstrap.py`'s own helpers -- arrives at
+// `aten_dispatch_entry`, so nothing user-visible escapes the consult.
+
+/// `torch._C`, resolved once. Cached with `get_or_try_init` rather than
+/// `get_or_init` so that a failure during interpreter start-up is *not*
+/// remembered as an answer.
+static TORCH_C_MODULE: std::sync::OnceLock<Py<PyAny>> = std::sync::OnceLock::new();
+
+/// `torch.utils._python_dispatch`, resolved once, for the gate below.
+static PYTHON_DISPATCH_MODULE: std::sync::OnceLock<Py<PyAny>> = std::sync::OnceLock::new();
+
+/// Fill a module cache without remembering a failure.
+///
+/// `OnceLock::get_or_init` cannot express "do not cache an error", and an
+/// error here is not hypothetical: the first dispatch of the process can
+/// happen while `import torch` is still running, when neither module is
+/// importable yet. Caching that would disable the mode stack for the life of
+/// the interpreter.
+fn cached_module<'a>(
+    cell: &'a std::sync::OnceLock<Py<PyAny>>,
+    py: Python<'_>,
+    name: &str,
+) -> PyResult<&'a Py<PyAny>> {
+    if let Some(found) = cell.get() {
+        return Ok(found);
+    }
+    let module = py.import(name)?.into_any().unbind();
+    let _ = cell.set(module);
+    Ok(cell.get().expect("just set"))
+}
+
+fn torch_c_module(py: Python<'_>) -> PyResult<&'static Py<PyAny>> {
+    cached_module(&TORCH_C_MODULE, py, "torch._C")
+}
+
+/// Is *any* torch-dispatch mode entered anywhere in this process?
+///
+/// **This is the whole of what the ordinary path pays.** One module attribute
+/// read and a truth test -- no Python call, no stack walk, no allocation. The
+/// authoritative lookup below runs only when this says yes, so with no mode on
+/// the stack `_aten_dispatch` reaches `aten_dispatch` having done a dict
+/// lookup, which is why golden is unmoved in result *and* in shape.
+///
+/// The flag is `torch/utils/_python_dispatch.py`'s own module global, set in
+/// `TorchDispatchMode.__enter__` and restored in `__exit__`. Reading torch's
+/// bookkeeping rather than keeping a second copy means the two cannot drift;
+/// the cost is that a mode installed by calling
+/// `torch._C._push_on_torch_dispatch_stack` directly, without the context
+/// manager, is not seen. Upstream's C++ does not use this flag for dispatch,
+/// so that is a difference and it is recorded here rather than in a comment
+/// that says "should be fine".
+#[inline]
+fn any_dispatch_mode_active(py: Python<'_>) -> bool {
+    let module = match cached_module(
+        &PYTHON_DISPATCH_MODULE,
+        py,
+        "torch.utils._python_dispatch",
+    ) {
+        Ok(m) => m,
+        // Not importable yet -- this is a dispatch from inside `import torch`.
+        // Nothing can have entered a mode, and the failure is not cached.
+        Err(_) => return false,
+    };
+    match module
+        .bind(py)
+        .getattr(intern!(py, "_is_in_torch_dispatch_mode"))
+    {
+        Ok(flag) => flag.is_truthy().unwrap_or(false),
+        Err(_) => false,
+    }
+}
+
+/// The mode that gets to answer, and how to put it back.
+struct ActiveMode<'py> {
+    mode: Bound<'py, PyAny>,
+    /// `Some` for an infra mode (`FakeTensorMode`, `ProxyTorchDispatchMode`),
+    /// which lives in a slot keyed by `_TorchDispatchModeKey` rather than on
+    /// the ordinary stack. The key is needed to unset and re-set the slot.
+    infra_key: Option<Bound<'py, PyAny>>,
+}
+
+/// Upstream's `TorchDispatchModeTLS::pop_stack` order, reproduced.
+///
+/// A user mode on the ordinary stack wins if there is one, innermost first.
+/// Only when that stack is empty do the infra slots answer, and then in
+/// reverse key order -- which is what makes an infra mode "lower precedence"
+/// in upstream's phrasing rather than merely elsewhere.
+///
+/// Both halves are read through the installed `torch._C` names rather than
+/// through any state of this crate's own, because those names are the
+/// bookkeeping `torch/utils/_python_dispatch.py` writes.
+fn innermost_dispatch_mode<'py>(py: Python<'py>) -> PyResult<Option<ActiveMode<'py>>> {
+    let c = torch_c_module(py)?.bind(py);
+    let depth: i64 = match c.call_method0(intern!(py, "_len_torch_dispatch_stack")) {
+        Ok(n) => n.extract().unwrap_or(0),
+        Err(_) => 0,
+    };
+    if depth > 0 {
+        let mode = c.call_method1(intern!(py, "_get_dispatch_stack_at"), (depth - 1,))?;
+        return Ok(Some(ActiveMode {
+            mode,
+            infra_key: None,
+        }));
+    }
+    // The infra slots. `_len_torch_dispatch_stack` counts only the ordinary
+    // stack in this shim (upstream's C++ counts both), so an infra mode is
+    // invisible to the branch above and has to be looked for by key.
+    let keys = match c.getattr(intern!(py, "_TorchDispatchModeKey")) {
+        Ok(k) => k,
+        Err(_) => return Ok(None),
+    };
+    let members: Vec<Bound<'py, PyAny>> = match keys.try_iter() {
+        Ok(iter) => iter.collect::<PyResult<Vec<_>>>()?,
+        Err(_) => return Ok(None),
+    };
+    for key in members.into_iter().rev() {
+        if let Ok(mode) = c.call_method1(intern!(py, "_get_dispatch_mode"), (&key,)) {
+            if !mode.is_none() {
+                return Ok(Some(ActiveMode {
+                    mode,
+                    infra_key: Some(key),
+                }));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// `torch.ops.<ns>.<name>.<overload>` for a dispatch key.
+///
+/// The mode is handed the `OpOverload` and not the string, because
+/// `__torch_dispatch__` implementations end by calling `func(*args, **kwargs)`
+/// and read `func._schema` / `func.overloadpacket` on the way. `str(func)` is
+/// then `aten.mul.Tensor`, which is what makes a mode's log comparable with
+/// upstream's at all.
+fn op_overload<'py>(py: Python<'py>, op: &str) -> PyResult<Bound<'py, PyAny>> {
+    let mut parts = op.splitn(3, '.');
+    let namespace = parts.next().unwrap_or("aten");
+    let name = parts.next().unwrap_or("");
+    let overload = match parts.next() {
+        None | Some("") => "default",
+        Some(other) => other,
+    };
+    py.import("torch")?
+        .getattr(intern!(py, "ops"))?
+        .getattr(namespace)?
+        .getattr(name)?
+        .getattr(overload)
+}
+
+/// The `types` tuple upstream passes: the types among the arguments that
+/// override `__torch_dispatch__`.
+///
+/// The test for "overrides" is `torch/_tensor.py:457`'s own --
+/// `type(a).__torch_dispatch__ is not torch.Tensor.__torch_dispatch__` -- so a
+/// plain tensor contributes nothing and the tuple is empty, which is exactly
+/// what upstream produces for `(x * 2 + 1).relu()` (measured side by side in
+/// docs/DISPATCH3.md §2). A `FakeTensor` argument does contribute, which is
+/// the case that makes the tuple worth computing rather than hard-coding.
+///
+/// Top-level arguments only. Upstream walks into lists; nothing that reaches a
+/// mode here passes a tensor subclass inside a list today, and inventing the
+/// recursion without a case that needs it would be a guess.
+fn overriding_types<'py>(
+    py: Python<'py>,
+    args: &Bound<'py, PyTuple>,
+    kwargs: Option<&Bound<'py, PyDict>>,
+) -> PyResult<Bound<'py, PyTuple>> {
+    let base = py
+        .import("torch")?
+        .getattr(intern!(py, "Tensor"))?
+        .getattr(intern!(py, "__torch_dispatch__"))
+        .ok();
+    let mut found: Vec<Bound<'py, PyAny>> = Vec::new();
+    let mut consider = |obj: Bound<'py, PyAny>| {
+        let ty = obj.get_type();
+        let Ok(theirs) = ty.getattr(intern!(py, "__torch_dispatch__")) else {
+            return;
+        };
+        if let Some(base) = base.as_ref() {
+            if theirs.is(base) {
+                return;
+            }
+        }
+        let ty = ty.into_any();
+        if !found.iter().any(|seen| seen.is(&ty)) {
+            found.push(ty);
+        }
+    };
+    for arg in args.iter() {
+        consider(arg);
+    }
+    if let Some(kwargs) = kwargs {
+        for (_, value) in kwargs.iter() {
+            consider(value);
+        }
+    }
+    PyTuple::new(py, found)
+}
+
+/// Give the mode the call, upstream's way: **pop it for the duration**.
+///
+/// Every `__torch_dispatch__` implementation worth the name ends by calling
+/// `func(*args, **kwargs)`, which comes straight back through
+/// `aten_dispatch_entry`. Without the pop that re-entry finds the same mode on
+/// top and recurses until the stack blows. Upstream pops with a C++ guard;
+/// `bootstrap.py::_through_torch_function_modes` does the same thing for the
+/// *torch-function* stack and for the same reason, so this is the shape this
+/// tree already uses.
+///
+/// The pop is restored in every exit path, including the one where the mode
+/// raised. A mode that leaked off the stack on an exception would turn one
+/// error into a silently mode-less block afterwards, which is worse than the
+/// error.
+fn dispatch_through_mode(
+    py: Python<'_>,
+    active: ActiveMode<'_>,
+    op: &str,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    let c = torch_c_module(py)?.bind(py).clone();
+    match active.infra_key.as_ref() {
+        Some(key) => {
+            c.call_method1(intern!(py, "_unset_dispatch_mode"), (key,))?;
+        }
+        None => {
+            c.call_method0(intern!(py, "_pop_torch_dispatch_stack"))?;
+        }
+    }
+    let result = (|| -> PyResult<Py<PyAny>> {
+        let func = op_overload(py, op)?;
+        let types = overriding_types(py, args, kwargs)?;
+        active
+            .mode
+            .call_method1(intern!(py, "__torch_dispatch__"), (func, types, args, kwargs))
+            .map(|value| value.unbind())
+    })();
+    let restored = match active.infra_key.as_ref() {
+        Some(_) => c.call_method1(intern!(py, "_set_dispatch_mode"), (&active.mode,)),
+        None => c.call_method1(intern!(py, "_push_on_torch_dispatch_stack"), (&active.mode,)),
+    };
+    // The mode's own error wins; a failure to restore is only reported when
+    // there is no error to lose by reporting it.
+    match (result, restored) {
+        (Ok(value), Ok(_)) => Ok(value),
+        (Ok(_), Err(err)) => Err(err),
+        (Err(err), _) => Err(err),
+    }
+}
+
 /// What Python calls. A thin wrapper whose only job is to split `op` off the
 /// front of the argument tuple and hand the rest to `aten_dispatch`, which is
 /// still the one door and still where everything happens.
@@ -536,6 +802,16 @@ pub fn aten_dispatch_entry(
     // bound by keyword, so `args` is just `(op,)`) the slice is empty and
     // CPython hands back the interned empty tuple without allocating.
     let rest = args.get_slice(1, args.len());
+    // The mode-stack consult (docs/DISPATCH3.md). When nothing has entered a
+    // `TorchDispatchMode` -- which is every golden case, every eager forward
+    // and every `loss.backward()` -- this is one module attribute read and a
+    // branch that is not taken, and `aten_dispatch` below is reached with the
+    // arguments untouched.
+    if any_dispatch_mode_active(py) {
+        if let Some(active) = innermost_dispatch_mode(py)? {
+            return dispatch_through_mode(py, active, op, &rest, kwargs);
+        }
+    }
     aten_dispatch(py, op, &rest, kwargs)
 }
 
