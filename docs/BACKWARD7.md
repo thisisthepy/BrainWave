@@ -449,7 +449,9 @@ Nobody would have found that from the passing runs.
 <!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_the_eager_tape_and_the_capture_tape_are_the_same_derivative_rules present -->
 <!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_the_eager_graph_is_freed_by_the_backward_that_walks_it present -->
 <!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_the_eager_graph_refuses_a_write_through_a_view_of_a_value_it_holds present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_tensor_backward_still_refuses_even_though_an_eager_graph_exists present -->
-<!-- The engine is still refused. Invert the test above rather than deleting it when it lands. -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_the_engine_answers_now_that_an_eager_graph_exists present -->
+<!-- The engine landed in docs/BACKWARD9.md and the test above was inverted rather than
+     deleted, which is what this line asked for. The marker follows it to its new name so
+     that the lineage stays greppable; §6 and §10 row 4 are history and are left as written. -->
 <!-- DOCWATCH: count smoke_ok ge 390 -->
 <!-- DOCWATCH: count golden_cases_passed ge 8509 -->

@@ -437,26 +437,24 @@ def test_the_autograd_boundary_is_where_autograd_md_says_it_is():
     # above from passing on a `grad_fn` that is simply always non-None.
     assert x.is_leaf is True and x.grad_fn is None
 
-    # 3. The wall a `backward()` reaches refuses by name rather than returning
-    #    zeros. AUTOGRAD.md §1.2 walks the path that gets here:
-    #    Tensor.backward -> autograd.backward -> _engine_run_backward, which
-    #    touches the thread-local first and the engine second. The thread-local
-    #    is no longer a wall (see the docstring), so this is now one wall and
-    #    it is the right one.
-    try:
-        _C._ImperativeEngine().run_backward()
-    except NotImplementedError as e:
-        assert "not implemented in torch._C shim" in str(e), str(e)
-        # A refusal that names only itself sends a reader nowhere.
-        # docs/DESIGN.md §6: name the alternative that works.
-        assert "CaptureTrace.backward()" in str(e), str(e)
-        assert "docs/BACKWARD2.md" in str(e), str(e)
-    else:
-        raise AssertionError(
-            "run_backward no longer refuses -- if autograd landed, invert this "
-            "test and update docs/AUTOGRAD.md §1 and docs/BACKWARD2.md rather "
-            "than deleting it"
-        )
+    # 3. **Inverted by docs/BACKWARD9.md, as the previous revision asked.** The
+    #    wall a `backward()` reaches used to refuse by name; it answers now, and
+    #    what replaces the refusal is the stronger claim -- the engine
+    #    differentiates *whatever produced this tensor* and writes the answer
+    #    into the leaf's `.grad`, which is the second of the two boundaries this
+    #    docstring keeps apart and the one that had never moved.
+    #
+    #    `y = x * x` with `x` full of 2.0, so `d(sum(y))/dx = 2x = 4` -- a value
+    #    a wrong rule cannot reach by returning the seed, the operand, or zeros.
+    total = _C._aten_dispatch("aten.sum.default", y)
+    assert _C._ImperativeEngine().run_backward(
+        (total,), (), False, False, (), True, True
+    ) == ()
+    assert x.grad is not None, "run_backward answered but wrote no .grad"
+    assert [float(v) for v in x.grad.flatten()] == [4.0, 4.0, 4.0, 4.0], (
+        [float(v) for v in x.grad.flatten()]
+    )
+    x.grad = None
     # ... and the thread-local store, which stood in front of it, is a store.
     # It is asserted here rather than left to its own test because the *reason*
     # it exists is that it was masking the assertion above.
@@ -16534,9 +16532,14 @@ out["nonscalar_seed"] = attempt(
     lambda: [None if g is None else g.shape[0] for g in _make_grads((nonscalar,), (None,),
                                                                     is_grads_batched=False)])
 
-# 3. ... and what would consume it.
-out["backward"] = attempt(lambda: (scalar.backward(), "returned")[1])
-out["autograd_grad"] = attempt(lambda: (torch.autograd.grad(scalar, x), "returned")[1])
+# 3. ... and what consumes it. Both doors answer since docs/BACKWARD9.md, so
+#    what is recorded is the *answer* rather than the refusal: `.backward()`
+#    fills `x.grad`, and `torch.autograd.grad` over a fresh forward returns the
+#    same numbers without touching it.
+out["backward"] = attempt(lambda: (scalar.backward(), [float(v) for v in x.grad])[1])
+out["autograd_grad"] = attempt(
+    lambda: [float(v) for v in torch.autograd.grad(x.sum(), x)[0]])
+out["grad_after_autograd_grad"] = attempt(lambda: [float(v) for v in x.grad])
 
 # 4/5. The two halves of upstream's non-leaf guard, optimizer.py:1153.
 import torch.optim
@@ -16645,14 +16648,18 @@ def test_the_backward_seed_is_absent_and_nothing_guesses_a_one():
     assert shim["nonscalar_seed"].get("exc") == "RuntimeError", shim["nonscalar_seed"]
     assert "scalar outputs" in shim["nonscalar_seed"]["msg"], shim["nonscalar_seed"]
 
-    # 3. Nothing consumes it: both doors into the engine refuse, by the engine's
-    #    own name rather than by a helper's. If this ever stops refusing while
-    #    the two rows above still read `[None]`, an engine is being handed a
-    #    missing seed -- which is the exact failure this test exists for.
-    for key in ("backward", "autograd_grad"):
-        got = shim[key]
-        assert got.get("exc") == "NotImplementedError", (key, got)
-        assert "_ImperativeEngine.run_backward" in got["msg"], (key, got)
+    # 3. **Inverted by docs/BACKWARD9.md.** Both doors into the engine answer
+    #    now, and the pair the previous revision held -- "the seed is right AND
+    #    nothing consumes it" -- becomes the pair that matters once something
+    #    does: the seed is right AND what consumes it produces upstream's
+    #    number. `d(sum(x))/dx` is one per element, and `torch.autograd.grad`
+    #    reaches the same answer while leaving `.grad` exactly as `.backward()`
+    #    left it, which is the half that separates the two doors.
+    assert shim["backward"] == {"ok": [1.0, 1.0, 1.0]}, shim["backward"]
+    assert shim["autograd_grad"] == {"ok": [1.0, 1.0, 1.0]}, shim["autograd_grad"]
+    assert shim["grad_after_autograd_grad"] == {"ok": [1.0, 1.0, 1.0]}, (
+        shim["grad_after_autograd_grad"]
+    )
 
     # 4/5. The divergence, closed. Both halves of upstream's guard
     #      `param.is_leaf or param.retains_grad` are answerable now: `is_leaf`
@@ -16693,6 +16700,11 @@ def test_the_backward_seed_is_absent_and_nothing_guesses_a_one():
     # the exception *type and text*: upstream has three wordings of the
     # requires_grad rule (docs/BACKWARD2.md §4.2) and this is the longest one.
     assert shim["scalar_seed"] == up["scalar_seed"], (shim, up)
+    # The three rows docs/BACKWARD9.md inverted, against the oracle rather than
+    # against the literals above -- which is what keeps them from drifting
+    # together into a shared mistake.
+    for key in ("backward", "autograd_grad", "grad_after_autograd_grad"):
+        assert shim[key] == up[key], (key, shim[key], up[key])
     assert shim["optim_nonleaf"] == up["optim_nonleaf"], (shim, up)
     assert shim["retains_grad"] == up["retains_grad"], (shim, up)
     assert shim["requires_grad_on_nonleaf"] == up["requires_grad_on_nonleaf"], (shim, up)
@@ -16703,9 +16715,14 @@ def test_the_backward_seed_is_absent_and_nothing_guesses_a_one():
     # merely unjustified.
     assert up["nonscalar_seed"].get("exc") == "RuntimeError", up["nonscalar_seed"]
     assert "scalar outputs" in up["nonscalar_seed"]["msg"], up["nonscalar_seed"]
-    # The engine runs there, so both doors return.
-    assert up["backward"] == {"ok": "returned"}, up["backward"]
-    assert up["autograd_grad"] == {"ok": "returned"}, up["autograd_grad"]
+    # The engine runs there, and now here too, so both doors return the
+    # gradient rather than the word "returned". `d(sum(x))/dx` is one per
+    # element in both interpreters, and the equality above is what ties them.
+    assert up["backward"] == {"ok": [1.0, 1.0, 1.0]}, up["backward"]
+    assert up["autograd_grad"] == {"ok": [1.0, 1.0, 1.0]}, up["autograd_grad"]
+    assert up["grad_after_autograd_grad"] == {"ok": [1.0, 1.0, 1.0]}, (
+        up["grad_after_autograd_grad"]
+    )
     # And the guard this shim walks past.
     assert up["optim_nonleaf"].get("exc") == "ValueError", up["optim_nonleaf"]
     assert "non-leaf" in up["optim_nonleaf"]["msg"], up["optim_nonleaf"]
@@ -22345,27 +22362,309 @@ def test_the_eager_graph_refuses_a_write_through_a_view_of_a_value_it_holds():
     _C._eager_reset()
 
 
-def test_tensor_backward_still_refuses_even_though_an_eager_graph_exists():
-    """docs/BACKWARD7.md §5. W8 and W9 landed; the **engine did not**.
+def test_the_engine_answers_now_that_an_eager_graph_exists():
+    """docs/BACKWARD9.md §1 -- **the inversion docs/BACKWARD7.md §6 asked for.**
 
-    The distinction this keeps is the one the round was told to keep: a graph
-    that records ops is not an engine. `_ImperativeEngine.run_backward` is
-    where `Tensor.backward()` and `torch.autograd.grad()` both land, and
-    wiring it needs `.grad` accumulation onto leaves, `allow_unused`,
-    `retain_grad`, hooks and `create_graph` -- none of which this round built
-    or checked. A refusal that names the wall is worth more than a
-    `.backward()` that half works.
+    The previous revision of this test pinned that
+    `_ImperativeEngine.run_backward` refused *while a graph existed*, and its
+    docstring said: "Invert this test when the engine lands; do not delete it."
+    The engine landed. So this asserts the stronger thing the inversion is for,
+    which is not "it does not raise":
 
-    Invert this test when the engine lands; do not delete it.
+      1. the engine **answers** through the same door `Tensor.backward()` and
+         `torch.autograd.grad()` both reach (docs/BACKWARD2.md §1.3);
+      2. the number it produces is the derivative and not the seed -- `y = x³`
+         at `x = 2` gives `12`, which no confusion of seed, operand or zeros
+         reaches;
+      3. it **writes** that number into the leaf, which is the whole difference
+         between `_eager_backward` (which returns gradients beside tensors) and
+         an engine (which accumulates onto `.grad`);
+      4. and `accumulate_grad=False` -- `torch.autograd.grad`'s spelling --
+         returns instead of writing, from the same function.
+
+    Row 4 is the control for row 3. Without it, an engine that wrote `.grad`
+    unconditionally would pass rows 1-3 and be wrong about `torch.autograd.grad`,
+    which upstream promises does not touch `.grad` at all.
     """
     assert hasattr(_C, "_eager_backward"), "W8 did not land"
+    _C._eager_reset()
+    engine = _C._ImperativeEngine()
+
+    x = _tape_f64([2.0, 2.0], [2]).to(_C.float32)
+    x.requires_grad = True
+    cube = _C._aten_dispatch("aten.pow.Tensor_Scalar", x, 3.0)
+    total = _C._aten_dispatch("aten.sum.default", cube)
+    assert total.grad_fn is not None
+    assert _C._eager_tape_size() > 0, "no graph existed -- this test is vacuous"
+
+    assert x.grad is None, "a gradient existed before any backward"
+    assert engine.run_backward((total,), (), False, False, (), True, True) == ()
+    assert x.grad is not None
+    assert [round(float(v), 5) for v in x.grad.flatten()] == [12.0, 12.0], (
+        [float(v) for v in x.grad.flatten()]
+    )
+
+    # 4. The same function, the other door: returns and does not write.
+    x.grad = None
+    _C._eager_reset()
+    cube = _C._aten_dispatch("aten.pow.Tensor_Scalar", x, 3.0)
+    total = _C._aten_dispatch("aten.sum.default", cube)
+    got = engine.run_backward((total,), (), False, False, (x,), False, False)
+    assert len(got) == 1 and got[0] is not None
+    assert [round(float(v), 5) for v in got[0].flatten()] == [12.0, 12.0]
+    assert x.grad is None, "autograd.grad's spelling wrote .grad"
+
+
+def test_two_leaves_of_one_add_do_not_share_one_gradient_tensor():
+    """docs/BACKWARD9.md §2 -- the defect the clone in `_accumulate_into_grad`
+    exists to stop, demonstrated as a program rather than argued.
+
+    `z = x + y` has the same derivative for both operands, and the tape hands
+    the *same object* back for both: `grads[0] is grads[1]` is `True`, measured.
+    An engine that stored what the tape returned would make `x.grad` and
+    `y.grad` one tensor, and the next step's in-place accumulation would double
+    the other leaf's gradient silently. Nothing about that is an error the
+    caller could see; it is a wrong number.
+
+    Two assertions, and both are needed. Identity alone would pass for a copy
+    that still aliased the same storage, so the write is performed and the other
+    leaf is read afterwards.
+
+    **Nullified** by storing `gradient` instead of `_dense_copy_of(gradient)`:
+    this goes red at the second assertion, reporting `y.grad` as 2.0.
+    """
+    _C._eager_reset()
+    engine = _C._ImperativeEngine()
+    x = _tape_f64([1.0, 1.0], [2]).to(_C.float32)
+    y = _tape_f64([1.0, 1.0], [2]).to(_C.float32)
+    x.requires_grad = True
+    y.requires_grad = True
+    total = _C._aten_dispatch(
+        "aten.sum.default", _C._aten_dispatch("aten.add.Tensor", x, y)
+    )
+    engine.run_backward((total,), (), False, False, (), True, True)
+    assert x.grad is not None and y.grad is not None
+    assert x.grad is not y.grad, "both leaves were given one gradient tensor"
+    _C._aten_dispatch("aten.add_.Scalar", x.grad, 1.0)
+    assert [float(v) for v in y.grad.flatten()] == [1.0, 1.0], (
+        "writing to one leaf's .grad moved another's -- the two share storage"
+    )
+
+
+def test_the_accumulated_grad_is_dense_enough_to_be_written_in_place():
+    """docs/BACKWARD9.md §2 -- why `_dense_copy_of` is not `clone()`.
+
+    `sum()`'s gradient is the seed **expanded** to the operand's shape:
+    `stride() == (0, 0)`, one element of storage read from every position. And
+    `clone()` preserves that layout. Stored as `.grad` it is a tensor whose
+    first in-place write refuses --
+
+        RuntimeError: unsupported operation: more than one element of the
+        written-to tensor refers to a single memory location.
+
+    -- so `p.grad.zero_()` and every `foreach` optimizer would fail on the
+    second step of any loop whose loss ends in `.sum()`. That is the single
+    most ordinary loss there is.
+
+    The test asserts the layout *and* exercises the write, because a
+    `is_contiguous()` check alone would pass for a shape whose expansion is
+    invisible in the strides.
+
+    **Nullified** by replacing `_dense_copy_of` with `gradient.clone()`: this
+    goes red on `zero_()` with the message above, and
+    `test_two_leaves_of_one_add_do_not_share_one_gradient_tensor` -- the control
+    -- stays green, because a clone is still a distinct object.
+    """
+    _C._eager_reset()
+    engine = _C._ImperativeEngine()
+    x = _tape_f64(_tape_ramp(6), [2, 3]).to(_C.float32)
+    x.requires_grad = True
+    total = _C._aten_dispatch("aten.sum.default", x)
+    engine.run_backward((total,), (), False, False, (), True, True)
+    assert x.grad.stride() == (3, 1), x.grad.stride()
+    assert x.grad.is_contiguous()
+    _C._aten_dispatch("aten.zero_.default", x.grad)
+    assert [float(v) for v in x.grad.flatten()] == [0.0] * 6
+
+
+def test_run_backward_accumulates_rather_than_assigning_on_the_second_backward():
+    """docs/BACKWARD9.md §2. `.grad` is `+=`, and `zero_grad` is what resets it.
+
+    Upstream's contract has three parts and each is a row here: `None` before
+    the first backward, the gradient after it, and **twice** the gradient after
+    a second one over the same program. The third is what makes the name
+    `AccumulateGrad` mean something, and it is the behaviour gradient
+    accumulation over micro-batches depends on.
+
+    The fourth row is the one an implementation gets wrong in the other
+    direction: the tensor's *identity* has to survive accumulation, because
+    `zero_grad(set_to_none=False)` and `foreach` optimizers hold `p.grad` across
+    steps. Assigning `leaf.grad = leaf.grad + g` would pass rows 1-3 and fail
+    this one.
+    """
+    _C._eager_reset()
+    engine = _C._ImperativeEngine()
+    x = _tape_f64([3.0], [1]).to(_C.float32)
+    x.requires_grad = True
+
+    def once():
+        total = _C._aten_dispatch(
+            "aten.sum.default", _C._aten_dispatch("aten.mul.Scalar", x, 5.0)
+        )
+        engine.run_backward((total,), (), False, False, (), True, True)
+
+    assert x.grad is None
+    once()
+    assert [float(v) for v in x.grad.flatten()] == [5.0]
+    identity = id(x.grad)
+    once()
+    assert [float(v) for v in x.grad.flatten()] == [10.0], (
+        "the second backward assigned instead of accumulating"
+    )
+    assert id(x.grad) == identity, (
+        ".grad changed identity across accumulation -- zero_grad(set_to_none="
+        "False) and foreach optimizers hold this tensor across steps"
+    )
+    # ... and zeroing is what resets it, not the next backward.
+    _C._aten_dispatch("aten.zero_.default", x.grad)
+    once()
+    assert [float(v) for v in x.grad.flatten()] == [5.0]
+
+
+def test_retain_graph_differentiates_the_same_forward_twice():
+    """docs/BACKWARD9.md §3. `retain_graph=True`, and the default that is not it.
+
+    W9's lifetime rule is upstream's `retain_graph=False` **default**: the
+    backward that walks the graph frees it. `retain_graph=True` is the caller
+    saying they will walk it again, and `Recorder::duplicate_for_retained_backward`
+    is how the tape survives its own backward -- the backward moves every field
+    into a trace and an `Env`, so there is nothing left to put back.
+
+    Three rows, and the third is the control:
+
+      1. with `retain_graph=True` the second backward answers, and accumulates,
+         so `.grad` is exactly twice the first gradient;
+      2. the graph is still there afterwards -- `_eager_tape_size()` is
+         unchanged, which is the *retention* rather than an inference from an
+         answer;
+      3. a backward without it frees the tape, and the next one refuses by
+         upstream's name.
+
+    Without row 3 this would pass for an implementation that never freed
+    anything, which is the leak docs/BACKWARD8.md §4 bounded.
+
+    **Nullified** by making `retain_graph` duplicate nothing (taking the tape
+    either way): row 1 goes red with *"Trying to backward through the graph a
+    second time"*, and row 3 -- which does not depend on the duplication --
+    stays green.
+    """
+    _C._eager_reset()
+    engine = _C._ImperativeEngine()
+    x = _tape_f64([1.0, 1.0, 1.0], [3]).to(_C.float32)
+    x.requires_grad = True
+    squared = _C._aten_dispatch("aten.mul.Tensor", x, x)
+    total = _C._aten_dispatch("aten.sum.default", squared)
+    size = _C._eager_tape_size()
+
+    engine.run_backward((total,), (), True, False, (), True, True)
+    assert [float(v) for v in x.grad.flatten()] == [2.0, 2.0, 2.0]
+    assert _C._eager_tape_size() == size, (
+        "retain_graph=True freed the tape anyway", _C._eager_tape_size(), size
+    )
+    engine.run_backward((total,), (), True, False, (), True, True)
+    assert [float(v) for v in x.grad.flatten()] == [4.0, 4.0, 4.0]
+
+    # 3. The default frees, and the next backward refuses by upstream's name.
+    engine.run_backward((total,), (), False, False, (), True, True)
+    assert _C._eager_tape_size() == 0, _C._eager_tape_size()
     try:
-        _C._ImperativeEngine().run_backward()
-    except NotImplementedError as exc:
-        message = str(exc)
+        engine.run_backward((total,), (), False, False, (), True, True)
+    except RuntimeError as exc:
+        assert "backward through the graph a second time" in str(exc), str(exc)
     else:
-        raise AssertionError("run_backward no longer refuses -- invert this test")
-    assert "_ImperativeEngine.run_backward" in message, message
+        raise AssertionError("a freed graph was differentiated again")
+
+
+def test_allow_unused_is_the_allow_unreachable_slot_and_both_defaults_are_upstreams():
+    """docs/BACKWARD9.md §4 -- **docs/BACKWARD7.md §10's "opposite default",
+    closed, and closed in the place that makes both reachable.**
+
+    §6 recorded that `_eager_backward` returns `None` for a leaf no gradient
+    reached where upstream *raises* unless `allow_unused=True`, and called the
+    two "different defaults". They are the same default now, and where the fix
+    went is the content: `run_backward` asks the tape for **every** leaf
+    (`wrt=None`) and selects in Python. Passing `inputs` down to
+    `_eager_backward` would have handed the selection to a function that raises
+    for an unread tensor, which makes `allow_unused=True` unreachable rather
+    than wrong.
+
+    `allow_unreachable` is upstream's name for this slot and `allow_unused` is
+    what `torch.autograd.grad` puts in it -- one parameter, not two.
+    """
+    _C._eager_reset()
+    engine = _C._ImperativeEngine()
+    used = _tape_f64([1.0], [1]).to(_C.float32)
+    unused = _tape_f64([1.0], [1]).to(_C.float32)
+    used.requires_grad = True
+    unused.requires_grad = True
+
+    def forward():
+        return _C._aten_dispatch(
+            "aten.sum.default", _C._aten_dispatch("aten.mul.Scalar", used, 3.0)
+        )
+
+    # allow_unused=False -- upstream's default -- raises, with upstream's text.
+    try:
+        engine.run_backward((forward(),), (), False, False, (unused,), False, False)
+    except RuntimeError as exc:
+        assert "appears to not have been used in the graph" in str(exc), str(exc)
+    else:
+        raise AssertionError("an unused input returned instead of raising")
+
+    # allow_unused=True returns None beside a real gradient, in `inputs` order.
+    got = engine.run_backward(
+        (forward(),), (), False, False, (used, unused), True, False
+    )
+    assert len(got) == 2, got
+    assert got[1] is None, "an unread leaf got a gradient"
+    assert [float(v) for v in got[0].flatten()] == [3.0]
+
+
+def test_the_engine_refuses_create_graph_and_several_roots_by_name():
+    """docs/BACKWARD9.md §6. What is *not* built, refused where a caller meets it.
+
+    Both would otherwise be silently wrong rather than slow.
+    `create_graph=True` asks for a backward that is itself differentiable, and
+    the eager backward runs under a `NoGradGuard` -- so its ops are not
+    recorded and a double backward would find an *empty* graph rather than
+    fail. Several roots asks for one traversal seeded from several places,
+    which the eager tape's single output cannot express.
+
+    Refusing by name is the whole of docs/DESIGN.md §6 here: a
+    `create_graph=True` that quietly behaved like `False` is the shape of
+    wrongness a gradient-penalty term would carry all the way to a number.
+    """
+    _C._eager_reset()
+    engine = _C._ImperativeEngine()
+    x = _tape_f64([1.0], [1]).to(_C.float32)
+    x.requires_grad = True
+    total = _C._aten_dispatch("aten.sum.default", _C._aten_dispatch("aten.mul.Scalar", x, 2.0))
+
+    try:
+        engine.run_backward((total,), (), False, True, (), True, True)
+    except NotImplementedError as exc:
+        assert "create_graph=True" in str(exc), str(exc)
+        assert "NoGradGuard" in str(exc), str(exc)
+    else:
+        raise AssertionError("create_graph=True was accepted")
+
+    try:
+        engine.run_backward((total, total), (), False, False, (), True, True)
+    except NotImplementedError as exc:
+        assert "2 root tensors" in str(exc), str(exc)
+    else:
+        raise AssertionError("several roots were accepted")
+
 
 # --- lowering toward a device operator set (docs/DECOMP.md §12) --------------
 #
@@ -25983,6 +26282,189 @@ def test_the_eager_tape_refuses_and_releases_when_it_grows_past_its_bound():
     finally:
         _C._eager_set_max_nodes(default)
         _C._eager_reset()
+
+
+_TRAINING_LOOP_SCRIPT = r"""
+import json, sys
+import torch
+import torch.nn as nn
+
+out = {"who": "shim" if hasattr(torch._C, "_aten_implemented") else "upstream"}
+
+
+def build():
+    model = nn.Sequential(nn.Linear(4, 3), nn.Tanh(), nn.Linear(3, 2))
+    # Deterministic without depending on either interpreter's RNG stream: the
+    # two draw from different generators, so seeded init would compare two
+    # different programs. docs/BACKWARD8.md §3 is the same problem, solved the
+    # other way because there a mask had to be shared.
+    with torch.no_grad():
+        k = 0
+        for p in model.parameters():
+            flat = p.reshape(-1)
+            for i in range(flat.shape[0]):
+                flat[i] = ((k * 37) % 17 - 8) / 16.0
+                k += 1
+    return model
+
+
+x = torch.arange(20, dtype=torch.float32).reshape(5, 4) / 20.0
+y = torch.arange(10, dtype=torch.float32).reshape(5, 2) / 10.0
+# `nn.MSELoss` is not reachable here -- it goes through `torch.broadcast_tensors`,
+# which has no overload table entry -- so the criterion is spelled out. It is
+# still a criterion the loop calls; nothing about `.backward()` differs.
+criterion = lambda o, t: ((o - t) ** 2).mean()
+
+model = build()
+optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+out["grad_before_first_backward"] = [p.grad is None for p in model.parameters()]
+
+losses = []
+for step in range(6):
+    loss = criterion(model(x), y)
+    loss.backward()
+    if step == 0:
+        out["first_grads"] = [
+            [float(v) for v in p.grad.reshape(-1)] for p in model.parameters()
+        ]
+        # `.grad` is a leaf: `zero_grad(set_to_none=False)` reads `grad_fn` and
+        # takes a non-None one as a graph it has to detach from.
+        out["grad_is_leaf"] = [
+            p.grad.grad_fn is None and not p.grad.requires_grad
+            for p in model.parameters()
+        ]
+    optimizer.step()
+    optimizer.zero_grad()
+    out["grad_after_zero_grad"] = [p.grad is None for p in model.parameters()]
+    losses.append(float(loss.detach()))
+
+out["losses"] = losses
+out["params"] = [[float(v) for v in p.reshape(-1)] for p in model.parameters()]
+
+# `zero_grad(set_to_none=False)` is the other spelling, and it writes rather
+# than dropping -- so it needs a `.grad` an in-place `zero_()` can reach.
+criterion(model(x), y).backward()
+optimizer.zero_grad(set_to_none=False)
+out["zeroed_in_place"] = [
+    p.grad is not None and all(float(v) == 0.0 for v in p.grad.reshape(-1))
+    for p in model.parameters()
+]
+
+json.dump(out, sys.stdout)
+"""
+
+
+def _training_loop_fixture(env_overrides):
+    env = dict(os.environ)
+    for key, value in env_overrides.items():
+        if value is None:
+            env.pop(key, None)
+        else:
+            env[key] = value
+    proc = subprocess.run(
+        [sys.executable, "-c", _TRAINING_LOOP_SCRIPT],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=600,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"training-loop subprocess exited {proc.returncode}\n"
+            f"--- stdout ---\n{proc.stdout}\n--- stderr ---\n{proc.stderr}"
+        )
+    return json.loads(proc.stdout)
+
+
+def test_a_real_training_loop_runs_through_loss_backward_and_agrees_with_upstream():
+    """docs/BACKWARD9.md §1 -- **the bar for this round**, and the reason the
+    engine is claimed rather than the parts of it.
+
+        loss = criterion(model(x), y)
+        loss.backward()
+        optimizer.step()
+        optimizer.zero_grad()
+
+    Six steps of it, on a real `nn.Sequential(Linear, Tanh, Linear)` with a real
+    `torch.optim.SGD`, and every number compared element-wise to **upstream
+    torch running the identical program** -- the central-oracle pattern
+    docs/FEDERATED3.md §2 uses, and the reason nothing here is a literal. A
+    hardcoded trajectory is a claim about 2.13.0 that nothing re-checks
+    (docs/AUDIT.md's repeated defect); a second interpreter running the same
+    source is a claim that re-checks itself every run.
+
+    The loop is where the pieces meet, and it is the only test here that
+    exercises all of them at once. `loss.backward()` reaches
+    `_ImperativeEngine.run_backward` through upstream's own
+    `torch/autograd/__init__.py`, which means upstream's `_make_grads` built the
+    seed, upstream's `Tensor.backward` did the argument marshalling, and
+    upstream's `zero_grad` decided what `.grad` should become. Nothing in this
+    program calls a shim-specific name.
+
+    Four things are asserted separately because each fails differently:
+
+      * **the loss trajectory**, element-wise -- a wrong gradient shows here
+        first and shows as divergence rather than as an error;
+      * **the first step's gradients**, element-wise, for every parameter --
+        the trajectory alone could agree while individual parameters were
+        wrong in compensating directions;
+      * **the final parameters**, element-wise, after six `optimizer.step()`s
+        -- which is the trajectory integrated, and is what a caller keeps;
+      * **the `.grad` protocol** -- `None` before the first backward, a leaf
+        after it, `None` again after `zero_grad()`, and zeroed-in-place after
+        `zero_grad(set_to_none=False)`.
+
+    The parameters are initialised arithmetically rather than from a seed
+    because the two interpreters do not share an RNG stream (docs/BACKWARD8.md
+    §3 met the same wall from the other side).
+    """
+    if not os.path.isfile(_CKPT_VENDOR_SHIM):
+        print("   (skipped: vendored tree has no _C.abi3.so)")
+        return
+    shim = _training_loop_fixture(
+        {"PYTHONPATH": _CKPT_VENDOR_DIR, "TORCH_USE_RTLD_GLOBAL": "1"}
+    )
+    assert shim["who"] == "shim", shim["who"]
+
+    # The `.grad` protocol, which is upstream's and is asserted before the
+    # numbers because a loop that never populated `.grad` would still produce a
+    # flat "trajectory" that agreed with itself.
+    assert shim["grad_before_first_backward"] == [True] * 4
+    assert shim["grad_is_leaf"] == [True] * 4
+    assert shim["grad_after_zero_grad"] == [True] * 4
+    assert shim["zeroed_in_place"] == [True] * 4
+
+    # The loop actually learned. Not an oracle -- a loop that returned the same
+    # wrong number six times would agree with an upstream that did too, and
+    # nothing else here would say so.
+    losses = shim["losses"]
+    assert len(losses) == 6, losses
+    assert all(b < a for a, b in zip(losses, losses[1:])), losses
+    assert losses[-1] < losses[0] * 0.6, losses
+
+    if _upstream_torch is None:
+        return  # no upstream torch in this interpreter -- see docs/E2E.md
+    up = _training_loop_fixture({"PYTHONPATH": None, "TORCH_USE_RTLD_GLOBAL": None})
+    assert up["who"] == "upstream", up["who"]
+
+    def compare(name, tolerance):
+        ours, theirs = shim[name], up[name]
+        if ours and isinstance(ours[0], list):
+            ours = [v for row in ours for v in row]
+            theirs = [v for row in theirs for v in row]
+        assert len(ours) == len(theirs), (name, len(ours), len(theirs))
+        worst = max(abs(a - b) for a, b in zip(ours, theirs))
+        assert worst <= tolerance, (name, worst, ours, theirs)
+        return len(ours), worst
+
+    # float32 rounding, and no more. docs/BACKWARD9.md §1 records the measured
+    # worst over all three quantities.
+    compare("losses", 1e-6)
+    compare("first_grads", 1e-6)
+    compare("params", 1e-6)
+    for key in ("grad_before_first_backward", "grad_is_leaf",
+                "grad_after_zero_grad", "zeroed_in_place"):
+        assert shim[key] == up[key], (key, shim[key], up[key])
 
 
 if __name__ == "__main__":

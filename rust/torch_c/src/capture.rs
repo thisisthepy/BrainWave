@@ -272,6 +272,7 @@ impl TensorMeta {
 /// never become an operand. See `refusal_for`: the only such ops that survive
 /// recording are the ones whose answer is a function of *metadata*, and
 /// metadata is what the guards pin.
+#[derive(Clone)]
 pub(crate) enum Slot {
     Tensor(TensorMeta),
     Other,
@@ -286,6 +287,40 @@ pub(crate) struct Node {
     /// same way the recorded program did, and "one tensor" and "a list of one
     /// tensor" are different returns.
     pub(crate) sequence: bool,
+}
+
+impl Arg {
+    /// A second reference to the same argument, for `retain_graph=True`.
+    ///
+    /// Hand-written rather than derived: `Py<PyAny>` is deliberately not
+    /// `Clone` in this pyo3 build (the `py-clone` feature is off, because an
+    /// implicit refcount bump without a `Python` token is what that feature
+    /// removes). `clone_ref` takes the token, so the duplication is explicit
+    /// about being a refcount and not a copy of the value.
+    fn duplicate(&self, py: Python<'_>) -> Arg {
+        match self {
+            Arg::Value(reference) => Arg::Value(*reference),
+            Arg::Literal(object) => Arg::Literal(object.clone_ref(py)),
+            Arg::List(items) => Arg::List(items.iter().map(|a| a.duplicate(py)).collect()),
+            Arg::Tuple(items) => Arg::Tuple(items.iter().map(|a| a.duplicate(py)).collect()),
+        }
+    }
+}
+
+impl Node {
+    fn duplicate(&self, py: Python<'_>) -> Node {
+        Node {
+            op: self.op.clone(),
+            args: self.args.iter().map(|a| a.duplicate(py)).collect(),
+            kwargs: self
+                .kwargs
+                .iter()
+                .map(|(name, arg)| (name.clone(), arg.duplicate(py)))
+                .collect(),
+            outputs: self.outputs.clone(),
+            sequence: self.sequence,
+        }
+    }
 }
 
 struct Recorder {
@@ -402,6 +437,51 @@ impl Recorder {
             if let Some(Some((_, version))) = self.const_stamps.get_mut(slot) {
                 *version += 1;
             }
+        }
+    }
+
+    /// A second `Recorder` over the same values, for `retain_graph=True`.
+    ///
+    /// **W12** (`docs/BACKWARD9.md` §3). `eager_backward` *takes* the tape,
+    /// which is upstream's `retain_graph=False` default and the whole of W9's
+    /// lifetime rule. `retain_graph=True` is the caller saying they will
+    /// differentiate the same forward again, so the tape has to survive its
+    /// own backward -- and the backward moves every field into a
+    /// `PyCaptureTrace` and an `Env`.
+    ///
+    /// Duplicating rather than borrowing, for a reason the shorter version
+    /// would have got wrong: the backward runs Python, Python runs kernels,
+    /// and a kernel that reaches `record_into` would try to borrow the same
+    /// `RefCell` this call is holding. Duplicating releases the borrow before
+    /// any of that. It is not a copy of the tensors -- every `Py` here is a
+    /// reference count -- so what it costs is the node list, which is the
+    /// honest price of asking for the graph twice.
+    ///
+    /// `const_stamps` is duplicated **as it stands**, not re-read: a retained
+    /// backward is the same freshness question asked twice, so a write between
+    /// the two must still be refused by the second.
+    fn duplicate_for_retained_backward(&self, py: Python<'_>) -> Self {
+        Self {
+            nodes: self.nodes.iter().map(|n| n.duplicate(py)).collect(),
+            inputs: self.inputs.clone(),
+            consts: self.consts.clone(),
+            known: self.known.clone(),
+            input_objects: self.input_objects.iter().map(|o| o.clone_ref(py)).collect(),
+            node_objects: self
+                .node_objects
+                .iter()
+                .map(|slots| {
+                    slots
+                        .iter()
+                        .map(|slot| slot.as_ref().map(|o| o.clone_ref(py)))
+                        .collect()
+                })
+                .collect(),
+            const_objects: self.const_objects.iter().map(|o| o.clone_ref(py)).collect(),
+            const_stamps: self.const_stamps.clone(),
+            storages: self.storages.clone(),
+            eager: self.eager,
+            poisoned: self.poisoned.clone(),
         }
     }
 
@@ -1877,17 +1957,22 @@ pub fn eager_reason() -> Option<String> {
 /// **is** the propagated `requires_grad` flag `docs/BACKWARD4.md` installed,
 /// computed from the same information one step earlier.
 ///
-/// Named `_eager_backward` and not wired into `Tensor.backward()`:
-/// `_ImperativeEngine.run_backward` still refuses. See `docs/BACKWARD7.md` §5
-/// for exactly what is between the two.
+/// **Wired into `Tensor.backward()` since `docs/BACKWARD9.md`.** It kept its
+/// name: `_ImperativeEngine.run_backward` in `bootstrap.py` is a translation
+/// onto this function and holds no derivative rule, no traversal and no
+/// lifetime rule of its own. What it adds is upstream's shape -- `.grad`
+/// accumulation, `allow_unused`, `inputs=`, and the two flags that tell
+/// `Tensor.backward()` from `torch.autograd.grad()`. `docs/BACKWARD7.md` §6
+/// was the list of what stood between the two.
 #[pyfunction]
 #[pyo3(name = "_eager_backward")]
-#[pyo3(signature = (output, grad_output = None, wrt = None))]
+#[pyo3(signature = (output, grad_output = None, wrt = None, retain_graph = false))]
 pub fn eager_backward<'py>(
     py: Python<'py>,
     output: &Bound<'py, PyAny>,
     grad_output: Option<&Bound<'py, PyAny>>,
     wrt: Option<&Bound<'py, PyAny>>,
+    retain_graph: bool,
 ) -> PyResult<Bound<'py, PyDict>> {
     if is_active() {
         return Err(pyo3::exceptions::PyRuntimeError::new_err(
@@ -1896,7 +1981,17 @@ pub fn eager_backward<'py>(
         ));
     }
     let address = output.as_ptr() as usize;
-    let rec = EAGER.with(|cell| cell.borrow_mut().take());
+    // `retain_graph=True` duplicates instead of taking, so the tape is still
+    // there for the second backward (`Recorder::duplicate_for_retained_backward`).
+    let rec = if retain_graph {
+        EAGER.with(|cell| {
+            cell.borrow()
+                .as_ref()
+                .map(|rec| rec.duplicate_for_retained_backward(py))
+        })
+    } else {
+        EAGER.with(|cell| cell.borrow_mut().take())
+    };
     let Some(rec) = rec else {
         return Err(eager_missing(py, output, "there is no eager graph"));
     };
@@ -2087,7 +2182,7 @@ fn eager_missing(py: Python<'_>, output: &Bound<'_, PyAny>, generic: &str) -> Py
              retain_graph=False default, and it is the whole of the lifetime rule: a \
              backward consumes the graph it walks (docs/BACKWARD5.md §3 measured what is \
              being released -- 302.6 MiB for SmolLM2-135M at S=128). Run the forward again, \
-             or keep a reference to what you need. retain_graph=True is not implemented",
+             or keep a reference to what you need, or pass retain_graph=True",
         );
     }
     pyo3::exceptions::PyRuntimeError::new_err(format!(

@@ -2625,9 +2625,11 @@ def install(module, surface_json: str, overloads_json: str, methods_json: str) -
     # The two walls a `Tensor.backward()` reaches, in the order it reaches
     # them. Both are synthesised above as table-less stubs, and both are
     # replaced here -- one because it is not autograd at all, the other because
-    # it is, and should say so. docs/BACKWARD2.md §4.3.
+    # it is. The second stopped being a wall in docs/BACKWARD9.md: it is the
+    # engine now, translating upstream's call into `_eager_backward` and back.
+    # docs/BACKWARD2.md §4.3.
     _install_thread_local_store(module)
-    _install_engine_refusal(module)
+    _install_engine(module)
 
     # `torch.Size` is a real tuple subclass upstream and the tree relies on it
     # being one (`isinstance(x.shape, tuple)`, unpacking, slicing).
@@ -5105,8 +5107,9 @@ class _GradFnNode:
             f"{type(self).__name__} records that {self._shim_op} produced this "
             "tensor and nothing else. There is no graph behind it: no "
             "next_functions, no saved operands, no apply. "
-            "Tensor.backward() refuses at _ImperativeEngine.run_backward for "
-            "the same reason; see docs/BACKWARD4.md §1.3 and docs/BACKWARD2.md §2."
+            "Tensor.backward() does not read this and works anyway: it walks "
+            "the eager tape, which records the same ops from the other side "
+            "(docs/BACKWARD9.md). See docs/BACKWARD4.md §1.3, docs/BACKWARD2.md §2."
         )
 
 
@@ -5280,10 +5283,13 @@ def _install_autograd_shape(tensorbase) -> None:
         now is a `torch.optim` step that silently skipped every parameter
         because the slot it reads cannot be filled.
 
-        Nothing fills it implicitly. `CaptureTrace.backward()` *returns*
-        gradients and the caller assigns them, the same shape
-        `torch.optim.sgd.sgd` already had (docs/LOSS.md §6.4) -- there is still
-        no `Tensor.backward()` behind this, and that stub still refuses.
+        **Something fills it implicitly now** (docs/BACKWARD9.md):
+        `Tensor.backward()` reaches `_ImperativeEngine.run_backward`, which
+        accumulates into this slot the way upstream's `AccumulateGrad` does --
+        a dense copy on the first backward and an in-place `+=` after.
+        `CaptureTrace.backward()` still *returns* gradients for the caller to
+        assign, the shape `torch.optim.sgd.sgd` already had (docs/LOSS.md §6.4),
+        and the two coexist because the setter does not care who writes.
         `None` is accepted because it is what `zero_grad(set_to_none=True)`,
         the default, writes.
         """
@@ -5328,11 +5334,13 @@ def _install_autograd_shape(tensorbase) -> None:
         true here. `retains_grad` starts reporting `True`, which is what
         `torch/optim/optimizer.py:1153` reads -- and reading it is only
         *possible* now that `is_leaf` stopped short-circuiting the `or`
-        (docs/BACKWARD3.md §1.2). What does not happen is the other half: no
-        gradient is ever populated into `.grad`, because `Tensor.backward()`
-        still refuses at `_ImperativeEngine.run_backward`. That is the same
-        boundary every other name in this installer draws, and it is drawn in
-        the same place.
+        (docs/BACKWARD3.md §1.2). What does not happen is the other half:
+        **no gradient is populated into a non-leaf's `.grad`.** That is no
+        longer because `Tensor.backward()` refuses -- it answers since
+        docs/BACKWARD9.md, and fills every *leaf*'s `.grad` -- but because the
+        engine accumulates onto the tape's constants, and a non-leaf is a node
+        result rather than a constant. The tape holds its value; nothing
+        surfaces it. docs/BACKWARD9.md §6 names it as unbuilt.
 
         On a leaf it is a no-op with no flag set, which is upstream's behaviour
         too -- upstream returns early for a tensor that is already an
@@ -5493,44 +5501,201 @@ def _install_thread_local_store(module) -> None:
         setattr(module, name, fn)
 
 
-def _install_engine_refusal(module) -> None:
-    """`_ImperativeEngine.run_backward` -- the wall, saying which wall it is.
+def _install_engine(module) -> None:
+    """`_ImperativeEngine.run_backward` -- the wall, **opened**. docs/BACKWARD9.md.
 
     This is where both `Tensor.backward()` and `torch.autograd.grad()` land
-    (docs/BACKWARD2.md §1.3 measured that it is one wall and not two), and with
-    `_install_thread_local_store` in place it is now the **first** thing a
-    `.backward()` reaches rather than the third.
+    (docs/BACKWARD2.md §1.3 measured that it is one wall and not two), and for
+    eleven rounds it refused by name. `docs/BACKWARD7.md` §6 listed what stood
+    between the refusal and an engine; `docs/BACKWARD8.md` closed the two that
+    were defects; this closes the rest that a training loop needs.
 
-    Synthesised from `surface.json` it would refuse with `_make_function`'s
-    generic text, which names the method and nothing else. A refusal that names
-    the alternative that works is docs/DESIGN.md §6's shape, and here there
-    genuinely is one: `CaptureTrace.backward()` differentiates a *captured
-    region* and moves all 272 of SmolLM2-135M's parameters where upstream moves
-    them (docs/BACKWARD.md §4).
+    **It is a translation, not a second engine.** Everything below turns
+    upstream's call into `torch._C._eager_backward(output, grad_output, wrt,
+    retain_graph)` and turns the answer back into upstream's shape. No
+    derivative rule, no traversal and no lifetime rule lives here -- those are
+    `tape.rs` and `capture.rs`, and putting any of them here would be a second
+    place for the two to disagree.
 
-    The distinction the message has to carry is the one
-    `test_the_autograd_boundary_is_where_autograd_md_says_it_is` exists to keep:
-    a tape differentiates **a recorded region**, `Tensor.backward()`
-    differentiates **whatever produced this tensor**, and the second needs a
-    graph node per op and a `requires_grad` flag that propagates through them.
-    Neither exists, and docs/BACKWARD2.md §1 walks all ten walls between here
-    and one that does.
+    Upstream's signature, which is C++ and positional:
+
+        run_backward(tensors, grad_tensors, keep_graph, create_graph, inputs,
+                     allow_unreachable=False, accumulate_grad=False)
+
+    `torch.autograd.backward` passes `allow_unreachable=True,
+    accumulate_grad=True` and ignores the return; `torch.autograd.grad` passes
+    **`allow_unused` in the `allow_unreachable` slot**, `accumulate_grad=False`,
+    and returns the tuple. So the two entry points differ here by exactly two
+    flags, which is why one function serves both and why `allow_unused` is not
+    a separate parameter.
+
+    Three things are refused by name rather than approximated, and each is
+    refused because answering would be a *wrong* answer rather than a slow one:
+    `create_graph=True` (the backward runs under `NoGradGuard`, so its own ops
+    are not on the tape and a second backward would silently see nothing),
+    more than one root tensor (the eager tape has one output and summing seeds
+    across roots is not what upstream does), and `GradientEdge` inputs.
+
+    **`.grad` accumulation is the piece with design content**, and
+    `_accumulate_into_grad` below is where it is.
     """
     engine = getattr(module, "_ImperativeEngine", None)
     if engine is None:
         return
 
-    def run_backward(self, *args, **kwargs):
-        raise NotImplementedError(
-            "not implemented in torch._C shim: _ImperativeEngine.run_backward "
-            "-- Tensor.backward() and torch.autograd.grad() differentiate "
-            "whatever produced a tensor, which needs a graph node per op and a "
-            "requires_grad flag that propagates through them; neither exists "
-            "here, and docs/BACKWARD2.md §1 walks every wall between them. "
-            "What does exist is CaptureTrace.backward(), which differentiates a "
-            "*captured region* -- torchnative.adapt is the surface over it, and "
-            "_C._tape_rules() lists the derivative rules it has"
-        )
+    def _no_grad_call(fn, *args):
+        """Run `fn` with grad mode off and restore it, whatever happens.
+
+        Accumulation is not differentiable and must not be recorded: an
+        `add_` into `p.grad` under grad mode would be a write the *next*
+        tape could see. It is also the write docs/BACKWARD8.md §2.3's guard is
+        about, so doing it off the tape is what keeps the two independent --
+        `forgive_own_write` forgives an op its own write, and this is not one.
+        """
+        was = module.is_grad_enabled()
+        module._set_grad_enabled(False)
+        try:
+            return fn(*args)
+        finally:
+            module._set_grad_enabled(was)
+
+    def _dense_copy_of(gradient):
+        """A gradient the caller can write to, which `clone()` alone is not.
+
+        `sum()`'s gradient is the seed *expanded* to the operand's shape --
+        `stride() == (0, 0)`, one element of storage read by every position --
+        and `clone()` preserves that layout. Storing it as `p.grad` gives a
+        tensor whose first in-place write refuses:
+
+            RuntimeError: unsupported operation: more than one element of the
+            written-to tensor refers to a single memory location.
+
+        So `p.grad.zero_()`, `p.grad.add_(...)` and every `foreach` optimizer
+        would fail on the second step of a loop whose loss ends in `.sum()`.
+        Measured, not reasoned about (docs/BACKWARD9.md §2).
+
+        `contiguous()` materialises when the layout is not dense and returns
+        the same storage when it already is, so the `data_ptr` test is what
+        makes this exactly one copy in both cases rather than two in one.
+        """
+        dense = gradient.contiguous()
+        if dense.data_ptr() == gradient.data_ptr():
+            dense = dense.clone()
+        return dense
+
+    def _accumulate_into_grad(leaf, gradient):
+        """`p.grad += g`, with the one thing that cannot be skipped: the clone.
+
+        Upstream's `AccumulateGrad` assigns on the first accumulation and adds
+        in place after, and the in-place half is load-bearing for optimizers --
+        `foreach` SGD and `zero_grad(set_to_none=False)` both assume `p.grad`
+        keeps its identity across steps.
+
+        **The first store is a clone, and it is not defensive.** The tape hands
+        back one gradient tensor per constant, and for some programs two
+        constants get *the same object*: `z = x + y; z.sum().backward()`
+        returns the seed itself for both, `grads[0] is grads[1]`, measured
+        (docs/BACKWARD9.md §2). Storing it directly would make `x.grad` and
+        `y.grad` one tensor, and the very next step's `x.grad.add_(...)` would
+        double `y.grad` silently -- a wrong number, not an error.
+        `test_two_leaves_of_one_add_do_not_share_one_gradient_tensor` is that
+        difference, and removing the clone turns it red.
+
+        The clone is also what makes `.grad` the caller's to mutate:
+        `zero_grad(set_to_none=False)` calls `p.grad.zero_()`, and a `.grad`
+        aliasing a value the tape had returned would zero that too.
+
+        And it is `_dense_copy_of` rather than `clone()` for a second reason
+        found the same way -- see that function.
+        """
+        existing = leaf.grad
+        if existing is None:
+            leaf.grad = _no_grad_call(_dense_copy_of, gradient)
+        else:
+            _no_grad_call(lambda: existing.add_(gradient))
+
+    def run_backward(
+        self,
+        tensors,
+        grad_tensors=(),
+        keep_graph=False,
+        create_graph=False,
+        inputs=(),
+        allow_unreachable=False,
+        accumulate_grad=False,
+    ):
+        if create_graph:
+            raise NotImplementedError(
+                "not implemented in torch._C shim: create_graph=True -- the eager "
+                "backward runs under a NoGradGuard, so the ops it performs are not "
+                "themselves recorded and a second backward through them would find "
+                "an empty graph rather than fail. Double backward, "
+                "torch.autograd.grad(..., create_graph=True) and any "
+                "gradient-penalty term need it; first-order training does not. "
+                "docs/BACKWARD9.md §6"
+            )
+        tensors = tuple(tensors)
+        if len(tensors) != 1:
+            raise NotImplementedError(
+                "not implemented in torch._C shim: "
+                f"_ImperativeEngine.run_backward over {len(tensors)} root tensors "
+                "-- the eager tape has one output, and differentiating several "
+                "roots at once means seeding each and summing into one traversal. "
+                "Call backward() once per root, or sum them into a scalar first. "
+                "docs/BACKWARD9.md §6"
+            )
+        root = tensors[0]
+        if not isinstance(root, module.TensorBase):
+            raise NotImplementedError(
+                "not implemented in torch._C shim: backward from a GradientEdge -- "
+                "the eager tape is addressed by tensor identity and has no name for "
+                "an edge. docs/BACKWARD9.md §6"
+            )
+        seed = grad_tensors[0] if grad_tensors else None
+        # `wrt=None`: ask the tape for every leaf that requires grad and select
+        # here. Passing `inputs` through would hand the selection to
+        # `_eager_backward`, which *raises* for a tensor no recorded op read --
+        # and that is precisely the case `allow_unused=True` exists to answer
+        # with `None`. Selecting in Python is what makes both defaults reachable.
+        answer = module._eager_backward(root, seed, None, bool(keep_graph))
+        leaves = answer["tensors"]
+        grads = answer["grads"]
+        found = {}
+        for leaf, gradient in zip(leaves, grads):
+            if gradient is not None:
+                found[id(leaf)] = gradient
+
+        inputs = tuple(inputs or ())
+        if accumulate_grad:
+            # `Tensor.backward()`. Upstream accumulates into every leaf that
+            # requires grad, or into `inputs` alone when it is given.
+            targets = inputs if inputs else [t for t in leaves if id(t) in found]
+            for leaf in targets:
+                gradient = found.get(id(leaf))
+                if gradient is None:
+                    if not allow_unreachable:
+                        raise RuntimeError(
+                            "One of the differentiated Tensors appears to not have "
+                            "been used in the graph. Set allow_unused=True if this "
+                            "is the desired behavior."
+                        )
+                    continue
+                _accumulate_into_grad(leaf, gradient)
+            return ()
+
+        # `torch.autograd.grad()`. Nothing is written to `.grad`; the answer is
+        # returned in `inputs` order, and `allow_unreachable` is `allow_unused`.
+        out = []
+        for leaf in inputs:
+            gradient = found.get(id(leaf))
+            if gradient is None and not allow_unreachable:
+                raise RuntimeError(
+                    "One of the differentiated Tensors appears to not have been "
+                    "used in the graph. Set allow_unused=True if this is the "
+                    "desired behavior."
+                )
+            out.append(gradient)
+        return tuple(out)
 
     run_backward.__name__ = "run_backward"
     run_backward.__qualname__ = "_ImperativeEngine.run_backward"
