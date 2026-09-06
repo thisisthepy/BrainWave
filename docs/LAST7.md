@@ -14,7 +14,7 @@ two that did needed it for different reasons:
 |---|---|---|
 | `TensorBase.unfold` (`univnet`) | **a real missing kernel** | `aten.rs` + `methods.json`. Landed. |
 | per-axis convolution padding (`nystromformer`) | **not a kernel and not an argument form** — a real candle refusal with a lowering around it | `aten.rs`, inside the existing `convolution` kernel. Landed. |
-| `torch.multinomial(Tensor, Tensor)` (`vilt`) | **an argument form** — upstream's *parser*, not its schema | `bootstrap.py`'s `_TypeChecker`. **Out of territory, not landed.** §5.1 |
+| `torch.multinomial(Tensor, Tensor)` (`vilt`) | **an argument form** — upstream's *parser*, not its schema | `bootstrap.py`'s `_TypeChecker`. Out of territory here; **landed by `docs/BIND5.md` in the same batch, and `vilt` forwards.** §5.1 |
 | `torch.repeat_interleave(Tensor repeats)` (`fastspeech2_conformer`) | **a real missing kernel**, and the only one of the four that is genuinely data-dependent | `aten.rs` **plus** `bootstrap.py`, `device.rs` and `capture.rs`. **Not landed**, and §5.2 is why landing the kernel alone would have been worse than not landing it. |
 
 **`univnet` and `nystromformer` run a complete forward.** `vilt` and
@@ -235,6 +235,17 @@ not close, so the two halves of `docs/ARGFORM.md` §1's finding stay separable.
 
 ### 5.1 `multinomial` — an argument form, and `docs/VOICE3.md` had it right
 
+> **Closed.** `docs/BIND5.md` taught `_TypeChecker` upstream's `SymInt` rule in
+> the same batch, and `vilt` forwards. The test below was written to fail the
+> moment that happened and to name this section; it is inverted rather than
+> deleted, and now asserts the **shape** of the rule — one element by
+> `numel()`, integral, not `bool`, with `bool` refused at the coercion so
+> upstream's two exception classes fall out. BIND5 also found that the same
+> rule landed one position over in `docs/BIND4.md` had used `int()` on any
+> tensor, so this build accepted `tensor(3.5)` and `tensor(True)` where
+> upstream raises. The refusals are the test.
+
+
 `modeling_vilt.py:155` is
 `torch.multinomial(torch.ones(v).float(), max_image_length)` with
 `max_image_length` arriving as a **tensor**. Measured on real torch 2.13.0:
@@ -303,7 +314,7 @@ left the architecture blocked anyway. It is written down instead, and
 refusal with the three-file list in its docstring so the write-down cannot rot
 into "forgotten".
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_last7.py test_multinomial_with_a_tensor_num_samples_is_an_argument_form_not_a_kernel present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_last7.py test_multinomial_with_a_tensor_num_samples_now_matches_upstreams_symint_rule present -->
 <!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_last7.py test_repeat_interleave_with_a_tensor_repeats_is_still_refused_by_name present -->
 
 ---
