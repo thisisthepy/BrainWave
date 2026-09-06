@@ -3739,8 +3739,12 @@ pub mod complex_ops {
     /// `pytests/test_complex.py` checks this against the dispatch table, so
     /// the two cannot drift.
     pub const COMPLEX_OPS: &[&str] = &[
+        "aten._to_copy.default",
+        "aten._unsafe_view.default",
         "aten.alias.default",
         "aten.clone.default",
+        "aten.complex.default",
+        "aten.constant_pad_nd.default",
         "aten.contiguous.default",
         "aten.copy_.default",
         "aten.detach.default",
@@ -3750,7 +3754,9 @@ pub mod complex_ops {
         "aten.mul.Tensor",
         "aten.polar.default",
         "aten.real.default",
+        "aten.slice.Tensor",
         "aten.unsqueeze.default",
+        "aten.view.default",
         "aten.view_as_complex.default",
         "aten.view_as_real.default",
     ];

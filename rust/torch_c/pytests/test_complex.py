@@ -139,6 +139,56 @@ v2 = torch.view_as_complex(b2)
 b2[0, 0] = 99.
 out["aliases_its_base"] = pair(v2)[0][0] == 99.0
 
+# 8. every name `_complex_ops()` advertises, asked whether it actually answers
+#    for a complex tensor. Derived rather than restated: the point is to catch
+#    the list drifting in either direction (docs/COMPLEX3.md §8.1 drifted short
+#    and nothing failed, because "sorted, unique, reachable" is true of a list
+#    that is simply incomplete).
+if hasattr(torch._C, "_complex_ops"):
+    z8 = torch.view_as_complex(torch.tensor([[1., -2.], [3., -4.], [5., -6.]]))
+    probes = {
+        "aten.alias.default":            lambda: torch.ops.aten.alias(z8),
+        "aten.clone.default":            lambda: z8.clone(),
+        "aten.contiguous.default":       lambda: z8.contiguous(),
+        "aten.copy_.default":            lambda: z8.clone().copy_(z8),
+        "aten.detach.default":           lambda: z8.detach(),
+        "aten.imag.default":             lambda: torch._C._aten_dispatch("aten.imag.default", z8),
+        "aten.real.default":             lambda: torch._C._aten_dispatch("aten.real.default", z8),
+        "aten.lift_fresh.default":       lambda: torch.ops.aten.lift_fresh(z8),
+        "aten.mul.Scalar":               lambda: z8 * 2,
+        "aten.mul.Tensor":               lambda: z8 * z8,
+        "aten.polar.default":            lambda: torch.polar(torch.ones(3), torch.ones(3)),
+        "aten.unsqueeze.default":        lambda: z8.unsqueeze(0),
+        "aten.view_as_complex.default":  lambda: torch.view_as_complex(torch.ones(2, 2)),
+        "aten.view_as_real.default":     lambda: torch.view_as_real(z8),
+        "aten._to_copy.default":         lambda: torch.ones(3).to(torch.complex64),
+        "aten.slice.Tensor":             lambda: z8[0:2],
+        "aten.constant_pad_nd.default":  lambda: torch.nn.functional.pad(z8, (0, 1)),
+        "aten.view.default":             lambda: z8.view(3, 1),
+        "aten._unsafe_view.default":     lambda: torch._C._aten_dispatch("aten._unsafe_view.default", z8, [3, 1]),
+        "aten.complex.default":          lambda: torch.complex(torch.ones(3), torch.ones(3)),
+    }
+    # Three of these go through `_aten_dispatch` rather than a Python
+    # spelling, and the first version of this probe did not: it called
+    # `z8.imag`, `z8.real` and `z8.reshape(...)` and reported all three as
+    # refusing. They do -- but the *bindings* refuse, not the ops, and
+    # `_complex_ops()` is a list of **ops**. Probing the spelling would have
+    # made this check demand three names be removed from a list they belong on.
+    # (`Tensor.real` and `Tensor.imag` really are missing; docs/COMPLEX3.md
+    # §6.2 routes them, and `fnet` waits on `real`.)
+    answers = {}
+    for name in torch._C._complex_ops():
+        fn = probes.get(name)
+        if fn is None:
+            answers[name] = None          # no probe written; neither claim made
+            continue
+        try:
+            fn()
+            answers[name] = True
+        except Exception:
+            answers[name] = False
+    out["complex_ops_answer"] = answers
+
 json.dump(out, sys.stdout)
 """
 
@@ -490,6 +540,59 @@ def test_the_refusal_points_at_a_list_that_is_not_stale():
 # ---------------------------------------------------------------------------
 # 4. The tag half, from the storage side
 # ---------------------------------------------------------------------------
+
+
+def test_complex_ops_is_derived_from_behaviour_and_not_only_from_its_own_shape():
+    """The staleness check above reads the list's *shape*; this reads its truth.
+
+    `docs/COMPLEX3.md` §8.1 taught five more ops and the list did not follow.
+    Nothing failed, because sorted-unique-reachable is true of a list that is
+    simply short -- and a refusal naming a list shorter than the truth tells a
+    user an op is unavailable when it works, which is the same class of harm as
+    naming one that is too long.
+
+    The `strided` round recommended this and declined to write it, because the
+    complex round was editing this file at the time and a collision there would
+    have cost more than it saved. It also refused to append the six names in
+    its own worktree, where the ops genuinely did refuse -- appending there
+    would have produced the staleness *inverted*, a list naming ops that raise.
+    Both calls were right, and this is the check that makes the next such
+    append unnecessary.
+
+    So: every name on the list must actually answer for a complex tensor, and
+    the ops the untaught sweep asserts must refuse must not be on it. Drift in
+    **either** direction is red.
+    """
+    r = _run("shim")
+    if r is None:
+        return
+    taught = set(_C._complex_ops())
+
+    answers = r["complex_ops_answer"]
+
+    # Every name that has a probe must answer. A `None` means no probe was
+    # written for it -- recorded, and neither claim is made about it, because
+    # asserting on an op nobody exercised would be the shape of check this
+    # repository keeps removing.
+    refusing = sorted(op for op, ok in answers.items() if ok is False)
+    assert not refusing, (
+        f"_complex_ops() names ops that refuse on a complex tensor: {refusing}. "
+        "The refusal points a reader at this list, so a name here is a promise."
+    )
+    unprobed = sorted(op for op, ok in answers.items() if ok is None)
+    assert not unprobed, (
+        f"no probe exists for {unprobed}, so this check says nothing about "
+        "them. Add one to _PROBE section 8 rather than leaving the list "
+        "partly unchecked."
+    )
+    assert set(answers) == taught, (sorted(set(answers) ^ taught))
+
+    # The *other* direction -- an op that answers and is missing from the list,
+    # which is how docs/COMPLEX3.md §8.1 drifted -- is
+    # `test_every_untaught_op_refuses_rather_than_dropping_the_imaginary_part`
+    # above: it asserts each op *not* on the list refuses. Between the two,
+    # drift is red either way. Asserting it here would be vacuous, since these
+    # answers are gathered by iterating the list itself.
 
 
 def test_the_complex_tags_still_report_no_candle_storage():
