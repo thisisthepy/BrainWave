@@ -24547,6 +24547,492 @@ def prims_split_dim_cases(torch_module, c_module, torch_call) -> list[Case]:
         )
     return cases
 
+# --- docs/INDEXSEL.md: index_select, argsort, where.Scalar, new_full, -------
+# unflatten, chunk (free-function), diff, multiply, logical_and ------------
+#
+# `TensorBase.reshape_as` is deliberately NOT here -- it has no genuine
+# `torch.ops.aten` entry to resolve against (see `IMPLEMENTED_AWAITING_GOLDEN`'s
+# comment in aten.rs), so it is proven against upstream directly in
+# `pytests/test_indexsel.py` instead of through this harness.
+
+
+def index_select_cases(torch_module, c_module, torch_call) -> list[Case]:
+    """`m2m_100`/`nllb_moe`/`xglm`/`kosmos2_5`/`seamless_m4t_v2`'s shared
+    position-embedding lookup: `weights.index_select(0, position_ids)`.
+
+    A plausible wrong implementation gets two things backwards that these
+    cases pin: reading `dim` off the wrong axis (the 2-D case has a
+    different answer on each axis), and wrapping a negative index instead of
+    refusing it (upstream never wraps here, unlike `index_put_`).
+    """
+    op = "aten.index_select.default"
+    a_t, a_c = pair_from_flat(
+        torch_module, c_module, [float(i) for i in range(24)], (4, 6), "float32"
+    )
+    idx0_t, idx0_c = pair_from_flat(torch_module, c_module, [2, 0, 0, 3], (4,), "int64")
+    idx1_t, idx1_c = pair_from_flat(torch_module, c_module, [1, 5, 5], (3,), "int64")
+    idx_i32_t, idx_i32_c = pair_from_flat(torch_module, c_module, [3, 1], (2,), "int32")
+    scalar_t, scalar_c = pair_from_flat(torch_module, c_module, [5.0], (), "float32")
+    scalar_idx_t, scalar_idx_c = pair_from_flat(torch_module, c_module, [0], (1,), "int64")
+    bad_idx_t, bad_idx_c = pair_from_flat(torch_module, c_module, [1, 99], (2,), "int64")
+    bad_dtype_idx_t, bad_dtype_idx_c = pair_from_flat(
+        torch_module, c_module, [0.0, 1.0], (2,), "float32"
+    )
+    rank2_idx_t, rank2_idx_c = pair_from_flat(torch_module, c_module, [0, 1], (1, 2), "int64")
+    return [
+        Case(
+            name="index_select(dim=0, repeated + zero index)",
+            op=op,
+            run_torch=lambda: torch_call(a_t, 0, idx0_t),
+            run_c=lambda: c_module._aten_dispatch(op, a_c, 0, idx0_c),
+        ),
+        Case(
+            name="index_select(dim=1, repeated index) -- the other axis",
+            op=op,
+            run_torch=lambda: torch_call(a_t, 1, idx1_t),
+            run_c=lambda: c_module._aten_dispatch(op, a_c, 1, idx1_c),
+        ),
+        Case(
+            name="index_select(dim=-1) negative dim normalises",
+            op=op,
+            run_torch=lambda: torch_call(a_t, -1, idx1_t),
+            run_c=lambda: c_module._aten_dispatch(op, a_c, -1, idx1_c),
+        ),
+        Case(
+            name="index_select int32 index",
+            op=op,
+            run_torch=lambda: torch_call(a_t, 1, idx_i32_t),
+            run_c=lambda: c_module._aten_dispatch(op, a_c, 1, idx_i32_c),
+        ),
+        Case(
+            name="index_select on a 0-d self",
+            op=op,
+            run_torch=lambda: torch_call(scalar_t, 0, scalar_idx_t),
+            run_c=lambda: c_module._aten_dispatch(op, scalar_c, 0, scalar_idx_c),
+        ),
+        Case(
+            name="index_select out-of-range index refuses on both sides",
+            op=op,
+            run_torch=lambda: torch_call(a_t, 0, bad_idx_t),
+            run_c=lambda: c_module._aten_dispatch(op, a_c, 0, bad_idx_c),
+            expect="both_error",
+        ),
+        Case(
+            name="index_select float index dtype refuses on both sides",
+            op=op,
+            run_torch=lambda: torch_call(a_t, 0, bad_dtype_idx_t),
+            run_c=lambda: c_module._aten_dispatch(op, a_c, 0, bad_dtype_idx_c),
+            expect="both_error",
+        ),
+        Case(
+            name="index_select rank-2 index refuses on both sides",
+            op=op,
+            run_torch=lambda: torch_call(a_t, 0, rank2_idx_t),
+            run_c=lambda: c_module._aten_dispatch(op, a_c, 0, rank2_idx_c),
+            expect="both_error",
+        ),
+    ]
+
+
+def argsort_default_cases(torch_module, c_module, torch_call) -> list[Case]:
+    """`aria`'s `torch.argsort(flatten_indices)` and `nllb_moe`'s
+    `.argsort(dim=0)`. Ties are the case an unstable sort cannot pass --
+    distinct values cannot tell `argsort` and `argsort.stable` apart, so
+    every scenario here repeats a value (docs/ARCH100.md's own warning).
+    """
+    op = "aten.argsort.default"
+    ties_t, ties_c = pair_from_flat(
+        torch_module, c_module, [3, 1, 3, 2, 1, 3, 0, 1], (8,), "int64"
+    )
+    two_d_t, two_d_c = pair_from_flat(
+        torch_module, c_module, [3, 1, 1, 3, 2, 2], (2, 3), "float32"
+    )
+    return [
+        Case(
+            name="argsort ascending, ties keep original order",
+            op=op,
+            run_torch=lambda: torch_call(ties_t),
+            run_c=lambda: c_module._aten_dispatch(op, ties_c),
+        ),
+        Case(
+            name="argsort descending, ties still keep original order",
+            op=op,
+            run_torch=lambda: torch_call(ties_t, -1, True),
+            run_c=lambda: c_module._aten_dispatch(op, ties_c, -1, True),
+        ),
+        Case(
+            name="argsort(dim=0) on a 2-D tensor with ties",
+            op=op,
+            run_torch=lambda: torch_call(two_d_t, 0, False),
+            run_c=lambda: c_module._aten_dispatch(op, two_d_c, 0, False),
+        ),
+    ]
+
+
+def argsort_stable_cases(torch_module, c_module, torch_call) -> list[Case]:
+    """`argsort.stable`'s own overload, reached when a caller passes
+    `stable=` explicitly. Same tie-bearing input as `argsort.default`'s
+    cases -- the two overloads are measured to agree, and a divergence
+    between them would only show up on ties.
+    """
+    op = "aten.argsort.stable"
+    ties_t, ties_c = pair_from_flat(
+        torch_module, c_module, [3, 1, 3, 2, 1, 3, 0, 1], (8,), "int64"
+    )
+    return [
+        Case(
+            name="argsort.stable(stable=True) ascending",
+            op=op,
+            run_torch=lambda: torch_call(ties_t, stable=True, dim=-1, descending=False),
+            run_c=lambda: c_module._aten_dispatch(
+                op, ties_c, stable=True, dim=-1, descending=False
+            ),
+        ),
+        Case(
+            name="argsort.stable(stable=True) descending",
+            op=op,
+            run_torch=lambda: torch_call(ties_t, stable=True, dim=-1, descending=True),
+            run_c=lambda: c_module._aten_dispatch(
+                op, ties_c, stable=True, dim=-1, descending=True
+            ),
+        ),
+        Case(
+            name="argsort.stable(stable=False) -- licensed to agree with stable",
+            op=op,
+            run_torch=lambda: torch_call(ties_t, stable=False, dim=-1, descending=False),
+            run_c=lambda: c_module._aten_dispatch(
+                op, ties_c, stable=False, dim=-1, descending=False
+            ),
+        ),
+    ]
+
+
+def where_scalar_cases(torch_module, c_module, torch_call) -> list[Case]:
+    """`cpmant`/`git`'s `where.Scalar` -- both branches are Python scalars,
+    not tensors. docs/SCALAR2.md's rule is per-op, so this pins the
+    dtype table `where_scalar_scalar`'s doc comment measured directly:
+    bool+bool -> bool, int+bool -> int64, anything+float -> float32.
+    """
+    op = "aten.where.Scalar"
+    cond_t, cond_c = pair_from_flat(torch_module, c_module, [1, 0, 1, 0], (4,), "bool")
+    return [
+        Case(
+            name="where.Scalar(bool, bool) -> bool",
+            op=op,
+            run_torch=lambda: torch_call(cond_t, True, False),
+            run_c=lambda: c_module._aten_dispatch(op, cond_c, True, False),
+        ),
+        Case(
+            name="where.Scalar(int, bool) -> int64",
+            op=op,
+            run_torch=lambda: torch_call(cond_t, 1, True),
+            run_c=lambda: c_module._aten_dispatch(op, cond_c, 1, True),
+        ),
+        Case(
+            name="where.Scalar(int, int) -> int64",
+            op=op,
+            run_torch=lambda: torch_call(cond_t, 3, -2),
+            run_c=lambda: c_module._aten_dispatch(op, cond_c, 3, -2),
+        ),
+        Case(
+            name="where.Scalar(bool, float) -> float32, the float wins",
+            op=op,
+            run_torch=lambda: torch_call(cond_t, True, 2.5),
+            run_c=lambda: c_module._aten_dispatch(op, cond_c, True, 2.5),
+        ),
+        Case(
+            name="where.Scalar(float, int) -> float32",
+            op=op,
+            run_torch=lambda: torch_call(cond_t, 2.5, 1),
+            run_c=lambda: c_module._aten_dispatch(op, cond_c, 2.5, 1),
+        ),
+    ]
+
+
+def new_full_cases(torch_module, c_module, torch_call) -> list[Case]:
+    """`led`'s `inputs_embeds.new_full((batch, pad_len), pad_token_id,
+    dtype=torch.long)`. Mirrors `new_ones_cases` row for row -- dtype
+    inherited from `self` unless overridden -- plus `full_like`'s
+    truncate-toward-zero rule on the fill value, which a plausible
+    "infer dtype from the fill like `full` does" implementation gets wrong.
+    """
+    op = "aten.new_full.default"
+    cases: list[Case] = []
+    for self_dtype in ["float32", "int64", "bool"]:
+        self_t, self_c = pair_from_flat(
+            torch_module, c_module, [0.0, 0.0, 0.0, 0.0], (2, 2), self_dtype
+        )
+        cases.append(
+            Case(
+                name=f"new_full(self_dtype={self_dtype}, shape=[2,3], fill=3) "
+                "[dtype inherited from self]",
+                op=op,
+                run_torch=lambda self_t=self_t: torch_call(self_t, [2, 3], 3),
+                run_c=lambda self_c=self_c: c_module._aten_dispatch(op, self_c, [2, 3], 3),
+            )
+        )
+    f32_t, f32_c = pair_from_flat(torch_module, c_module, [0.0, 0.0], (2,), "float32")
+    i64_t, i64_c = pair_from_flat(torch_module, c_module, [0, 0], (2,), "int64")
+    cases.append(
+        Case(
+            name="new_full(int64_self, fill=7.5) -- truncates toward zero, not `full`'s rule",
+            op=op,
+            run_torch=lambda: torch_call(i64_t, [2, 2], 7.5),
+            run_c=lambda: c_module._aten_dispatch(op, i64_c, [2, 2], 7.5),
+        )
+    )
+    cases.append(
+        Case(
+            name="new_full(dtype= override beats self's)",
+            op=op,
+            run_torch=lambda: torch_call(f32_t, [2, 2], 5, dtype=torch_module.int64),
+            run_c=lambda: c_module._aten_dispatch(
+                op, f32_c, [2, 2], 5, dtype=c_module.int64
+            ),
+        )
+    )
+    return cases
+
+
+def unflatten_int_cases(torch_module, c_module, torch_call) -> list[Case]:
+    """`siglip_vision_model`'s wall, reached through
+    `F.multi_head_attention_forward`'s `kv_proj.unflatten(-1, (2, E))`.
+    """
+    op = "aten.unflatten.int"
+    a_t, a_c = pair_from_flat(
+        torch_module, c_module, [float(i) for i in range(24)], (2, 3, 4), "float32"
+    )
+    return [
+        Case(
+            name="unflatten(dim=1, sizes=(3,1))",
+            op=op,
+            run_torch=lambda: torch_call(a_t, 1, [3, 1]),
+            run_c=lambda: c_module._aten_dispatch(op, a_c, 1, [3, 1]),
+        ),
+        Case(
+            name="unflatten(dim=-1, sizes=(2,-1)) -- inferred size",
+            op=op,
+            run_torch=lambda: torch_call(a_t, -1, [2, -1]),
+            run_c=lambda: c_module._aten_dispatch(op, a_c, -1, [2, -1]),
+        ),
+        Case(
+            name="unflatten(dim=0, sizes=(-1,1)) -- inferred leading size",
+            op=op,
+            run_torch=lambda: torch_call(a_t, 0, [-1, 1]),
+            run_c=lambda: c_module._aten_dispatch(op, a_c, 0, [-1, 1]),
+        ),
+        Case(
+            name="unflatten sizes that don't multiply up refuses on both sides",
+            op=op,
+            run_torch=lambda: torch_call(a_t, 1, [2, 2]),
+            run_c=lambda: c_module._aten_dispatch(op, a_c, 1, [2, 2]),
+            expect="both_error",
+        ),
+        Case(
+            name="unflatten two -1s refuses on both sides",
+            op=op,
+            run_torch=lambda: torch_call(a_t, 1, [-1, -1]),
+            run_c=lambda: c_module._aten_dispatch(op, a_c, 1, [-1, -1]),
+            expect="both_error",
+        ),
+    ]
+
+
+def chunk_default_cases(torch_module, c_module, torch_call) -> list[Case]:
+    """The free-function spelling, `diffllama`'s
+    `torch.chunk(value_states, 2, dim=1)`. `arange(3).chunk(7)` and
+    `empty(0).chunk(3)` are the two rows a plausible even-division
+    implementation gets wrong -- `chunks` is an upper bound on how many
+    pieces come back, not a promise, per `_install_tensor_chunk`'s own
+    measurement.
+    """
+    # Reuses `split_cases`' own `_chunk_list_check` rather than a second
+    # hand-written comparator: this shim's self-test (`compare.py
+    # --self-test`) injects a dtype fault into every comparator in turn and
+    # a first draft here that checked shape+values through `.tolist()` alone
+    # missed it -- `.tolist()` does not carry dtype, so a chunk piece
+    # corrupted to the wrong dtype with the same numeric values sailed
+    # through. `_chunk_list_check` compares dtype, shape and values per
+    # piece and is already proven against that exact fault by `split`'s own
+    # coverage.
+    op = "aten.chunk.default"
+    a_t, a_c = pair_from_flat(
+        torch_module, c_module, [float(i) for i in range(10)], (10,), "float32"
+    )
+    uneven_t, uneven_c = pair_from_flat(
+        torch_module, c_module, [0.0, 1.0, 2.0], (3,), "float32"
+    )
+    empty_t, empty_c = pair_from_flat(torch_module, c_module, [], (0,), "float32")
+    return [
+        Case(
+            name="chunk(10, chunks=3) -> shapes 4,4,2",
+            op=op,
+            run_torch=lambda: torch_call(a_t, 3, 0),
+            run_c=lambda: c_module._aten_dispatch(op, a_c, 3, 0),
+            value_check=_chunk_list_check,
+        ),
+        Case(
+            name="chunk(3, chunks=7) -> three pieces, not seven",
+            op=op,
+            run_torch=lambda: torch_call(uneven_t, 7, 0),
+            run_c=lambda: c_module._aten_dispatch(op, uneven_c, 7, 0),
+            value_check=_chunk_list_check,
+        ),
+        Case(
+            name="chunk(empty(0), chunks=3) -> three empty pieces",
+            op=op,
+            run_torch=lambda: torch_call(empty_t, 3, 0),
+            run_c=lambda: c_module._aten_dispatch(op, empty_c, 3, 0),
+            value_check=_chunk_list_check,
+        ),
+    ]
+
+
+def diff_default_cases(torch_module, c_module, torch_call) -> list[Case]:
+    """`voxtral_realtime_encoder`'s
+    `torch.diff(position_ids, prepend=first_dummy_value, dim=-1)`. `n=2`
+    with a `prepend` and `n=0` (which is licensed to ignore `prepend`
+    entirely, measured) are the two rows that catch a plausible
+    "apply first-difference to the un-prepended axis `n` times" bug.
+    """
+    op = "aten.diff.default"
+    x_t, x_c = pair_from_flat(torch_module, c_module, [1, 3, 6, 10, 15], (5,), "int64")
+    prepend1_t, prepend1_c = pair_from_flat(torch_module, c_module, [0], (1,), "int64")
+    prepend2_t, prepend2_c = pair_from_flat(torch_module, c_module, [0, 0], (2,), "int64")
+    append_t, append_c = pair_from_flat(torch_module, c_module, [100], (1,), "int64")
+    y_t, y_c = pair_from_flat(
+        torch_module, c_module, [float(i) for i in range(12)], (3, 4), "float32"
+    )
+    return [
+        Case(
+            name="diff(n=1) default order",
+            op=op,
+            run_torch=lambda: torch_call(x_t),
+            run_c=lambda: c_module._aten_dispatch(op, x_c),
+        ),
+        Case(
+            name="diff(n=2)",
+            op=op,
+            run_torch=lambda: torch_call(x_t, 2, -1, None, None),
+            run_c=lambda: c_module._aten_dispatch(op, x_c, 2, -1, None, None),
+        ),
+        Case(
+            name="diff(prepend=1 element)",
+            op=op,
+            run_torch=lambda: torch_call(x_t, 1, -1, prepend1_t, None),
+            run_c=lambda: c_module._aten_dispatch(op, x_c, 1, -1, prepend1_c, None),
+        ),
+        Case(
+            name="diff(n=2, prepend=2 elements)",
+            op=op,
+            run_torch=lambda: torch_call(x_t, 2, -1, prepend2_t, None),
+            run_c=lambda: c_module._aten_dispatch(op, x_c, 2, -1, prepend2_c, None),
+        ),
+        Case(
+            name="diff(append=1 element)",
+            op=op,
+            run_torch=lambda: torch_call(x_t, 1, -1, None, append_t),
+            run_c=lambda: c_module._aten_dispatch(op, x_c, 1, -1, None, append_c),
+        ),
+        Case(
+            name="diff(n=0) ignores prepend entirely -- self unchanged",
+            op=op,
+            run_torch=lambda: torch_call(x_t, 0, -1, prepend1_t, None),
+            run_c=lambda: c_module._aten_dispatch(op, x_c, 0, -1, prepend1_c, None),
+        ),
+        Case(
+            name="diff(dim=0) on a 2-D tensor",
+            op=op,
+            run_torch=lambda: torch_call(y_t, 1, 0, None, None),
+            run_c=lambda: c_module._aten_dispatch(op, y_c, 1, 0, None, None),
+        ),
+    ]
+
+
+def multiply_tensor_cases(torch_module, c_module, torch_call) -> list[Case]:
+    """`convbert`'s `torch.multiply(mixed_key_conv_attn_layer,
+    mixed_query_layer)` -- a pure alias for `mul.Tensor`, measured with a
+    `TorchDispatchMode` logger (docs/INDEXSEL.md). Proven against upstream
+    rather than assumed: if this were wired to the wrong kernel, or dropped
+    `mul`'s promotion, this is the case that would catch it.
+    """
+    op = "aten.multiply.Tensor"
+    a_t, a_c = pair_from_flat(torch_module, c_module, [1.0, 2.0, 3.0, 4.0], (4,), "float32")
+    b_t, b_c = pair_from_flat(torch_module, c_module, [2, 3, 4, 5], (4,), "int64")
+    return [
+        Case(
+            name="multiply.Tensor same dtype",
+            op=op,
+            run_torch=lambda: torch_call(a_t, a_t),
+            run_c=lambda: c_module._aten_dispatch(op, a_c, a_c),
+        ),
+        Case(
+            name="multiply.Tensor promotes float32 x int64",
+            op=op,
+            run_torch=lambda: torch_call(a_t, b_t),
+            run_c=lambda: c_module._aten_dispatch(op, a_c, b_c),
+        ),
+    ]
+
+
+def multiply_scalar_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.multiply.Scalar"
+    a_t, a_c = pair_from_flat(torch_module, c_module, [1.0, 2.0, 3.0, 4.0], (4,), "float32")
+    return [
+        Case(
+            name="multiply.Scalar",
+            op=op,
+            run_torch=lambda: torch_call(a_t, 2.5),
+            run_c=lambda: c_module._aten_dispatch(op, a_c, 2.5),
+        ),
+    ]
+
+
+def logical_and_cases(torch_module, c_module, torch_call) -> list[Case]:
+    """`longt5`'s two boolean attention masks combined with
+    `torch.logical_and`. The mixed-dtype and broadcasting cases are what a
+    "bitwise and on the raw bit pattern" implementation gets wrong -- `3 &
+    2` truthiness-ands to `True`, while a bitwise bit-and would still be
+    truthy here but silently wrong on `1 & 2` (both nonzero, bitwise gives
+    zero).
+    """
+    op = "aten.logical_and.default"
+    bool_a_t, bool_a_c = pair_from_flat(torch_module, c_module, [1, 0, 1, 0], (4,), "bool")
+    bool_b_t, bool_b_c = pair_from_flat(torch_module, c_module, [1, 1, 0, 0], (4,), "bool")
+    int_a_t, int_a_c = pair_from_flat(torch_module, c_module, [1, 0, 3, 2], (4,), "int64")
+    float_a_t, float_a_c = pair_from_flat(
+        torch_module, c_module, [1.5, 0.0, -2.0, 0.0], (4,), "float32"
+    )
+    row_t, row_c = pair_from_flat(torch_module, c_module, [1, 0], (1, 2), "int64")
+    col_t, col_c = pair_from_flat(torch_module, c_module, [1, 1], (2, 1), "int64")
+    return [
+        Case(
+            name="logical_and(bool, bool)",
+            op=op,
+            run_torch=lambda: torch_call(bool_a_t, bool_b_t),
+            run_c=lambda: c_module._aten_dispatch(op, bool_a_c, bool_b_c),
+        ),
+        Case(
+            name="logical_and(int64, bool) -- truthiness, not a bit-and",
+            op=op,
+            run_torch=lambda: torch_call(int_a_t, bool_b_t),
+            run_c=lambda: c_module._aten_dispatch(op, int_a_c, bool_b_c),
+        ),
+        Case(
+            name="logical_and(float32, float32) with a NaN-free negative",
+            op=op,
+            run_torch=lambda: torch_call(float_a_t, float_a_t),
+            run_c=lambda: c_module._aten_dispatch(op, float_a_c, float_a_c),
+        ),
+        Case(
+            name="logical_and broadcasts (1,2) against (2,1)",
+            op=op,
+            run_torch=lambda: torch_call(row_t, col_t),
+            run_c=lambda: c_module._aten_dispatch(op, row_c, col_c),
+        ),
+    ]
+
+
 CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
     "aten.adaptive_avg_pool2d.default": adaptive_avg_pool2d_cases,
     "aten.where.ScalarSelf": where_scalar_self_cases,
@@ -24833,6 +25319,18 @@ CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
     "aten.nonzero.default": nonzero_default_cases,
     "aten.where.default": where_default_cases,
 
+    # docs/INDEXSEL.md
+    "aten.index_select.default": index_select_cases,
+    "aten.argsort.default": argsort_default_cases,
+    "aten.argsort.stable": argsort_stable_cases,
+    "aten.where.Scalar": where_scalar_cases,
+    "aten.new_full.default": new_full_cases,
+    "aten.unflatten.int": unflatten_int_cases,
+    "aten.chunk.default": chunk_default_cases,
+    "aten.diff.default": diff_default_cases,
+    "aten.multiply.Tensor": multiply_tensor_cases,
+    "aten.multiply.Scalar": multiply_scalar_cases,
+    "aten.logical_and.default": logical_and_cases,
 }
 
 

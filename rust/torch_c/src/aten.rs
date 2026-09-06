@@ -70,6 +70,8 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.arange.start",
     "aten.arange.start_step",
     "aten.argmax.default",
+    "aten.argsort.default",
+    "aten.argsort.stable",
     "aten.avg_pool2d.default",
     "aten.max_pool2d.default",
     "aten.baddbmm.default",
@@ -83,6 +85,7 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.cat.default",
     "aten.ceil.default",
     "aten.ceil_.default",
+    "aten.chunk.default",
     "aten.clamp.default",
     "aten.clamp_.default",
     "aten.clamp_min.default",
@@ -95,6 +98,7 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.cos_.default",
     "aten.cumsum.default",
     "aten.detach.default",
+    "aten.diff.default",
     "aten.div.Scalar_mode",
     "aten.div.Tensor",
     "aten.div.Tensor_mode",
@@ -135,6 +139,7 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.index.Tensor",
     "aten.index_add_.default",
     "aten.index_put_.default",
+    "aten.index_select.default",
     "aten.is_floating_point.default",
     "aten.isin.Tensor_Tensor",
     "aten.le.Scalar",
@@ -147,6 +152,7 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.log2.default",
     "aten.log2_.default",
     "aten.log_.default",
+    "aten.logical_and.default",
     "aten.lt.Scalar",
     "aten.lt.Tensor",
     "aten.masked_fill.Scalar",
@@ -168,6 +174,8 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.mul_.Scalar",
     "aten.mul_.Tensor",
     "aten.multinomial.default",
+    "aten.multiply.Scalar",
+    "aten.multiply.Tensor",
     "aten.native_batch_norm.default",
     "aten.native_group_norm.default",
     "aten.native_dropout.default",
@@ -177,6 +185,7 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.neg.default",
     "aten.neg_.default",
     "aten.new_empty.default",
+    "aten.new_full.default",
     "aten.new_ones.default",
     "aten.new_zeros.default",
     "aten.nll_loss_forward.default",
@@ -237,12 +246,14 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.tril.default",
     "aten.triu.default",
     "aten.unbind.int",
+    "aten.unflatten.int",
     "aten.uniform_.default",
     "aten.unsqueeze.default",
     "aten.upsample_bicubic2d.default",
     "aten.upsample_bilinear2d.default",
     "aten.view.default",
     "aten.view.dtype",
+    "aten.where.Scalar",
     "aten.where.ScalarOther",
     "aten.nonzero.default",
     "aten.where.default",
@@ -320,6 +331,14 @@ pub const IMPLEMENTED_AWAITING_GOLDEN: &[&str] = &[
     "aten.contiguous.default",
     "aten.div.Scalar",
     "aten.masked_fill.Tensor",
+    // Not a genuine upstream aten op -- `aten.reshape_as.default` is this
+    // shim's own invented key for `TensorBase.reshape_as` (see
+    // `reshape_as_default`'s doc comment). `tools/golden/loader.py`'s
+    // `resolve_torch_overload` refuses by design when `torch.ops.aten` has
+    // no matching entry, so this cannot go through `compare.py`'s normal
+    // per-op golden loop -- it is proven against upstream directly in
+    // `pytests/test_indexsel.py` instead (docs/INDEXSEL.md).
+    "aten.reshape_as.default",
     "aten.zeros.default",
 ];
 
@@ -2235,6 +2254,23 @@ fn aten_dispatch_inner(
         "aten.detach_.default" => detach_inplace_refusal(py, args, kwargs),
 
         "aten.one_hot.default" => one_hot_default(py, args, kwargs),
+
+        // -- docs/INDEXSEL.md: index_select, argsort, where.Scalar, new_full,
+        // reshape_as, unflatten, chunk (free-function), diff, multiply,
+        // logical_and --------------------------------------------------
+        "aten.index_select.default" => index_select_default(py, args, kwargs),
+        "aten.argsort.default" => argsort_default(py, args, kwargs),
+        "aten.argsort.stable" => argsort_stable(py, args, kwargs),
+        "aten.where.Scalar" => where_scalar_scalar(py, args, kwargs),
+        "aten.new_full.default" => new_full_default(py, args, kwargs),
+        "aten.reshape_as.default" => reshape_as_default(py, args, kwargs),
+        "aten.unflatten.int" => unflatten_int(py, args, kwargs),
+        "aten.chunk.default" => chunk_default(py, args, kwargs),
+        "aten.diff.default" => diff_default(py, args, kwargs),
+        "aten.multiply.Tensor" => arith_tensor(py, args, kwargs, "aten.multiply.Tensor", Arith::Mul),
+        "aten.multiply.Scalar" => arith_scalar(py, args, kwargs, "aten.multiply.Scalar", Arith::Mul),
+        "aten.logical_and.default" => logical_and_default(py, args, kwargs),
+
         other => Err(aten_not_implemented(other)),
     }
 }
@@ -20301,6 +20337,619 @@ fn one_hot_default(
     let out_t = Tensor::from_vec(out_data, out_dims, t.device()).map_err(|e| candle_err(OP, e))?;
     let py_t = pyo3::Py::new(py, PyTensorBase::new(out_t)?)?;
     Ok(py_t.into_any())
+}
+
+// ---------------------------------------------------------------------------
+// docs/INDEXSEL.md -- the five m2m_100-family position embeddings
+// (`index_select`), `argsort`, `where.Scalar`, `new_full`, `reshape_as`,
+// `unflatten`, the free-function spelling of `chunk`, `diff` and the pure
+// aliases `multiply`/`logical_and`.
+// ---------------------------------------------------------------------------
+
+/// `aten::index_select(Tensor self, int dim, Tensor index) -> Tensor`
+///
+/// `TensorBase.index_select`: the row lookup every sinusoidal position
+/// embedding in the m2m_100 family shares verbatim --
+/// `self.weights.index_select(0, position_ids.view(-1))` -- reached by
+/// `m2m_100`, `nllb_moe`, `xglm`, `kosmos2_5` and `seamless_m4t_v2`.
+///
+/// Measured against upstream 2.13.0:
+///   * `index` must be `int32` or `int64` -- "Expected dtype int32 or int64
+///     for index" is upstream's wording for anything else.
+///   * `index` must be rank <= 1 -- "index_select(): Index is supposed to be
+///     a vector" otherwise.
+///   * a **0-d `self`** is accepted as if it had one element along the
+///     implied axis: the index must carry **exactly one** value ("Index to
+///     scalar can have only 1 value, got N value(s)"), checked before the
+///     range check, and the answer is `self` unchanged (there is only one
+///     valid index into it, `0`).
+///   * an out-of-range index value raises, unconditionally -- no
+///     negative-index wraparound, the same rule `index_add_`'s kernel
+///     already carries.
+///
+/// **No host readback.** Every other index-bearing kernel in this file
+/// validates the index values by pulling them to a `Vec` first
+/// (`index_add_`'s own `read_flat`, above); this one does not, on purpose --
+/// `MPS_HOST_READBACK_OPS` (device.rs) is a fixed table this round's
+/// territory does not include, and adding a new host-reading kernel would
+/// have needed an entry there. candle's own `index_select` already validates
+/// the range (`Error::InvalidIndex`, checked against its C source) and a
+/// negative `i64` index cast through `IntDType::as_usize` wraps to a huge
+/// `usize` that the same range check catches -- so relying on it rather than
+/// re-checking host-side answers the same refusal without ever reading the
+/// index tensor's bytes back. The 0-d `self` case reshapes to a 1-element
+/// 1-D view first (`self.dims()[dim]` would be a phantom `1`, not a real
+/// axis), which routes it through the identical candle-side check instead of
+/// a second hand-written one.
+fn index_select_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.index_select.default";
+    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let rank = input.tensor()?.rank();
+    let dim = normalise_dim(
+        OP,
+        dim_arg(args, kwargs, 1, "dim")?.ok_or_else(|| missing(OP, "dim"))?,
+        rank,
+    )?;
+    let index = tensor_arg(OP, args, kwargs, 2, "index")?;
+
+    match index.tag() {
+        TorchDType::Int32 | TorchDType::Int64 => {}
+        other => {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "index_select(): Expected dtype int32 or int64 for index, got {}",
+                scalar_type_name(other)
+            )))
+        }
+    }
+    let index_dims = index.tensor()?.dims().to_vec();
+    if index_dims.len() > 1 {
+        return Err(pyo3::exceptions::PyIndexError::new_err(format!(
+            "index_select(): Index is supposed to be a vector, but got dim: {} with type: {} \
+             and size: {:?}",
+            index_dims.len(),
+            scalar_type_name(index.tag()),
+            index_dims
+        )));
+    }
+
+    let numel = index.tensor()?.elem_count();
+    if rank == 0 && numel != 1 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "index_select(): Index to scalar can have only 1 value, got {numel} value(s)"
+        )));
+    }
+
+    // A signed index in any width candle's own `index_select` accepts
+    // (`u8`/`u32`/`i64`), so this only ever narrows or is a no-op -- never a
+    // readback, since `to_dtype` is a device-side cast.
+    let index_i64 = index
+        .tensor()?
+        .to_dtype(candle_core::DType::I64)
+        .map_err(|e| candle_err(OP, e))?;
+
+    let (source, select_dim) = if rank == 0 {
+        // `dims()[dim]` on a 0-d tensor is not a real axis; reshape to the
+        // one it stands in for so candle's own bounds check runs on it.
+        (
+            input.tensor()?.reshape(1).map_err(|e| candle_err(OP, e))?,
+            0,
+        )
+    } else {
+        (
+            input.tensor()?.contiguous().map_err(|e| candle_err(OP, e))?,
+            dim,
+        )
+    };
+    let selected = source
+        .index_select(&index_i64, select_dim)
+        .map_err(|e| candle_err(OP, e))?;
+    let out = if rank == 0 {
+        selected.reshape(()).map_err(|e| candle_err(OP, e))?
+    } else {
+        selected
+    };
+    finish(py, out, input.tag())
+}
+
+/// The core `argsort` both overloads share: `order_along` (`sort`'s own
+/// helper) is unconditionally stable, so the same call answers `.default`
+/// and `.stable` alike -- `aria`'s `torch.argsort(flatten_indices)` and
+/// `nllb_moe`'s `importance_scores.argsort(dim=0)`.
+fn argsort_core(
+    op: &str,
+    input: &PyTensorBase,
+    dim_raw: isize,
+    descending: bool,
+) -> PyResult<(Vec<i64>, Vec<usize>)> {
+    let rank = input.tensor()?.rank();
+    let dim = normalise_dim(op, dim_raw, rank)?;
+    let ordered = order_along(op, input, dim, descending, None)?;
+    Ok((ordered.indices, ordered.dims))
+}
+
+fn argsort_finish(
+    py: Python<'_>,
+    input: &PyTensorBase,
+    indices: Vec<i64>,
+    dims: Vec<usize>,
+) -> PyResult<Py<PyAny>> {
+    let device = input.tensor()?.device().clone();
+    let out = Tensor::from_vec(indices, dims, &device).map_err(|e| candle_err("aten.argsort", e))?;
+    finish(py, out, TorchDType::Int64)
+}
+
+/// `aten::argsort(Tensor self, int dim=-1, bool descending=False) -> Tensor`
+fn argsort_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.argsort.default";
+    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let dim = dim_arg(args, kwargs, 1, "dim")?.unwrap_or(-1);
+    let descending = bool_arg(args, kwargs, 2, "descending")?.unwrap_or(false);
+    let (indices, dims) = argsort_core(OP, &input, dim, descending)?;
+    argsort_finish(py, &input, indices, dims)
+}
+
+/// `aten::argsort.stable(Tensor self, *, bool stable, int dim=-1,
+///     bool descending=False) -> Tensor`
+///
+/// `stable` is read and discarded rather than branched on: `order_along` is
+/// stable unconditionally (its own doc comment has the measurement `sort`
+/// leans on), and measured on 2.13.0 `argsort`'s plain overload already
+/// agrees with `stable=True` in both directions, including on ties -- so
+/// `stable=False` computes the same answer this shim always gives, which is
+/// within upstream's licence rather than a divergence from it.
+fn argsort_stable(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.argsort.stable";
+    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let _stable = bool_arg(args, kwargs, 1, "stable")?.ok_or_else(|| missing(OP, "stable"))?;
+    let dim = dim_arg(args, kwargs, 2, "dim")?.unwrap_or(-1);
+    let descending = bool_arg(args, kwargs, 3, "descending")?.unwrap_or(false);
+    let (indices, dims) = argsort_core(OP, &input, dim, descending)?;
+    argsort_finish(py, &input, indices, dims)
+}
+
+/// `aten::where.Scalar(Tensor condition, Scalar self, Scalar other) -> Tensor`
+///
+/// Both branches are Python scalars -- docs/SCALAR2.md's per-op wrapping
+/// rule applies here and is not `add`'s. Measured against upstream 2.13.0,
+/// the result dtype depends only on the two scalars' *Python types*, never
+/// their values:
+///
+/// ```text
+/// self       other      dtype
+/// bool       bool       bool
+/// bool/int   bool/int   int64      (at least one side a non-bool integer)
+/// anything   float      float32    (a float on either side wins)
+/// ```
+///
+/// which is `where.ScalarOther`'s wrapped-number column read against itself
+/// with no tensor operand to anchor either side -- `cpmant` and `git` are
+/// the two measured callers (docs/ARCH100.md).
+fn where_scalar_scalar(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.where.Scalar";
+    let condition = tensor_arg(OP, args, kwargs, 0, "condition")?;
+    let self_raw = required(OP, args, kwargs, 1, "self")?;
+    let other_raw = required(OP, args, kwargs, 2, "other")?;
+
+    where_condition_check(&condition)?;
+    for (raw, name) in [(&self_raw, "self"), (&other_raw, "other")] {
+        if raw.is_instance_of::<PyTensorBase>() {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "aten::where() Expected a value of type 'number' for argument '{name}' \
+                 but instead found type Tensor",
+            )));
+        }
+    }
+    let self_is_bool = self_raw.is_instance_of::<pyo3::types::PyBool>();
+    let self_is_int = self_is_bool || self_raw.is_instance_of::<pyo3::types::PyInt>();
+    let other_is_bool = other_raw.is_instance_of::<pyo3::types::PyBool>();
+    let other_is_int = other_is_bool || other_raw.is_instance_of::<pyo3::types::PyInt>();
+
+    let tag = if !self_is_int || !other_is_int {
+        TorchDType::Float32
+    } else if self_is_bool && other_is_bool {
+        TorchDType::Bool
+    } else {
+        TorchDType::Int64
+    };
+
+    let self_value = scalar_arg(OP, args, kwargs, 1, "self")?.ok_or_else(|| missing(OP, "self"))?;
+    let other_value = scalar_arg(OP, args, kwargs, 2, "other")?.ok_or_else(|| missing(OP, "other"))?;
+    checked_convert(&self_raw, self_is_int, tag, 1)?;
+    checked_convert(&other_raw, other_is_int, tag, 1)?;
+
+    let device = condition.tensor()?.device().clone();
+    let build = |value: Scalar| -> PyResult<Tensor> {
+        if tag == TorchDType::Bool {
+            Tensor::full(u8::from(value.as_f64() != 0.0), (), &device)
+                .map_err(|e| candle_err(OP, e))
+        } else {
+            let storage = PyDtype::new(tag).storage(OP)?;
+            if storage.is_int() {
+                Tensor::full(value.as_i64(), (), &device)
+            } else {
+                Tensor::full(value.as_f64(), (), &device)
+            }
+            .and_then(|t| t.fast_to(storage))
+            .map_err(|e| candle_err(OP, e))
+        }
+    };
+    let lhs = build(self_value)?;
+    let rhs = build(other_value)?;
+    let out = where_select(OP, &condition, &lhs, &rhs, tag)?;
+    finish(py, out, tag)
+}
+
+/// `aten::new_full(Tensor self, SymInt[] size, Scalar fill_value, *,
+///     ScalarType? dtype=None, Layout? layout=None, Device? device=None,
+///     bool? pin_memory=None) -> Tensor`
+///
+/// `led`'s wall: `_pad_to_window_size` pads with
+/// `inputs_embeds.new_full((batch, pad_len), pad_token_id, dtype=torch.long)`.
+/// `new_ones`/`new_zeros`'s schema, character for character, with a third
+/// positional slot for the fill -- and `full_like`'s fill semantics rather
+/// than `full`'s: the dtype comes from the **reference tensor** (an explicit
+/// `dtype=` still wins), not from the fill value's Python type, so
+/// `int64_t.new_full((2,), 7.5)` is `7`, not `7.5`. `filled_block` and
+/// `checked_convert` are `full_like_default`'s two rules (its own comment has
+/// the measured table); this is a third caller of both rather than a new
+/// copy of either.
+fn new_full_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.new_full.default";
+    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let size: Vec<usize> = required(OP, args, kwargs, 1, "size")?.extract()?;
+    let fill = required(OP, args, kwargs, 2, "fill_value")?;
+    let tag = dtype_arg(args, kwargs, 3, "dtype")?.unwrap_or(input.tag());
+    reject_unsupported(OP, args, kwargs, &[(4, "layout"), (6, "pin_memory")])?;
+    let label = device_arg_or_label(args, kwargs, 5, "device", &input.device_label())?;
+
+    let fill_is_bool = fill.is_instance_of::<pyo3::types::PyBool>();
+    let fill_is_int = fill_is_bool || fill.is_instance_of::<pyo3::types::PyInt>();
+    checked_convert(&fill, fill_is_int, tag, size.iter().product())?;
+    if label.is_meta() {
+        return meta_result(py, size, tag);
+    }
+    let device = label.resolve()?;
+
+    let value = if fill_is_bool {
+        Scalar::Int(i64::from(fill.extract::<bool>()?))
+    } else if fill_is_int {
+        Scalar::Int(fill.extract()?)
+    } else {
+        Scalar::Float(fill.extract()?)
+    };
+    let out = filled_block(OP, value, tag, &size, &device)?;
+    finish(py, out, tag)
+}
+
+/// `TensorBase.reshape_as(other)` -- **not a genuine upstream aten op**: a
+/// `TorchDispatchMode` logger over `x.reshape_as(y)` on 2.13.0 fires exactly
+/// one record, `aten.view.default`, with `y`'s shape as the argument. This
+/// entry's `methods.json` schema is therefore this shim's own invention
+/// rather than a transcription of `str(torch.ops.aten.reshape_as..._schema)`
+/// -- there is no such op to transcribe -- written only so the table-driven
+/// resolver can bind `self`/`other` the way it binds every other method.
+/// `roformer`'s wall: `sin_pos = torch.stack([sin, sin], -1).reshape_as(x)`.
+fn reshape_as_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.reshape_as.default";
+    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let other = tensor_arg(OP, args, kwargs, 1, "other")?;
+    let requested: Vec<isize> = other.tensor()?.dims().iter().map(|&d| d as isize).collect();
+    let target = resolve_shape(OP, &requested, input.tensor()?.elem_count())?;
+    let out = input
+        .tensor()?
+        .contiguous()
+        .and_then(|t| t.reshape(target))
+        .map_err(|e| candle_err(OP, e))?;
+    finish(py, out, input.tag())
+}
+
+/// `aten::unflatten.int(Tensor(a) self, int dim, SymInt[] sizes) -> Tensor(a)`
+///
+/// `siglip_vision_model`'s wall, reached through the vendored
+/// `torch/functional.py`'s own `_in_projection_packed` -- `torch/_tensor.py`
+/// forwards `Tensor.unflatten` straight to this overload (`super().unflatten`,
+/// measured), so it is a real method dispatch rather than a Python composite
+/// the way `reshape_as` is.
+///
+/// Splits axis `dim` into `sizes`, replacing it in place. One entry of
+/// `sizes` may be `-1` (inferred so the product matches the original axis),
+/// measured rules:
+///   * `sizes` must be non-empty -- "sizes must be non-empty".
+///   * at most one `-1` -- "only one dimension can be inferred", upstream's
+///     own wording (shared with `view`/`reshape`'s inference failure).
+///   * the given sizes must multiply up to the axis they replace --
+///     "Provided sizes [..] don't multiply up to the size of dim N (M) in
+///     the input tensor".
+fn unflatten_int(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.unflatten.int";
+    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let rank = input.tensor()?.rank();
+    let dim = normalise_dim(
+        OP,
+        dim_arg(args, kwargs, 1, "dim")?.ok_or_else(|| missing(OP, "dim"))?,
+        rank,
+    )?;
+    let requested = shape_arg(OP, args, kwargs, 2, "sizes")?;
+    if requested.is_empty() {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "unflatten: sizes must be non-empty",
+        ));
+    }
+    let dims = input.tensor()?.dims().to_vec();
+    let dim_size = if rank == 0 { 1 } else { dims[dim] };
+
+    let mut known: usize = 1;
+    let mut wildcard: Option<usize> = None;
+    for (i, &value) in requested.iter().enumerate() {
+        if value == -1 {
+            if wildcard.is_some() {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                    "only one dimension can be inferred",
+                ));
+            }
+            wildcard = Some(i);
+        } else if value < 0 {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "{OP}: invalid shape dimension {value}"
+            )));
+        } else {
+            known *= value as usize;
+        }
+    }
+    let mismatch = || {
+        pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "unflatten: Provided sizes {requested:?} don't multiply up to the size of dim \
+             {dim} ({dim_size}) in the input tensor"
+        ))
+    };
+    let mut resolved: Vec<usize> = requested
+        .iter()
+        .map(|&v| if v == -1 { 0 } else { v as usize })
+        .collect();
+    if let Some(index) = wildcard {
+        if known == 0 || dim_size % known != 0 {
+            return Err(mismatch());
+        }
+        resolved[index] = dim_size / known;
+    } else if known != dim_size {
+        return Err(mismatch());
+    }
+
+    let prefix = if rank == 0 { Vec::new() } else { dims[..dim].to_vec() };
+    let suffix = if rank == 0 { Vec::new() } else { dims[dim + 1..].to_vec() };
+    let mut new_dims = prefix;
+    new_dims.extend(resolved);
+    new_dims.extend(suffix);
+    let out = input
+        .tensor()?
+        .contiguous()
+        .and_then(|t| t.reshape(new_dims))
+        .map_err(|e| candle_err(OP, e))?;
+    finish(py, out, input.tag())
+}
+
+/// `aten::chunk(Tensor(a -> *) self, int chunks, int dim=0) -> Tensor(a)[]`
+///
+/// The **free-function** spelling of `Tensor.chunk` -- `torch.chunk(x, n,
+/// dim)` is a separate Python entry point from `x.chunk(n, dim)`, looked up
+/// through `overloads.json` rather than `methods.json`, and `diffllama`'s
+/// wall is this spelling specifically (`torch.chunk(value_states, 2, dim=1)`
+/// in its attention). Same arithmetic as `_install_tensor_chunk` in
+/// bootstrap.py (`at::native::chunk`, transcribed there in full, including
+/// the zero-extent branch): `chunks` is an upper bound on how many pieces
+/// come back, not a promise, and only the zero-extent input is licensed to
+/// return exactly `chunks` of them. Not reused by calling into that Python
+/// function -- it is Python-level for a reason unrelated to this key
+/// (`aten.chunk.default` is a key no upstream dispatcher ever sees) -- so the
+/// arithmetic is repeated here rather than a `methods.json` entry pointing
+/// at a kernel that would answer a different overload's caller too.
+fn chunk_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.chunk.default";
+    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let rank = input.tensor()?.rank();
+    if rank == 0 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "chunk expects at least a 1-dimensional tensor",
+        ));
+    }
+    let chunks_raw = int_arg(args, kwargs, 1, "chunks")?.ok_or_else(|| missing(OP, "chunks"))?;
+    if chunks_raw <= 0 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "chunk expects `chunks` to be greater than 0, got: {chunks_raw}"
+        )));
+    }
+    let chunks = chunks_raw as usize;
+    let dim_raw = dim_arg(args, kwargs, 2, "dim")?.unwrap_or(0);
+    let dim = normalise_dim(OP, dim_raw, rank)?;
+    let dim_size = input.tensor()?.dims()[dim];
+    let split_size = (dim_size + chunks - 1) / chunks;
+
+    let sizes: Vec<usize> = if split_size == 0 && dim_size == 0 {
+        // "an arbitrary number of empty chunks sums to zero all the same" --
+        // the branch `_install_tensor_chunk`'s comment quotes upstream on.
+        // Only this branch returns exactly `chunks` pieces.
+        let mut sizes = vec![split_size; chunks];
+        let last = chunks - 1;
+        sizes[last] = split_size - (split_size * chunks - dim_size);
+        sizes
+    } else {
+        let mut sizes = Vec::new();
+        let mut start = 0usize;
+        while start < dim_size {
+            let length = split_size.min(dim_size - start);
+            sizes.push(length);
+            start += length;
+        }
+        sizes
+    };
+
+    let mut items: Vec<Py<PyAny>> = Vec::with_capacity(sizes.len());
+    let mut start = 0usize;
+    for size in sizes {
+        let piece = input
+            .tensor()?
+            .narrow(dim, start, size)
+            .map_err(|e| candle_err(OP, e))?;
+        items.push(crate::tensor::promote(py, finish(py, piece, input.tag())?)?);
+        start += size;
+    }
+    Ok(PyTuple::new(py, items)?.into_any().unbind())
+}
+
+/// `aten::diff(Tensor self, int n=1, int dim=-1, Tensor? prepend=None,
+///     Tensor? append=None) -> Tensor`
+///
+/// `voxtral_realtime_encoder`'s wall: `masking_utils.py`'s
+/// `find_packed_sequence_indices` runs
+/// `torch.diff(position_ids, prepend=first_dummy_value, dim=-1)` to find
+/// where a packed sequence of position ids restarts at zero.
+///
+/// Upstream's algorithm, measured on 2.13.0 rather than guessed: `prepend`
+/// and `append`, if given, are concatenated onto `self` along `dim` **once**;
+/// `n`-th order then means the ordinary first difference applied `n` times to
+/// that concatenation, not to `self`'s own axis extended by less each time. A
+/// mixed-dtype `prepend`/`append` promotes against `self` the same way
+/// `sub.Tensor` does (`promote_types`), since the two are subtracted the same
+/// way. `n == 0` is licensed and answers `self` **unchanged, prepend and
+/// append both ignored** -- measured, not inferred: `diff(x, n=0,
+/// prepend=y)` is `x`, not the concatenation. `n < 0` raises upstream's own
+/// wording, "order must be non-negative but got {n}".
+fn diff_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.diff.default";
+    let input = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let n = int_arg(args, kwargs, 1, "n")?.unwrap_or(1);
+    if n < 0 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "order must be non-negative but got {n}"
+        )));
+    }
+    if n == 0 {
+        return finish(py, input.tensor()?.clone(), input.tag());
+    }
+    let rank = input.tensor()?.rank();
+    let dim = normalise_dim(OP, dim_arg(args, kwargs, 2, "dim")?.unwrap_or(-1), rank)?;
+    let prepend = optional_tensor_arg(OP, args, kwargs, 3, "prepend")?;
+    let append = optional_tensor_arg(OP, args, kwargs, 4, "append")?;
+
+    let mut tag = input.tag();
+    for extra in [&prepend, &append].into_iter().flatten() {
+        if tag != extra.tag() {
+            tag = promote_types(tag, extra.tag()).ok_or_else(|| {
+                not_implemented(format!(
+                    "{OP}: dtype promotion not implemented in torch._C shim: {} vs {}",
+                    tag.name(),
+                    extra.tag().name()
+                ))
+            })?;
+        }
+    }
+    let storage = PyDtype::new(tag).storage(OP)?;
+    let cast = |t: &Tensor| -> PyResult<Tensor> { t.fast_to(storage).map_err(|e| candle_err(OP, e)) };
+
+    let mut pieces: Vec<Tensor> = Vec::new();
+    if let Some(p) = &prepend {
+        pieces.push(cast(p.tensor()?)?);
+    }
+    pieces.push(cast(input.tensor()?)?);
+    if let Some(a) = &append {
+        pieces.push(cast(a.tensor()?)?);
+    }
+    let mut current = if pieces.len() == 1 {
+        pieces.into_iter().next().expect("checked len == 1")
+    } else {
+        Tensor::cat(&pieces, dim).map_err(|e| candle_err(OP, e))?
+    };
+
+    for _ in 0..n {
+        let extent = current.dims()[dim];
+        if extent == 0 {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "diff expects prepend or append to be the same dimension as input",
+            ));
+        }
+        let head = current.narrow(dim, 1, extent - 1).map_err(|e| candle_err(OP, e))?;
+        let tail = current.narrow(dim, 0, extent - 1).map_err(|e| candle_err(OP, e))?;
+        current = apply_arith(OP, Arith::Sub, &head, &tail)?;
+    }
+    finish(py, current, tag)
+}
+
+/// `aten::logical_and(Tensor self, Tensor other) -> Tensor`
+///
+/// `longt5`'s wall: two boolean-shaped attention masks combined with
+/// `torch.logical_and`. Always answers `bool`, whatever the two input
+/// dtypes are -- measured, `logical_and(int64, bool)` and
+/// `logical_and(float, float)` both give `torch.bool` -- and reads each
+/// operand through truthiness rather than a bit pattern: `any_from` is
+/// `any`/`all`'s own "is this element non-zero" mask (NaN counts as
+/// non-zero, matching upstream), reused here rather than reimplemented so
+/// the truthiness rule cannot drift between the three callers.
+fn logical_and_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.logical_and.default";
+    let lhs = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let rhs = tensor_arg(OP, args, kwargs, 1, "other")?;
+
+    let shape = lhs
+        .tensor()?
+        .shape()
+        .broadcast_shape_binary_op(rhs.tensor()?.shape(), "logical_and")
+        .map_err(|e| candle_err(OP, e))?;
+
+    let mask_of = |t: &PyTensorBase| -> PyResult<Tensor> {
+        let broadcast = t
+            .tensor()?
+            .broadcast_as(shape.clone())
+            .and_then(|t| t.contiguous())
+            .map_err(|e| candle_err(OP, e))?;
+        any_from(OP, &broadcast)
+    };
+    let left = mask_of(&lhs)?;
+    let right = mask_of(&rhs)?;
+    let out = (left.to_dtype(candle_core::DType::U8))
+        .and_then(|l| right.to_dtype(candle_core::DType::U8).map(|r| (l, r)))
+        .and_then(|(l, r)| l.mul(&r))
+        .map_err(|e| candle_err(OP, e))?;
+    Ok(PyTensorBase::boolean(out)?.into_pyobject(py)?.into_any().unbind())
 }
 
 fn adaptive_avg_pool1d_default(
