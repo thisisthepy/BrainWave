@@ -903,6 +903,9 @@
   "polar": [
     "aten::polar(Tensor abs, Tensor angle) -> Tensor"
   ],
+  "complex": [
+    "aten::complex(Tensor real, Tensor imag) -> Tensor"
+  ],
   "real": [
     "aten::real(Tensor(a) self) -> Tensor(a)"
   ],
