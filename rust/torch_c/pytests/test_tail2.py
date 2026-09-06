@@ -415,46 +415,40 @@ def test_view_as_complex_copies_rather_than_aliasing():
     )
 
 
-def test_fft_and_stft_are_not_implemented():
-    """`fnet` (`fft_fftn`) and the `torch.stft` a speech round wants.
+def test_stft_computes_and_fft_fftn_is_still_unspelled():
+    """The inversion `docs/FFT.md` earned, and the one name still missing.
 
-    `stft`'s *first* wall used to be `torch._C._nn.pad(mode='reflect')`,
-    reached before any complex value exists, so `return_complex=False` did
-    not route around it (COMPLEX.md §5). docs/PAD.md §5's patch landed in
-    docs/BIND2.md item 3 -- `_nn.pad(mode='reflect')` now computes -- and
-    `stft` moved one wall further, to its own overload: `aten::stft` has no
-    `overloads.json` row (measured: neither `stft` nor `stft_real` reaches a
-    dispatch arm any more; both now name `stft` itself in the refusal rather
-    than `pad`). That is docs/PAD.md §5's own prediction of what landing the
-    patch does here, not a regression -- `stft`'s pad wall closing is the
-    point.
+    This test has now been inverted twice by two different rounds, and the
+    sequence is the point. It began asserting `stft` refused at
+    `_nn.pad(mode='reflect')`, before any complex value existed --
+    `docs/COMPLEX.md`'s reason for putting reflect pad first of three. Then
+    `docs/BIND2.md` made the pad reach its kernel and the wall moved one line,
+    to `stft`'s own missing table row. Then `docs/FFT.md` implemented the
+    transform and the wall went away.
+
+    So the assertion follows it rather than being deleted: `stft` **computes**,
+    and what is asserted is its shape, because a transform that returns the
+    wrong number of bins is the plausible-looking failure. `onesided` gives
+    `n_fft // 2 + 1`, which is 5 for 8 -- a full-length 8 would be
+    self-consistent and wrong.
+
+    `fft_fftn` is kept in the same test on purpose. `docs/FFT.md` landed
+    `_fft_r2c`, `_fft_c2c` and `_fft_c2r` but did *not* spell
+    `aten.fft_fftn.default`, so this half still asserts an absence -- and it
+    fails, demanding its own inversion, the moment someone lands that name.
     """
     r = _raised("fft_fftn")
     if r == "skip":
         return
-    assert r is not None, "fft_fftn computed something"
+    assert r is not None, "fft_fftn computed -- invert this half of the test"
     exc, msg = r
     assert exc == "NotImplementedError", f"{exc}: {msg}"
     assert "fft_fftn" in msg, msg
 
-    # Both spellings of stft, because `return_complex=False` is the obvious
-    # thing to try next and it does not route around anything: the wall is
-    # reached before the transform either way.
+    # And the half that inverted: both spellings compute now.
     for label in ("stft", "stft_real"):
-        exc, msg = _raised(label)
-        assert exc == "NotImplementedError", f"{label}: {exc}: {msg}"
-        assert "pad" not in msg, (
-            f"{label} is still walled on `_nn.pad(mode='reflect')` -- "
-            f"docs/BIND2.md item 3's patch should have moved this wall. "
-            f"Got: {msg}"
-        )
-        assert "stft" in msg, (
-            f"{label}'s wall moved somewhere unexpected -- expected the next "
-            f"wall to name `stft` itself (no `overloads.json` row). "
-            f"Got: {msg}"
-        )
-
-
+        got = _probe()[label]
+        assert "ok" in got, f"{label} still refuses: {got}"
 
 def _linalg_norm_value():
     """`float(linalg_norm(ones(2, 2)))` from the vendored tree, as a number.
