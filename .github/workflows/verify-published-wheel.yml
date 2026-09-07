@@ -22,7 +22,7 @@ on:
         # the upload -- checks written for a newer release skip themselves by
         # name here (`tools/ci/verify_published.py`), so an older default is
         # honest rather than broken.
-        default: "0.0.12a0"
+        default: "0.1.0b0"
   push:
     paths:
       - ".github/workflows/verify-published-wheel.yml"
@@ -221,7 +221,7 @@ jobs:
         run: |
           python -m pip download --no-deps --only-binary :all: \
             --platform ios_14_0_arm64_iphonesimulator --python-version 3.13 --abi abi3 \
-            -d dist "torchnative==${{ inputs.version || '0.0.12a0' }}"
+            -d dist "torchnative==${{ inputs.version || '0.1.0b0' }}"
           ls -la dist
 
       - name: Verify it computes in a simulator
@@ -235,7 +235,7 @@ jobs:
         if: matrix.label != 'ios-simulator-arm64'
         run: |
           python -m pip install --upgrade pip
-          python -m pip install "torchnative==${{ inputs.version || '0.0.12a0' }}"
+          python -m pip install "torchnative==${{ inputs.version || '0.1.0b0' }}"
 
       - name: Which wheel landed
         if: matrix.label != 'ios-simulator-arm64'

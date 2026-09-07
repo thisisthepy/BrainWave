@@ -345,7 +345,7 @@ only exists on a platform. Every ✅ has a run behind it.
 | installs | ✅ | ✅ | — | ✅ | ⚠️ | ✅ | ✅ *pip matched the tag on real aarch64 Linux* | ✅ | ⚠️ | ✅ *mounted, no wheel* |
 | `import torch` | ✅ | ✅ | — | ✅ | ⚠️ | ✅ | ✅ | ✅ | ⚠️ | ✅ |
 | computes | ✅ | ✅ | — | ✅ | ⚠️ | ✅ | ✅ *glibc 2.17 **and** modern* | ✅ | ⚠️ | ✅ |
-| **on PyPI `0.0.12a0`** | ✅ | ✅ | 🔲 | ✅ | ✅ | ✅ | 🔲 *built, not published* | ✅ | 🔲 *built, not published* | — |
+| **on PyPI `0.1.0b0`** | ✅ | ✅ | 🔲 *refuses* | ✅ | ✅ | ✅ | ✅ *first published here* | ✅ | ✅ *first published here* | ✅ |
 | can be run *here* | ✅ | emulator | ❌ *no x86-64 emulator on Apple Silicon* | simulator | ❌ | CI | ✅ *Docker, native aarch64* | CI | ❌ | ✅ *Node* |
 
 **The two CUDA rows are the weakest cells in this table and are marked generously.**
@@ -572,7 +572,7 @@ pip install torchnative
 Every published version is a pre-release, so if your resolver is configured to skip those, ask for
 one by name: `pip install --pre torchnative`.
 
-`0.0.12a0` ships five platform wheels, all `cp313-abi3` — one binary per platform, loadable by
+`0.1.0b0` ships **nine** platform wheels, all `cp313-abi3` — one binary per platform, loadable by
 CPython 3.13 and every later release. Each carries the `_C` extension and the vendored upstream
 tree, so `import torch` resolves to *this* build.
 
@@ -621,7 +621,7 @@ answer and an `nn.Linear` forward runs ([`docs/platform/WHEEL.md`](docs/platform
 > [!NOTE]
 > `0.0.1a0` is still on PyPI and does **not** work — it is `py3-none-any` and carries the
 > `torchnative` skeleton alone, no `_C` and no `torch`, so it installs cleanly and then fails to
-> import. Ask for `0.0.12a0` or later.
+> import. Ask for `0.1.0b0` or later.
 >
 > There is no source distribution. Building needs a Rust toolchain and a vendoring step that
 > `pip` cannot drive, so an sdist would install and then fail; the recipe is below instead.
