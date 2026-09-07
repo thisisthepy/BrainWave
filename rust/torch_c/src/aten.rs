@@ -1370,6 +1370,29 @@ pub fn aten_dispatch(
             crate::device::mps_host_readback_gate(op)?;
             aten_dispatch_inner(py, op, args, kwargs)?
         }
+        // The cuda half, and it is the mps half twice over: same table, same
+        // gate, one shared body in `device.rs`. A cuda tensor is a
+        // `Repr::Dense` exactly as an mps one is, so it has the same absence of
+        // structural protection and needs the same door.
+        //
+        // It needs it *more*. On Metal the float readback path was already
+        // loud, because `read_flat` widens through `f64` and Metal has no
+        // `F32 -> F64` -- thirteen of the fourteen silent fallbacks
+        // docs/MPS.md §2 probed were on the integer path. CUDA implements
+        // `f64`, so those same kernels succeed quietly there.
+        //
+        // `note_cuda_dispatch` is after the gate and before the kernel: it
+        // counts ops that actually ran on cuda tensors, which is the runtime
+        // half of the evidence `_cuda_counters()` reports (docs/CUDA.md §5).
+        // Placed here rather than inside the kernels for the reason
+        // docs/MPSATTN.md §3.1 gives -- there is one door, and a kernel cannot
+        // acquire a cuda tensor without coming through it, so this count cannot
+        // be dodged by moving code around the way a source scan can.
+        Some(Where::Dense(ref device)) if crate::device::is_cuda(device) => {
+            crate::device::cuda_host_readback_gate(op)?;
+            crate::device::note_cuda_dispatch(op);
+            aten_dispatch_inner(py, op, args, kwargs)?
+        }
         // The upload. `x.to("vulkan")` arrives here as an ordinary CPU
         // `_to_copy`, and before this round it went on to `resolve()` and got
         // "device not available in torch._C shim: vulkan" -- so the *only* way

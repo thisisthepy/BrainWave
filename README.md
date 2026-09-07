@@ -336,6 +336,8 @@ only exists on a platform. Every ✅ has a run behind it.
 | target CPython | ✅ | ✅ | ❌ *none exists, none downloadable* | ✅ | ✅ | ✅ | ✅ *PBS `20260825`* | ✅ | ✅ *PBS `20260825`* | ✅ *Pyodide 3.14* |
 | candle builds | ✅ | ✅ | 🔲 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | candle **computes** | ✅ | ✅ | 🔲 | ✅ | ⚠️ | ✅ *CI* | ✅ *here* | ✅ *CI* | ⚠️ | ✅ *under Node* |
+| CUDA extension **builds** | — | — | — | — | — | 🔲 *CI job written, never run* | 🔲 *not targeted* | 🔲 | — | — |
+| CUDA **computes** | — | — | — | — | — | ⚠️ | 🔲 *not targeted* | ⚠️ | — | — |
 | extension builds | ✅ | ✅ | 🔲 | ✅ | ✅ | ✅ *`cargo-zigbuild`* | ✅ *`cargo-zigbuild`* | ✅ *`cargo-xwin`* | ✅ *`cargo-xwin`* | ✅ *emscripten* |
 | wheel builds | ✅ | ✅ | ❌ *refuses by name* | ✅ | ✅ | ✅ *`manylinux_2_17_x86_64`* | ✅ *`manylinux_2_17_aarch64`* | ✅ *`win_amd64`* | ✅ *`win_arm64`* | ⚠️ *by hand, not by `build.py`* |
 | symbols resolve | ✅ | ✅ | — | ✅ | ✅ *118 names against the device framework* | ⚠️ *weaker: ELF names only versioned imports* | ⚠️ *same* | ✅ *PE names every one* | ✅ *PE names every one* | ✅ *stub behaviour proven against the real host* |
@@ -345,6 +347,14 @@ only exists on a platform. Every ✅ has a run behind it.
 | computes | ✅ | ✅ | — | ✅ | ⚠️ | ✅ | ✅ *glibc 2.17 **and** modern* | ✅ | ⚠️ | ✅ |
 | **on PyPI `0.0.12a0`** | ✅ | ✅ | 🔲 | ✅ | ✅ | ✅ | 🔲 *built, not published* | ✅ | 🔲 *built, not published* | — |
 | can be run *here* | ✅ | emulator | ❌ *no x86-64 emulator on Apple Silicon* | simulator | ❌ | CI | ✅ *Docker, native aarch64* | CI | ❌ | ✅ *Node* |
+
+**The two CUDA rows are the weakest cells in this table and are marked generously.**
+`computes` is ⚠️ rather than 🔲 because the wiring is complete and only a GPU is missing — but
+strictly, ⚠️ reads "built, never executed" and **nothing has been built either**. This project's
+machine is an arm64 Mac with no `nvcc`, so no compiler has yet seen the CUDA-gated code;
+`.github/workflows/build-cuda-wheel.yml` is the one that will, and it has not run.
+[`docs/CUDA.md`](docs/CUDA.md) §8 is the exact boundary and §6 is the procedure that would move
+these cells.
 
 **Linux and Windows now compute, and it is a run rather than an argument.** A hosted runner is the
 machine this project does not have, so `.github/workflows/verify-published-wheel.yml` installs the
@@ -434,7 +444,7 @@ module does not have, and a target this repo cannot check would ship unchecked
 | `mps` | ✅ | — | 🔲 | — | — | — | candle's Metal backend, on. An op whose kernel would compute on the **CPU under an `mps` label** is refused at the door, naming the op — 54 of them, listed by `_C._shim_mps_host_readback_ops()` ([`docs/MPS.md`](docs/MPS.md)) |
 | `vulkan` | ✅ | ❌ | — | 🔲 | 🔲 | — | eighteen ops by name through real `VkBuffer`s (eleven compute kernels); an MLP forwards; every other op refuses naming itself |
 | NNAPI · CoreML | — | ❌ | ❌ | — | — | — | needs the graph path, blocked at decomposition |
-| `cuda` | ❌ | ❌ | ❌ | 🔲 | 🔲 | — | constructible as a label, refuses to allocate |
+| `cuda` | — | — | — | ⚠️ | ⚠️ | — | **Wired, never run.** One `resolve()` arm, because `Device::Cuda` is already a variant of candle's enum — the `mps` shape, not the `vulkan` one, so **no kernel of ours**. Off unless built with `--cfg torch_c_cuda`, which reaches Linux and Windows only. When unavailable it names **which** of `not_built` / `no_driver` / `no_device` / `wrong_arch` / `unclassified` it is. Nothing has compiled it (this machine has no `nvcc`) and nothing has run it ([`docs/CUDA.md`](docs/CUDA.md)) |
 | WebGPU | — | — | — | — | — | 🔲 | the only accelerator a browser offers |
 
 ### dtypes on `cpu`
@@ -539,6 +549,7 @@ torchnative.nn.federated    rounds · client selection · aggregation · dropout
 | **Device abstraction** | **Done.** `torch.device`, per-device dispatch, and a `Repr` arm per device. Everything below attached here. |
 | **Metal** | **On, computing on the real GPU** (Apple M1, candle's Metal backend), Apple targets only. An `mps` tensor is an ordinary candle tensor, so no kernel had to be taught it ([`docs/VULKAN3.md`](docs/VULKAN3.md)) — which is also why it needs a gate the Vulkan representation does not: the ops whose kernels read the tensor back to the host are refused by name, `aten._softmax.default` among them, so a transformer does not forward on `mps` ([`docs/MPS.md`](docs/MPS.md)). |
 | **Vulkan** | **Wired and computing**, through real `VkBuffer`s on this host — a fourth arm of `tensor::Repr` outside candle entirely, which is what makes a silent CPU fallback unrepresentable rather than merely avoided. **Eighteen ops by name** -- eleven SPIR-V compute kernels and seven metadata ops -- chosen by tracing what a real forward pass dispatches, and a whole `nn.Sequential(Linear, ReLU, Linear)` forwards on the GPU with **zero host readbacks**. A transformer does not: `native_layer_norm`, `_softmax`, `gelu`, `embedding` and `bmm` are on that trace and all still refuse. Performance still needs a phone ([`docs/VULKAN4.md`](docs/VULKAN4.md)). |
+| **CUDA** | **Wired, and that is the whole claim.** `Device::Cuda` is already a variant of candle's closed enum, so a `cuda` tensor is an ordinary candle tensor and **not one kernel had to be written** — the same asymmetry that put `mps` before `vulkan`. Target-scoped and off by default: `--cfg torch_c_cuda` on Linux/Windows only, structurally unreachable from Android, iOS and wasm. Unavailability is a **named** refusal — `not_built`, `no_driver`, `no_device`, `wrong_arch`, `unclassified` — and the readback gate that `mps` needed applies unchanged, from the same derived list, and matters *more* there because CUDA implements the `f64` that made those kernels loud on Metal. **Nothing has been compiled with CUDA on and nothing has run on a GPU**: this project's only machine has no `nvcc`. A CI job builds it and has not run; [`docs/CUDA.md`](docs/CUDA.md) §6 is the procedure for a machine with a GPU and §8 is the honest boundary. |
 | **`torch.distributed`** | **`world_size >= 3` runs**, over loopback TCP in a star with the hub at rank 0. Only `allreduce(op=SUM)` is implemented; every other collective and every other reduce op refuses by name ([`docs/FEDERATED4.md`](docs/FEDERATED4.md), [`docs/TRANSPORT.md`](docs/TRANSPORT.md)). |
 | **NPU** | **The capture layer is built** and a whole model lowers through it — prims folded back to aten, BatchNorm fused into the preceding convolution, nothing left outside NNAPI's op set for `mobilenet_v2`. **CoreML executes**; the NNAPI blob is structurally validated and has never met an NPU ([`docs/NPU.md`](docs/NPU.md)). |
 | **Eager training** | **`loss.backward()` and an optimizer step work** and match upstream to one float32 ulp on a small `nn.Sequential`. Not a milestone that is finished: no transformer has been trained through it, and there is no convolution backward rule ([`docs/BACKWARD9.md`](docs/BACKWARD9.md)). |

@@ -26,6 +26,8 @@
 //! accelerator of the same kind is addressable -- at which point `PyTensorBase`
 //! has to carry the label the way it already carries `tag` for dtype. See
 //! docs/DEVICE_ABS.md §3.2.
+use std::sync::atomic::AtomicU64;
+
 use candle_core::Device;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyModule, PyTuple};
@@ -263,6 +265,27 @@ impl PyDevice {
             // branch on `is_meta()` before resolving, and saying so is more
             // use than repeating the "not available" message the other
             // nineteen kinds share.
+            // The second accelerator, and it is the *same* one arm as `mps` for
+            // the same structural reason: `Device::Cuda(CudaDevice)` sits beside
+            // `Device::Metal(MetalDevice)` in candle's closed enum, so a `cuda`
+            // tensor is an ordinary `candle_core::Tensor` -- no `tensor::Repr`
+            // arm, no dispatcher arm, no kernel of ours. docs/CUDA.md §1.
+            //
+            // **Unlike the `mps` arm this one carries no `#[cfg]`, and that is a
+            // property of candle rather than a decision here.** When the `cuda`
+            // feature is off, `candle_core::CudaDevice` resolves to
+            // `dummy_cuda_backend::CudaDevice` and `Device::new_cuda` returns
+            // `Error::NotCompiledWithCudaSupport` -- so the arm compiles on
+            // every target this crate builds for, including Android, iOS and
+            // wasm, and *runs* there. What it does there is refuse, by name,
+            // with `reason: not_built`. That is why the refusal below is a live
+            // code path on a machine with no NVIDIA GPU at all, and why this
+            // round could test it rather than only wire it.
+            //
+            // The index comes from the label the caller wrote, so `cuda:1` asks
+            // candle for device 1 and gets a refusal naming `no_device` rather
+            // than device 0's results under device 1's name.
+            "cuda" => Self::cuda_device(self.index.unwrap_or(0).max(0) as usize),
             "meta" => Err(not_implemented(
                 "torch._C shim: the meta device has no backend to resolve to -- a \
                  meta tensor holds shape and dtype and no storage, so this call site \
@@ -324,6 +347,48 @@ impl PyDevice {
         Ok(device)
     }
 
+    /// One `CudaDevice` per index, for the process -- `metal_device`'s twin,
+    /// and cached for the same measured reason.
+    ///
+    /// `Device::new_cuda` is a constructor, not a lookup: it opens a context
+    /// and a stream and takes a fresh `DeviceId`, and candle's
+    /// `Device::same_device` compares those ids. Two `resolve()` calls without
+    /// this cache would produce two handles that do not consider themselves
+    /// equal, and `aten.rs`'s mixed-device gate would then reject two `cuda`
+    /// tensors against each other with a message naming the same device twice.
+    /// That failure was *measured* on `mps` (docs/VULKAN3.md §2); it is
+    /// structural rather than Metal-specific, so it is pre-empted here rather
+    /// than rediscovered on the first machine with a GPU.
+    ///
+    /// Keyed by index, for `metal_device`'s reason: a second GPU is the common
+    /// case on CUDA hardware, and `cuda:1` silently receiving device 0's handle
+    /// is the exact mistake `from_candle`'s hardcoded index warns about.
+    ///
+    /// **Nothing is cached unless it passed the architecture check below**, so
+    /// a device that is refused once is refused every time rather than being
+    /// admitted by a second caller.
+    fn cuda_device(index: usize) -> PyResult<Device> {
+        let mut cached = cuda_cache()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some((_, device)) = cached.iter().find(|(i, _)| *i == index) {
+            CUDA_RESOLVES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Ok(device.clone());
+        }
+        let device = Device::new_cuda(index).map_err(|e| cuda_refusal(index, &e.to_string()))?;
+        // The one check candle does not make, and the one this crate is in a
+        // position to make: a GPU older than the kernels in the artefact.
+        // Without it the failure arrives at the first kernel launch as
+        // `CUDA_ERROR_NO_BINARY_FOR_GPU`, several frames inside candle and
+        // attached to whichever op happened to be first.
+        if let Some(problem) = cuda_arch_mismatch(&device) {
+            return Err(cuda_refusal(index, &problem));
+        }
+        cached.push((index, device.clone()));
+        CUDA_RESOLVES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(device)
+    }
+
     /// A label for a live candle handle.
     ///
     /// **This direction is lossy and the loss is load-bearing.** candle's
@@ -338,9 +403,15 @@ impl PyDevice {
     pub fn from_candle(device: &Device) -> Self {
         match device {
             Device::Cpu => Self::cpu(),
+            // `cuda` no longer hardcodes 0, because `resolve()` above can now
+            // hand out `cuda:1` and this function is what a tensor's `.device`
+            // is read back through. `cuda_stream().context().ordinal()` is the
+            // ordinal candle itself opened. The `Metal` arm below is untouched
+            // and still hardcodes 0 -- that is a real gap, stated rather than
+            // widened, and it belongs to whoever makes `mps:1` reachable.
             Device::Cuda(_) => Self {
                 kind: "cuda".to_string(),
-                index: Some(0),
+                index: Some(cuda_ordinal(device)),
             },
             Device::Metal(_) => Self {
                 kind: "mps".to_string(),
@@ -760,17 +831,46 @@ pub fn is_metal(device: &Device) -> bool {
 /// that is what this is. The op is not implemented *for mps*; it is
 /// implemented for the CPU, and the message says so and says how to get it.
 pub fn mps_host_readback_gate(op: &str) -> PyResult<()> {
+    host_readback_gate(op, "mps", "an", "_shim_mps_host_readback_ops", "docs/MPS.md")
+}
+
+/// The same gate for `cuda`, over the same derived list, and **one body**.
+///
+/// Two copies of a guard is the shape the round before this one had to fix
+/// ("the drain guard existed twice, so neither copy could be tested"), so the
+/// wording lives in `host_readback_gate` below and the two public entry points
+/// differ only in the four words that name the device.
+///
+/// The counter is here rather than in the shared body because only the cuda
+/// side has one: `_cuda_counters()` reports refusals so a run on a GPU can tell
+/// "the model never touched a readback op" from "the gate fired and something
+/// upstream swallowed it".
+pub fn cuda_host_readback_gate(op: &str) -> PyResult<()> {
+    let verdict = host_readback_gate(op, "cuda", "a", "_shim_cuda_host_readback_ops", "docs/CUDA.md");
+    if verdict.is_err() {
+        CUDA_READBACK_REFUSALS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    verdict
+}
+
+fn host_readback_gate(
+    op: &str,
+    device: &str,
+    article: &str,
+    lister: &str,
+    doc: &str,
+) -> PyResult<()> {
     if !MPS_HOST_READBACK_OPS.contains(&op) {
         return Ok(());
     }
     Err(not_implemented(format!(
-        "{op}: not implemented for the mps device. This kernel reads the tensor \
+        "{op}: not implemented for the {device} device. This kernel reads the tensor \
          back to host memory and computes there, so it would return a correct \
-         value that the GPU did not compute, under an mps label -- the shim \
+         value that the GPU did not compute, under {article} {device} label -- the shim \
          refuses that rather than doing it silently. Move the tensor with \
          .cpu() to ask for the CPU on purpose. {} of the ops this build \
-         implements are refused on mps for this reason; \
-         torch._C._shim_mps_host_readback_ops() lists them (docs/MPS.md).",
+         implements are refused on {device} for this reason; \
+         torch._C.{lister}() lists them ({doc}).",
         MPS_HOST_READBACK_OPS.len(),
     )))
 }
@@ -795,10 +895,652 @@ fn shim_mps_readback_but_allowed() -> Vec<&'static str> {
     MPS_READBACK_BUT_ALLOWED.to_vec()
 }
 
+// ---------------------------------------------------------------------------
+// cuda -- the named refusals, the gate, and the runtime evidence
+// ---------------------------------------------------------------------------
+//
+// docs/CUDA.md is the whole argument; this comment says only what a reader of
+// this file needs in order not to misread the code below.
+//
+// **What is here and what is deliberately not.** `cuda` costs one `resolve()`
+// arm because `Device::Cuda(CudaDevice)` is already a variant of candle's
+// closed enum -- the `mps` asymmetry (docs/VULKAN3.md §1), not the `vulkan`
+// one. So there is no `Repr::Cuda`, no dispatcher arm and no kernel. What
+// *does* have to exist is everything below: `mps` proved that an accelerator
+// which is an ordinary `Repr::Dense` has no structural protection against this
+// crate's own kernels reading the tensor back and computing on the host
+// (docs/MPS.md §1.1), and `cuda` inherits that exactly.
+//
+// **And it inherits it in a worse form, which is the one finding here that is
+// about CUDA rather than about accelerators in general.** On Metal the
+// float readback path was *loud*: `read_flat` widens through `f64` and Metal
+// has no `F32 -> F64`, so thirteen of the fourteen probed silent fallbacks
+// were on the integer path and the float ones raised (docs/MPS.md §2). CUDA
+// implements `f64`. The same kernels that were noisy on Metal will be silent
+// on CUDA, so the gate matters more here, not less.
+
+/// Every reason `cuda` can be unavailable, as a closed vocabulary.
+///
+/// The instruction for this round was that a refusal must **say which** of no
+/// driver / no device / wrong arch it was. Five names rather than three,
+/// because two more are real:
+///
+/// * `not_built` -- the artefact has no CUDA in it at all. On this project's
+///   own machine, and on every wheel published so far, this is the answer, and
+///   it is a live code path rather than a `cfg`'d-out one (see `resolve()`).
+/// * `unclassified` -- the driver said something this table does not know. A
+///   taxonomy that maps everything onto four names would be lying at exactly
+///   the moment it mattered most; this arm hands back the driver's own words
+///   and admits it did not recognise them.
+pub const CUDA_REFUSAL_REASONS: [&str; 5] = [
+    "not_built",
+    "no_driver",
+    "no_device",
+    "wrong_arch",
+    "unclassified",
+];
+
+/// `(CUresult token, reason)`, in the order they are tried.
+///
+/// **These tokens are not invented and not guessed from an error seen once.**
+/// `cudarc::driver::DriverError`'s `Debug` -- which is also its `Display` --
+/// prints `DriverError(CUresult::CUDA_ERROR_*, "<cuGetErrorString text>")`, so
+/// the `CUresult` variant name is in every message candle wraps. Each token
+/// below is a variant of `cudarc::driver::sys::CUresult` (cudarc 0.19.8,
+/// `src/driver/sys/mod.rs`), which is the version `candle-core` 0.11.0
+/// resolves. The *classification* is a judgement; the spelling is not.
+///
+/// Matching on the token rather than on the human sentence is deliberate: the
+/// sentence comes from `cuGetErrorString` in whatever driver is installed and
+/// is free to be reworded, while the enumerator name is ABI.
+const CUDA_REFUSAL_TOKENS: [(&str, &str); 12] = [
+    // No usable driver: the library is there (or the process would not have
+    // loaded at all -- see docs/CUDA.md §3) but it cannot be used.
+    ("CUDA_ERROR_NOT_INITIALIZED", "no_driver"),
+    ("CUDA_ERROR_STUB_LIBRARY", "no_driver"),
+    ("CUDA_ERROR_SYSTEM_DRIVER_MISMATCH", "no_driver"),
+    ("CUDA_ERROR_SYSTEM_NOT_READY", "no_driver"),
+    ("CUDA_ERROR_COMPAT_NOT_SUPPORTED_ON_DEVICE", "no_driver"),
+    // A driver, but not the device that was asked for.
+    ("CUDA_ERROR_NO_DEVICE", "no_device"),
+    ("CUDA_ERROR_INVALID_DEVICE", "no_device"),
+    ("CUDA_ERROR_DEVICE_UNAVAILABLE", "no_device"),
+    ("CUDA_ERROR_DEVICE_NOT_LICENSED", "no_device"),
+    // A device, but not one these kernels have code for. All four arrive at
+    // module load or kernel launch, which is why `cuda_device()` checks the
+    // compute capability at open time as well -- by the time one of these is
+    // raised it is attached to whichever op happened to run first.
+    ("CUDA_ERROR_NO_BINARY_FOR_GPU", "wrong_arch"),
+    ("CUDA_ERROR_INVALID_PTX", "wrong_arch"),
+    ("CUDA_ERROR_UNSUPPORTED_PTX_VERSION", "wrong_arch"),
+];
+
+/// The compute capability the kernels in *this* artefact were compiled for, or
+/// `None` on a build with no CUDA in it.
+///
+/// Read from `CUDA_COMPUTE_CAP` at compile time. That variable is not this
+/// crate's invention: `candle-kernels`'s build script detects the capability
+/// with `nvidia-smi --query-gpu=compute_cap` and requires the variable when
+/// there is no GPU to ask, so any CUDA build has it set. `build.rs` declares
+/// the rerun dependency.
+pub const CUDA_BUILT_COMPUTE_CAP: Option<&str> = option_env!("CUDA_COMPUTE_CAP");
+
+/// Parse `"75"`, `"90a"`, `"sm_90a"` to `75` / `90` / `90`.
+///
+/// The `a` suffix is nvcc's "architecture-specific" marker; it does not change
+/// which generation the code is for, so the comparison below drops it.
+fn compute_cap_base(text: &str) -> Option<u32> {
+    let text = text.trim();
+    let text = text.strip_prefix("sm_").unwrap_or(text);
+    let digits: String = text.chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse().ok()
+}
+
+/// Which of `CUDA_REFUSAL_REASONS` a candle error text is.
+///
+/// Public and reachable from Python (`_shim_cuda_classify_refusal`) because
+/// **this is the only part of the CUDA refusal that a machine with no GPU can
+/// test**, and it is the part that decides what the user is told. Four of the
+/// five arms cannot be produced live on the machine this was written on; a
+/// classifier that is only exercised by the one arm that can would be three
+/// quarters untested.
+pub fn classify_cuda_refusal(detail: &str) -> &'static str {
+    // candle's own words when the feature is off -- `Error::NotCompiledWith
+    // CudaSupport`'s `#[error(...)]` text, verbatim. Checked first because it
+    // is the only one that is not a driver answer at all.
+    if detail.contains("has not been built with cuda support") {
+        return "not_built";
+    }
+    // This crate's own architecture check, which runs before any kernel does.
+    if detail.contains("compute capability") {
+        return "wrong_arch";
+    }
+    for (token, reason) in CUDA_REFUSAL_TOKENS {
+        if detail.contains(token) {
+            return reason;
+        }
+    }
+    "unclassified"
+}
+
+/// The refusal itself. `NotImplementedError`, matching every other "this build
+/// cannot do that device" refusal in this crate.
+///
+/// The reason is in the message **as a token, near the front**, so that a
+/// caller can match on it without parsing prose -- `reason: no_driver` -- and
+/// the driver's own text is carried through unedited after it. Both halves
+/// matter: the token is what a test asserts, the text is what a person needs.
+fn cuda_refusal(index: usize, detail: &str) -> PyErr {
+    let reason = classify_cuda_refusal(detail);
+    CUDA_REFUSALS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let advice = match reason {
+        "not_built" => {
+            "This artefact has no CUDA in it. The CUDA build is a separate wheel, \
+             not a flag on this one: candle pins cudarc to `dynamic-linking`, so a \
+             CUDA-enabled `_C.so` names libcuda/libcudart/libcublas as load-time \
+             dependencies and would fail to import at all on a machine without \
+             them -- taking `import torch` with it (docs/CUDA.md §3)."
+        }
+        "no_driver" => {
+            "The CUDA libraries loaded but the driver did not answer. This is \
+             usually a host with the toolkit and no kernel module, or a container \
+             started without `--gpus`, or a driver older than the runtime \
+             (docs/CUDA.md §4)."
+        }
+        "no_device" => {
+            "The driver answered and there is no such device. Check the index \
+             against `_C._cuda_probe()['device_count']`, and CUDA_VISIBLE_DEVICES \
+             (docs/CUDA.md §4)."
+        }
+        "wrong_arch" => {
+            "There is a GPU and it is older than the kernels in this build. PTX \
+             is forward-compatible only: the driver can JIT sm_N code onto sm_M \
+             for M > N and cannot go the other way, and this build's statically \
+             compiled kernels are exact-arch with no JIT at all (docs/CUDA.md §2). \
+             Rebuild with CUDA_COMPUTE_CAP set to this device's capability."
+        }
+        _ => {
+            "This build does not recognise that failure. The driver's own words \
+             are above, unedited; docs/CUDA.md §4 has the token table this was \
+             matched against and is where a new one should be added."
+        }
+    };
+    not_implemented(format!(
+        "cuda:{index} is not available -- reason: {reason}. {advice} \
+         The underlying error was: {detail}"
+    ))
+}
+
+/// The one `CudaDevice` per index, for the process.
+///
+/// A free function rather than a `static` inside `cuda_device`, because
+/// `cuda_memory` below has to be able to *look* without opening.
+fn cuda_cache() -> &'static std::sync::Mutex<Vec<(usize, Device)>> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<Vec<(usize, Device)>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+/// A device this process has already opened, or `None`.
+///
+/// **Never opens one.** This is the difference between an instrument and a
+/// participant: `_cuda_counters()` must be able to read free device memory
+/// without allocating a CUDA context as a side effect of being asked whether a
+/// CUDA context exists -- which is exactly what routing it through `resolve()`
+/// did in the first draft, and which would also have made every call to the
+/// counters bump `resolves` and quietly ruin the deltas the counters are for.
+#[allow(dead_code)]
+fn cuda_cached_device(index: usize) -> Option<Device> {
+    cuda_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .iter()
+        .find(|(i, _)| *i == index)
+        .map(|(_, device)| device.clone())
+}
+
+/// Is this GPU older than the kernels in the artefact?
+///
+/// `None` means "no objection", which on a non-CUDA build is the only answer
+/// there is -- and it is never reached there, because `Device::new_cuda` has
+/// already refused with `not_built`.
+///
+/// The comparison is `>=`, not `==`, and the asymmetry is the point: nvcc's
+/// `--ptx` output for `compute_N` is JIT-compiled by the driver onto any
+/// `sm_M` with `M >= N`, and never downwards.
+///
+/// **What this check does not cover, stated because it would otherwise read as
+/// covered.** `candle-kernels` also builds `moe_*.cu` and `mmq_*.cu` into a
+/// static `libmoe.a` with `-gencode arch=compute_N,code=sm_N`, which is cubin
+/// and carries no PTX -- those kernels have no JIT path and need `M == N`. The
+/// probe reports the mismatch; this function does not refuse on it, because
+/// refusing every `M != N` would refuse the ordinary and correct case of
+/// running sm_80-built PTX on an sm_89 card.
+#[cfg(torch_c_cuda)]
+fn cuda_arch_mismatch(device: &Device) -> Option<String> {
+    let built = compute_cap_base(CUDA_BUILT_COMPUTE_CAP?)?;
+    let handle = device.as_cuda_device().ok()?;
+    let (major, minor) = handle.cuda_stream().context().compute_capability().ok()?;
+    let found = (major as u32) * 10 + (minor as u32);
+    if found >= built {
+        return None;
+    }
+    Some(format!(
+        "this device reports compute capability {major}.{minor} (sm_{found}) and \
+         the kernels in this build were compiled for sm_{built}"
+    ))
+}
+
+#[cfg(not(torch_c_cuda))]
+fn cuda_arch_mismatch(_device: &Device) -> Option<String> {
+    None
+}
+
+/// The ordinal candle actually opened, for `from_candle`.
+#[cfg(torch_c_cuda)]
+fn cuda_ordinal(device: &Device) -> i64 {
+    device
+        .as_cuda_device()
+        .ok()
+        .map(|d| d.cuda_stream().context().ordinal() as i64)
+        .unwrap_or(0)
+}
+
+/// Unreachable on a build with no CUDA -- `resolve()` refuses `cuda` before a
+/// handle could exist -- and left as a function rather than `unreachable!()`
+/// for the reason the `Metal` arm's hardcoded 0 is left visible: turning the
+/// feature on should fail a review, not silently mislabel a tensor.
+#[cfg(not(torch_c_cuda))]
+fn cuda_ordinal(_device: &Device) -> i64 {
+    0
+}
+
+/// Is this candle handle a CUDA one?
+///
+/// `is_metal`'s twin, and a free function for the same reason: the one place
+/// `aten.rs` has to know about CUDA is a call by name. The variant exists in
+/// candle's enum on every target (the `cuda` feature changes what `CudaDevice`
+/// *is*, not whether the arm is there), so no `cfg` is needed and the gate
+/// cannot go missing on a target nobody compiled.
+#[inline]
+pub fn is_cuda(device: &Device) -> bool {
+    matches!(device, Device::Cuda(_))
+}
+
+/// The ops refused on `cuda`, which are **the same ops, from the same
+/// derivation**, as the ones refused on `mps`.
+///
+/// This is an alias and not a second list, and that is the whole design.
+/// `MPS_HOST_READBACK_OPS` is not a statement about Metal: it is the set of
+/// kernels in `aten.rs` that pull a tensor's bytes to the host and do the
+/// arithmetic in Rust, derived by scanning that file (docs/MPS.md §3.1). What
+/// makes an op unsafe under an accelerator label is a property of *this
+/// crate's kernel*, not of the accelerator, so the two devices cannot
+/// legitimately disagree -- and a hand-written second list is exactly how they
+/// would come to.
+///
+/// `test_the_cuda_refusal_list_is_the_mps_one_and_both_are_derived` asserts
+/// both halves against the loaded artefact: that the two tables are equal, and
+/// that the table equals the set re-derived from `aten.rs` right then.
+///
+/// docs/VOICE3.md §6 is why the derivation is not trusted further than it goes:
+/// it follows helper calls **one level, by name**, and `var`/`std` reached the
+/// list through nothing until the read was spelled at each dispatch target.
+/// The companion classification test is what covers the level below that.
+pub const CUDA_HOST_READBACK_OPS: &[&str] = &MPS_HOST_READBACK_OPS;
+
+// ---------------------------------------------------------------------------
+// The instrument
+// ---------------------------------------------------------------------------
+
+/// Process-wide counters, in the shape `_vulkan_counters()` established.
+///
+/// **Why counters and not a source-scanning test.** docs/MPSATTN.md §3.1
+/// records, against its own round, that moving a `read_flat` one call deeper --
+/// into a helper the scan does not know by name -- passes *both* of the `mps`
+/// derivation tests while keeping the readback. Every check that greps the
+/// source can be defeated by moving the thing it greps for. So the three
+/// numbers below are not descriptions of this crate's source:
+///
+/// * `resolves` / `dispatches` / `readback_refusals` are incremented at the
+///   only doors those events can pass through -- `cuda_device()`, the `is_cuda`
+///   arm of `aten_dispatch`, and `cuda_host_readback_gate`. There is one door
+///   each, and a kernel cannot reach a CUDA tensor without going through the
+///   dispatcher's.
+/// * `device_free_bytes` / `device_total_bytes` are read from the **driver**,
+///   at the moment `_cuda_counters()` is called, through
+///   `CudaContext::mem_get_info()`. Nothing in this repository can move that
+///   out of the way, because it is not in this repository: it is the GPU
+///   reporting its own memory. A tensor that is on the device makes it fall;
+///   an answer computed on the host does not.
+///
+/// **What the pair does and does not establish, so it is not over-read.**
+/// `dispatches` says an op ran with CUDA tensors and was not refused by the
+/// readback gate. `device_free_bytes` says the bytes are on the GPU. Together
+/// with candle's CUDA backend having no silent CPU fallback -- which is a read
+/// of candle's source, not a measurement this round performed -- that is the
+/// argument. docs/CUDA.md §6 is a procedure for someone with a GPU that closes
+/// the remaining gap from outside the process, with `nvidia-smi`.
+static CUDA_RESOLVES: AtomicU64 = AtomicU64::new(0);
+static CUDA_DISPATCHES: AtomicU64 = AtomicU64::new(0);
+static CUDA_READBACK_REFUSALS: AtomicU64 = AtomicU64::new(0);
+static CUDA_REFUSALS: AtomicU64 = AtomicU64::new(0);
+
+/// Per-op dispatch counts, so a run on a GPU can say *which* ops ran there
+/// rather than only how many.
+///
+/// A `Mutex` on the dispatch path is defensible only because it is inside the
+/// `is_cuda` arm: a CPU or meta or mps dispatch never reaches this function, so
+/// the cost is paid by the device that is being investigated and by nothing
+/// else. `_vulkan_counters()` did not need this because `_vulkan_ops()` is a
+/// closed list of eighteen; here the list is every op the crate implements.
+static CUDA_DISPATCHED_OPS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::BTreeMap<String, u64>>,
+> = std::sync::OnceLock::new();
+
+/// Called from the one `is_cuda` arm in `aten.rs`, after the readback gate has
+/// passed and before the kernel runs.
+pub fn note_cuda_dispatch(op: &str) {
+    CUDA_DISPATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut seen = CUDA_DISPATCHED_OPS
+        .get_or_init(|| std::sync::Mutex::new(std::collections::BTreeMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *seen.entry(op.to_string()).or_insert(0) += 1;
+}
+
+/// `(free, total)` device bytes, straight from the driver, or `None`.
+///
+/// Deliberately takes no argument and reports device 0's context only when one
+/// has already been opened by `resolve()`: querying is not a reason to open a
+/// context, and opening one here would make `_cuda_counters()` allocate GPU
+/// memory as a side effect of being asked whether GPU memory was allocated.
+#[cfg(torch_c_cuda)]
+fn cuda_memory(index: usize) -> Option<(u64, u64)> {
+    let device = cuda_cached_device(index)?;
+    let handle = device.as_cuda_device().ok()?;
+    let (free, total) = handle.cuda_stream().context().mem_get_info().ok()?;
+    Some((free as u64, total as u64))
+}
+
+#[cfg(not(torch_c_cuda))]
+fn cuda_memory(_index: usize) -> Option<(u64, u64)> {
+    None
+}
+
+/// `_C._cuda_counters()` -- the runtime answer to "did the GPU do it?".
+///
+/// `device_free_bytes` and `device_total_bytes` are `None` where there is no
+/// CUDA build or no device already open. `None` rather than `0`: a zero would
+/// read as "the GPU has no free memory", which is a different and alarming
+/// claim.
+///
+/// **This function opens nothing and changes no counter.** `_cuda_probe()`
+/// does -- it resolves, so it increments `resolves` -- and the two are
+/// deliberately different that way: a probe is a question about the machine and
+/// may open a device to answer it, while the counters are the measuring
+/// instrument and must not perturb what they measure. So `device_free_bytes` is
+/// `None` until something has actually put a tensor on the GPU, and that is the
+/// correct answer rather than a gap.
+#[pyfunction]
+#[pyo3(name = "_cuda_counters")]
+#[pyo3(signature = (index = 0))]
+fn cuda_counters(py: Python<'_>, index: usize) -> PyResult<Py<PyAny>> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let d = PyDict::new(py);
+    d.set_item("resolves", CUDA_RESOLVES.load(Relaxed))?;
+    d.set_item("dispatches", CUDA_DISPATCHES.load(Relaxed))?;
+    d.set_item("readback_refusals", CUDA_READBACK_REFUSALS.load(Relaxed))?;
+    d.set_item("refusals", CUDA_REFUSALS.load(Relaxed))?;
+    let ops = PyDict::new(py);
+    if let Some(seen) = CUDA_DISPATCHED_OPS.get() {
+        let seen = seen.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        for (op, count) in seen.iter() {
+            ops.set_item(op, count)?;
+        }
+    }
+    d.set_item("ops", ops)?;
+    match cuda_memory(index) {
+        Some((free, total)) => {
+            d.set_item("device_free_bytes", free)?;
+            d.set_item("device_total_bytes", total)?;
+        }
+        None => {
+            d.set_item("device_free_bytes", py.None())?;
+            d.set_item("device_total_bytes", py.None())?;
+        }
+    }
+    Ok(d.into_any().unbind())
+}
+
+/// `_C._cuda_probe()` -- `_vulkan_probe()`'s twin: absence is a value, not an
+/// exception.
+///
+/// It never raises. A caller asking "is there a GPU here" should not have to
+/// catch anything, and every field that cannot be answered is `None` with
+/// `reason` saying which of `CUDA_REFUSAL_REASONS` it was.
+#[pyfunction]
+#[pyo3(name = "_cuda_probe")]
+#[pyo3(signature = (index = 0))]
+fn cuda_probe(py: Python<'_>, index: usize) -> PyResult<Py<PyAny>> {
+    let d = PyDict::new(py);
+    d.set_item("built", cfg!(torch_c_cuda))?;
+    d.set_item("built_compute_cap", CUDA_BUILT_COMPUTE_CAP)?;
+    // Parsed, because the raw value may carry nvcc's `a` suffix (`sm_90a`) and
+    // the comparison in `cuda_arch_mismatch` is on the base number. Reporting
+    // both means a reader can see that the parse agreed with the string.
+    d.set_item(
+        "built_compute_cap_base",
+        CUDA_BUILT_COMPUTE_CAP.and_then(compute_cap_base),
+    )?;
+    let resolved = PyDevice {
+        kind: "cuda".to_string(),
+        index: Some(index as i64),
+    }
+    .resolve();
+    match resolved {
+        Ok(device) => {
+            d.set_item("available", true)?;
+            d.set_item("reason", py.None())?;
+            d.set_item("error", py.None())?;
+            cuda_probe_device(&d, &device)?;
+        }
+        Err(e) => {
+            let detail = e.value(py).to_string();
+            d.set_item("available", false)?;
+            d.set_item("reason", classify_cuda_refusal(&detail))?;
+            d.set_item("error", detail)?;
+            d.set_item("device_count", py.None())?;
+            d.set_item("name", py.None())?;
+            d.set_item("compute_cap", py.None())?;
+            d.set_item("free_bytes", py.None())?;
+            d.set_item("total_bytes", py.None())?;
+            d.set_item("arch_exact", py.None())?;
+        }
+    }
+    Ok(d.into_any().unbind())
+}
+
+#[cfg(torch_c_cuda)]
+fn cuda_probe_device(d: &Bound<'_, PyDict>, device: &Device) -> PyResult<()> {
+    let handle = device
+        .as_cuda_device()
+        .map_err(|e| crate::err::candle_err("_cuda_probe", e))?;
+    let stream = handle.cuda_stream();
+    let context = stream.context();
+    d.set_item(
+        "device_count",
+        cudarc::driver::CudaContext::device_count().ok(),
+    )?;
+    d.set_item("name", context.name().ok())?;
+    let cap = context.compute_capability().ok();
+    d.set_item(
+        "compute_cap",
+        cap.map(|(major, minor)| format!("{major}{minor}")),
+    )?;
+    // Whether the statically compiled (cubin, no PTX, no JIT) half of
+    // `candle-kernels` has code for this exact device -- see
+    // `cuda_arch_mismatch`'s note. Reported and not refused on.
+    d.set_item(
+        "arch_exact",
+        match (cap, CUDA_BUILT_COMPUTE_CAP.and_then(compute_cap_base)) {
+            (Some((major, minor)), Some(built)) => {
+                Some((major as u32) * 10 + (minor as u32) == built)
+            }
+            _ => None,
+        },
+    )?;
+    match context.mem_get_info() {
+        Ok((free, total)) => {
+            d.set_item("free_bytes", free as u64)?;
+            d.set_item("total_bytes", total as u64)?;
+        }
+        Err(_) => {
+            d.set_item("free_bytes", None::<u64>)?;
+            d.set_item("total_bytes", None::<u64>)?;
+        }
+    }
+    Ok(())
+}
+
+/// Unreachable: on a build with no CUDA, `resolve()` cannot return `Ok`.
+#[cfg(not(torch_c_cuda))]
+fn cuda_probe_device(_d: &Bound<'_, PyDict>, _device: &Device) -> PyResult<()> {
+    Ok(())
+}
+
+/// The refusal classifier, callable from Python.
+///
+/// **This exists so that four refusals that cannot happen on this machine can
+/// still be tested by name here**, and the test that uses it says so in its own
+/// name. It is not a stand-in for running on a GPU and docs/CUDA.md §8 says
+/// exactly what it does and does not establish: that the taxonomy maps the
+/// driver's tokens onto the five names, not that any of those states was ever
+/// entered.
+#[pyfunction]
+#[pyo3(name = "_shim_cuda_classify_refusal")]
+fn shim_cuda_classify_refusal(detail: &str) -> &'static str {
+    classify_cuda_refusal(detail)
+}
+
+/// The cuda gate's table, readable from Python for the reason
+/// `_shim_mps_host_readback_ops` is: a test must check the *artefact*, not the
+/// constant it was compiled from.
+#[pyfunction]
+#[pyo3(name = "_shim_cuda_host_readback_ops")]
+fn shim_cuda_host_readback_ops() -> Vec<&'static str> {
+    CUDA_HOST_READBACK_OPS.to_vec()
+}
+
+/// The closed vocabulary, so a test can assert that every refusal this build
+/// can produce is one of the names the documentation lists -- rather than
+/// asserting the five names it happens to know about, which would go stale in
+/// the one direction that matters (a sixth reason added and undocumented).
+#[pyfunction]
+#[pyo3(name = "_shim_cuda_refusal_reasons")]
+fn shim_cuda_refusal_reasons() -> Vec<&'static str> {
+    CUDA_REFUSAL_REASONS.to_vec()
+}
+
+#[cfg(test)]
+mod cuda_tests {
+    use super::{classify_cuda_refusal, compute_cap_base, CUDA_REFUSAL_REASONS};
+
+    /// nvcc's architecture spellings, all three of them.
+    ///
+    /// The `a` suffix (`sm_90a`, `sm_100a`) is cudaforge's `auto_suffix`, which
+    /// it applies to every capability at or above 90 -- so on any Hopper or
+    /// newer build machine `CUDA_COMPUTE_CAP` reaches this crate *with* a
+    /// suffix, and a parser that only handled digits would silently answer
+    /// `None` and switch the architecture check off. That is a failure that
+    /// opens rather than closes, which is the direction docs/MPS.md §3.2 says
+    /// not to accept.
+    #[test]
+    fn compute_cap_parses_every_spelling_nvcc_uses() {
+        assert_eq!(compute_cap_base("75"), Some(75));
+        assert_eq!(compute_cap_base("sm_80"), Some(80));
+        assert_eq!(compute_cap_base("90a"), Some(90));
+        assert_eq!(compute_cap_base("sm_100a"), Some(100));
+        assert_eq!(compute_cap_base(" 89 "), Some(89));
+        assert_eq!(compute_cap_base(""), None);
+        assert_eq!(compute_cap_base("hopper"), None);
+    }
+
+    /// Each of the five reasons, from a string of the shape the driver
+    /// produces, and each one distinct from the others.
+    ///
+    /// The texts are `cudarc::driver::DriverError`'s own `Debug` shape --
+    /// `DriverError(CUresult::CUDA_ERROR_*, "<cuGetErrorString text>")` -- with
+    /// the sentence half deliberately *wrong* or missing, to prove the match is
+    /// on the enumerator name and not on prose that a driver update may reword.
+    #[test]
+    fn every_cuda_refusal_reason_is_reachable_and_distinct() {
+        let cases = [
+            ("the candle crate has not been built with cuda support", "not_built"),
+            (
+                "DriverError(CUresult::CUDA_ERROR_NOT_INITIALIZED, \"whatever\")",
+                "no_driver",
+            ),
+            (
+                "DriverError(CUresult::CUDA_ERROR_SYSTEM_DRIVER_MISMATCH, \"\")",
+                "no_driver",
+            ),
+            ("DriverError(CUresult::CUDA_ERROR_NO_DEVICE, \"\")", "no_device"),
+            (
+                "DriverError(CUresult::CUDA_ERROR_INVALID_DEVICE, \"\")",
+                "no_device",
+            ),
+            (
+                "DriverError(CUresult::CUDA_ERROR_NO_BINARY_FOR_GPU, \"\")",
+                "wrong_arch",
+            ),
+            (
+                "DriverError(CUresult::CUDA_ERROR_UNSUPPORTED_PTX_VERSION, \"\")",
+                "wrong_arch",
+            ),
+            (
+                "this device reports compute capability 6.1 (sm_61) and the kernels \
+                 in this build were compiled for sm_80",
+                "wrong_arch",
+            ),
+            ("DriverError(CUresult::CUDA_ERROR_UNKNOWN, \"\")", "unclassified"),
+            ("", "unclassified"),
+        ];
+        let mut seen = std::collections::BTreeSet::new();
+        for (detail, expected) in cases {
+            let got = classify_cuda_refusal(detail);
+            assert_eq!(got, expected, "classifying {detail:?}");
+            seen.insert(got);
+        }
+        // Every name in the published vocabulary was produced by one of the
+        // cases above. A sixth reason added to the constant without a case here
+        // fails, which is the only way this test can keep meaning what it says.
+        let published: std::collections::BTreeSet<&str> =
+            CUDA_REFUSAL_REASONS.iter().copied().collect();
+        assert_eq!(seen, published, "some reason has no case in this test");
+    }
+
+    /// The two lists are one list.
+    ///
+    /// `CUDA_HOST_READBACK_OPS` is an alias of `MPS_HOST_READBACK_OPS` rather
+    /// than a copy, and this asserts that from inside the crate so the
+    /// Python-side test is checking a property that is *structural* here and
+    /// not merely currently true.
+    #[test]
+    fn the_cuda_readback_list_is_the_mps_list() {
+        assert_eq!(super::CUDA_HOST_READBACK_OPS, &super::MPS_HOST_READBACK_OPS);
+    }
+}
+
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyDevice>()?;
     m.add_function(wrap_pyfunction!(shim_same_device, m)?)?;
     m.add_function(wrap_pyfunction!(shim_mps_host_readback_ops, m)?)?;
     m.add_function(wrap_pyfunction!(shim_mps_readback_but_allowed, m)?)?;
+    m.add_function(wrap_pyfunction!(shim_cuda_host_readback_ops, m)?)?;
+    m.add_function(wrap_pyfunction!(shim_cuda_classify_refusal, m)?)?;
+    m.add_function(wrap_pyfunction!(shim_cuda_refusal_reasons, m)?)?;
+    m.add_function(wrap_pyfunction!(cuda_probe, m)?)?;
+    m.add_function(wrap_pyfunction!(cuda_counters, m)?)?;
     Ok(())
 }
