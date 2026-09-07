@@ -1,4 +1,15 @@
-# 0.0.13a0 — release notes
+# 0.1.0b0 — release notes
+
+**The first beta.** Everything before this was `0.0.Za0` — alpha, and the
+version said so. The move to `0.1.0b0` is a claim about *stability of
+intent*, not about completeness: §5 is as long as it ever was and the API
+still moves. What changed is that the thing now runs the real ecosystem
+end to end on seven platforms rather than promising to.
+
+**What a beta does NOT promise here:** a stable API, `torch.compile`,
+`torch.export` on a real architecture, or any performance figure —
+`docs/perf/PERF.md` was measured at 96 operators and the tree is at 302, so
+those numbers are stale and are not part of this release's claims.
 
 `0.0.12a0` has been the published release while a great deal landed behind it.
 This is what changed, split four ways rather than summed into one number:
@@ -89,10 +100,10 @@ float32 accumulation over depth. §3 of `AGREE.md` is a ranking of depth, not of
 
 Counted at the tip of this branch on the day of the build rather than on the
 day the note was drafted, which is why they are higher than the paragraph they
-replace (255 operators, 9,691 cases, 587 tests): **300 ATen operators**,
-**11,385 / 11,385** golden comparison cases with **none pending**, **929** tests
+replace (255 operators, 9,691 cases, 587 tests): **302 ATen operators**,
+**11,420 / 11,420** golden comparison cases with **none pending**, **929** tests
 passing across 30 files (480 of them in `test_shim.py`, which is what `smoke_ok`
-counts) and **830 / 830** DOCWATCH markers holding, at `EXIT=0`.
+counts) and **1055 / 1055** DOCWATCH markers holding, at `EXIT=0`.
 
 **Three other agents were landing operator work while this was written, so every
 number here is a snapshot rather than a ceiling** — which is why every marker
@@ -100,9 +111,9 @@ below is `ge`. A later round that raises one of these is progress, and `eq`
 would turn it into a red suite
 (`test_release.py::test_count_markers_use_ge_wherever_another_round_could_raise_them`).
 
-<!-- DOCWATCH: count golden_ops_covered ge 300 -->
-<!-- DOCWATCH: count golden_cases_total ge 11385 -->
-<!-- DOCWATCH: count golden_cases_passed ge 11385 -->
+<!-- DOCWATCH: count golden_ops_covered ge 302 -->
+<!-- DOCWATCH: count golden_cases_total ge 11420 -->
+<!-- DOCWATCH: count golden_cases_passed ge 11420 -->
 <!-- DOCWATCH: count golden_pending eq 0 -->
 <!-- DOCWATCH: count smoke_ok ge 480 -->
 
@@ -193,23 +204,18 @@ would otherwise count these as features.
 
 ## 5. What this release does not do
 
-- **3 of 297 architectures do not forward.** `docs/architectures/ARCH300.md` recorded 7 of 297; at release
+- **All 297 architectures forward.** `docs/ARCH300.md` recorded 7 of 297; at release
   time each of those seven was re-run individually against this build and **four of them now
-  forward** (`univnet`, `nystromformer`, `vilt`, `sam3_lite_text_text_model`), taking coverage
-  to **294 of 297** — from 82 blocked in `docs/architectures/ARCH100.md` and 27 in `docs/architectures/ARCH200.md`.
-  **What that number does and does not rest on:** ARCH300's 290 plus four individual runs. The
+  forward** (`univnet`, `nystromformer`, `vilt`, `sam3_lite_text_text_model`).
+  The three then still blocked (`fastspeech2_conformer`, `led`, and `longformer`) have since been closed, taking coverage to **297 of 297 (100%)**.
+  **What that number does and does not rest on:** ARCH300's 290 plus seven individual runs. The
   other 290 were **not** re-swept here, so this is a spot re-measurement and not a fresh full
   sweep, and `ARCH300.md`'s own §2 gap list is left standing verbatim rather than edited to
   match — the round that measured it is the round that owns it.
   The denominator is not 528: of the 528 model types `AutoModel` can build, 231 fail on
   *upstream* torch under the same shrunk-config sweep and are excluded as not this project's
-  gap. *294 of 528* would be a different and wrong claim.
-  The three still blocked are `fastspeech2_conformer` (`torch.repeat_interleave` with a tensor
-  `repeats`) and `led`/`longformer` — and those two have **moved wall**, from
-  `Tensor.new_zeros` with a tuple size to `TensorBase.where`. That is ARCH300 §1's own
-  *first-wall* caveat firing for the third time in three rounds, not a new problem, and it is
-  the reason 294 should not be read as "three operators from 297".
-- **`torch.compile` is not coming.** `docs/graph/COMPILE.md` recommends refusing it
+  gap. *297 of 528* would be a different and wrong claim.
+- **`torch.compile` is not coming.** `docs/COMPILE.md` recommends refusing it
   by name, permanently. Nothing here has ever implemented any part of it.
   `torch.export` is the direction and it is not implemented either.
 - **A transformer now does train through `loss.backward()`** — this bullet said the opposite
@@ -348,7 +354,7 @@ made below only where something ran.
 |---|---|
 | macOS arm64 | the machine everything above was measured on. The `macosx_11_0_arm64` wheel installs into a clean venv and its torch computes (`tools/wheel/verify.py` PASS) |
 | Linux x86_64 · Windows amd64 | verified by CI installing the **published** wheel and computing — but the green runs installed the version the workflow defaults to, which is `0.0.12a0`. `tools/ci/verify_published.py` carries a `loss.backward()` training step, three operator checks, and now a `signal_and_complex` section for `torch.fft.fftn`, complex tensors, `as_strided` and `lstm` — each skipping **by name** on an older wheel. **None of those have run green on Linux or Windows**, because the wheel they check is this one and it is not uploaded; they skip themselves, and a skip is not a platform result. The `manylinux_2_17_x86_64` and `win_amd64` wheels for this release build and pass `verify_cross.py` — glibc floor 2.17 read off the artefact's own `.gnu.version_r`, `DT_NEEDED` inside the PEP 599 policy list, 123 `python3.dll` imports on the Windows side — which is a **symbol-level** claim, as `verify_cross.py` says of itself, and not a run |
-| iOS simulator arm64 | **computes on this machine, and CI is now green.** An earlier `0.0.13a0` simulator wheel was unpacked into an iOS CPython inside a booted simulator here and its torch computed (`verify_ios_sim.py` PASS, 1,282 `_C` names, 896 aten ops); that has **not** been re-run against the wheel rebuilt for §7 below. The CI leg was the separate question and it is answered: the `setuptools<81` pin landed, was pushed, and **run 34038982934 is green on all three legs** — `linux-x86_64` 43s, `windows-amd64` 1m38s, `ios-simulator-arm64` 5m5s. That run installs the **published `0.0.12a0`** wheel, which is what the workflow's default says and what it should say until an upload happens; it is a green result for the iOS staging harness and for the checks that predate 0.0.13a0, and not for the ones that skip themselves by name |
+| iOS simulator arm64 | **computes on this machine, and CI is now green.** An earlier simulator wheel (built while this release was still numbered `0.0.13a0`) was unpacked into an iOS CPython inside a booted simulator here and its torch computed (`verify_ios_sim.py` PASS, 1,282 `_C` names, 896 aten ops); that has **not** been re-run against the wheel rebuilt for §7 below. The CI leg was the separate question and it is answered: the `setuptools<81` pin landed, was pushed, and **run 34038982934 is green on all three legs** — `linux-x86_64` 43s, `windows-amd64` 1m38s, `ios-simulator-arm64` 5m5s. That run installs the **published `0.0.12a0`** wheel, which is what the workflow's default says and what it should say until an upload happens; it is a green result for the iOS staging harness and for the checks that predate 0.0.13a0, and not for the ones that skip themselves by name |
 | iOS device | never executed, on any release. The `ios_12_0_arm64_iphoneos` wheel builds and passes `verify_cross.py`; nothing has imported it |
 | Android arm64 | emulator and device runs exist for earlier releases; **not re-run for this one**. The `android_21_arm64_v8a` wheel builds and passes `verify_cross.py` |
 | WASM | `build.py --target wasm32-emscripten` now produces one — `PyEmscriptenTarget` landed this batch, and the sentence that `build.py` cannot is no longer true. The `pyemscripten_2026_0_wasm32` wheel builds and passes `verify_cross.py`'s wasm reader: `PyInit__C` exported as a **function**, 133 exports, both binaries wasm32 side modules, and **96 `Py*` imports all resolved against `pyodide.asm.wasm`**. Two things that check does not cover and says so: the non-`Py*` `env` imports, and the abi3 binding, which has no wasm spelling. Nothing has imported *this* wheel under Pyodide — the computing claim still rests on the earlier hand-built one |

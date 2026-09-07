@@ -5,7 +5,7 @@
 
 | 질문 | 답 |
 |---|---|
-| `docs/platform/RELEASE_0_0_13a0.md` §5 의 "No transformer forwards on `mps`" 는 맞았나 | **아니오.** 쓰였을 때 이미 거짓이었다 — `docs/devices/MPSFWD.md` 가 SmolLM2-135M 을 거기서 돌렸고 §5 이 갱신되지 않았다 |
+| `docs/platform/RELEASE_0_1_0b0.md` §5 의 "No transformer forwards on `mps`" 는 맞았나 | **아니오.** 쓰였을 때 이미 거짓이었다 — `docs/devices/MPSFWD.md` 가 SmolLM2-135M 을 거기서 돌렸고 §5 이 갱신되지 않았다 |
 | "every attention block passes through `_softmax`" 는 맞았나 | **SDPA 경로에서는 아니고, eager 경로에서는 맞다.** `docs/devices/MPSFWD.md` 는 SmolLM2 하나로 "어떤 어텐션도 지나지 않는다" 를 결론냈다. `attn_implementation="eager"` 인 BERT 는 레이어마다 두 번 지난다 |
 | 그래서 §5 이 지목한 공백은 실재했나 | **실재했다.** 단, 그것을 밟을 수 있는 모델을 `docs/devices/MPSFWD.md` 가 돌리지 않았을 뿐이다 |
 | 어텐션 블록을 `mps` 에서 돌리면 실제로 무엇이 거절했나 | 게이트 거절은 **`aten._softmax.default` 하나.** 나머지 세 개는 거절이 아니라 **벽**이었다 (§3) |

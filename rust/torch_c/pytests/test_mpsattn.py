@@ -1,6 +1,6 @@
 """An eager attention block on `mps`, and the four walls that were in its way.
 
-docs/platform/RELEASE_0_0_13a0.md §5 says:
+docs/platform/RELEASE_0_1_0b0.md §5 says:
 
     No transformer forwards on `mps`. `aten._softmax.default` is in the set of
     ops refused there, and every attention block passes through it.
@@ -449,7 +449,7 @@ def _flatten_nested(v):
 
 
 def test_a_bert_encoder_forwards_on_mps_and_agrees_with_upstream():
-    """The claim docs/platform/RELEASE_0_0_13a0.md §5 said could not be made.
+    """The claim docs/platform/RELEASE_0_1_0b0.md §5 said could not be made.
 
     A shrunk BERT with `attn_implementation="eager"` -- so its attention block
     really does go through `aten._softmax.default`, twice a layer -- forwards

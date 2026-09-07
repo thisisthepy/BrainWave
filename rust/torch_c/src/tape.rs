@@ -1371,7 +1371,7 @@ fn cast_like<'py>(py: Python<'py>, g: Obj<'py>, like: &Obj<'py>) -> PyResult<Obj
 /// `aten::convolution`'s three gradients, and every one of them is spelled as
 /// another convolution through the same door the forward used.
 ///
-/// **Nothing here is a kernel.** `docs/platform/RELEASE_0_0_13a0.md` §5 lists "there is
+/// **Nothing here is a kernel.** `docs/platform/RELEASE_0_1_0b0.md` §5 lists "there is
 /// still no convolution backward rule" as the reason a vision model does not
 /// train, and the shape of the missing thing is not a new `conv2d`: upstream's
 /// `convolution_backward` is itself three convolutions, and this shim already

@@ -33,13 +33,20 @@ VERIFY = REPO / "tools/ci/verify_published.py"
 
 
 def _version_tuple(s):
-    """(0, 0, 13, 0) from '0.0.13a0'. Enough to order this project's own
-    versions, which are all `X.Y.ZaN`; deliberately not a PEP 440 parser,
-    because a dependency on `packaging` here would make the suite refuse on a
-    host that has none."""
-    m = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)a(\d+)", s)
-    assert m, f"not an X.Y.ZaN version: {s!r}"
-    return tuple(int(g) for g in m.groups())
+    """(0, 1, 0, 1, 0) from '0.1.0b0'. Enough to ORDER this project's own
+    versions; deliberately not a PEP 440 parser, because a dependency on
+    `packaging` here would make the suite refuse on a host that has none.
+
+    The pre-release letter is part of the ordering, not decoration: `a` sorts
+    before `b`, so 0.1.0a9 < 0.1.0b0 < 0.1.0b1. This accepted `a` alone until
+    0.1.0b0, and the assertion below fired on the first beta -- which is the
+    right failure, but it is worth knowing that it is a NUMBERING limit here
+    and not a claim about the version."""
+    m = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)([ab])(\d+)", s)
+    assert m, f"not an X.Y.Z[a|b]N version: {s!r}"
+    major, minor, patch, letter, serial = m.groups()
+    return (int(major), int(minor), int(patch),
+            {"a": 0, "b": 1}[letter], int(serial))
 
 
 def _project_version():
@@ -50,11 +57,19 @@ def _project_version():
 
 
 def test_the_version_is_a_prerelease_and_parses():
+    """A pre-release, which is `a` or `b` -- not `a` alone.
+
+    This asserted `"a" in v` until 0.1.0b0 and fired on the first beta. The
+    intent was never "must be alpha"; it was "must be a PRE-release, because
+    the README tells users to pass `--pre` and a final version would make that
+    instruction wrong". Widened to what it meant.
+    """
     v = _project_version()
     _version_tuple(v)
-    assert "a" in v, (
-        f"{v} is not an alpha version. Every release of this project so far "
-        f"has been a pre-release, and the README tells users to pass --pre."
+    assert re.search(r"\d[ab]\d", v), (
+        f"{v} is not a pre-release. Every release of this project so far has "
+        f"been one, and the README tells users to pass --pre; a final version "
+        f"would make that instruction wrong."
     )
 
 

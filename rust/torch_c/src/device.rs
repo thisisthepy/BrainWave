@@ -695,7 +695,7 @@ fn shim_same_device(left: PyDevice, right: PyDevice) -> bool {
 /// **Two more left it the same way** (docs/devices/MPSATTN.md): `aten._softmax.default`
 /// and `aten._safe_softmax.default` are now `max_keepdim` / `broadcast_sub` /
 /// `exp` / `sum_keepdim` / `broadcast_div` on the device instead of `read_flat`
-/// and a scalar loop. That pair is the one `docs/platform/RELEASE_0_0_13a0.md` §5 named
+/// and a scalar loop. That pair is the one `docs/platform/RELEASE_0_1_0b0.md` §5 named
 /// as the reason no transformer forwards on `mps`. §5 was **half right**: the
 /// SDPA path does not go through `_softmax` (docs/devices/MPSFWD.md measured that on
 /// SmolLM2 and it still holds), but an **eager** attention block does, twice a

@@ -1,6 +1,6 @@
 # COLLECT2 — the collectives above one rank, and the sentence that described them wrongly in both directions
 
-`docs/platform/RELEASE_0_0_13a0.md` §5 said:
+`docs/platform/RELEASE_0_1_0b0.md` §5 said:
 
 > `world_size >= 3` is `allreduce(op=SUM)` only, over loopback on one machine.
 > Other collectives, other reduce ops, secure aggregation and differential

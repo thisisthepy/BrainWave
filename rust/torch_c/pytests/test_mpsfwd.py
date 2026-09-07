@@ -1,6 +1,6 @@
 """A transformer forward on `mps`, and the four kernels that were in its way.
 
-docs/platform/RELEASE_0_0_13a0.md §5 lists "no transformer forwards on `mps`" as a gap.
+docs/platform/RELEASE_0_1_0b0.md §5 lists "no transformer forwards on `mps`" as a gap.
 docs/devices/MPS.md named the shape of it: the ops whose kernels in `aten.rs` read a
 dispatched tensor back to host memory are refused on `mps` rather than allowed
 to return a correct value the GPU did not compute -- and a transformer's path
@@ -326,7 +326,7 @@ def test_sdpa_on_mps_agrees_with_cpu():
 
 
 def test_a_transformer_block_forwards_on_mps_and_agrees_with_cpu():
-    """The gap in docs/platform/RELEASE_0_0_13a0.md §5, at a size that fits in a suite.
+    """The gap in docs/platform/RELEASE_0_1_0b0.md §5, at a size that fits in a suite.
 
     Every op SmolLM2's decoder layer reaches is here in the order it reaches
     them -- RMSNorm (`pow(2)`, `mean`, `rsqrt`, `mul`), the rotary halves

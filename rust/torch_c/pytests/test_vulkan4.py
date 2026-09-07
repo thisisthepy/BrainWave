@@ -1,6 +1,6 @@
 """Vulkan, widened from four ops to eighteen -- and what the four actually were.
 
-docs/platform/RELEASE_0_0_13a0.md §5 says:
+docs/platform/RELEASE_0_1_0b0.md §5 says:
 
     Vulkan is four ops. Correctness is testable on this host; performance
     needs a phone and has not been measured.

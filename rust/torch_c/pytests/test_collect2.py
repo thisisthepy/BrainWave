@@ -1,6 +1,6 @@
 """The collectives of `ProcessGroupLocal` above one rank, against upstream gloo.
 
-`docs/platform/RELEASE_0_0_13a0.md` §5 said this layer was "`allreduce(op=SUM)` only,
+`docs/platform/RELEASE_0_1_0b0.md` §5 said this layer was "`allreduce(op=SUM)` only,
 over loopback on one machine. Other collectives, other reduce ops, secure
 aggregation and differential privacy refuse by name."
 

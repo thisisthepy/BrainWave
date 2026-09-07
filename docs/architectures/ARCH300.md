@@ -181,7 +181,7 @@ the upstream-clean set that ARCH200's 27 did not already account for.
 * **Golden: 11336/11336 cases, ops=299 — exactly unmoved.** No Rust, `bootstrap.py`, or `aten.rs`
   was touched in this worktree; `git status --short` before writing this document showed changes
   confined to this document's own territory (`README.md`, `docs/architectures/ARCH300.md`, a pointer added to
-  `docs/architectures/ARCH200.md`'s head, `docs/platform/RELEASE_0_0_13a0.md`).
+  `docs/architectures/ARCH200.md`'s head, `docs/platform/RELEASE_0_1_0b0.md`).
 * **Suite gate: 868 ok, `DOCWATCH: PASS` 777/777, `EXIT=0`**, measured in this worktree on a
   freshly built shim (`cargo build --release` then `vendor/install_shim.sh`,
   `CARGO_TARGET_DIR=/Volumes/macMini/caches/cargo-target-arch300`), with `PYTHON=$PY` set for

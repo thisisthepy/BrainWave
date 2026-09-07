@@ -1,6 +1,6 @@
 """Tests for docs/graph/NPU2.md -- the round that put a graph on an NPU.
 
-docs/platform/RELEASE_0_0_13a0.md §5 carried one entry no round had moved: *nothing has
+docs/platform/RELEASE_0_1_0b0.md §5 carried one entry no round had moved: *nothing has
 run on an NPU*. docs/graph/NPU.md had compiled and run a CoreML model, and had
 serialised an NNAPI blob and decoded it back -- but it drew the line between
 **executed** and **structurally validated** and put NNAPI on the wrong side of

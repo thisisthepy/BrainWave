@@ -1,6 +1,6 @@
 """Tests for docs/training/TRAIN2.md -- convolution's backward, and a model that trains.
 
-`docs/platform/RELEASE_0_0_13a0.md` §5 states two gaps as one sentence:
+`docs/platform/RELEASE_0_1_0b0.md` §5 states two gaps as one sentence:
 
     No transformer trains through `loss.backward()` yet. ... There is no
     convolution backward rule, so vision models stop.
@@ -668,7 +668,7 @@ json.dump(out, sys.stdout)
 
 
 def test_a_tiny_transformer_language_model_trains_and_agrees_with_upstream():
-    """**docs/platform/RELEASE_0_0_13a0.md §5's first clause was already false.**
+    """**docs/platform/RELEASE_0_1_0b0.md §5's first clause was already false.**
 
     "No transformer trains through `loss.backward()` yet" was written beside
     the convolution gap in the same sentence, and only the convolution half was

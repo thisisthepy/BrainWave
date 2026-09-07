@@ -1,6 +1,6 @@
 # Vulkan — 네 개가 무엇이었는지 다시 재고, 열여덟 개로 넓힌 라운드
 
-**결론부터: `docs/platform/RELEASE_0_0_13a0.md` §5 의 "Vulkan is four ops" 는 틀리지 않았습니다.
+**결론부터: `docs/platform/RELEASE_0_1_0b0.md` §5 의 "Vulkan is four ops" 는 틀리지 않았습니다.
 맞는데 오해를 부르는 문장이었고, 그 오해가 어디에 있었는지가 이 라운드의 첫 번째 산출물입니다.**
 
 | 질문 | 답 |

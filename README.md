@@ -220,8 +220,8 @@ loads on 3.13, 3.14 and later without a rebuild.
 
 <table>
 <tr><th align="left">Working</th><th align="left"></th></tr>
-<tr><td>ATen operators</td><td><b>300</b>, each compared against upstream</td></tr>
-<!-- DOCWATCH: count golden_ops_covered ge 300 -->
+<tr><td>ATen operators</td><td><b>302</b>, each compared against upstream</td></tr>
+<!-- DOCWATCH: count golden_ops_covered ge 302 -->
 <tr><td>Golden comparison cases</td><td><b>11,420 / 11,420</b> — values, shapes, dtypes, positional <i>and</i> keyword, through the door <i>and</i> through the member. The <code>golden_cases_failed</code> marker below is the one that matters: for a while the only two markers here were <code>ge</code> floors on <i>passed</i> and on <i>total</i>, and a pair of floors cannot see <i>passed &lt; total</i>. One case failed for three commits with the gate green</td></tr>
 <!-- DOCWATCH: count golden_cases_total ge 11420 -->
 <!-- DOCWATCH: count golden_cases_passed ge 11420 -->
@@ -229,10 +229,10 @@ loads on 3.13, 3.14 and later without a rebuild.
 <!-- DOCWATCH: count golden_pending eq 0 -->
 <tr><td>Smoke tests</td><td><b>929</b> across <b>30</b> files — <b>480</b> of them in <code>test_shim.py</code>, which is what the marker below counts, and the rest in the files split off it, one per round. The split exists because reconstructing a single conflict hunk in one large file had twice silently dropped tests</td></tr>
 <!-- DOCWATCH: count smoke_ok ge 480 -->
-<tr><td><code>from_pretrained</code></td><td>works for models whose init computes on the <b>meta</b> device — the Llama-3.2 <code>rope_scaling</code> path needed 30-odd meta kernels that were absent (<a href="docs/devices/META.md">META.md</a>)</td></tr>
-<tr><td>Signature and schema tables</td><td><b>5,016 of 5,029</b> entries checked against upstream</td></tr>
-<!-- DOCWATCH: count schema_entries_matched ge 5016 -->
-<!-- DOCWATCH: count schema_entries_total ge 5029 -->
+<tr><td><code>from_pretrained</code></td><td>works for models whose init computes on the <b>meta</b> device — the Llama-3.2 <code>rope_scaling</code> path needed 30-odd meta kernels that were absent (<a href="docs/META.md">META.md</a>)</td></tr>
+<tr><td>Signature and schema tables</td><td><b>5,024 of 5,037</b> entries checked against upstream</td></tr>
+<!-- DOCWATCH: count schema_entries_matched ge 5024 -->
+<!-- DOCWATCH: count schema_entries_total ge 5037 -->
 <tr><td>Architectures — operator coverage</td><td><b>26 of 26</b> reach zero missing operators in the traced sweep</td></tr>
 <tr><td>Architectures — <b>agreeing with upstream</b></td><td><b>26 of 26</b>, matching upstream. Agreement is module-by-module through forward hooks, because two of the toy outputs are degenerate enough that their argmax is a tie — reported as a tie rather than as a match (<a href="docs/kernels/KERNELS26.md">KERNELS26.md</a>)</td></tr>
 <tr><td>Architectures — <b>swept, all of them</b></td><td><b>297 of 297 forward</b> (100%) — <code>docs/architectures/ARCH300.md</code> recorded <b>290</b> (98%), and the re-measurement below adds four; up from 270/297 (91%) in ARCH200 and 215/297 (72%) in ARCH100. <b>The denominator is not 528.</b> 528 is every model type <code>AutoModel</code> can build; of those, <b>231 fail on upstream torch too</b> under the same shrunk random-weight config, so they are not this project's gap and are excluded — <i>294 of 528</i> would be a different and wrong claim. ARCH300's remaining <b>7</b> were blocked on argument forms and kernels, three of them sharing one argument-form gap (a tensor/tuple passed where the shim's table has no matching row), which is a <i>first-wall</i> count: closing one wall can reveal another. And <b>a forward is not a match</b> — this row measures reachability only; the row below measures agreement (<a href="docs/architectures/ARCH300.md">ARCH300.md</a>, prior rounds <a href="docs/architectures/ARCH200.md">ARCH200.md</a>, <a href="docs/architectures/ARCH100.md">ARCH100.md</a>). <b>Re-measured at release time</b> on the current head: the seven were each re-run individually and four of them now forward (<code>univnet</code>, <code>nystromformer</code>, <code>vilt</code>, <code>sam3_lite_text_text_model</code>), taking that step to <b>294 of 297</b>. The other 290 were <i>not</i> re-swept, so 294 rests on ARCH300's 290 plus four individual runs rather than on a fresh full sweep. The three then still blocked have since been closed and <b>all 297 forward</b> — <code>fastspeech2_conformer</code> needed <code>repeat_interleave</code> with a tensor <code>repeats</code>, and <code>led</code>/<code>longformer</code> needed <code>Tensor.where</code> and then an <code>as_strided</code> size element arriving as a 0-dim tensor, ARCH300's own first-wall caveat firing twice more. The same qualification carries: <b>297 rests on ARCH300's 290 plus seven individual runs, not on a fresh full sweep</b> (<a href="docs/kernels/REPEAT.md">REPEAT.md</a>)</td></tr>

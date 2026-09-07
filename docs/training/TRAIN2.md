@@ -1,6 +1,6 @@
 # W13: convolution's backward, and a model that trains through it
 
-`docs/platform/RELEASE_0_0_13a0.md` §5 states two of this project's own gaps in one sentence:
+`docs/platform/RELEASE_0_1_0b0.md` §5 states two of this project's own gaps in one sentence:
 
 > **No transformer trains through `loss.backward()` yet.** ... There is no convolution backward
 > rule, so vision models stop.
@@ -272,7 +272,7 @@ Counted per CLAUDE.md §5.3, since "+10 tests" is four different things otherwis
 | **features added** | 3 derivative rules (`convolution`, `avg_pool2d`, `adaptive_avg_pool2d`) |
 | **defects fixed** | none — nothing here was previously wrong; it was absent |
 | **tests added** | 10 in `test_train.py`, 3 finite-difference cases in `test_shim.py` |
-| **documentation corrected** | `docs/platform/RELEASE_0_0_13a0.md` §5's transformer clause is now measurably false (§4) — **not edited by this round**, because that file is not this round's territory; it is named here so the next round has the measurement |
+| **documentation corrected** | `docs/platform/RELEASE_0_1_0b0.md` §5's transformer clause is now measurably false (§4) — **not edited by this round**, because that file is not this round's territory; it is named here so the next round has the measurement |
 | **deleted** | nothing |
 
 <!-- DOCWATCH: symbol-in-file rust/torch_c/src/tape.rs convolution_backward present -->
