@@ -5648,6 +5648,12 @@ def test_ops_without_a_meta_kernel_name_themselves():
     meta = _C.device("meta")
     a = d("aten.empty.memory_format", [2, 3], _C.float32, device=meta)
     b = d("aten.empty.memory_format", [2, 3], _C.float32, device=meta)
+    at = d("aten.empty.memory_format", [3, 2], _C.float32, device=meta)
+    a3 = d("aten.empty.memory_format", [2, 2, 3], _C.float32, device=meta)
+    a3t = d("aten.empty.memory_format", [2, 3, 2], _C.float32, device=meta)
+    w = d("aten.empty.memory_format", [5, 3], _C.float32, device=meta)
+    idx = d("aten.empty.memory_format", [2], _C.int64, device=meta)
+    gidx = d("aten.empty.memory_format", [2, 1], _C.int64, device=meta)
 
     # `add.Tensor` used to head this list and is now implemented
     # (docs/META.md §7.1). It was replaced rather than the test deleted: the
@@ -5664,21 +5670,34 @@ def test_ops_without_a_meta_kernel_name_themselves():
     # `any.default`, `amax.default`, `t.default`, `transpose.int`,
     # `permute.default`, `unsqueeze.default`, `squeeze.dim` and
     # `squeeze.default` moved to the answering half below. The boundary moved
-    # again rather than the test being deleted: contractions, most indexing,
-    # the composite ops, combine/split, and the reduction/view members
-    # METAFAM.md left alone (`max.dim`, `argmax`, `topk`, `sort`, `stack`,
-    # `unbind`, `squeeze.dims`, `narrow`, `index.Tensor`, ...) are still here.
+    # again rather than the test being deleted, and docs/METAEMB.md moved it a
+    # third time: `embedding`, `gather`, `max.dim`, `argmax`, `topk`, `sort`,
+    # the contraction family, `native_layer_norm`, `cat`, `split`,
+    # `convolution`, SDPA, the activations, `repeat` and the integer half of
+    # `index.Tensor` all moved to the answering half below. What is left here
+    # was CONFIRMED still refusing by direct dispatch before this list was
+    # edited (METAEMB.md §6) rather than assumed: `stack`, `unbind`,
+    # `squeeze.dims`, `narrow`, `flip`, `scatter`, `_softmax`,
+    # `constant_pad_nd` and three of the elementwise stragglers.
+    #
+    # `zeros_like` was in that confirmed-refusing list and is not any more,
+    # and neither round was wrong. METAEMB confirmed it refusing on its base
+    # while EXPORT5 independently gave it a meta kernel on a sibling branch;
+    # the two edits merged cleanly as text and produced a stale list. This
+    # test caught it at the merge, which is the whole reason it names ops
+    # instead of counting them.
     for op, args in (
-        ("aten.mm.default", (a, a)),
-        ("aten.bmm.default", (a, a)),
-        ("aten.cat.default", ([a, b], 0)),
-        ("aten.max.dim", (a, 0)),
-        ("aten.argmax.default", (a,)),
-        ("aten.topk.default", (a, 1)),
-        ("aten.sort.default", (a,)),
-        ("aten.stack.default", ([a],)),
+        ("aten.stack.default", ([a, b], 0)),
+        ("aten.unbind.int", (a, 0)),
         ("aten.squeeze.dims", (a, [0])),
-        ("aten.index.Tensor", (a, [None])),
+        ("aten.narrow.default", (a, 0, 0, 1)),
+        ("aten.flip.default", (a, [0])),
+        ("aten._softmax.default", (a, -1, False)),
+        ("aten.constant_pad_nd.default", (a, [1, 1])),
+        ("aten.abs.default", (a,)),
+        ("aten.ceil.default", (a,)),
+        ("aten.floor_divide.default", (a, b)),
+        ("aten.bitwise_and.Tensor", (a, b)),
     ):
         try:
             d(op, *args)
@@ -5715,9 +5734,44 @@ def test_ops_without_a_meta_kernel_name_themselves():
         ("aten.squeeze.dim", (a, 0)),
         ("aten.squeeze.default", (a,)),
         ("aten.slice.Tensor", (a, 0, 0, 1)),
+        # docs/EXPORT5.md -- export needs this one on meta, and it landed on a
+        # branch parallel to METAEMB's, which is why the refusing list above
+        # still named it after the merge.
+        ("aten.zeros_like.default", (a,)),
+        # docs/METAEMB.md -- the measured wall and what stood behind it.
+        ("aten.embedding.default", (w, idx)),
+        ("aten.gather.default", (a, 1, gidx)),
+        ("aten.mm.default", (a, at)),
+        ("aten.bmm.default", (a3, a3t)),
+        ("aten.addmm.default", (a, a, at)),
+        ("aten.matmul.default", (a, at)),
+        ("aten.cat.default", ([a, b], 0)),
+        ("aten.repeat.default", (a, [2, 2])),
+        ("aten.gelu.default", (a,)),
+        ("aten.silu.default", (a,)),
+        ("aten.relu.default", (a,)),
+        ("aten.index.Tensor", (a, [None])),
     ):
         out = d(op, *args)
         assert out.is_meta is True, op
+
+    # The multi-output ones are checked separately: they answer a pair or a
+    # triple, so `out.is_meta` above would not typecheck -- and the INDEX
+    # dtype is the whole point of docs/METAEMB.md §3.1, so it is read here
+    # rather than only in test_metaemb.py.
+    for op, args, count in (
+        ("aten.max.dim", (a, 0), 2),
+        ("aten.topk.default", (a, 1), 2),
+        ("aten.sort.default", (a,), 2),
+        ("aten.split.Tensor", (a, 1, 0), 2),
+        ("aten.native_layer_norm.default", (a, [3], None, None, 1e-5), 3),
+    ):
+        out = d(op, *args)
+        assert len(out) == count, (op, out)
+        for part in out:
+            assert part.is_meta is True, op
+    for op, args in (("aten.argmax.default", (a,)),):
+        assert d(op, *args).is_meta is True, op
 
     # `_aten_implemented()` is untouched by any of this: it means "has a kernel
     # *and* tools/golden/cases.py compares it against upstream", and a meta

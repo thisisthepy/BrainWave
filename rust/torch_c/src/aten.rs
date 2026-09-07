@@ -2664,6 +2664,943 @@ fn meta_dispatch(
             dims[dim] = length;
             meta_result(py, dims, input.tag())
         }
+        // ---------------------------------------------------------------
+        // Contraction/indexing family and the multi-output reductions.
+        // docs/METAEMB.md. Two things distinguish this block from the
+        // reduction and view blocks above.
+        //
+        // **The first is that these are what real models actually hit.**
+        // Re-measured (METAEMB.md §2, not trusted from METAFAM.md §2.2, which
+        // had gone stale): the first wall of a `forward` under
+        // `torch.device("meta")` is `aten.embedding.default` for five of eight
+        // architectures and `aten.gather.default` for two more.
+        //
+        // **The second is the INDEX-DTYPE RULE**, which the four multi-output
+        // ops all obey and which is stated once here rather than four times
+        // below:
+        //
+        //   The index half of a multi-output reduction is `int64`
+        //   UNCONDITIONALLY -- independent of the input's dtype, of `keepdim`,
+        //   of `largest`/`sorted`/`descending`/`stable`, of whether the result
+        //   is empty, and of the device. The VALUE half carries the input's
+        //   own dtype unchanged: no widening, no promotion.
+        //
+        // Derived, not assumed: measured across nine input dtypes x
+        // {cpu, meta} x {max.dim, argmax, topk, sort} on upstream 2.13.0
+        // (METAEMB.md §3.1). `argmax` is the degenerate member -- it returns
+        // only the index half, so its ENTIRE output is `int64` whatever went
+        // in, which is why it does not share the value-dtype half of the rule.
+        //
+        // This rule is the reason these four were left for their own round.
+        // A meta kernel that returns the input's dtype for the index half
+        // answers a perfectly plausible-looking pair; nothing fails until a
+        // caller uses the index, which is arbitrarily far away.
+        "aten.embedding.default" => {
+            let weight = tensor_arg(op, args, kwargs, 0, "weight")?;
+            let indices = tensor_arg(op, args, kwargs, 1, "indices")?;
+            // `padding_idx` (index 2) is read and ignored by the dense kernel
+            // because it is backward-only; the other two are refused there
+            // rather than ignored, and the meta arm refuses identically so
+            // that the one door gives one answer. Note this is a place where
+            // this shim is deliberately STRICTER than upstream, which accepts
+            // both on the forward path -- the dense kernel's refusal, not a
+            // new one invented here.
+            for (index, name) in [(3, "scale_grad_by_freq"), (4, "sparse")] {
+                if bool_arg(args, kwargs, index, name)?.unwrap_or(false) {
+                    return Err(not_implemented(format!(
+                        "{op}: argument '{name}' only affects the backward pass, and there \
+                         is no autograd in torch._C shim"
+                    )));
+                }
+            }
+            let rank = weight.dims().len();
+            if rank != 2 {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "{op}: weight must be 2D, got {rank}D"
+                )));
+            }
+            // The index dtype check is one of the few things a meta tensor
+            // CAN answer, and `embedding_default`'s own comment records why
+            // it exists: `cpmant` casts its `input_ids` to `int32`.
+            match indices.tag() {
+                TorchDType::Int64 | TorchDType::Int32 => {}
+                other_tag => {
+                    return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "Expected tensor for argument #1 'indices' to have one of the following \
+                         scalar types: Long, Int; but got {} instead (while checking arguments \
+                         for embedding)",
+                        legacy_tensor_type_name(other_tag)
+                    )))
+                }
+            }
+            // Shape: the index tensor's own shape with the embedding width
+            // appended -- so a 0-dim index answers rank 1, and an empty index
+            // answers a zero-extent leading dim. Both measured on upstream.
+            // Dtype: the WEIGHT's, never the index's.
+            let mut shape = indices.dims().to_vec();
+            shape.push(weight.dims()[1]);
+            meta_result(py, shape, weight.tag())
+        }
+        // `aten::gather(Tensor self, int dim, Tensor index, *, bool
+        // sparse_grad=False) -> Tensor` -- bert's and roberta's wall.
+        //
+        // Shape is the INDEX's, dtype is the INPUT's. Every check
+        // `gather_default` makes is reproduced here except one, and the
+        // exception is the point: the dense kernel also validates that each
+        // index VALUE is in bounds for `self`'s extent along `dim`, and a meta
+        // tensor holds no values, so that check cannot exist here. Upstream's
+        // own meta kernel omits it for the same reason (measured: an
+        // out-of-bounds index on meta answers a shape, on cpu it raises).
+        // Stated rather than hidden -- it is the one thing a caller loses by
+        // running `gather` on meta.
+        "aten.gather.default" => {
+            let input = tensor_arg(op, args, kwargs, 0, "self")?;
+            let dim_raw = dim_arg(args, kwargs, 1, "dim")?.ok_or_else(|| missing(op, "dim"))?;
+            let index = tensor_arg(op, args, kwargs, 2, "index")?;
+            let _sparse_grad = bool_arg(args, kwargs, 3, "sparse_grad")?;
+            if !matches!(index.tag(), TorchDType::Int64 | TorchDType::Int32) {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                    "gather(): Expected dtype int32/int64 for index",
+                ));
+            }
+            // `ensure_nonempty_dim`: a 0-d tensor counts as one dimension of
+            // extent 1 for the rank and size checks, while the OUTPUT keeps
+            // the index's real (possibly empty) shape. `gather_default`'s own
+            // rule, transcribed.
+            let self_dims: Vec<usize> = if input.dims().is_empty() {
+                vec![1]
+            } else {
+                input.dims().to_vec()
+            };
+            let idx_shape = index.dims().to_vec();
+            let idx_dims: Vec<usize> = if idx_shape.is_empty() {
+                vec![1]
+            } else {
+                idx_shape.clone()
+            };
+            if idx_dims.len() != self_dims.len() {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                    "Index tensor must have the same number of dimensions as input tensor",
+                ));
+            }
+            let dim = normalise_dim(op, dim_raw, input.dims().len())?;
+            for d in 0..self_dims.len() {
+                if d != dim && idx_dims[d] > self_dims[d] {
+                    return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "Size does not match at dimension {d} expected index {idx_dims:?} \
+                         to be no larger than self {self_dims:?} apart from dimension {dim}"
+                    )));
+                }
+            }
+            meta_result(py, idx_shape, input.tag())
+        }
+        // `aten::max.dim` / `aten::min.dim` -- the first of the four
+        // multi-output ops. Both names are here because `extremum_dim` is one
+        // dense function serving both, and giving meta only the `max` half
+        // would put a second, narrower boundary in a place the dense side
+        // does not have one.
+        //
+        // The zero-extent refusal is this shim's dense kernel's decision (and
+        // upstream's CPU kernel's, in upstream's own wording). Upstream's
+        // *meta* kernel answers a shape there instead -- one of the seven
+        // upstream self-disagreements METAEMB.md §3.3 catalogues, the same
+        // shape of thing META.md §7.3 already records for `bitwise_not` and
+        // `clamp`. This shim has one door, so it follows the dense side.
+        "aten.max.dim" | "aten.min.dim" => {
+            let which = if op == "aten.max.dim" {
+                Extremum::Max
+            } else {
+                Extremum::Min
+            };
+            let name = if op == "aten.max.dim" { "max" } else { "min" };
+            let input = tensor_arg(op, args, kwargs, 0, "self")?;
+            let rank = input.dims().len();
+            let dim = normalise_dim(
+                op,
+                dim_arg(args, kwargs, 1, "dim")?.ok_or_else(|| missing(op, "dim"))?,
+                rank,
+            )?;
+            let keepdim = bool_arg(args, kwargs, 2, "keepdim")?.unwrap_or(false);
+            // A 0-dim input reduces to a 0-dim pair whatever `keepdim` says
+            // (measured on both upstream devices), and `reduced_dims` has no
+            // axis to remove, so it is a branch rather than a call.
+            let shape = if rank == 0 {
+                Vec::new()
+            } else {
+                if input.dims()[dim] == 0 {
+                    return Err(pyo3::exceptions::PyIndexError::new_err(format!(
+                        "{name}(): Expected reduction dim {dim} to have non-zero size."
+                    )));
+                }
+                reduced_dims(input.dims(), &[dim], keepdim)
+            };
+            meta_values_indices(py, extremum_result_type(py, which)?, shape, input.tag())
+        }
+        // `aten::argmax(Tensor self, int? dim=None, bool keepdim=False)` --
+        // the degenerate member of the INDEX-DTYPE RULE: there is no value
+        // half, so the whole result is `int64` whatever the input dtype was.
+        //
+        // `dim=None` flattens, and with `keepdim=True` upstream answers a
+        // shape of `rank` ones (measured `(1, 1)` for a `(3, 4)` input on both
+        // devices). This shim's DENSE kernel answers `(1,)` there -- a
+        // pre-existing dense defect, found by writing this arm and reported in
+        // METAEMB.md §3.4 rather than fixed here, since fixing a dense kernel
+        // is a golden-case change and out of this round's scope.
+        "aten.argmax.default" => {
+            let input = tensor_arg(op, args, kwargs, 0, "self")?;
+            let rank = input.dims().len();
+            let dim = dim_arg(args, kwargs, 1, "dim")?;
+            let keepdim = bool_arg(args, kwargs, 2, "keepdim")?.unwrap_or(false);
+            let shape = match dim {
+                None => {
+                    if input.dims().iter().product::<usize>() == 0 {
+                        return Err(pyo3::exceptions::PyIndexError::new_err(
+                            "argmax(): Expected reduction dim to be specified for \
+                             input.numel() == 0.",
+                        ));
+                    }
+                    if keepdim {
+                        vec![1usize; rank]
+                    } else {
+                        Vec::new()
+                    }
+                }
+                Some(named) => {
+                    let d = normalise_dim(op, named, rank)?;
+                    if rank == 0 {
+                        Vec::new()
+                    } else {
+                        if input.dims()[d] == 0 {
+                            return Err(pyo3::exceptions::PyIndexError::new_err(format!(
+                                "argmax(): Expected reduction dim {d} to have non-zero size."
+                            )));
+                        }
+                        reduced_dims(input.dims(), &[d], keepdim)
+                    }
+                }
+            };
+            meta_result(py, shape, TorchDType::Int64)
+        }
+        // `aten::topk(Tensor self, SymInt k, int dim=-1, bool largest=True,
+        //             bool sorted=True) -> (Tensor values, Tensor indices)`
+        //
+        // `largest` and `sorted` change WHICH elements and in what order --
+        // neither changes the shape or either dtype, so both are read (so a
+        // wrong spelling still refuses) and discarded. The `k` range check is
+        // `topk_default`'s own, including upstream's conflation of "negative"
+        // with "too large" under one message.
+        "aten.topk.default" => {
+            let input = tensor_arg(op, args, kwargs, 0, "self")?;
+            let rank = input.dims().len();
+            let k = int_arg(args, kwargs, 1, "k")?.ok_or_else(|| missing(op, "k"))?;
+            let dim = normalise_dim(op, dim_arg(args, kwargs, 2, "dim")?.unwrap_or(-1), rank)?;
+            let _largest = bool_arg(args, kwargs, 3, "largest")?;
+            let _sorted = bool_arg(args, kwargs, 4, "sorted")?;
+            let extent = if rank == 0 { 1 } else { input.dims()[dim] };
+            if k < 0 || k as usize > extent {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                    "selected index k out of range",
+                ));
+            }
+            let mut shape = input.dims().to_vec();
+            if rank > 0 {
+                shape[dim] = k as usize;
+            }
+            meta_values_indices(
+                py,
+                values_indices_type(py, &TOPK_RESULT, "topk")?,
+                shape,
+                input.tag(),
+            )
+        }
+        // `aten::sort(Tensor self, int dim=-1, bool descending=False)
+        //     -> (Tensor values, Tensor indices)`
+        //
+        // The shape is the input's, unchanged -- sorting moves elements, it
+        // does not remove or add any. So the ONLY thing this kernel can get
+        // wrong is the index dtype, which is exactly why it needed the rule
+        // stated before it was written.
+        //
+        // `dim` is normalised and then discarded. That normalisation is not
+        // dead: it is the whole refusal. Upstream's own meta kernel
+        // SILENTLY ACCEPTS an out-of-range `dim` here (measured:
+        // `sort(zeros(3,4, device="meta"), dim=9)` answers `(3, 4)`), while
+        // its cpu kernel raises `IndexError`. This shim follows the dense
+        // side and refuses -- METAEMB.md §3.3, divergence 5.
+        "aten.sort.default" => {
+            let input = tensor_arg(op, args, kwargs, 0, "self")?;
+            let rank = input.dims().len();
+            let _dim = normalise_dim(op, dim_arg(args, kwargs, 1, "dim")?.unwrap_or(-1), rank)?;
+            let _descending = bool_arg(args, kwargs, 2, "descending")?;
+            meta_values_indices(
+                py,
+                values_indices_type(py, &SORT_RESULT, "sort")?,
+                input.dims().to_vec(),
+                input.tag(),
+            )
+        }
+        // ---------------------------------------------------------------
+        // The contraction family proper (docs/META.md §7.4's 축약 column),
+        // reached on the SECOND round of the same measurement: with
+        // `embedding` and `gather` closed, `matmul` became the first wall for
+        // mistral and qwen2 and `native_layer_norm` for the other five
+        // (METAEMB.md §2.3). Re-measuring after each landing rather than
+        // implementing a list is docs/META.md §7.2's own method.
+        //
+        // Every shape rule here is transcribed from its dense sibling and
+        // every REFUSAL is the dense kernel's, including the ones where the
+        // dense kernel is narrower than upstream -- `matmul` with a 1-D
+        // operand is refused here exactly as `matmul_default` refuses it,
+        // because a meta kernel that accepted a form the dense kernel will
+        // not compute would advertise a capability this shim does not have.
+        "aten.mm.default" => {
+            let lhs = tensor_arg(op, args, kwargs, 0, "self")?;
+            let rhs = tensor_arg(op, args, kwargs, 1, "mat2")?;
+            let (a, b) = (lhs.dims(), rhs.dims());
+            if a.len() != 2 || b.len() != 2 {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "{op}: both arguments to mm need to be 2D, but they are {}D and {}D",
+                    a.len(),
+                    b.len()
+                )));
+            }
+            if a[1] != b[0] {
+                return Err(mm_shape_refusal(a, b));
+            }
+            meta_result(py, vec![a[0], b[1]], lhs.tag())
+        }
+        "aten.bmm.default" => {
+            let lhs = tensor_arg(op, args, kwargs, 0, "self")?;
+            let rhs = tensor_arg(op, args, kwargs, 1, "mat2")?;
+            let (a, b) = (lhs.dims(), rhs.dims());
+            if a.len() != 3 || b.len() != 3 {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "{op}: both arguments to bmm need to be 3D, but they are {}D and {}D",
+                    a.len(),
+                    b.len()
+                )));
+            }
+            if a[0] != b[0] || a[2] != b[1] {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "Expected size for first two dimensions of batch2 tensor to be: \
+                     [{}, {}] but got: [{}, {}].",
+                    a[0], a[2], b[0], b[1]
+                )));
+            }
+            meta_result(py, vec![a[0], a[1], b[2]], lhs.tag())
+        }
+        // `aten::addmm` -- the shape is `mm`'s; `self` is the bias and only
+        // broadcasts into it, so it contributes no extent of its own. dtype
+        // is `mat1`'s, matching the dense kernel.
+        "aten.addmm.default" => {
+            let _bias = tensor_arg(op, args, kwargs, 0, "self")?;
+            let lhs = tensor_arg(op, args, kwargs, 1, "mat1")?;
+            let rhs = tensor_arg(op, args, kwargs, 2, "mat2")?;
+            let (a, b) = (lhs.dims(), rhs.dims());
+            if a.len() != 2 || b.len() != 2 {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "{op}: mat1 and mat2 must both be 2D, but they are {}D and {}D",
+                    a.len(),
+                    b.len()
+                )));
+            }
+            if a[1] != b[0] {
+                return Err(mm_shape_refusal(a, b));
+            }
+            meta_result(py, vec![a[0], b[1]], lhs.tag())
+        }
+        // `aten::matmul` -- the batched, broadcasting one. The batch dims are
+        // the two operands' leading dims broadcast together; the last two are
+        // an ordinary matrix product.
+        "aten.matmul.default" => {
+            let lhs = tensor_arg(op, args, kwargs, 0, "self")?;
+            let rhs = tensor_arg(op, args, kwargs, 1, "other")?;
+            let (a, b) = (lhs.dims().to_vec(), rhs.dims().to_vec());
+            // The dense kernel's own refusal, quoted: torch's vector rules
+            // (1-D operands are promoted, multiplied, then squeezed) were
+            // never measured for it, so neither path claims them.
+            if a.len() < 2 || b.len() < 2 {
+                return Err(not_implemented(format!(
+                    "{op}: matmul with a 1-D operand ({}D x {}D) is not implemented in \
+                     torch._C shim -- torch's vector rules were not measured",
+                    a.len(),
+                    b.len()
+                )));
+            }
+            if a[a.len() - 1] != b[b.len() - 2] {
+                return Err(mm_shape_refusal(&a, &b));
+            }
+            let mut batch = broadcast_shape(op, &a[..a.len() - 2], &b[..b.len() - 2])?;
+            batch.push(a[a.len() - 2]);
+            batch.push(b[b.len() - 1]);
+            meta_result(py, batch, lhs.tag())
+        }
+        // `aten::native_layer_norm(Tensor input, SymInt[] normalized_shape,
+        //     Tensor? weight, Tensor? bias, float eps)
+        //     -> (Tensor, Tensor mean, Tensor rstd)`
+        //
+        // A THREE-output op, and the same lesson as the index-dtype rule with
+        // a different variable: the first output's shape and dtype are the
+        // input's and are trivially right, while `mean` and `rstd` have both
+        // a different SHAPE (the normalised axes collapsed to 1, not removed)
+        // and, in one case, a different DTYPE.
+        //
+        // The stat dtype rule, transcribed from `native_layer_norm_default`'s
+        // `stat_tag`: the statistics carry the INPUT's dtype, except when a
+        // `float32` weight/bias stands in front of a `float16`/`bfloat16`
+        // input ("mixed dtype"), where they are `float32`. Upstream's own
+        // META kernel disagrees with this -- it answers `float32` statistics
+        // for a reduced-precision input even with no parameters at all, where
+        // its cpu kernel answers `float16`. METAEMB.md §3.3 divergence 6;
+        // this shim follows its dense kernel, which follows cpu.
+        "aten.native_layer_norm.default" => {
+            let input = tensor_arg(op, args, kwargs, 0, "input")?;
+            let normalized = shape_arg(op, args, kwargs, 1, "normalized_shape")?;
+            let weight = optional_tensor_arg(op, args, kwargs, 2, "weight")?;
+            let bias = optional_tensor_arg(op, args, kwargs, 3, "bias")?;
+            if normalized.is_empty() {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                    "Expected normalized_shape to be at least 1-dimensional, i.e., containing at \
+                     least one element, but got normalized_shape = []",
+                ));
+            }
+            let dims = input.dims().to_vec();
+            let k = normalized.len();
+            let fits = k <= dims.len()
+                && dims[dims.len() - k..]
+                    .iter()
+                    .zip(normalized.iter())
+                    .all(|(&have, &want)| have as i64 == want as i64);
+            if !fits {
+                let star: String = normalized.iter().map(|v| format!(", {v}")).collect();
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "Given normalized_shape={normalized:?}, expected input with shape [*{star}], \
+                     but got input of size{dims:?}"
+                )));
+            }
+            let ns: Vec<usize> = normalized.iter().map(|&v| v as usize).collect();
+            let tag = input.tag();
+            if !tag.is_floating_point() {
+                return Err(pyo3::exceptions::PyNotImplementedError::new_err(format!(
+                    "\"LayerNormKernelImpl\" not implemented for '{}'",
+                    scalar_type_name(tag)
+                )));
+            }
+            for (label, param) in [("weight", &weight), ("bias", &bias)] {
+                if let Some(param) = param {
+                    if param.dims() != ns.as_slice() {
+                        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                            "Expected {label} to be of same shape as normalized_shape, but got \
+                             {label} of shape {:?} and normalized_shape = {ns:?}",
+                            param.dims()
+                        )));
+                    }
+                }
+            }
+            let mixed_dtype = || {
+                pyo3::exceptions::PyRuntimeError::new_err(if tag == TorchDType::Float64 {
+                    "mixed dtype (CPU): all inputs must share same datatype."
+                } else {
+                    "mixed dtype (CPU): expect parameter to have scalar type of Float"
+                })
+            };
+            let param_tag = match (&weight, &bias) {
+                (Some(w), Some(b)) if w.tag() != b.tag() => return Err(mixed_dtype()),
+                (Some(w), _) => Some(w.tag()),
+                (None, Some(b)) => Some(b.tag()),
+                (None, None) => None,
+            };
+            let mixed = match param_tag {
+                None => false,
+                Some(param) if param == tag => false,
+                Some(TorchDType::Float32)
+                    if matches!(tag, TorchDType::Float16 | TorchDType::BFloat16) =>
+                {
+                    true
+                }
+                Some(_) => return Err(mixed_dtype()),
+            };
+            if ns.iter().product::<usize>() == 0 {
+                return Err(not_implemented(format!(
+                    "{op}: a zero-extent normalized_shape ({ns:?}) is not implemented in torch._C \
+                     shim -- upstream answers mean=0 with rstd=nan there, and that pair was not \
+                     measured well enough to reproduce"
+                )));
+            }
+            let stat_tag = if mixed { TorchDType::Float32 } else { tag };
+            // Collapsed to 1, not removed -- `keepdim=True`'s shape, which is
+            // why this is not `reduced_dims(.., false)`.
+            let stat_dims: Vec<usize> = dims[..dims.len() - k]
+                .iter()
+                .copied()
+                .chain(std::iter::repeat(1).take(k))
+                .collect();
+            let triple = [
+                meta_result(py, dims, tag)?,
+                meta_result(py, stat_dims.clone(), stat_tag)?,
+                meta_result(py, stat_dims, stat_tag)?,
+            ];
+            Ok(PyTuple::new(py, triple)?.into_any().unbind())
+        }
+        // ---------------------------------------------------------------
+        // Combine/split and composite (docs/META.md §7.4's 결합·분할 and
+        // 합성·활성 columns), reached on the THIRD round of the measurement:
+        // with the contraction family closed, the eight architectures'
+        // first wall moved to SDPA (x4), `cat` (x2), `split` and
+        // `convolution` (METAEMB.md §2.3). None of these is in the family
+        // this round was scoped to; they are here because §2's question --
+        // "how many of the eight construct end to end" -- cannot be answered
+        // by stopping at a family boundary, and a kernel count is not an
+        // answer to it (CLAUDE.md §5.3).
+        "aten.cat.default" => {
+            let tensors: Vec<PyTensorBase> = required(op, args, kwargs, 0, "tensors")?.extract()?;
+            if tensors.is_empty() {
+                // Upstream raises `ValueError` here on BOTH devices; this
+                // shim's dense kernel raises `RuntimeError` with the same
+                // wording. A pre-existing dense defect (METAEMB.md §3.4); the
+                // meta arm answers upstream's class rather than copying it.
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "torch.cat(): expected a non-empty list of Tensors",
+                ));
+            }
+            // Same rule, same function as the dense path -- `promote_list`
+            // reads only `.tag()`, so it works unchanged on meta.
+            let tag = promote_list(op, &tensors)?;
+            // Upstream skips a 1-D EMPTY tensor entirely when deciding rank
+            // and extents (`cat([zeros(0), zeros(3)])` is `(3,)`, not a rank
+            // error), so the first non-skippable entry sets the shape.
+            let skippable =
+                |t: &PyTensorBase| t.dims().len() == 1 && t.dims()[0] == 0;
+            let anchor = tensors.iter().find(|t| !skippable(t));
+            let Some(anchor) = anchor else {
+                return meta_result(py, vec![0], tag);
+            };
+            let rank = anchor.dims().len();
+            let dim = normalise_dim(op, dim_arg(args, kwargs, 1, "dim")?.unwrap_or(0), rank)?;
+            let mut shape = anchor.dims().to_vec();
+            let mut total = 0usize;
+            for (number, t) in tensors.iter().enumerate() {
+                if skippable(t) {
+                    continue;
+                }
+                let dims = t.dims();
+                if dims.len() != rank {
+                    return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "Tensors must have same number of dimensions: got {rank} and {}",
+                        dims.len()
+                    )));
+                }
+                for d in 0..rank {
+                    if d != dim && dims[d] != shape[d] {
+                        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                            "Sizes of tensors must match except in dimension {dim}. \
+                             Expected size {} but got size {} for tensor number {number} \
+                             in the list.",
+                            shape[d], dims[d]
+                        )));
+                    }
+                }
+                total += dims[dim];
+            }
+            shape[dim] = total;
+            meta_result(py, shape, tag)
+        }
+        // `aten::split.Tensor` and `aten::split_with_sizes` -- one arm,
+        // because they differ only in where the chunk lengths come from.
+        // Both return a TUPLE of tensors rather than one, which is the same
+        // multi-output shape of problem as `max.dim` with the index-dtype
+        // half removed: every chunk carries the input's own dtype.
+        "aten.split.Tensor" | "aten.split_with_sizes.default" => {
+            let input = tensor_arg(op, args, kwargs, 0, "self")?;
+            let rank = input.dims().len();
+            if rank == 0 {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                    "split expects at least a 1-dimensional tensor",
+                ));
+            }
+            let dim = normalise_dim(op, dim_arg(args, kwargs, 2, "dim")?.unwrap_or(0), rank)?;
+            let extent = input.dims()[dim];
+            let lengths: Vec<usize> = if op == "aten.split.Tensor" {
+                let split_size =
+                    int_arg(args, kwargs, 1, "split_size")?.ok_or_else(|| missing(op, "split_size"))?;
+                if split_size < 0 {
+                    return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "split expects split_size be non-negative, but got split_size={split_size}"
+                    )));
+                }
+                let split_size = split_size as usize;
+                if split_size == 0 && extent != 0 {
+                    return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "split_size can only be 0 if dimension size is 0, but got dimension \
+                         size of {extent}"
+                    )));
+                }
+                if extent == 0 {
+                    vec![0]
+                } else {
+                    let mut out = Vec::new();
+                    let mut left = extent;
+                    while left > 0 {
+                        let take = left.min(split_size);
+                        out.push(take);
+                        left -= take;
+                    }
+                    out
+                }
+            } else {
+                let sizes = shape_arg(op, args, kwargs, 1, "split_sizes")?;
+                let total: i64 = sizes.iter().map(|&v| v as i64).sum();
+                if total != extent as i64 {
+                    return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "split_with_sizes expects split_sizes to sum exactly to {extent} \
+                         (input tensor's size at dimension {dim}), but got \
+                         split_sizes={sizes:?}"
+                    )));
+                }
+                sizes.iter().map(|&v| v as usize).collect()
+            };
+            let mut chunks: Vec<Py<PyAny>> = Vec::with_capacity(lengths.len());
+            for length in lengths {
+                let mut shape = input.dims().to_vec();
+                shape[dim] = length;
+                chunks.push(crate::tensor::promote(py, meta_result(py, shape, input.tag())?)?);
+            }
+            Ok(PyTuple::new(py, chunks)?.into_any().unbind())
+        }
+        // `aten::convolution` -- whisper's wall, and the only kernel in this
+        // round whose shape rule is ARITHMETIC rather than a rearrangement.
+        // Both directions, written out, because the transposed one is not the
+        // forward one inverted in any way a reader should have to derive:
+        //
+        //   forward     out = (in + 2*pad - dil*(k - 1) - 1) / stride + 1
+        //   transposed  out = (in - 1)*stride - 2*pad + dil*(k - 1)
+        //                     + output_padding + 1
+        //
+        // and the output channel count comes from a different axis of
+        // `weight` in each (`weight[0]` forward, `weight[1] * groups`
+        // transposed).
+        //
+        // The "kernel bigger than the padded input" refusal is upstream's, on
+        // both its devices. This shim's DENSE kernel answers a zero-extent
+        // spatial dim there instead (measured: `(1, 8, 0)`) -- a pre-existing
+        // dense defect, METAEMB.md §3.4, not reproduced here.
+        "aten.convolution.default" => {
+            let input = tensor_arg(op, args, kwargs, 0, "input")?;
+            let weight = tensor_arg(op, args, kwargs, 1, "weight")?;
+            let stride = shape_arg(op, args, kwargs, 3, "stride")?;
+            let padding = shape_arg(op, args, kwargs, 4, "padding")?;
+            let dilation = shape_arg(op, args, kwargs, 5, "dilation")?;
+            let transposed = bool_arg(args, kwargs, 6, "transposed")?.unwrap_or(false);
+            let output_padding = shape_arg(op, args, kwargs, 7, "output_padding")?;
+            let groups = int_arg(args, kwargs, 8, "groups")?.unwrap_or(1);
+            let idims = input.dims().to_vec();
+            let wdims = weight.dims().to_vec();
+            if idims.len() != wdims.len() || idims.len() < 3 {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "{op}: expected input and weight to have the same rank of at least 3, \
+                     got {}D input and {}D weight",
+                    idims.len(),
+                    wdims.len()
+                )));
+            }
+            let spatial = idims.len() - 2;
+            // A scalar-spelled stride/padding/dilation is broadcast across
+            // every spatial axis, which is what `nn.Conv1d(..., padding=1)`
+            // sends down.
+            let at = |v: &Vec<isize>, i: usize| -> i64 {
+                if v.len() == 1 {
+                    v[0] as i64
+                } else {
+                    v[i] as i64
+                }
+            };
+            let out_channels = if transposed {
+                wdims[1] * groups.max(1) as usize
+            } else {
+                wdims[0]
+            };
+            let mut shape = vec![idims[0], out_channels];
+            for i in 0..spatial {
+                let (input_extent, kernel) = (idims[2 + i] as i64, wdims[2 + i] as i64);
+                let (s, p, d) = (at(&stride, i), at(&padding, i), at(&dilation, i));
+                let extent = if transposed {
+                    let op_pad = if output_padding.is_empty() {
+                        0
+                    } else {
+                        at(&output_padding, i)
+                    };
+                    (input_extent - 1) * s - 2 * p + d * (kernel - 1) + op_pad + 1
+                } else {
+                    let padded = input_extent + 2 * p;
+                    let reach = d * (kernel - 1) + 1;
+                    if reach > padded {
+                        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                            "Calculated padded input size per channel: ({padded}). Kernel \
+                             size: ({kernel}). Kernel size can't be greater than actual \
+                             input size"
+                        )));
+                    }
+                    (padded - reach) / s + 1
+                };
+                shape.push(extent.max(0) as usize);
+            }
+            meta_result(py, shape, input.tag())
+        }
+        // `aten::_scaled_dot_product_flash_attention_for_cpu(Tensor query,
+        //     Tensor key, Tensor value, float dropout_p=0.0,
+        //     bool is_causal=False, *, Tensor? attn_mask=None, float? scale=None)
+        //     -> (Tensor output, Tensor logsumexp)`
+        //
+        // The op four of the eight architectures reach, and a THIRD instance
+        // of the pattern this round is about: a multi-output op where the
+        // second output has both a different shape and a different dtype from
+        // the first. `logsumexp` is `(batch, heads, query_len)` and is
+        // **`float32` whatever the query dtype was** -- measured on both
+        // upstream devices for a `float16` query. That is the index-dtype
+        // rule's shape with `float32` in place of `int64`, and getting it
+        // wrong is the same silent failure: a plausible tensor that is wrong
+        // only where somebody later reads it.
+        "aten._scaled_dot_product_flash_attention_for_cpu.default" => {
+            let query = tensor_arg(op, args, kwargs, 0, "query")?;
+            let key = tensor_arg(op, args, kwargs, 1, "key")?;
+            let value = tensor_arg(op, args, kwargs, 2, "value")?;
+            let q = query.dims().to_vec();
+            if q.len() != 4 || key.dims().len() != 4 || value.dims().len() != 4 {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                    "scaled_dot_product_attention_flash_attention: Accept only 4 dims inputs \
+                     shape of {B, H, T, K}",
+                ));
+            }
+            // Upstream's CPU kernel refuses unequal head sizes; its META
+            // kernel silently answers the query's (METAEMB.md §3.3 divergence
+            // 7). One door, so this follows cpu.
+            if key.dims()[3] != q[3] || value.dims()[3] != q[3] {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                    "scaled_dot_product_attention_flash_attention: Q/K/V should have the \
+                     same head size",
+                ));
+            }
+            let pair = [
+                meta_result(py, q.clone(), query.tag())?,
+                meta_result(py, vec![q[0], q[1], q[2]], TorchDType::Float32)?,
+            ];
+            Ok(PyTuple::new(py, pair)?.into_any().unbind())
+        }
+        // The activation family (docs/META.md §7.4's 합성·활성 column), the
+        // FOURTH round's wall: `gelu` for five architectures, `silu` for two.
+        // Shape-preserving and dtype-preserving, so the only content of these
+        // kernels is the refusal -- which is why they are one arm and not
+        // folded into the `unary_float_tag` list above, whose members
+        // PROMOTE an integral input rather than refusing it.
+        //
+        // All three refuse a non-floating input on cpu and ACCEPT one on
+        // upstream's meta device (measured; METAEMB.md §3.3 divergence 8).
+        // This shim's dense kernels reproduce cpu's three distinct messages
+        // exactly, verified before this arm was written, so the meta arm
+        // transcribes them rather than inventing a fourth wording.
+        "aten.gelu.default" | "aten.silu.default" | "aten.relu.default" => {
+            let input = tensor_arg(op, args, kwargs, 0, "self")?;
+            let tag = input.tag();
+            if !tag.is_floating_point() {
+                return Err(match op {
+                    // `relu` is the odd one: it computes on an integral input
+                    // and refuses only `bool`, with a different exception
+                    // class from the other two.
+                    "aten.relu.default" => {
+                        if tag == TorchDType::Bool {
+                            pyo3::exceptions::PyRuntimeError::new_err(
+                                "Boolean inputs not supported for relu",
+                            )
+                        } else {
+                            return meta_result(py, input.dims().to_vec(), tag);
+                        }
+                    }
+                    "aten.gelu.default" => pyo3::exceptions::PyNotImplementedError::new_err(
+                        format!("\"GeluKernelImpl\" not implemented for '{}'", scalar_type_name(tag)),
+                    ),
+                    _ => pyo3::exceptions::PyNotImplementedError::new_err(format!(
+                        "\"silu_cpu\" not implemented for '{}'",
+                        scalar_type_name(tag)
+                    )),
+                });
+            }
+            meta_result(py, input.dims().to_vec(), tag)
+        }
+        // `aten::repeat(Tensor self, SymInt[] repeats)` -- whisper's LAST
+        // wall, and the one that takes the count from six of eight to seven
+        // of eight (METAEMB.md §2.4). Tiling, not broadcasting: the input is
+        // right-aligned against `repeats`, padded with leading 1s, and each
+        // axis multiplied.
+        //
+        // The negative-repeat refusal follows this shim's DENSE kernel, which
+        // matches upstream's cpu ("Trying to create tensor with negative
+        // dimension -2: [-2, 9]" -- upstream's message names the computed
+        // extent, not the repeat). Upstream's meta kernel says something
+        // else entirely ("Repeats cannot be negative, found -1 at index 0");
+        // METAEMB.md §3.3 divergence 9.
+        "aten.repeat.default" => {
+            let input = tensor_arg(op, args, kwargs, 0, "self")?;
+            let repeats = shape_arg(op, args, kwargs, 1, "repeats")?;
+            let dims = input.dims().to_vec();
+            if repeats.len() < dims.len() {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                    "Number of dimensions of repeat dims can not be smaller than number \
+                     of dimensions of tensor",
+                ));
+            }
+            let lead = repeats.len() - dims.len();
+            let mut shape = Vec::with_capacity(repeats.len());
+            for (i, &repeat) in repeats.iter().enumerate() {
+                let extent = if i < lead { 1i64 } else { dims[i - lead] as i64 };
+                let out = repeat as i64 * extent;
+                if out < 0 {
+                    let all: Vec<i64> = repeats
+                        .iter()
+                        .enumerate()
+                        .map(|(j, &r)| {
+                            r as i64 * if j < lead { 1 } else { dims[j - lead] as i64 }
+                        })
+                        .collect();
+                    return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "Trying to create tensor with negative dimension {out}: {all:?}"
+                    )));
+                }
+                shape.push(out as usize);
+            }
+            meta_result(py, shape, input.tag())
+        }
+        // `aten::index.Tensor(Tensor self, Tensor?[] indices)` -- advanced
+        // indexing, and the LAST wall between whisper and a complete forward
+        // (METAEMB.md §2.4).
+        //
+        // **This kernel is deliberately PARTIAL, and the split is the point.**
+        // With integer index tensors the output shape is a function of the
+        // shapes alone: the index tensors broadcast together into one block,
+        // and that block replaces the axes they index. With a BOOLEAN mask it
+        // is not -- the mask's true count sets an extent, and a meta tensor
+        // holds no values to count. So the integer half is answered and the
+        // boolean half refuses, by name, with the reason.
+        //
+        // Upstream draws the line in exactly the same place and says so in
+        // the same words: a bool mask on a meta tensor routes into
+        // `torch.nonzero`'s meta registration, which refuses unless the
+        // caller opts into an upper bound. Measured, METAEMB.md §5.
+        //
+        // Two placement rules, both measured rather than reasoned:
+        //   * indices ADJACENT in the argument list -> the broadcast block
+        //     sits where they were  (`[None, idx]` on `(5,3)` -> `(5, 2)`)
+        //   * indices SEPARATED by a `None` -> the block moves to the FRONT
+        //     (`[idx, None, idx]` on `(5,3,7)` -> `(2, 3)`)
+        "aten.index.Tensor" => {
+            let input = tensor_arg(op, args, kwargs, 0, "self")?;
+            let raw = required(op, args, kwargs, 1, "indices")?;
+            let entries: Vec<Option<PyTensorBase>> = raw.extract()?;
+            let dims = input.dims().to_vec();
+            if entries.is_empty() {
+                return Err(pyo3::exceptions::PyIndexError::new_err(
+                    "at least one index must be provided",
+                ));
+            }
+            if entries.len() > dims.len() {
+                return Err(pyo3::exceptions::PyIndexError::new_err(format!(
+                    "too many indices for tensor of dimension {} (got {})",
+                    dims.len(),
+                    entries.len()
+                )));
+            }
+            let mut positions: Vec<usize> = Vec::new();
+            let mut block: Vec<usize> = Vec::new();
+            for (at, entry) in entries.iter().enumerate() {
+                let Some(index) = entry else { continue };
+                match index.tag() {
+                    TorchDType::Int64 | TorchDType::Int32 => {}
+                    TorchDType::Bool | TorchDType::UInt8 => {
+                        return Err(not_implemented(format!(
+                            "{op} with a {} mask has no meta kernel, and cannot have one: \
+                             the output's extent is the number of TRUE entries in the mask, \
+                             which is a property of the mask's VALUES, and a meta tensor \
+                             holds none. This is the same boundary upstream draws -- a bool \
+                             mask on a meta tensor reaches torch.nonzero's meta registration, \
+                             which refuses for the same reason. The integer-index half of \
+                             this op IS answered. See docs/METAEMB.md §5.",
+                            index.tag().name()
+                        )))
+                    }
+                    other => {
+                        return Err(pyo3::exceptions::PyIndexError::new_err(format!(
+                            "tensors used as indices must be long, int, byte or bool tensors, \
+                             but got {}",
+                            other.name()
+                        )))
+                    }
+                }
+                block = broadcast_shape(op, &block, index.dims())?;
+                positions.push(at);
+            }
+            if positions.is_empty() {
+                return meta_result(py, dims, input.tag());
+            }
+            // Adjacent iff the indexed positions form a run with no `None`
+            // between them; that is what decides whether the block stays in
+            // place or moves to the front.
+            let adjacent = positions
+                .windows(2)
+                .all(|pair| pair[1] == pair[0] + 1);
+            let untouched: Vec<usize> = (0..dims.len())
+                .filter(|d| !positions.contains(d))
+                .map(|d| dims[d])
+                .collect();
+            let shape = if adjacent {
+                let before = positions[0];
+                let mut out: Vec<usize> = dims[..before].to_vec();
+                out.extend(block.iter().copied());
+                out.extend(
+                    (0..dims.len())
+                        .filter(|d| *d > positions[positions.len() - 1] || (*d >= before && !positions.contains(d)))
+                        .map(|d| dims[d]),
+                );
+                out
+            } else {
+                let mut out = block.clone();
+                out.extend(untouched.iter().copied());
+                out
+            };
+            meta_result(py, shape, input.tag())
+        }
+        // ---------------------------------------------------------------
+        // Refused BY NAME, with the reason -- not left to the fallthrough.
+        //
+        // The generic message below says the op "would have to infer its
+        // output shape without computing -- which is a real kernel". For
+        // these three that sentence is FALSE, and falsely encouraging: their
+        // output shape is a function of the input's VALUES, not of its shape,
+        // so no meta kernel can exist. `masked_select`'s length is the number
+        // of true entries in the mask; `_unique2`'s is the number of distinct
+        // elements; `repeat_interleave.Tensor`'s is the sum of the repeat
+        // tensor. None of the three is recoverable from shape and dtype.
+        //
+        // Upstream agrees, and says so in its own words: the first two have
+        // NO meta registration at all ("attempted to run this operator with
+        // Meta tensors, but there was no fake impl or Meta kernel
+        // registered"), and the third refuses by name -- "cannot
+        // repeat_interleave a meta tensor without output_size". Measured on
+        // 2.13.0, METAEMB.md §5.
+        //
+        // `aten.nonzero.default` is the fourth op of this kind and is
+        // deliberately NOT in this list: it already has an arm above, gated
+        // behind upstream's own `meta_nonzero_assume_all_nonzero` config
+        // flag, which is upstream's way of letting a caller opt in to an
+        // upper-bound answer. That opt-in is the difference; where upstream
+        // offers no such switch, neither does this.
+        "aten.masked_select.default"
+        | "aten._unique2.default"
+        | "aten.repeat_interleave.Tensor" => Err(not_implemented(format!(
+            "torch._C shim will not have a meta kernel for {op}: its output SHAPE is a \
+             function of the input's VALUES, not of the input's shape, and a meta tensor \
+             holds no values. This is a refusal, not a gap -- upstream has no meta kernel \
+             for these either, for the same reason. Use a dense tensor, or supply the \
+             output size explicitly where the op accepts one. See docs/METAEMB.md §5."
+        ))),
         other => Err(not_implemented(format!(
             "torch._C shim has no meta kernel for {other}. A meta tensor holds shape and \
              dtype and no storage, so this op would have to infer its output shape without \
@@ -2684,6 +3621,48 @@ fn reduce_dims_or_all(named: Option<Vec<usize>>, rank: usize) -> Vec<usize> {
         Some(d) if !d.is_empty() => d,
         _ => (0..rank).collect(),
     }
+}
+
+/// The inner-dimension refusal `mm`, `addmm` and `matmul`'s meta arms share.
+///
+/// The wording is UPSTREAM's, not this shim's dense kernel's. The dense side
+/// answers here with a leaked candle message (`candle: shape mismatch in
+/// matmul, lhs: [3, 4], rhs: [5, 6]`), which is a defect rather than a rule --
+/// transcribing it into a kernel that never calls candle would be copying the
+/// leak into a second place. METAEMB.md §3.4 records it as a pre-existing
+/// dense defect and this arm does not reproduce it.
+fn mm_shape_refusal(a: &[usize], b: &[usize]) -> pyo3::PyErr {
+    pyo3::exceptions::PyRuntimeError::new_err(format!(
+        "mat1 and mat2 shapes cannot be multiplied ({}x{} and {}x{})",
+        a[a.len() - 2],
+        a[a.len() - 1],
+        b[b.len() - 2],
+        b[b.len() - 1]
+    ))
+}
+
+/// The `(values, indices)` pair the four multi-output reductions return, as
+/// two meta tensors inside the same namedtuple the dense path builds.
+///
+/// **The `int64` is here and only here.** Writing it once is the mechanical
+/// half of the INDEX-DTYPE RULE stated at the block's head in
+/// `meta_dispatch`: four call sites cannot drift to four different index
+/// dtypes if none of them names one.
+///
+/// `promote` is applied to each half rather than left to the dispatcher's
+/// single exit, for the reason `finish_ordered` gives on the dense side: the
+/// pair leaves inside a namedtuple, and `promote` does not look into one.
+fn meta_values_indices(
+    py: Python<'_>,
+    result_type: &'static Py<PyAny>,
+    shape: Vec<usize>,
+    values_tag: TorchDType,
+) -> PyResult<Py<PyAny>> {
+    let pair = (
+        crate::tensor::promote(py, meta_result(py, shape.clone(), values_tag)?)?,
+        crate::tensor::promote(py, meta_result(py, shape, TorchDType::Int64)?)?,
+    );
+    Ok(result_type.bind(py).call1(pair)?.unbind())
 }
 
 /// A finished meta tensor: shape and dtype, no allocation.
