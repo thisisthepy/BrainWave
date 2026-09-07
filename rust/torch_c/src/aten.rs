@@ -2173,6 +2173,57 @@ fn meta_dispatch(
             let input = tensor_arg(op, args, kwargs, 0, "self")?;
             meta_result(py, input.dims().to_vec(), unary_float_tag(input.tag()))
         }
+        // `aten::sum.default(Tensor self, *, ScalarType? dtype=None)` -- a
+        // full reduction, so the output is **rank 0 whatever the input's rank
+        // was**. That is the whole shape inference; there is no `dim` and no
+        // `keepdim` on this overload (`sum.dim_IntList` is the one that has
+        // them, and it is not here because nothing has asked for it).
+        //
+        // Reached by voicestudio's BigVGAN (docs/VOICE4.md §4): every
+        // anti-aliased activation normalises its resampling filter with
+        // `taps / taps.sum()` in `__init__`, and `from_pretrained` runs
+        // `__init__` under `init_empty_weights` -- so the 218 filters are
+        // built on **meta** tensors and the sum has to answer without
+        // computing. The dense `aten.sum.default` had been implemented for a
+        // long time; only the meta half was missing, which is the finding
+        // VOICE4.md §4 records: an op can be present in
+        // `_aten_implemented()` and still be a wall.
+        //
+        // The dtype is `sum_natural_tag`'s, i.e. the dense kernel's own rule,
+        // with the explicit `dtype=` winning over it exactly as `sum_or_mean`
+        // has it.
+        "aten.sum.default" => {
+            let input = tensor_arg(op, args, kwargs, 0, "self")?;
+            let natural = sum_natural_tag(input.tag());
+            let tag = dtype_arg(args, kwargs, 1, "dtype")?.unwrap_or(natural);
+            meta_result(py, Vec::new(), tag)
+        }
+        // `aten::view.default(Tensor(a) self, SymInt[] size)` -- the next link
+        // in BigVGAN's `(taps / taps.sum()).view(1, 1, kernel_size)`, and pure
+        // metadata even on a dense tensor: a view never moves an element.
+        //
+        // `resolve_shape` is the dense path's own helper and is already
+        // storage-free, so this is the same `-1` rule and the same refusal
+        // wording rather than a second copy of them. What this arm has to add
+        // is the check candle would otherwise have made on the dense side:
+        // with no `-1` present, `resolve_shape` cannot notice that the
+        // requested shape holds a different number of elements, because it
+        // only consults `numel` when it has a wildcard to fill. On a meta
+        // tensor there is no candle call afterwards to catch it, so a
+        // mismatched `view` would silently answer the wrong shape.
+        "aten.view.default" => {
+            let input = tensor_arg(op, args, kwargs, 0, "self")?;
+            let numel: usize = input.dims().iter().product();
+            let requested = shape_arg(op, args, kwargs, 1, "size")?;
+            let dims = resolve_shape(op, &requested, numel)?;
+            let got: usize = dims.iter().product();
+            if got != numel {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "shape '{requested:?}' is invalid for input of size {numel}"
+                )));
+            }
+            meta_result(py, dims, input.tag())
+        }
         other => Err(not_implemented(format!(
             "torch._C shim has no meta kernel for {other}. A meta tensor holds shape and \
              dtype and no storage, so this op would have to infer its output shape without \
@@ -9572,6 +9623,24 @@ fn reduce_dims_named(
 /// input to `int64` (`bool_t.sum() -> int64`, `int32_t.sum() -> int64`) while
 /// a floating input keeps its dtype, and `mean` refuses a non-floating input
 /// outright rather than promoting it.
+/// The dtype `aten::sum` produces when no `dtype=` is supplied: a floating
+/// input keeps its own, and **everything else widens to `int64`** -- including
+/// `bool`, which is why `zeros(3).bool().sum()` is an `int64` 0 and not a
+/// `bool`.
+///
+/// Factored out so the meta kernel can *call* it rather than restate it. That
+/// is not tidiness: a meta kernel advertises the dtype the dense kernel would
+/// have produced, and the only way to guarantee that is for one of them to ask
+/// the other. `arith_tag` is shared between the two paths for the same reason
+/// and says so at its own call site.
+fn sum_natural_tag(tag: TorchDType) -> TorchDType {
+    if tag.is_floating_point() {
+        tag
+    } else {
+        TorchDType::Int64
+    }
+}
+
 fn sum_or_mean(
     py: Python<'_>,
     args: &Bound<'_, PyTuple>,
@@ -9595,13 +9664,7 @@ fn sum_or_mean(
     };
 
     let natural = match kind {
-        Reduce::Sum => {
-            if input.tag().is_floating_point() {
-                input.tag()
-            } else {
-                TorchDType::Int64
-            }
-        }
+        Reduce::Sum => sum_natural_tag(input.tag()),
         Reduce::Mean => {
             if !input.tag().is_floating_point() {
                 return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(

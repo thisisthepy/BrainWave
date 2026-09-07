@@ -479,12 +479,21 @@ neg(int64_meta)                  torch.int64       단항이라고 다 승격하
 
 **작은 목록이 아닙니다. 숫자를 적습니다.** 커널이 있는 op 148 개 중 meta 에서 닿는 것은
 **66 개**(이 표 + 자기 dense 커널 안에서 `is_meta()` 로 갈라지는 팩토리 10 개)이고,
-**82 개가 여전히 닿지 않습니다.** 갈래별로:
+**80 개가 여전히 닿지 않습니다.** 갈래별로:
+
+> **2026-09 정정.** 이 표의 앞판은 82 개였고 축소에 `sum`, 뷰·모양에 `view` 가 들어 있었습니다.
+> docs/VOICE4.md §4 가 그 둘의 `.default` 오버로드에 meta 커널을 넣었습니다 — voicestudio 의
+> BigVGAN 이 `__init__` 에서 218 개의 리샘플링 필터를 `(taps / taps.sum()).view(1, 1, k)` 로
+> 정규화하고, `from_pretrained` 가 그 `__init__` 을 meta 에서 돌리기 때문입니다.
+>
+> **계열이 닫힌 것이 아니라 각 계열의 한 멤버가 닫힌 것입니다.** `sum.dim_IntList` 와
+> `mean.dim` 은 그대로 남아 있고, `reshape` 도 남아 있습니다 — `reshape` 는 *복사할 수*
+> 있으므로 `view` 의 규칙으로 답하면 상류가 복사를 돌려줄 자리에서 뷰를 약속하게 됩니다.
 
 | 갈래 | 수 | 예 |
 |---|---:|---|
-| 축소 | 22 | `sum` · `mean` · `amax` · `max.dim` · `argmax` · `any` · `cumsum` · `topk` · `sort` |
-| 뷰·모양 | 13 | `view` · `reshape` · `t` · `permute` · `transpose` · `slice` · `squeeze` · `unsqueeze` |
+| 축소 | 21 | `sum.dim_IntList` · `mean` · `amax` · `max.dim` · `argmax` · `any` · `cumsum` · `topk` · `sort` |
+| 뷰·모양 | 12 | `reshape` · `t` · `permute` · `transpose` · `slice` · `squeeze` · `unsqueeze` |
 | 제자리 | 12 | `add_` · `mul_` · `sub_` · `div_` · `exp_` · `neg_` · `relu_` · `clamp_` |
 | 축약 | 8 | `mm` · `bmm` · `matmul` · `addmm` · `baddbmm` · `_grouped_mm` · `convolution` · `embedding` |
 | 인덱싱 | 7 | `index.Tensor` · `gather` · `masked_fill` · `index_put_` · `isin` |

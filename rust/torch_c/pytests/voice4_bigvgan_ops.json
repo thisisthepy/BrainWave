@@ -1,0 +1,54 @@
+{
+  "_how": "rust/torch_c/pytests/voice4_capture.py -- rerun it to regenerate this file.",
+  "_what": "Every aten op voicestudio 5.16.0's BigVGANModel dispatches, captured on upstream torch 2.13.0 under TorchDispatchMode, on the real NVIDIA checkpoint nvidia/bigvgan_v2_24khz_100band_256x (112,414,512 params).",
+  "audio_absmax_f32": 0.4726355969905853,
+  "audio_absmax_f64": 0.47263580853581794,
+  "audio_shape": [
+    1,
+    23808
+  ],
+  "checkpoint": "nvidia/bigvgan_v2_24khz_100band_256x",
+  "construction_ops": {
+    "aten.add.Tensor": 218,
+    "aten.arange.start": 218,
+    "aten.copy_.default": 109,
+    "aten.detach.default": 109,
+    "aten.div.Tensor": 218,
+    "aten.empty.memory_format": 449,
+    "aten.kaiser_window.beta": 218,
+    "aten.lift_fresh.default": 1,
+    "aten.mul.Tensor": 654,
+    "aten.normal_.default": 116,
+    "aten.sinc.default": 218,
+    "aten.sum.default": 218,
+    "aten.uniform_.default": 231,
+    "aten.view.default": 218,
+    "aten.zero_.default": 333
+  },
+  "forward_ops": {
+    "aten.add.Tensor": 290,
+    "aten.clamp.default": 1,
+    "aten.convolution.default": 334,
+    "aten.div.Tensor": 6,
+    "aten.exp.default": 218,
+    "aten.expand.default": 109,
+    "aten.mul.Tensor": 436,
+    "aten.pow.Tensor_Scalar": 109,
+    "aten.reciprocal.default": 109,
+    "aten.replication_pad1d.default": 218,
+    "aten.sin.default": 109,
+    "aten.slice.Tensor": 109,
+    "aten.squeeze.dim": 1,
+    "aten.view.default": 218
+  },
+  "input": "1.0 s of real speech (Narsil/asr_dummy mlk.flac) at 24 kHz mono, mel via the model's own mel_spectrogram(): n_fft 1024, hop 256, win 1024, 100 bands",
+  "mel_shape": [
+    1,
+    100,
+    93
+  ],
+  "model": "voicestudio.models.bigvgan.BigVGANModel",
+  "num_parameters": 112414512,
+  "upstream_f32_vs_f64_rel": 6.778489736706869e-05,
+  "upstream_torch": "2.13.0"
+}
