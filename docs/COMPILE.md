@@ -46,7 +46,7 @@ by itself. The question is what `torch.compile` needs *from us*.
 
 ### 1.1 What it needs from us, measured
 
-`spike/compile_depth.py` calls `torch.compile(f, backend="eager")(x)`, and on
+`tools/spike/compile_depth.py` calls `torch.compile(f, backend="eager")(x)`, and on
 each failure patches only the object named in the failing line and goes again.
 The chain, on today's tree:
 
@@ -169,7 +169,7 @@ different path from Dynamo, FakeTensor-based, does not use the eval-frame
 hook): how far does it get in this shim?" Measured now, and it is the most
 useful result in this document.
 
-`spike/export_depth3.py` runs `torch.export.export(M(), (x,))`, no-opping one
+`tools/spike/export_depth3.py` runs `torch.export.export(M(), (x,))`, no-opping one
 missing symbol at a time and recording each. **19 rounds, and the eval-frame
 hook never appears:**
 
@@ -338,7 +338,7 @@ returns cleanly. It does not raise. Dynamo proceeds, finds no hook installed,
 and the wrapped function runs in Python.
 
 Today the user is protected from that by pure accident — the unrelated
-`pt2_archive_constants` `AttributeError` from §2 fires first. `spike/silent_eager.py`
+`pt2_archive_constants` `AttributeError` from §2 fires first. `tools/spike/silent_eager.py`
 removes the accident, filling that data module and the four dispatcher blockers
 from §1.1, and asks the only question that matters:
 
@@ -498,14 +498,14 @@ export TORCH_C_ARTEFACT=$CARGO_TARGET_DIR/release/lib_C.dylib
 PY=/Volumes/macMini/caches/spike-venv/bin/python
 export PYTHONPATH=$PWD/torchnative/src/main TORCH_USE_RTLD_GLOBAL=1
 
-$PY spike/compile_depth.py eager   # §1.1  the 5-step chain
-$PY spike/export_depth.py          # §3    three front doors compared
-$PY spike/export_depth2.py         # §3,§5.2  export past the data gap; jit.trace
-$PY spike/export_depth3.py         # §3    the 18-symbol census
-$PY spike/silent_eager.py          # §5    SILENT EAGER FALLBACK
+$PY tools/spike/compile_depth.py eager   # §1.1  the 5-step chain
+$PY tools/spike/export_depth.py          # §3    three front doors compared
+$PY tools/spike/export_depth2.py         # §3,§5.2  export past the data gap; jit.trace
+$PY tools/spike/export_depth3.py         # §3    the 18-symbol census
+$PY tools/spike/silent_eager.py          # §5    SILENT EAGER FALLBACK
 ```
 
-The `spike/` scripts are **not part of the crate** and nothing that ships
+The `tools/spike/` scripts are **not part of the crate** and nothing that ships
 imports them; each says so in its docstring. They monkey-patch `torch._C` at
 runtime and write nothing.
 

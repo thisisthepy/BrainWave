@@ -9,7 +9,7 @@ placeholder that could possibly satisfy it, and go again.  When the loop stops
 finding cheap patches, the blocker it stopped on is the real wall.
 
 Run:
-  PYTHONPATH=<repo>/torchnative/src/main TORCH_USE_RTLD_GLOBAL=1 python spike/compile_depth.py
+  PYTHONPATH=<repo>/torchnative/src/main TORCH_USE_RTLD_GLOBAL=1 python tools/spike/compile_depth.py
 """
 import re
 import sys
