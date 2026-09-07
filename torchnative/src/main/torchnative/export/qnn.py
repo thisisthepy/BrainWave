@@ -740,7 +740,7 @@ def _build_classes():
         return _CLASSES
     npu = _import("torchnative.export.npu")
 
-    class ExecuTorchModule(_Loader, npu.DelegateModule):
+    class ExecuTorchModule(_Loader, npu._DelegateModule):
         """Any ExecuTorch `.pte`, behind an `nn.Module`.
 
         **Not a QNN claim.** This will happily run an XNNPACK-delegated or a
@@ -752,7 +752,7 @@ def _build_classes():
         backend_name = "ExecuTorch"
 
         def __init__(self, artefact_path, method_name="forward"):
-            npu.DelegateModule.__init__(self)
+            npu._DelegateModule.__init__(self)
             self.artefact_path = artefact_path
             self.method_name = method_name
             self._method = None

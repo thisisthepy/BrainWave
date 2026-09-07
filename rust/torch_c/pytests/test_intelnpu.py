@@ -43,6 +43,7 @@ _ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."
 _VENDOR_DIR = os.path.join(_ROOT, "torchnative", "src", "main")
 sys.path.insert(0, _VENDOR_DIR)
 
+import torchnative.export.intelnpu as intelnpu  # noqa: E402
 from torchnative.export.intelnpu import (  # noqa: E402
     EXECUTION_DEVICES,
     MAX_DIM,
@@ -51,15 +52,13 @@ from torchnative.export.intelnpu import (  # noqa: E402
     IntelNPUExecutionError,
     IntelNPUUnavailable,
     IntelNPUUnsupported,
-    compile_module,
-    dynamo_backend,
+    IntelNPUWithdrawn,
     judge,
     library_candidates,
     linear_ir,
     minimal_ir,
     pack_f16,
     parse_execution_devices,
-    quantize_,
     supported_ops,
     unpack_f16,
     verdict_execution_devices,
@@ -412,7 +411,9 @@ def _assert_refuses(fn, *needles):
 def test_compile_module_refuses_by_name_and_distinguishes_itself_from_compile_model():
     """Two doors, different coverage. Redirecting one to the other would misreport."""
     text = _assert_refuses(
-        compile_module, "compile_module", "docs/devices/INTELNPU.md", "docs/graph/NPU2.md"
+        lambda: intelnpu.compile_module,
+        "compile_module",
+        "docs/graph/NPU2.md",
     )
     assert "compile_model" in text, text
     assert "captured-graph" in text, text
@@ -421,7 +422,7 @@ def test_compile_module_refuses_by_name_and_distinguishes_itself_from_compile_mo
 
 def test_quantize_refuses_and_points_at_torchnative_quant():
     _assert_refuses(
-        quantize_,
+        lambda: intelnpu.quantize_,
         "neural-compressor",
         "torchnative.quant.quantize_",
         "docs/graph/QUANT2.md",
@@ -431,7 +432,9 @@ def test_quantize_refuses_and_points_at_torchnative_quant():
 
 def test_dynamo_backend_refuses_permanently():
     """Must not weaken: torch.compile is a permanent refusal, docs/graph/COMPILE.md."""
-    text = _assert_refuses(dynamo_backend, "PEP 523", "abi3", "docs/graph/COMPILE.md")
+    text = _assert_refuses(
+        lambda: intelnpu.dynamo_backend, "PEP 523", "abi3", "docs/graph/COMPILE.md"
+    )
     assert "will not" in text, text
     print("ok   intelnpu: torch.compile backend refused permanently, naming PEP 523")
 
@@ -474,7 +477,7 @@ model = torch.nn.Sequential(
 )
 x = torch.randn(4, 8)
 eager = model(x)
-model, report = I.compile_model(model, device="CPU", library=path)
+model, report = I._compile_model(model, device="CPU", library=path)
 lowered = model(x)
 out["report"] = report
 out["max_abs_diff"] = float((lowered - eager).abs().max())
@@ -493,7 +496,7 @@ sx = torch.randn(2, 6)
 square_eager = square_layer(sx)
 # What the flipped-transpose fault would produce: x @ W rather than x @ W.T.
 square_wrong = sx @ weight + bias
-square, _ = I.compile_model(
+square, _ = I._compile_model(
     torch.nn.Sequential(square_layer), device="CPU", library=path
 )
 square_out = square(sx)
@@ -634,7 +637,7 @@ def test_compile_model_lowers_a_real_nn_linear_tree_and_the_numbers_agree():
     assert report["left_on_cpu"] == {"ReLU": 1}, report
     assert report["fully_offloaded"] is False, report
     assert report["execution_devices"] == ["CPU"], report
-    assert payload["leaf_type"] == "NPULinear", payload["leaf_type"]
+    assert payload["leaf_type"] == "_NPULinear", payload["leaf_type"]
     assert payload["is_nn_module"] is True, payload
     assert payload["max_abs_diff"] <= 1e-2, payload["max_abs_diff"]
     assert payload["control_diff"] > payload["max_abs_diff"] * 100, payload
@@ -765,6 +768,108 @@ def test_probe_on_real_hardware():
         f"control reports {report['execution_devices_control']}, and the Linear it ran "
         f"agrees to {report['agreement']:g} with a control of {report['control_diff']:g}"
     )
+
+
+# --------------------------------------------------------- the withdrawal
+
+#: Every name `intelnpu` used to export as "call this to run your model".
+#: Listed here rather than read off `intelnpu._WITHDRAWN`, deliberately: a test
+#: that asks the module which names it withdrew cannot fail when a name is
+#: quietly put back. This list is the independent statement of the claim
+#: (CLAUDE.md §5.5).
+WITHDRAWN_INTELNPU = (
+    "compile_model",
+    "NPULinear",
+    "compile_module",
+    "quantize_",
+    "dynamo_backend",
+)
+
+
+def test_every_withdrawn_intelnpu_name_refuses_by_name_and_names_the_replacement():
+    """Withdrawn is not deleted: reaching for one says so, and says what instead.
+
+    A silent `AttributeError` teaches nothing. Each of these has to name itself,
+    say it was withdrawn, name `AutoModelForCausalLM` as the replacement, say
+    plainly that the replacement does not exist yet, and -- for this Intel path
+    -- name `optimum-intel`, which ships today what this module was reaching for.
+    """
+    for name in WITHDRAWN_INTELNPU:
+        try:
+            getattr(intelnpu, name)
+        except IntelNPUWithdrawn as exc:
+            text = str(exc)
+        else:
+            raise AssertionError(f"intelnpu.{name} did not refuse")
+        assert text.startswith(f"torchnative intelnpu: {name} was withdrawn"), text
+        assert "AutoModelForCausalLM" in text, (name, text)
+        assert "not implemented yet" in text, (name, text)
+        assert "optimum-intel" in text or "optimum.intel" in text, (name, text)
+        assert "OVModelForCausalLM" in text, (name, text)
+    print(
+        f"ok   intelnpu: {len(WITHDRAWN_INTELNPU)} withdrawn names refuse by name, "
+        f"naming AutoModelForCausalLM (unimplemented) and optimum-intel"
+    )
+
+
+def test_the_withdrawal_does_not_promise_a_working_npu_device_string():
+    """`.to("npu")` appears in the message as a shape, never as a working call.
+
+    `torch.device("npu")` raises on this shim -- `_rename_privateuse1_backend`
+    is a stub -- so a refusal that showed the snippet without saying so would
+    send the reader at a second wall with no name on it.
+    """
+    text = str(intelnpu._withdrawal_message("compile_model"))
+    assert 'model.to("npu")' in text, text
+    assert "torch.device" in text and "raises" in text, text
+    assert "_rename_privateuse1_backend" in text, text
+    print("ok   intelnpu: the withdrawal names the second wall (no `npu` device) too")
+
+
+def test_the_kept_machinery_is_still_exported():
+    """The verdict logic, the emitters and the probe are kept -- they are evidence.
+
+    This is the other half of the withdrawal and the half that can rot: it would
+    be easy to take the whole file out with the API. These names are how this
+    project tells "it ran on the NPU" from "the answer happened to be right".
+    """
+    kept = (
+        "assert_execution_device",
+        "verdict_execution_devices",
+        "parse_execution_devices",
+        "EXECUTION_DEVICES",
+        "probe",
+        "available_devices",
+        "npu_available",
+        "library_candidates",
+        "load_openvino_c",
+        "OpenVINO",
+        "minimal_ir",
+        "linear_ir",
+        "pack_f16",
+        "unpack_f16",
+        "supported_ops",
+    )
+    for name in kept:
+        assert name in intelnpu.__all__, f"{name} fell out of __all__"
+        assert getattr(intelnpu, name) is not None, name
+    for name in WITHDRAWN_INTELNPU:
+        assert name not in intelnpu.__all__, f"{name} is still exported"
+    print(f"ok   intelnpu: {len(kept)} verification names kept, {len(WITHDRAWN_INTELNPU)} withdrawn")
+
+
+def test_an_unknown_name_is_still_a_plain_attribute_error():
+    """The withdrawal `__getattr__` must not swallow ordinary typos."""
+    try:
+        intelnpu.no_such_name_at_all
+    except IntelNPUWithdrawn as exc:  # noqa: BLE001
+        raise AssertionError(f"a typo was reported as a withdrawal: {exc}")
+    except AttributeError:
+        pass
+    else:
+        raise AssertionError("a missing attribute did not raise")
+    print("ok   intelnpu: an unknown name is an AttributeError, not a withdrawal")
+
 
 
 if __name__ == "__main__":

@@ -1,36 +1,60 @@
-"""The front end: a real `transformers` model with submodules swapped for a delegate.
+"""Internal submodule-swapping plumbing. **Its user-facing API was withdrawn.**
 
 This module is deliberately small and deliberately says nothing about any
-vendor. It holds the one shape docs/devices/QNN.md §2 and docs/devices/INTELNPU.md both need:
+vendor. It holds the mechanism docs/devices/QNN.md §2 and
+docs/devices/INTELNPU.md both need:
 
     front (FIXED)      real transformers, from_pretrained, generate
     back  (SWAPPABLE)  Apple -> CoreML ; Android -> ExecuTorch/QNN ; Windows -> Intel
 
-The load-bearing decision is that `from_pretrained` **returns the real
-`transformers` model object**, with some of its submodules replaced in place.
-It does not return a wrapper. That is not a convenience: `generate()` is
-`GenerationMixin.generate`, several thousand lines that read `self.config`,
-`self.device`, `self.can_generate()`, the cache classes and
-`_prepare_generation_config`. Anything that wraps the model has to forward all
-of that, and every forward is a place the wrapper can be wrong. Returning the
-model means there is nothing to forward and nothing to keep in sync.
+**What was withdrawn, and why.** `NpuModelForCausalLM`, `delegate_`,
+`delegated_paths`, `DelegateModule`, `replace_submodule` and `resolve_submodule`
+were exported as the way to run a model. Three separate faults:
 
-`docs/graph/QUANT2.md` §3 already framed torchnative's own `quantize_` this way, and
-gave the precedent from the other side -- the archived
-`intel_npu_acceleration_library.compile(model, dtype=torch.int8)` replaces
-leaves and hands the model back too. The user never holds the compiled graph.
+* **Naming.** `NpuModelForCausalLM` copied the archived
+  `intel_npu_acceleration_library`. The ecosystem convention names the *project*
+  -- `OVModelForCausalLM` (optimum-intel), `ORTModelForCausalLM`,
+  `IPEXModelForCausalLM` -- with no `Auto` prefix. "NPU" names neither this
+  project nor a single vendor.
+* **Shape.** `delegate_(model, plan)` was a second in-place module-replacement
+  entry point beside `torchnative.quant.quantize_(model, format=...)`, which
+  already had torchao's spelling for the same move. One codebase, two shapes,
+  one operation.
+* **`.to(device)`.** Because `from_pretrained` here returned a real
+  `nn.Module`, there was nothing for `.to("npu")` to mean: `nn.Module.to()`
+  moves parameters, PyTorch has no `npu` device on this shim
+  (`torch.device("npu")` raises -- `torch._C._rename_privateuse1_backend` is a
+  stub), and a graph-compiling accelerator cannot dispatch eager ops one at a
+  time. optimum can honour `model.to("npu")` only because `OVModel` is a
+  *wrapper* owning a compiled graph and `.to()` recompiles. There was no
+  wrapper here.
 
-What a back end has to supply is a `DelegateModule` subclass. That is the whole
-interface between this file and a vendor:
+The replacement is `torchnative.transformers.AutoModelForCausalLM`, taking
+optimum's shape exactly, and it is **not implemented yet**. Nothing in this file
+should be read as saying it exists.
 
-    class MyDelegate(DelegateModule):
+**What survives, and why.** The plumbing itself is sound and
+`torchnative.export.qnn` builds on it, so it is kept private:
+`_DelegateModule`, `_delegate_`, `_delegated_paths`, `_replace_submodule`,
+`_resolve_submodule`. Every refusal they carry is unchanged. The reasoning that
+made returning a real `transformers` model attractive is also unchanged and is
+recorded here rather than deleted: `generate()` is `GenerationMixin.generate`,
+several thousand lines reading `self.config`, `self.device`,
+`self.can_generate()`, the cache classes and `_prepare_generation_config`, and
+anything that wraps the model has to forward all of it. That is a real cost of
+the wrapper shape, and the wrapper shape was chosen anyway, because it is the
+only shape in which `.to(device)` is honest.
+
+A back end supplies a `_DelegateModule` subclass. That is the whole interface
+between this file and a vendor:
+
+    class MyDelegate(_DelegateModule):
         backend_name = "MyBackend"
         def forward(self, *args, **kwargs): ...
 
-`delegate_` does the swapping and `refuse` is how a subclass says no. Neither
+`_delegate_` does the swapping and `refuse` is how a subclass says no. Neither
 knows what a `.pte`, an `.mlpackage` or an OpenVINO blob is.
 """
-
 from __future__ import annotations
 
 import torch.nn as nn
@@ -38,13 +62,44 @@ import torch.nn as nn
 
 __all__ = [
     "DelegateRefused",
-    "DelegateModule",
-    "resolve_submodule",
-    "replace_submodule",
-    "delegate_",
-    "delegated_paths",
-    "NpuModelForCausalLM",
+    "DelegateWithdrawn",
 ]
+
+#: Every user-facing name this module used to export, and the one-line reason
+#: each was withdrawn. `__getattr__` below turns each of them into a refusal
+#: that names itself, so that reaching for one fails loudly at *access* rather
+#: than at call: `npu.NpuModelForCausalLM.from_pretrained(...)` has to refuse on
+#: the attribute, since there is no class left to hold the method.
+_WITHDRAWN = {
+    "NpuModelForCausalLM": (
+        "its name copies the archived intel_npu_acceleration_library's "
+        "`NPUModelForCausalLM`, and `NPU` names neither this project nor a "
+        "single vendor. The HuggingFace convention for a backend is "
+        "`<Project>ModelForCausalLM` -- `OVModelForCausalLM` (optimum-intel), "
+        "`ORTModelForCausalLM`, `IPEXModelForCausalLM` -- with no `Auto` prefix"
+    ),
+    "delegate_": (
+        "it was a second in-place module-replacement entry point beside "
+        "`torchnative.quant.quantize_`, with a different shape, doing the same "
+        "kind of thing (replacing leaves) in the same codebase"
+    ),
+    "delegated_paths": (
+        "it only has a meaning for callers of `delegate_`, which is withdrawn"
+    ),
+    "DelegateModule": (
+        "it is the extension point of the withdrawn `delegate_` front end. The "
+        "class itself survives privately as `_DelegateModule`, because "
+        "`torchnative.export.qnn` still builds on it internally"
+    ),
+    "replace_submodule": (
+        "it is plumbing for the withdrawn `delegate_`, not something a user "
+        "was ever meant to call"
+    ),
+    "resolve_submodule": (
+        "it is plumbing for the withdrawn `delegate_`, not something a user "
+        "was ever meant to call"
+    ),
+}
 
 
 class DelegateRefused(RuntimeError):
@@ -58,7 +113,16 @@ class DelegateRefused(RuntimeError):
     """
 
 
-class DelegateModule(nn.Module):
+class DelegateWithdrawn(DelegateRefused):
+    """A user-facing name that this module used to export and no longer does.
+
+    A subclass of `DelegateRefused` on purpose: everything that already caught
+    a refusal from this layer keeps catching it, and the withdrawal reads as
+    what it is -- a refusal that names itself and its reason, per CLAUDE.md §6.
+    """
+
+
+class _DelegateModule(nn.Module):
     """An `nn.Module` whose forward is somebody else's compiled artefact.
 
     Subclasses set `backend_name` and implement `forward`. `refuse` is provided
@@ -90,7 +154,7 @@ class DelegateModule(nn.Module):
 
     def forward(self, *args, **kwargs):
         self.refuse(
-            f"{type(self).__name__} has no forward. A DelegateModule subclass "
+            f"{type(self).__name__} has no forward. A _DelegateModule subclass "
             "must implement one; inheriting this method means the artefact was "
             "never wired to anything."
         )
@@ -99,7 +163,7 @@ class DelegateModule(nn.Module):
         return f"backend={self.backend_name}"
 
 
-def resolve_submodule(model, path):
+def _resolve_submodule(model, path):
     """The submodule at a dotted `path`, or a refusal naming what was found.
 
     `model.get_submodule` exists upstream and does nearly this, but its
@@ -140,7 +204,7 @@ def resolve_submodule(model, path):
     return obj
 
 
-def replace_submodule(model, path, new):
+def _replace_submodule(model, path, new):
     """Put `new` at `path` and return what was there. In place; returns the old.
 
     The old module is returned rather than dropped because a caller that wants
@@ -154,9 +218,9 @@ def replace_submodule(model, path, new):
             "them (state_dict, .to(), .eval()) assumes nn.Module."
         )
     parts = [p for p in path.split(".") if p]
-    parent = resolve_submodule(model, ".".join(parts[:-1])) if len(parts) > 1 else model
+    parent = _resolve_submodule(model, ".".join(parts[:-1])) if len(parts) > 1 else model
     leaf = parts[-1]
-    old = resolve_submodule(model, path)
+    old = _resolve_submodule(model, path)
     if leaf.isdigit() and isinstance(parent, (nn.Sequential, nn.ModuleList)):
         parent[int(leaf)] = new
     else:
@@ -164,10 +228,10 @@ def replace_submodule(model, path, new):
     return old
 
 
-def delegate_(model, plan):
+def _delegate_(model, plan):
     """Replace each submodule named in `plan` with its delegate. Returns `model`.
 
-    `plan` maps a dotted path to a `DelegateModule`. The trailing underscore is
+    `plan` maps a dotted path to a `_DelegateModule`. The trailing underscore is
     upstream's spelling for "in place" (`Tensor.add_`, `torchao.quantize_`) and
     it is accurate here: the same object comes back, so a caller who wrote
     `model = AutoModelForCausalLM.from_pretrained(...)` still holds a model
@@ -181,32 +245,32 @@ def delegate_(model, plan):
     """
     if not isinstance(plan, dict):
         raise DelegateRefused(
-            f"torchnative npu: plan must be a dict of path -> DelegateModule, "
+            f"torchnative npu: plan must be a dict of path -> _DelegateModule, "
             f"got {type(plan).__name__}."
         )
     if not plan:
         raise DelegateRefused(
             "torchnative npu: empty plan. Replacing nothing and reporting "
-            "success would make `delegate_` indistinguishable from a no-op, "
+            "success would make `_delegate_` indistinguishable from a no-op, "
             "which is exactly what a silent fallback looks like."
         )
     for path, new in plan.items():
-        if not isinstance(new, DelegateModule):
+        if not isinstance(new, _DelegateModule):
             raise DelegateRefused(
                 f"torchnative npu: {path!r} maps to a "
-                f"{type(new).__name__}, not a DelegateModule. Only a "
-                "DelegateModule can name a back end when it refuses, and that "
+                f"{type(new).__name__}, not a _DelegateModule. Only a "
+                "_DelegateModule can name a back end when it refuses, and that "
                 "naming is the entire contract of this layer."
             )
-        resolve_submodule(model, path)  # refuses by name before anything moves
+        _resolve_submodule(model, path)  # refuses by name before anything moves
 
     for path, new in plan.items():
-        replace_submodule(model, path, new)
+        _replace_submodule(model, path, new)
     return model
 
 
-def delegated_paths(model):
-    """Every path in `model` currently held by a `DelegateModule`, sorted.
+def _delegated_paths(model):
+    """Every path in `model` currently held by a `_DelegateModule`, sorted.
 
     This is the answer to "did the swap actually happen", read off the model
     rather than off the plan that was submitted. A plan is a request; this is
@@ -215,45 +279,60 @@ def delegated_paths(model):
     return sorted(
         name
         for name, mod in model.named_modules()
-        if isinstance(mod, DelegateModule)
+        if isinstance(mod, _DelegateModule)
     )
 
 
-class NpuModelForCausalLM:
-    """`from_pretrained` that hands back a real model with delegated submodules.
+# --------------------------------------------------------------------------
+# Withdrawn. See `_WITHDRAWN` above for the per-name reason.
+#
+# The three faults were: a name copied from an archived vendor library rather
+# than naming this project; a second module-replacement shape beside this
+# repository's own `torchnative.quant.quantize_`; and a `from_pretrained` that
+# returns a bare `nn.Module`, which leaves nothing for a `.to(device)` to mean
+# (`nn.Module.to` moves parameters, and a graph-compiling accelerator cannot
+# dispatch eager ops one at a time).
+#
+# The replacement is `torchnative.transformers.AutoModelForCausalLM`, and it is
+# **not implemented yet** -- this file must not be read as saying it exists.
+# --------------------------------------------------------------------------
 
-    The whole class is one static method and that is the point. The archived
-    `intel_npu_acceleration_library` exposed `NPUModelForCausalLM` with the
-    same shape, and docs/graph/QUANT2.md §3 records why this repository already
-    agreed with it: the model is a real `transformers` instance, the source is
-    not edited, the *instance* is.
+#: Named here rather than spelled out at each refusal, so the one place that
+#: has to change when it lands is this line.
+REPLACEMENT = "torchnative.transformers.AutoModelForCausalLM"
 
-    ::
 
-        model = NpuModelForCausalLM.from_pretrained(
-            "HuggingFaceTB/SmolLM2-135M",
-            plan={"model.layers.0.mlp": QnnModule("layer0_mlp.pte")},
-        )
-        model.generate(**tokenizer("hello", return_tensors="pt"))
+def _withdrawal_message(name):
+    """The refusal text for a withdrawn `name`: what went, why, and what instead."""
+    return (
+        f"torchnative npu: {name} was withdrawn and is not available. It was "
+        f"withdrawn because {_WITHDRAWN[name]}.\n"
+        f"The replacement is {REPLACEMENT}, taking optimum's shape:\n"
+        f"\n"
+        f"    from torchnative.transformers import AutoModelForCausalLM\n"
+        f"    model = AutoModelForCausalLM.from_pretrained(model_id, export=True, load_in_4bit=True)\n"
+        f"    model.to(\"npu\")\n"
+        f"\n"
+        f"**{REPLACEMENT} is not implemented yet**, and neither is the device "
+        f"string: `torch.device(\"npu\")` raises on this shim, because "
+        f"`torch._C._rename_privateuse1_backend` is a stub. The `.to(\"npu\")` "
+        f"above is the intended shape, not a working call, and when it does "
+        f"land it will be a method on the wrapper that recompiles a graph -- "
+        f"as `OVModel.to()` does -- not `nn.Module.to()` moving parameters. "
+        f"There is no substitute available in this repository today; saying so "
+        f"is the point of this refusal."
+    )
 
-    `model` there **is** a `LlamaForCausalLM`. `isinstance` says so, `.config`
-    is the checkpoint's, and `.generate` is `GenerationMixin.generate` with
-    nothing in front of it. Only `model.model.layers[0].mlp` is different.
 
-    `plan` may be a callable taking the freshly-built model and returning the
-    dict, for the common case where the caller wants to name every layer of a
-    stack it has not seen yet.
+def __getattr__(name):
+    """Refuse a withdrawn name by name, and leave every other miss alone.
 
-    This class deliberately does **not** know how to produce an artefact. That
-    is offline work on another host (docs/devices/QNN.md §2), and a `from_pretrained`
-    that quietly compiled something would be doing minutes of work behind a
-    call that reads like a download.
+    Refusing at *attribute access* rather than at call is deliberate: the
+    withdrawn `NpuModelForCausalLM` was reached as
+    `NpuModelForCausalLM.from_pretrained(...)`, so a callable stub would have
+    to grow a fake `from_pretrained` to be reached at all. There is no class
+    left; the attribute is where the truth is.
     """
-
-    @staticmethod
-    def from_pretrained(model_id, *, plan, **kwargs):
-        from transformers import AutoModelForCausalLM
-
-        model = AutoModelForCausalLM.from_pretrained(model_id, **kwargs)
-        resolved = plan(model) if callable(plan) else plan
-        return delegate_(model, resolved)
+    if name in _WITHDRAWN:
+        raise DelegateWithdrawn(_withdrawal_message(name))
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
