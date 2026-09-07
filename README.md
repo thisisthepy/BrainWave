@@ -221,9 +221,10 @@ loads on 3.13, 3.14 and later without a rebuild.
 <tr><th align="left">Working</th><th align="left"></th></tr>
 <tr><td>ATen operators</td><td><b>300</b>, each compared against upstream</td></tr>
 <!-- DOCWATCH: count golden_ops_covered ge 300 -->
-<tr><td>Golden comparison cases</td><td><b>11,385 / 11,385</b> — values, shapes, dtypes, positional <i>and</i> keyword, through the door <i>and</i> through the member</td></tr>
-<!-- DOCWATCH: count golden_cases_total ge 11385 -->
-<!-- DOCWATCH: count golden_cases_passed ge 11385 -->
+<tr><td>Golden comparison cases</td><td><b>11,420 / 11,420</b> — values, shapes, dtypes, positional <i>and</i> keyword, through the door <i>and</i> through the member. The <code>golden_cases_failed</code> marker below is the one that matters: for a while the only two markers here were <code>ge</code> floors on <i>passed</i> and on <i>total</i>, and a pair of floors cannot see <i>passed &lt; total</i>. One case failed for three commits with the gate green</td></tr>
+<!-- DOCWATCH: count golden_cases_total ge 11420 -->
+<!-- DOCWATCH: count golden_cases_passed ge 11420 -->
+<!-- DOCWATCH: count golden_cases_failed eq 0 -->
 <!-- DOCWATCH: count golden_pending eq 0 -->
 <tr><td>Smoke tests</td><td><b>929</b> across <b>30</b> files — <b>480</b> of them in <code>test_shim.py</code>, which is what the marker below counts, and the rest in the files split off it, one per round. The split exists because reconstructing a single conflict hunk in one large file had twice silently dropped tests</td></tr>
 <!-- DOCWATCH: count smoke_ok ge 480 -->

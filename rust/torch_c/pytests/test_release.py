@@ -137,14 +137,22 @@ def test_the_newer_checks_can_skip_on_an_older_published_wheel():
 def test_count_markers_use_ge_wherever_another_round_could_raise_them():
     """`eq` on a number that a later correct round can raise turns growth into
     a red suite. Three separate rounds in this repository have made that
-    mistake. The one legitimate `eq` is `golden_pending`: it is zero, and a
-    change in either direction is news rather than progress."""
+    mistake. The legitimate `eq`s are the two counts that are zero and must
+    stay zero -- `golden_pending` and `golden_cases_failed`. For those a
+    change in either direction is news rather than progress, and `ge` would
+    be worse than useless: `golden_cases_failed ge 0` holds for every number.
+
+    `golden_cases_failed` was added after the absence of it let a failing
+    golden case ride three commits with the gate green. The only two markers
+    were `ge` floors on *passed* and on *total*, and a pair of floors cannot
+    see `passed < total`."""
+    zero_and_must_stay_zero = {"golden_pending", "golden_cases_failed"}
     offenders = []
     for path in sorted(REPO.glob("docs/*.md")) + [README]:
         for i, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
             for m in re.finditer(r"DOCWATCH: count (\w+) (\w+) (\d+)", line):
                 name, op, _ = m.groups()
-                if op == "eq" and name != "golden_pending":
+                if op == "eq" and name not in zero_and_must_stay_zero:
                     offenders.append(f"{path.relative_to(REPO)}:{i} count {name} eq")
     assert not offenders, (
         "count markers pinned with `eq` on a number that can legitimately "

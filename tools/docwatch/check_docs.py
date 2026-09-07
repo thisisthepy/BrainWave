@@ -341,6 +341,7 @@ class LiveFacts:
 COUNT_SOURCES = {
     "smoke_ok": lambda lf: lf.smoke_ok(),
     "golden_cases_passed": lambda lf: lf.golden()["golden_cases_passed"],
+    "golden_cases_failed": lambda lf: lf.golden()["golden_cases_failed"],
     "golden_cases_total": lambda lf: lf.golden()["golden_cases_total"],
     "golden_ops_covered": lambda lf: lf.golden()["golden_ops_covered"],
     "golden_pending": lambda lf: lf.golden()["golden_pending"],

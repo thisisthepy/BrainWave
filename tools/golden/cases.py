@@ -1216,6 +1216,24 @@ def _dtype_shape_only_check(t_res, c_res) -> tuple[bool, str]:
     return True, f"dtype={t_dtype} shape={t_shape} (values unchecked -- uninitialized memory)"
 
 
+def _dtype_shape_stride_only_check(t_res, c_res) -> tuple[bool, str]:
+    """dtype + shape + STRIDE must agree; the values are uninitialized.
+
+    `empty_strided` differs from `empty` in exactly one way -- the caller
+    names the stride -- so a check that looked only at dtype and shape would
+    be blind to the only argument that distinguishes the op. It would pass a
+    kernel that ignored `stride` entirely.
+    """
+    ok, detail = _dtype_shape_only_check(t_res, c_res)
+    if not ok:
+        return ok, detail
+    t_stride = tuple(int(x) for x in t_res.stride())
+    c_stride = tuple(int(x) for x in c_res.stride())
+    if t_stride != c_stride:
+        return False, f"stride mismatch: torch={t_stride} c={c_stride}"
+    return True, f"{detail} stride={t_stride}"
+
+
 def _flatten_values(x) -> list:
     if isinstance(x, list):
         out: list = []
@@ -2121,6 +2139,57 @@ def empty_cases(torch_module, c_module, torch_call) -> list[Case]:
                 run_c=lambda c_dt=c_dt: c_module._aten_dispatch(op, [2, 3], dtype=c_dt),
                 value_check=_dtype_shape_only_check,
                 note="uninitialized memory -- only dtype/shape are meaningful, see module note above",
+            )
+        )
+
+    return cases
+
+
+# --- aten.empty_strided.default ------------------------------------------------
+#
+# Contiguous strides only. `docs/EXPORT4.md` records that this shim refuses a
+# non-contiguous `empty_strided` by name -- candle's Layout has no
+# representation for one on either the meta or the dense path -- so a golden
+# case for one would be a case for a refusal, which `test_export4.py` already
+# holds. What golden adds here is that the CONTIGUOUS answers agree, including
+# the stride, which is the argument that distinguishes this op from `empty`.
+
+_EMPTY_STRIDED_CASES: list[tuple[list[int], list[int], str]] = [
+    ([], [], "0-dim: no axes, so no strides"),
+    ([3], [1], "1-D contiguous"),
+    ([2, 3], [3, 1], "2-D contiguous -- the row stride is the inner extent"),
+    ([0, 3], [3, 1], "an empty leading axis still carries the inner stride"),
+    ([1, 4, 1], [4, 1, 1], "size-1 axes: the stride is not free, torch names it"),
+]
+
+
+def empty_strided_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.empty_strided.default"
+    cases: list[Case] = []
+
+    for shape, stride, why in _EMPTY_STRIDED_CASES:
+        cases.append(
+            Case(
+                name=f"empty_strided(size={shape}, stride={stride})",
+                op=op,
+                run_torch=lambda shape=shape, stride=stride: torch_call(shape, stride),
+                run_c=lambda shape=shape, stride=stride: c_module._aten_dispatch(op, shape, stride),
+                value_check=_dtype_shape_stride_only_check,
+                note=f"uninitialized memory -- dtype/shape/stride only. {why}",
+            )
+        )
+
+    for dtype_name in dt.DEFAULT_DTYPES:
+        c_dt = dt.c_dtype(c_module, dtype_name)
+        t_dt = dt.torch_dtype(torch_module, dtype_name)
+        cases.append(
+            Case(
+                name=f"empty_strided(size=[2, 3], stride=[3, 1], dtype={dtype_name})",
+                op=op,
+                run_torch=lambda t_dt=t_dt: torch_call([2, 3], [3, 1], dtype=t_dt),
+                run_c=lambda c_dt=c_dt: c_module._aten_dispatch(op, [2, 3], [3, 1], dtype=c_dt),
+                value_check=_dtype_shape_stride_only_check,
+                note="uninitialized memory -- dtype/shape/stride only",
             )
         )
 
@@ -30206,6 +30275,7 @@ CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
     "aten.cat.default": cat_cases,
     "aten.embedding.default": embedding_cases,
     "aten.empty.memory_format": empty_cases,
+    "aten.empty_strided.default": empty_strided_cases,
     "aten.is_floating_point.default": is_floating_point_cases,
     "aten.isin.Tensor_Tensor": isin_cases,
     "aten.ones.default": ones_cases,

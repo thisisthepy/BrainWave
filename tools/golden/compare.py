@@ -418,6 +418,8 @@ BLIND_BY_DESIGN: dict[tuple[str, str], str] = {
     # -- and `randint`/`randperm` now run on `_rng_stream_check`, which catches
     # all three. These are not entries that rotted; they are entries whose
     # blindness was removed.
+    ("_dtype_shape_stride_only_check", "value"): "aten.empty_strided returns uninitialized memory -- there is no correct value to diff. Unlike _dtype_shape_only_check this one is NOT blind to order: it compares the stride, which is the one argument that distinguishes empty_strided from empty",
+    ("_dtype_shape_stride_only_check", "value-last"): "same: uninitialized memory has no correct value",
     ("_topk_multiset_check", "permute-all"): "upstream's own order under ties / sorted=False is a partition artefact, not a promise -- pinning it would pin an implementation detail. Note this is `permute-all` (values and indices moved together); plain `permute` breaks the value/index pairing and IS caught",
 }
 
@@ -451,6 +453,19 @@ class _FakeResult:
 
     def tolist(self):
         return self._values
+
+    def stride(self):
+        """The fault injector's stand-in answers the tensor protocol it is
+        asked for. `_dtype_shape_stride_only_check` (empty / empty_strided)
+        asks for a stride, and a stand-in that raised `AttributeError` would
+        make the self-test fail for a reason unrelated to the injected fault.
+        Contiguous, derived from `shape`, so an injected SHAPE fault shows up
+        in the stride too rather than being masked by it."""
+        stride, acc = [], 1
+        for extent in reversed([int(x) for x in self.shape]):
+            stride.append(acc)
+            acc *= extent
+        return tuple(reversed(stride))
 
 
 def comparator_name(case: Case) -> str:
