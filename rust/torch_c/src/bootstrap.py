@@ -13612,41 +13612,156 @@ def _install_distributed_c10d(module, spec) -> None:
                     f"rootRank {root} is not in a world of size 1"
                 )
 
-        def _require_sum(self, opts, what):
+        #: The reductions this backend folds above `world_size` 1. The value is
+        #: the in-place `Tensor` method that folds one more contribution into
+        #: the accumulator, applied in **ascending rank order** -- see the
+        #: class docstring. `AVG` is `SUM` followed by one division, which is
+        #: why it is not in this table.
+        #: `SUM` and `PRODUCT` accumulate *in the tensor's own dtype*, so the
+        #: bracketing is observable and the class docstring's ascending-rank
+        #: order is the contract. `MIN`/`MAX` are not here: they are folded
+        #: elementwise in `_extremum` instead, because neither rounds -- see
+        #: `_reduce_fold`.
+        _FOLD_STEP = {"SUM": "add_", "PRODUCT": "mul_"}
+
+        #: The reductions folded above `world_size` 1, `AVG` included.
+        _REDUCTIONS = ("SUM", "PRODUCT", "MIN", "MAX", "AVG")
+
+        @classmethod
+        def _extremum(cls, a, b, pick):
+            """`pick` applied elementwise down two payloads of equal shape."""
+            if isinstance(a, list):
+                return [cls._extremum(x, y, pick) for x, y in zip(a, b)]
+            return pick(a, b)
+
+        def _reduce_kind(self, opts, what):
+            """The `_RedOpType` this collective will fold with, or a refusal.
+
+            `_check_reduce_op` has already turned away `PREMUL_SUM` and
+            `UNUSED`, which name no fold at any size. What is left is the
+            arithmetic four -- folded -- and the bitwise three, which are not.
+            """
             op = getattr(opts, "reduceOp", None)
             kind = getattr(op, "op", op)
-            if kind is not getattr(_RedOpType, "SUM", None):
-                refuse(
-                    f"ProcessGroupLocal.{what} with a non-SUM op at "
-                    f"world_size {self._size}",
-                    "Only SUM is implemented above world_size 1. AVG would be "
-                    "SUM over a divisor, which is the one number a federated "
-                    "aggregator must choose for itself",
-                )
+            if kind is None:
+                kind = _RedOpType.SUM
+            name = getattr(kind, "name", str(kind))
+            if name in self._REDUCTIONS:
+                return kind
+            refuse(
+                f"ProcessGroupLocal.{what} with ReduceOp.{name} at "
+                f"world_size {self._size}",
+                "the bitwise reductions are not implemented. SUM, PRODUCT, "
+                "MIN, MAX and AVG are (docs/COLLECT2.md); BAND, BOR and BXOR "
+                "are defined only on integral dtypes -- upstream gloo raises "
+                "`Cannot use ReduceOp.BAND with non-integral dtype` -- and the "
+                "float tables this layer's federated callers reduce are "
+                "exactly the ones upstream would refuse, so there was no "
+                "caller to build it for",
+            )
 
-        @staticmethod
-        def _sum_fold(template):
-            """Fold `payloads` into their sum, in the order they are given."""
+        @classmethod
+        def _reduce_fold(cls, template, kind=None):
+            """Fold `payloads` with `kind`, in the order they are given.
+
+            The order is the contract, not an implementation detail: float
+            addition is not associative and neither is float multiplication,
+            so `((x_0 op x_1) op x_2)` is a different number from any other
+            bracketing and the class docstring pins which one this is.
+
+            `AVG` divides by **the number of contributions folded**, which is
+            the world size when nobody is missing. Under `tolerate=True` that
+            is the survivor count rather than the world -- the same verdict the
+            hub reports in the envelope, so every survivor divides by the same
+            number. `docs/FEDERATED4.md` §6 is the argument for why that has to
+            be one process's decision.
+            """
+            name = getattr(kind, "name", "SUM") if kind is not None else "SUM"
+
+            if name in ("MIN", "MAX"):
+                # Folded on the JSON payloads rather than through a tensor, and
+                # this is exact rather than a shortcut: an extremum *selects* a
+                # contribution, it never combines two, so no rounding happens at
+                # any width and the float64 that `tolist` produced for a float32
+                # value converts back to that same float32 bit for bit. It is
+                # also the one place where the ascending-rank contract is
+                # vacuous -- min and max are associative and commutative, so
+                # every bracketing agrees. (`aten.minimum` is not implemented in
+                # this shim; `aten.maximum` is. Doing both here rather than one
+                # each way keeps the two symmetric.)
+                pick = min if name == "MIN" else max
+
+                def fold(payloads, ranks):
+                    acc = payloads[0]
+                    for payload in payloads[1:]:
+                        acc = cls._extremum(acc, payload, pick)
+                    return acc
+                return fold
+
+            step = cls._FOLD_STEP.get(name, "add_")
+
             def fold(payloads, ranks):
                 import torch
                 acc = torch.tensor(payloads[0], dtype=template.dtype,
                                    device=template.device)
                 for payload in payloads[1:]:
-                    acc.add_(torch.tensor(payload, dtype=template.dtype,
-                                          device=template.device))
+                    getattr(acc, step)(torch.tensor(
+                        payload, dtype=template.dtype, device=template.device))
+                if name == "AVG":
+                    acc = (acc / len(payloads)).to(template.dtype)
                 return acc.tolist()
             return fold
+
+        @classmethod
+        def _sum_fold(cls, template):
+            """`_reduce_fold` at `SUM`. Kept as its own name because
+            `allreduce_partial`'s callers in `torchnative.nn.federated` are
+            about summing deltas and nothing else."""
+            return cls._reduce_fold(template, None)
+
+        @staticmethod
+        def _pick_fold(root, what):
+            """Fold that keeps the root rank's contribution and drops the rest.
+
+            This is what `broadcast` and `scatter` are on a star: every rank
+            still sends, because the hub reads from everybody before it writes
+            to anybody and that is what makes the exchange deadlock-free at any
+            size (`_star_exchange`). The leaves' payloads are then thrown away.
+            It costs `size - 1` payloads of wire that a real backend would not
+            send; on loopback that is a copy, and the alternative is a second
+            exchange shape whose deadlock argument would have to be made
+            again from scratch.
+            """
+            def fold(payloads, ranks):
+                for rank, payload in zip(ranks, payloads):
+                    if rank == root:
+                        return payload
+                raise RuntimeError(
+                    "connection closed: rank %d is the root of this %s and did "
+                    "not arrive, so there is nothing to send" % (root, what))
+            return fold
+
+        def _check_root_n(self, opts, what):
+            """`rootRank`, validated against *this* world rather than against 1."""
+            root = getattr(opts, "rootRank", 0)
+            if isinstance(root, bool) or not isinstance(root, int) \
+                    or not 0 <= root < self._size:
+                raise ValueError(
+                    f"torch._C._distributed_c10d.ProcessGroupLocal.{what}: "
+                    f"rootRank {root!r} is not in a world of size {self._size}"
+                )
+            return root
 
         def _allreduce(self, tensors, opts, tolerate):
             self._check_reduce_op(opts, "allreduce")
             if self._size == 1:
                 return Work(tensors), ()
-            self._require_sum(opts, "allreduce")
+            kind = self._reduce_kind(opts, "allreduce")
             import torch
             missing = ()
             for t in tensors:
                 result, gone = self._star_exchange(
-                    t.tolist(), self._sum_fold(t), tolerate)
+                    t.tolist(), self._reduce_fold(t, kind), tolerate)
                 if gone and not tolerate:
                     raise RuntimeError(
                         "connection closed: rank(s) %s did not contribute to "
@@ -13687,17 +13802,62 @@ def _install_distributed_c10d(module, spec) -> None:
             return Work(tensors)
 
         def reduce(self, tensors, opts=None):
-            if self._size != 1:
-                refuse("ProcessGroupLocal.reduce", "Only world_size 1 is implemented")
+            """`allreduce` whose answer is kept only by the root.
+
+            **Only the root's tensor is specified.** Upstream gloo leaves a
+            non-root's buffer holding whatever partial its place in the tree
+            produced -- measured on this host at three ranks: rank 1 came back
+            with 5.0 and rank 2 with 3.0 where the total was 6.0. Those are not
+            errors, they are the absence of a promise. This leaves the non-root
+            buffers *untouched*, which is inside the same absence, and
+            `docs/COLLECT2.md` says so rather than letting a caller discover
+            which of the two it got.
+            """
             self._check_reduce_op(opts, "reduce")
-            self._check_root(opts, "reduce")
+            if self._size == 1:
+                self._check_root(opts, "reduce")
+                return Work(tensors)
+            root = self._check_root_n(opts, "reduce")
+            kind = self._reduce_kind(opts, "reduce")
+            import torch
+            for t in tensors:
+                result, gone = self._star_exchange(
+                    t.tolist(), self._reduce_fold(t, kind), False)
+                if gone:
+                    raise RuntimeError(
+                        "connection closed: rank(s) %s did not contribute to "
+                        "this reduce" % (list(gone),))
+                if self._rank == root and result is not None:
+                    t.copy_(torch.tensor(result, dtype=t.dtype,
+                                         device=t.device))
             return Work(tensors)
 
         # -- movement ------------------------------------------------------
         def broadcast(self, tensors, opts=None):
-            if self._size != 1:
-                refuse("ProcessGroupLocal.broadcast", "Only world_size 1 is implemented")
-            self._check_root(opts, "broadcast")
+            """The root rank's tensor, on every rank.
+
+            Every rank sends and the hub keeps the root's -- `_pick_fold` says
+            why the leaves' payloads are sent only to be discarded. The root
+            may be any rank, not only the hub: `_check_root_n` validates
+            against this world, and rank 0's answer travels back through the
+            same envelope every other rank reads, so there is no path on which
+            two ranks decode different bytes.
+            """
+            if self._size == 1:
+                self._check_root(opts, "broadcast")
+                return Work(tensors)
+            root = self._check_root_n(opts, "broadcast")
+            import torch
+            for t in tensors:
+                result, gone = self._star_exchange(
+                    t.tolist(), self._pick_fold(root, "broadcast"), False)
+                if gone:
+                    raise RuntimeError(
+                        "connection closed: rank(s) %s never reached this "
+                        "broadcast" % (list(gone),))
+                if result is not None:
+                    t.copy_(torch.tensor(result, dtype=t.dtype,
+                                         device=t.device))
             return Work(tensors)
 
         @staticmethod
@@ -13822,55 +13982,309 @@ def _install_distributed_c10d(module, spec) -> None:
             return Work(input_list)
 
         def gather(self, output_tensors, input_tensors, opts=None):
-            if self._size != 1:
-                refuse("ProcessGroupLocal.gather", "Only world_size 1 is implemented")
-            self._check_root(opts, "gather")
-            for outputs, source in zip(output_tensors, input_tensors):
-                outputs[0].copy_(source)
+            """`allgather` whose result lands only on the root.
+
+            The wire is the same exchange -- the hub has every contribution
+            either way -- so what distinguishes this from `allgather` is only
+            which ranks copy out. A non-root passes no output list, and this
+            does not invent one for it.
+            """
+            if self._size == 1:
+                self._check_root(opts, "gather")
+                for outputs, source in zip(output_tensors, input_tensors):
+                    outputs[0].copy_(source)
+                return Work([t for group in output_tensors for t in group])
+            root = self._check_root_n(opts, "gather")
+            import torch
+            for index, source in enumerate(input_tensors):
+                payloads, _ = self._allgather(source, tolerate=False)
+                if self._rank != root:
+                    continue
+                outputs = output_tensors[index] if index < len(output_tensors) else []
+                if len(outputs) != self._size:
+                    raise ValueError(
+                        "torch._C._distributed_c10d.ProcessGroupLocal.gather: "
+                        f"the root's output list has {len(outputs)} slots for "
+                        f"a world of size {self._size}"
+                    )
+                for rank, payload in enumerate(payloads):
+                    outputs[rank].copy_(torch.tensor(
+                        payload, dtype=outputs[rank].dtype,
+                        device=outputs[rank].device))
             return Work([t for group in output_tensors for t in group])
 
         def scatter(self, output_tensors, input_tensors, opts=None):
-            self._check_root(opts, "scatter")
-            for output, sources in zip(output_tensors, input_tensors):
-                output.copy_(sources[0])
+            """Slot `i` of the root's list, to rank `i`.
+
+            **This was silently wrong above one rank**: it copied `sources[0]`
+            unconditionally, so rank 0 got the right chunk by coincidence and
+            every other rank got its own untouched buffer -- no refusal, no
+            error, a plausible tensor. `docs/COLLECT2.md` §1 measured it. It is
+            the shape of defect this layer exists to refuse, and it survived
+            because `world_size >= 3` was described as refusing here when in
+            fact nothing checked the size at all.
+
+            The star sends *one* frame to every rank, so the root cannot hand
+            each leaf a different chunk in a single exchange. It broadcasts the
+            whole list instead and each rank selects its own index. That is
+            `size` times the wire a real backend would send; on loopback it is
+            a memcpy, and it reuses an exchange whose deadlock-freedom is
+            already argued rather than introducing a second shape.
+            """
+            if self._size == 1:
+                self._check_root(opts, "scatter")
+                for output, sources in zip(output_tensors, input_tensors):
+                    output.copy_(sources[0])
+                return Work(list(output_tensors))
+            root = self._check_root_n(opts, "scatter")
+            import torch
+            for index, output in enumerate(output_tensors):
+                if self._rank == root:
+                    sources = input_tensors[index] if index < len(input_tensors) else []
+                    if len(sources) != self._size:
+                        raise ValueError(
+                            "torch._C._distributed_c10d.ProcessGroupLocal."
+                            f"scatter: the root's input list has {len(sources)} "
+                            f"chunks for a world of size {self._size}"
+                        )
+                    payload = [t.tolist() for t in sources]
+                else:
+                    payload = None
+                result, gone = self._star_exchange(
+                    payload, self._pick_fold(root, "scatter"), False)
+                if gone:
+                    raise RuntimeError(
+                        "connection closed: rank(s) %s never reached this "
+                        "scatter" % (list(gone),))
+                if result is not None:
+                    output.copy_(torch.tensor(
+                        result[self._rank], dtype=output.dtype,
+                        device=output.device))
             return Work(list(output_tensors))
 
+        def _reduce_scatter_fold(self, template, kind):
+            """Fold chunk `j` across ranks, for every `j`, in rank order.
+
+            Each payload is one rank's *list* of `size` chunks. The result is a
+            list of `size` reduced chunks, of which each rank keeps its own.
+            The per-chunk fold is `_reduce_fold`'s, so the rank ordering and
+            the accumulation dtype are the same contract as `allreduce`'s and
+            not a second one that could drift from it.
+            """
+            def fold(payloads, ranks):
+                folded = []
+                for j in range(self._size):
+                    per_rank = [payload[j] for payload in payloads]
+                    folded.append(
+                        self._reduce_fold(template, kind)(per_rank, ranks))
+                return folded
+            return fold
+
         def reduce_scatter(self, output_tensors, input_tensors, opts=None):
+            """Chunk `i` reduced across all ranks, delivered to rank `i`.
+
+            **This was silently wrong above one rank**, in the same way
+            `scatter` was and for the same reason: it copied `sources[0]` with
+            no size check, so at three ranks it returned each rank's own first
+            chunk, unreduced, and said nothing. Measured against upstream gloo
+            on this host with the same inputs: gloo returned
+            `[30,33] [36,39] [42,45]`, this returned `[0,1] [10,11] [20,21]`
+            (`docs/COLLECT2.md` §1).
+
+            Every rank sends all `size` of its chunks; the hub folds each chunk
+            index across the ranks and sends the whole folded list back, and
+            each rank keeps index `self._rank`. The hub therefore does `size`
+            reductions where a real backend would do one per rank in parallel
+            -- the cost of a star, paid on loopback.
+            """
             self._check_reduce_op(opts, "reduce_scatter")
-            for output, sources in zip(output_tensors, input_tensors):
+            if self._size == 1:
                 # One rank, so the scatter picks slot 0 and the reduction over
                 # a single element is that element.
-                output.copy_(sources[0])
+                for output, sources in zip(output_tensors, input_tensors):
+                    output.copy_(sources[0])
+                return Work(list(output_tensors))
+            kind = self._reduce_kind(opts, "reduce_scatter")
+            import torch
+            for output, sources in zip(output_tensors, input_tensors):
+                if len(sources) != self._size:
+                    raise ValueError(
+                        "torch._C._distributed_c10d.ProcessGroupLocal."
+                        f"reduce_scatter: the input list has {len(sources)} "
+                        f"chunks for a world of size {self._size}"
+                    )
+                result, gone = self._star_exchange(
+                    [t.tolist() for t in sources],
+                    self._reduce_scatter_fold(output, kind), False)
+                if gone:
+                    raise RuntimeError(
+                        "connection closed: rank(s) %s did not contribute to "
+                        "this reduce_scatter" % (list(gone),))
+                if result is not None:
+                    output.copy_(torch.tensor(
+                        result[self._rank], dtype=output.dtype,
+                        device=output.device))
             return Work(list(output_tensors))
 
         def _reduce_scatter_base(self, output, input, opts=None):
+            """The flat spelling: `input` is `world_size` chunks end to end.
+
+            Above one rank this copied `input` into `output` wholesale, which
+            at three ranks did not even have a shape to land in -- it raised
+            `cannot broadcast [6] to [2]` from inside `copy_`. That is a
+            refusal by accident, from the wrong layer, with a message about
+            broadcasting; it is now the collective, and the size mismatch it
+            *should* refuse is refused by name below.
+            """
             self._check_reduce_op(opts, "_reduce_scatter_base")
-            output.copy_(input)
+            if self._size == 1:
+                output.copy_(input)
+                return Work([output])
+            flat = input.reshape(-1)
+            total = flat.shape[0]
+            width = output.reshape(-1).shape[0]
+            if total != width * self._size:
+                raise ValueError(
+                    "torch._C._distributed_c10d.ProcessGroupLocal."
+                    f"reduce_scatter_tensor: the input holds {total} elements, "
+                    f"which is not {self._size} chunks of the output's {width}"
+                )
+            chunks = [flat[j * width:(j + 1) * width] for j in range(self._size)]
+            [out] = [output]
+            self.reduce_scatter([out], [chunks], opts)
             return Work([output])
 
         def reduce_scatter_single(self, output, input, opts=None):
             return self._reduce_scatter_base(output, input, opts)
 
         def reduce_scatter_single_coalesced(self, outputs, inputs, opts=None):
+            # The copy below is the identity that one rank makes true, and
+            # nothing more. Above one rank it was returning each rank's own
+            # input with no reduction and no refusal -- the same silent defect
+            # `reduce_scatter` had (docs/COLLECT2.md §1). Refused by name here
+            # rather than built: coalescing is a batching of the single form,
+            # and there is no caller for it in this tree yet.
+            if self._size != 1:
+                refuse("ProcessGroupLocal.reduce_scatter_single_coalesced at world_size %d" % self._size,
+                       "only the uncoalesced `reduce_scatter` and "
+                       "`reduce_scatter_tensor` are implemented above one rank "
+                       "(docs/COLLECT2.md)")
             self._check_reduce_op(opts, "reduce_scatter_single_coalesced")
             for output, source in zip(outputs, inputs):
                 output.copy_(source)
             return Work(list(outputs))
 
         def reduce_scatter_tensor_coalesced(self, outputs, inputs, opts=None):
+            # The copy below is the identity that one rank makes true, and
+            # nothing more. Above one rank it was returning each rank's own
+            # input with no reduction and no refusal -- the same silent defect
+            # `reduce_scatter` had (docs/COLLECT2.md §1). Refused by name here
+            # rather than built: coalescing is a batching of the single form,
+            # and there is no caller for it in this tree yet.
+            if self._size != 1:
+                refuse("ProcessGroupLocal.reduce_scatter_tensor_coalesced at world_size %d" % self._size,
+                       "only the uncoalesced `reduce_scatter` and "
+                       "`reduce_scatter_tensor` are implemented above one rank "
+                       "(docs/COLLECT2.md)")
             self._check_reduce_op(opts, "reduce_scatter_tensor_coalesced")
             for output, source in zip(outputs, inputs):
                 output.copy_(source)
             return Work(list(outputs))
 
         def alltoall(self, output_tensors, input_tensors, opts=None):
-            for output, source in zip(output_tensors, input_tensors):
-                output.copy_(source)
+            """Rank `i`'s chunk `j` becomes rank `j`'s chunk `i` -- a transpose.
+
+            **This was silently wrong above one rank.** It copied each input to
+            the output beside it, so every rank got its own data back
+            unchanged: at three ranks it returned `[[0],[1],[2]]` where upstream
+            gloo returns `[[0],[10],[20]]`. Nothing checked the world size and
+            nothing refused (`docs/COLLECT2.md` §1).
+
+            The hub gathers the full `size x size` matrix and sends all of it to
+            everybody; each rank reads its own column. Every rank therefore
+            receives every other rank's payload, which a real all-to-all does
+            not do -- it is the star again, and it is the reason `send`/`recv`
+            stay refused rather than being built on top of this.
+            """
+            if self._size == 1:
+                for output, source in zip(output_tensors, input_tensors):
+                    output.copy_(source)
+                return Work(list(output_tensors))
+            if len(input_tensors) != self._size or len(output_tensors) != self._size:
+                raise ValueError(
+                    "torch._C._distributed_c10d.ProcessGroupLocal.alltoall: "
+                    f"{len(input_tensors)} inputs and {len(output_tensors)} "
+                    f"outputs in a world of size {self._size}"
+                )
+            import torch
+            matrix, gone = self._star_exchange(
+                [t.tolist() for t in input_tensors],
+                lambda payloads, ranks: {str(r): p
+                                         for r, p in zip(ranks, payloads)},
+                False)
+            if gone:
+                raise RuntimeError(
+                    "connection closed: rank(s) %s never reached this alltoall"
+                    % (list(gone),))
+            if matrix is not None:
+                for src in range(self._size):
+                    out = output_tensors[src]
+                    out.copy_(torch.tensor(
+                        matrix[str(src)][self._rank],
+                        dtype=out.dtype, device=out.device))
             return Work(list(output_tensors))
 
         def alltoall_base(self, output, input, output_split_sizes=None,
                           input_split_sizes=None, opts=None):
-            output.copy_(input)
+            """The flat spelling of `alltoall`, equal splits only.
+
+            Uneven splits are refused by name rather than approximated. They are
+            not a harder transpose -- they are a different collective, because
+            each rank has to know every other rank's split vector before it can
+            say where its own chunk lands, and that is an exchange this has not
+            done. Silently treating them as equal is what the old body did to
+            the whole operation.
+            """
+            if self._size == 1:
+                output.copy_(input)
+                return Work([output])
+            for name, splits in (("output_split_sizes", output_split_sizes),
+                                 ("input_split_sizes", input_split_sizes)):
+                if splits is None or len(splits) == 0:
+                    continue
+                sizes = list(splits)
+                if len(set(sizes)) != 1:
+                    refuse(
+                        "ProcessGroupLocal.all_to_all_single with uneven "
+                        f"{name} at world_size {self._size}",
+                        f"{name}={sizes} is not one width repeated. An uneven "
+                        "all-to-all needs every rank to know every other "
+                        "rank's split vector before it can place its own "
+                        "chunk, which is an exchange this backend does not do. "
+                        "Equal splits are implemented (docs/COLLECT2.md)",
+                    )
+            flat_in = input.reshape(-1)
+            total = flat_in.shape[0]
+            if total % self._size:
+                raise ValueError(
+                    "torch._C._distributed_c10d.ProcessGroupLocal."
+                    f"all_to_all_single: {total} input elements do not divide "
+                    f"into {self._size} equal chunks"
+                )
+            width = total // self._size
+            out_total = output.reshape(-1).shape[0]
+            if out_total != width * self._size:
+                raise ValueError(
+                    "torch._C._distributed_c10d.ProcessGroupLocal."
+                    f"all_to_all_single: the output holds {out_total} elements "
+                    f"where {width * self._size} are being scattered into it"
+                )
+            import torch
+            ins = [flat_in[j * width:(j + 1) * width] for j in range(self._size)]
+            outs = [torch.zeros(width, dtype=output.dtype, device=output.device)
+                    for _ in range(self._size)]
+            self.alltoall(outs, ins, opts)
+            output.copy_(torch.cat(outs).reshape(output.shape))
             return Work([output])
 
         # `distributed_c10d.py:5131`'s spelling. With one rank the split sizes

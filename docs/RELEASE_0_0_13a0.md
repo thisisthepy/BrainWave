@@ -270,9 +270,28 @@ would otherwise count these as features.
   8/8 operations, ~3e-08 against replay — but every driver there is software
   (`nnapi-reference` and the image's sample drivers). A vendor NPU driver needs
   a physical device.
-- **`world_size >= 3` is `allreduce(op=SUM)` only**, over loopback on one
-  machine. Other collectives, other reduce ops, secure aggregation and
-  differential privacy refuse by name.
+- **`world_size >= 3` runs eleven collectives over loopback on one machine —
+  and the sentence that used to stand here was wrong in both directions.** It
+  said `allreduce(op=SUM)` only, with everything else refusing by name. When it
+  was re-measured (`docs/COLLECT2.md` §1), `all_gather`,
+  `all_gather_into_tensor` and `barrier` **already worked** and had done since
+  `FEDERATED4`; and `reduce_scatter`, `scatter`, `all_to_all` and
+  `all_to_all_single` **did not refuse at all** — they returned the calling
+  rank's own input, unreduced and untransposed, with no error, because their
+  bodies were the `world_size = 1` identity and nothing checked the size. A
+  promised refusal is worse than a missing one when the truth is a wrong
+  answer, because the reader has been told there is nothing there to check.
+  All four are fixed and all eleven are now compared element-wise against
+  upstream's own gloo backend at world 3 and world 4, at a tolerance derived
+  from upstream's float32-vs-float64 error the way `docs/AGREE.md` §2 derives
+  its own — which for the collectives that move numbers rather than combining
+  them comes out at zero, so those are held to bit equality.
+  `allreduce` now folds `MIN`, `MAX`, `PRODUCT` and `AVG` beside `SUM`.
+  **Still refusing by name**: genuine `async_op` (these collectives complete
+  inside the call, so the returned `Work` is already done where upstream's is
+  not — `docs/COLLECT2.md` §7), uneven-split `all_to_all`, the bitwise reduce
+  ops, the `_coalesced` spellings, `send`/`recv`, `new_group`, secure
+  aggregation and differential privacy.
 
 ## 6. Platform status for this release
 
