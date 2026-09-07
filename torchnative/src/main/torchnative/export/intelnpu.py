@@ -31,9 +31,11 @@ same property without taking an archived, Windows-only, end-of-life dependency:
 a stable `extern "C"` surface, loadable by `ctypes`, no C++ of our own to ship,
 no build-time OpenVINO SDK, and no threat to the abi3 single-wheel discipline.
 
-What it reaches the device *with*. `compile_model(model, device="NPU")` walks a
-module tree and replaces every `torch.nn.Linear` with an `NPULinear` whose forward
-runs on the device. That is not an approximation of what the archived library does
+What it reaches the device *with* --- and this is now a **private** capability,
+not an API. `_compile_model(model, device="NPU")` walks a module tree and
+replaces every `torch.nn.Linear` with an `_NPULinear` whose forward runs on the
+device. It was public as `compile_model` and was withdrawn (see the bottom of
+this file); it is kept private because the measurements in this file rest on it. That is not an approximation of what the archived library does
 --- it is the same mechanism. `intel_npu_acceleration_library.compile`
 (`compiler.py:42-81`) does no tracing at all; it is `named_children()` +
 `add_module()` (`compiler.py:103-141`) swapping `torch.nn.Linear` for a leaf that
@@ -42,11 +44,14 @@ substitution is the whole of what makes `NPUModelForCausalLM.from_pretrained(...
 followed by `model.generate(...)` run on an NPU: `generate()` never learns
 anything about the hardware.
 
-What this module does NOT do, and says so by name rather than pretending: it does
-not lower a *captured graph* (`compile_module` --- a different door from
-`compile_model`, and the distinction matters because they cover different amounts
-of a model), it does not quantize, and it offers no `torch.compile` backend. See
-the refusals at the bottom of this file.
+What this module does NOT do, and says so by name rather than pretending: it
+does not lower a *captured graph* (there is no `decompose` -> `refold` trace
+serialised to OpenVINO IR here, the way `coreml.py` and `nnapi.py` do), it does
+not quantize, and it offers no `torch.compile` backend. Nor does it offer a way
+to run your model: every such entry point was withdrawn, and each refuses by
+name at the bottom of this file. The replacement is
+`torchnative.transformers.AutoModelForCausalLM` and it is **not implemented yet**;
+for int4 on an Intel NPU today the answer is `optimum-intel`.
 
 Where the claims in this file were measured. The IR, the C bindings, the weights
 blob, the inference and the numerics were all exercised against a real OpenVINO
@@ -66,6 +71,7 @@ __all__ = [
     "IntelNPUUnavailable",
     "IntelNPUExecutionError",
     "IntelNPUUnsupported",
+    "IntelNPUWithdrawn",
     "OV_STATUS",
     "EXECUTION_DEVICES",
     "MAX_DIM",
@@ -83,11 +89,6 @@ __all__ = [
     "assert_execution_device",
     "probe",
     "supported_ops",
-    "NPULinear",
-    "compile_model",
-    "compile_module",
-    "quantize_",
-    "dynamo_backend",
 ]
 
 
@@ -113,6 +114,15 @@ class IntelNPUExecutionError(RuntimeError):
 
 class IntelNPUUnsupported(NotImplementedError):
     """Something is refused by name, permanently or for now, with the reason given."""
+
+
+class IntelNPUWithdrawn(IntelNPUUnsupported):
+    """A user-facing name this module used to export and no longer does.
+
+    A subclass of `IntelNPUUnsupported` so that anything already catching this
+    module's refusals keeps catching it. A withdrawal *is* a refusal: it names
+    itself, gives the reason, and names what to use instead (CLAUDE.md §6).
+    """
 
 
 # --------------------------------------------------------------------------
@@ -983,7 +993,7 @@ def _torch():
     return torch
 
 
-class NPULinear:
+class _NPULinear:
     """A `torch.nn.Linear` replacement whose forward runs on the OpenVINO device.
 
     Constructed through `from_torch`, never directly from a caller's shapes, so the
@@ -1012,7 +1022,7 @@ class NPULinear:
         # torch being importable at all.
         torch = _torch()
         if not issubclass(cls, torch.nn.Module):
-            cls = type("NPULinear", (NPULinear, torch.nn.Module), {})
+            cls = type("_NPULinear", (_NPULinear, torch.nn.Module), {})
             obj = torch.nn.Module.__new__(cls)
             return obj
         return super().__new__(cls)
@@ -1022,15 +1032,16 @@ class NPULinear:
         torch.nn.Module.__init__(self)
         if weight.dim() != 2:
             raise IntelNPUUnsupported(
-                f"torchnative intelnpu: NPULinear needs a 2-D weight, got shape "
+                f"torchnative intelnpu: _NPULinear needs a 2-D weight, got shape "
                 f"{tuple(weight.shape)}. There is no Linear here to lower."
             )
         if not weight.dtype.is_floating_point:
             raise IntelNPUUnsupported(
-                f"torchnative intelnpu: NPULinear will not lower a {weight.dtype} "
+                f"torchnative intelnpu: _NPULinear will not lower a {weight.dtype} "
                 f"weight. This stage emits f16 IR only; integer weights need the "
-                f"quantized path, which is refused by name in quantize_() and "
-                f"described in docs/devices/INTELNPU.md section 1.4."
+                f"quantized path, which is not implemented here. Use "
+                f"torchnative.quant.quantize_(model, format=...); "
+                f"docs/devices/INTELNPU.md section 1.4 has the details."
             )
         self.out_features, self.in_features = int(weight.shape[0]), int(weight.shape[1])
         # Raises here, at construction, for an oversized layer -- before the model
@@ -1114,8 +1125,8 @@ class NPULinear:
         )
 
 
-def compile_model(model, device: str = "NPU", library: str | None = None):
-    """Swap every `torch.nn.Linear` in `model` for an `NPULinear`. In place.
+def _compile_model(model, device: str = "NPU", library: str | None = None):
+    """Swap every `torch.nn.Linear` in `model` for an `_NPULinear`. In place.
 
     This is `intel_npu_acceleration_library.compile` minus everything that is not
     the mechanism: no `torch.compile`, no dynamo, no tracing, no fx, no
@@ -1151,7 +1162,7 @@ def compile_model(model, device: str = "NPU", library: str | None = None):
         for name, child in list(parent.named_children()):
             path = f"{prefix}{name}"
             if isinstance(child, torch.nn.Linear):
-                parent.add_module(name, NPULinear.from_torch(child, device, library))
+                parent.add_module(name, _NPULinear.from_torch(child, device, library))
                 swapped.append(path)
                 continue
             grandchildren = list(child.named_children())
@@ -1194,11 +1205,14 @@ def compile_model(model, device: str = "NPU", library: str | None = None):
 
 
 # --------------------------------------------------------------------------
-# Refused by name. Each of these has a test asserting the refusal.
+# What this file can answer for. Each of these has a test.
 # --------------------------------------------------------------------------
 
 
-#: The module types `compile_model` lowers, and nothing else. One entry.
+#: The module types the (now private) `_compile_model` lowers, and nothing else.
+#: One entry. Kept public because it answers a question about this file's reach
+#: rather than offering a way to run anything --- the same reason `supported_ops`
+#: is kept.
 #:
 #: Deliberately not the same question as "what does OpenVINO's NPU plugin
 #: accept" -- `coreml.py` calls that distinction out by name, and conflating the
@@ -1212,78 +1226,137 @@ SUPPORTED_MODULES = frozenset({"torch.nn.Linear"})
 def supported_ops() -> frozenset:
     """OpenVINO ops this module can emit: `MatMul` and `Add`, as one Linear.
 
-    There is no captured-graph lowering table here and `compile_module` says so.
-    This module reaches the device by *module replacement*, the mechanism
-    docs/devices/INTELNPU.md section 1.2 found underneath `NPUModelForCausalLM`, not by
-    serialising a `decompose` -> `refold` trace. The two are different doors and
-    this function answers for the one that is open.
+    There is no captured-graph lowering table here, and the withdrawn
+    `compile_module` said so by name. This module reaches the device by *module
+    replacement*, the mechanism docs/devices/INTELNPU.md section 1.2 found
+    underneath `NPUModelForCausalLM`, not by serialising a `decompose` ->
+    `refold` trace. Both doors are now shut to callers --- one because it was
+    never written, the other because it was withdrawn --- and this function
+    still answers honestly for what the emitters in this file can produce.
     """
     return frozenset({"MatMul", "Add"})
 
 
-def compile_module(module=None, example_inputs=None, **kwargs):
-    """Refused: **captured-graph** lowering is not implemented.
+# --------------------------------------------------------------------------
+# Withdrawn user-facing entry points.
+#
+# Everything above this line is kept: the device-reading and verdict logic, the
+# IR emitters, the C bindings, `probe`, and every refusal. That machinery is how
+# this project tells "it ran on the NPU" from "the answer happened to be right",
+# and it is reusable for CoreML and QNN.
+#
+# What was withdrawn is the part that presented itself as "call this to run your
+# model". It was wrong in two ways at once. Its *name* copied the archived
+# `intel_npu_acceleration_library`, where the ecosystem convention names the
+# project (`OVModelForCausalLM`, `ORTModelForCausalLM`, `IPEXModelForCausalLM`),
+# and its *shape* -- `compile_model(model, device="NPU") -> (model, report)` --
+# was a second in-place module-replacement API beside this repository's own
+# `torchnative.quant.quantize_(model, format=...)`, which already had torchao's
+# spelling for the same move.
+#
+# The implementations survive privately as `_compile_model` and `_NPULinear`.
+# They are not deleted because the measured claims in docs/devices/INTELNPU.md
+# rest on them and the OpenVINO-gated tests still exercise them; they are
+# private because they are evidence, not an API.
+# --------------------------------------------------------------------------
 
-    Not to be confused with `compile_model`, which is implemented and is a
-    different mechanism. The distinction is the one docs/devices/INTELNPU.md section 1.2
-    turns on:
+#: The replacement, named in one place so that one line changes when it lands.
+REPLACEMENT = "torchnative.transformers.AutoModelForCausalLM"
 
-    * `compile_model` replaces `torch.nn.Linear` leaves with `NPULinear`. No
-      capture, no trace, no graph -- and it is what the archived library does.
-    * `compile_module` would take a `decompose` -> `refold` trace and serialise
-      the whole graph to OpenVINO IR, the way `coreml.py` and `nnapi.py` do. That
-      reaches fusions and inter-module structure that leaf replacement cannot,
-      and it is not written.
+_WITHDRAWN = {
+    "compile_model": (
+        "it was a second in-place module-replacement entry point beside "
+        "torchnative.quant.quantize_(model, format=...), which already had "
+        "torchao's spelling (`_` for in-place) for the same move -- replacing "
+        "leaves. Two shapes for one operation in one codebase. It also returned "
+        "`(model, report)` rather than the model, so it was not in-place in the "
+        "way its own mechanism was. The lowering it did survives privately as "
+        "`_compile_model`, and the report it produced -- which named every leaf "
+        "left on the CPU -- is the part worth keeping"
+    ),
+    "NPULinear": (
+        "it is the leaf `compile_model` swapped in, and it reached the device "
+        "for `torch.nn.Linear` only, with static shapes and element-at-a-time "
+        "FFI. It survives privately as `_NPULinear` because the numbers in "
+        "docs/devices/INTELNPU.md were measured through it"
+    ),
+    "compile_module": (
+        "captured-graph lowering was never implemented here -- there is no "
+        "decompose->refold trace serialised to OpenVINO IR, the way coreml.py "
+        "and nnapi.py do for their targets -- and the leaf-replacement door it "
+        "used to point at (compile_model) is itself now withdrawn. It refused "
+        "rather than silently redirecting, because the two cover different "
+        "amounts of the model and docs/graph/NPU2.md is about being told a "
+        "model was offloaded when part of it was not"
+    ),
+    "quantize_": (
+        "there is no quantizer here. intel_npu_acceleration_library routes "
+        "int4/int8 through Intel neural-compressor (quantization.py:90-109, "
+        "PostTrainingQuantConfig(approach='weight_only', algorithm='RTN')), "
+        "which reaches deep into PyTorch internals and is not hostable on "
+        "torchnative's shim. This name also collided with the real one: "
+        "torchnative.quant.quantize_(model, format='q8_0') is this "
+        "repository's one existing user-facing API and is unaffected by this "
+        "withdrawal -- use it. See docs/graph/QUANT2.md section 3, which cites "
+        "that library's module-replacement approach as the precedent. Note "
+        "that the archived library also carries a dependency-free per-row "
+        "symmetric quantizer (quantization.py:15-64) that needs no "
+        "neural-compressor; docs/devices/INTELNPU.md section 1.4 has the details"
+    ),
+    "dynamo_backend": (
+        "there is no torch.compile backend and there will not be one. Dynamo "
+        "needs CPython's PEP 523 frame-evaluation hook "
+        "(_PyInterpreterState_SetEvalFrameFunc plus the _PyInterpreterFrame "
+        "layout), neither of which is reachable from an abi3 extension -- see "
+        "docs/graph/COMPILE.md. This costs nothing: docs/devices/INTELNPU.md "
+        "section 1.2 establishes that intel_npu_acceleration_library's own NPU "
+        "path does not use torch.compile either. Its compile() "
+        "(compiler.py:42-81) is plain nn.Module subtree replacement; the "
+        "@register_backend npu at compiler.py:270 is a separate, optional entry "
+        "point that NPUModelForCausalLM never touches. This refusal is "
+        "permanent and is not lifted by the replacement API"
+    ),
+}
 
-    Refusing rather than quietly falling back to `compile_model` matters: the
-    two have different coverage, and a caller who asked for the whole graph and
-    silently got the Linears would be told a model was offloaded that mostly is
-    not. That is the failure docs/graph/NPU2.md records.
-    """
-    raise IntelNPUUnsupported(
-        "torchnative intelnpu: compile_module is not implemented -- there is no "
-        "captured-graph lowering here. It would serialise a decompose->refold trace "
-        "to OpenVINO IR in memory and compile it through the path this module "
-        "already opens, the way coreml.py and nnapi.py do for their targets. What "
-        "*is* implemented is compile_model(), which replaces torch.nn.Linear leaves "
-        "with NPULinear -- the mechanism docs/devices/INTELNPU.md section 1.2 found "
-        "underneath NPUModelForCausalLM. Use that, and read its report: it names "
-        "every leaf left on the CPU, which whole-graph lowering would not have to. "
-        "This refuses rather than silently redirecting to compile_model, because the "
-        "two cover different amounts of the model and docs/graph/NPU2.md is about being "
-        "told a model was offloaded when part of it was not."
+
+def _withdrawal_message(name):
+    """The refusal text for a withdrawn `name`: what went, why, what instead."""
+    return (
+        f"torchnative intelnpu: {name} was withdrawn and is not available. It "
+        f"was withdrawn because {_WITHDRAWN[name]}.\n"
+        f"The replacement is {REPLACEMENT}, taking optimum's shape:\n"
+        f"\n"
+        f"    from torchnative.transformers import AutoModelForCausalLM\n"
+        f"    model = AutoModelForCausalLM.from_pretrained(model_id, export=True, load_in_4bit=True)\n"
+        f"    model.to(\"npu\")\n"
+        f"\n"
+        f"**{REPLACEMENT} is not implemented yet.** Neither is the device "
+        f"string it would take: torch.device(\"npu\") raises on this shim "
+        f"because torch._C._rename_privateuse1_backend is a stub. The snippet "
+        f"above is the intended shape, not a working call.\n"
+        f"\n"
+        f"If what you need is int4 on an Intel NPU today, the answer is not in "
+        f"this repository -- it is optimum-intel, which HuggingFace and Intel "
+        f"maintain and which already ships what this module was reaching for:\n"
+        f"\n"
+        f"    from optimum.intel import OVModelForCausalLM\n"
+        f"    model = OVModelForCausalLM.from_pretrained(model_id, export=True, load_in_4bit=True).to(\"npu\")\n"
+        f"\n"
+        f"Its runtime model is an OpenVINO graph rather than a real nn.Module, "
+        f"so it cannot backprop. optimum DOES reach mobile -- "
+        f"optimum-executorch exports for Android and iOS -- but it exports "
+        f"FROM a desktop and the artefact runs in ExecuTorch's C++ runtime, "
+        f"with no Python on the device. This project runs Python ON the "
+        f"device, which is the difference it exists for, and not NPU "
+        f"coverage. docs/devices/INTELNPU.md records the comparison."
     )
 
 
-def quantize_(model=None, format=None, **kwargs):
-    """Refused: use `torchnative.quant.quantize_`, not neural-compressor."""
-    raise IntelNPUUnsupported(
-        "torchnative intelnpu: no quantizer here. intel_npu_acceleration_library "
-        "routes int4/int8 through Intel neural-compressor "
-        "(quantization.py:90-109, PostTrainingQuantConfig(approach='weight_only', "
-        "algorithm='RTN')), which reaches deep into PyTorch internals and is not "
-        "hostable on torchnative's shim. torchnative already has the same shape at "
-        "torchnative.quant.quantize_(model, format='q8_0') -- see docs/graph/QUANT2.md "
-        "section 3, which cites that library's module-replacement approach as the "
-        "precedent. Note that the archived library also carries a dependency-free "
-        "per-row symmetric quantizer (quantization.py:15-64) that needs no "
-        "neural-compressor; docs/devices/INTELNPU.md section 1.4 has the details."
-    )
-
-
-def dynamo_backend(*args, **kwargs):
-    """Refused permanently: torch.compile does not exist here."""
-    raise IntelNPUUnsupported(
-        "torchnative intelnpu: there is no torch.compile backend and there will not "
-        "be one. Dynamo needs CPython's PEP 523 frame-evaluation hook "
-        "(_PyInterpreterState_SetEvalFrameFunc plus the _PyInterpreterFrame layout), "
-        "neither of which is reachable from an abi3 extension -- see docs/graph/COMPILE.md. "
-        "This costs nothing here: docs/devices/INTELNPU.md section 1.2 establishes that "
-        "intel_npu_acceleration_library's own NPU path does not use torch.compile "
-        "either. Its compile() (compiler.py:42-81) is plain nn.Module subtree "
-        "replacement; the @register_backend npu at compiler.py:270 is a separate, "
-        "optional entry point that NPUModelForCausalLM never touches."
-    )
+def __getattr__(name):
+    """Refuse a withdrawn name by name; leave every other miss as an AttributeError."""
+    if name in _WITHDRAWN:
+        raise IntelNPUWithdrawn(_withdrawal_message(name))
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 if __name__ == "__main__":  # pragma: no cover - this is the Windows entry point

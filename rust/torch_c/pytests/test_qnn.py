@@ -34,9 +34,27 @@ oracle every numerical claim in this repository is measured against.
 
 import json
 import os
+import pathlib
 import subprocess
 import sys
 import tempfile
+
+# `torchnative` is not on the path the gate hands this process: `run.sh` puts
+# the staged `_C` and `pytests/` there, and the package lives beside the
+# vendored `torch` under `torchnative/src/main`. The subprocess fixtures below
+# get it from `_VENDOR_DIR`; the tests that import it IN THIS PROCESS have to
+# add it themselves, and four of them failed with ModuleNotFoundError until
+# they did.
+# APPENDED, not inserted at the front. `src/main` holds the vendored `torch`
+# beside `torchnative`, and `test_shim.py` imports UPSTREAM torch at module
+# scope. Putting this first shadowed upstream with the vendored tree, which
+# needs its own initialisation and raised from `_preload_cuda_deps` -- the
+# whole file then crashed before running one test, and the suite reported
+# 1209 ok / 0 FAIL rather than a failure, because a crashed file has no
+# result to report.
+_SRC_MAIN = str(pathlib.Path(__file__).resolve().parents[3] / "torchnative" / "src" / "main")
+if _SRC_MAIN not in sys.path:
+    sys.path.append(_SRC_MAIN)
 
 from test_shim import _CKPT_VENDOR_DIR, _CKPT_VENDOR_SHIM
 
@@ -60,7 +78,7 @@ out["aot_refusal"] = qnn.qnn_aot_refusal()
 out["aot_available"] = qnn.qnn_aot_available()
 
 
-class Fake(npu.DelegateModule):
+class Fake(npu._DelegateModule):
     backend_name = "TestBackend"
 
     def __init__(self, inner):
@@ -73,7 +91,7 @@ class Fake(npu.DelegateModule):
         return self.inner(*a, **k)
 
 
-class Nameless(npu.DelegateModule):
+class Nameless(npu._DelegateModule):
     pass
 
 
@@ -81,14 +99,14 @@ class Nameless(npu.DelegateModule):
 m = nn.Sequential(nn.Linear(4, 4), nn.ReLU(), nn.Linear(4, 2))
 inner = nn.Linear(4, 4)
 inner.load_state_dict(m[0].state_dict())
-old = npu.replace_submodule(m, "0", Fake(inner))
+old = npu._replace_submodule(m, "0", Fake(inner))
 out["old_type"] = type(old).__name__
-out["paths"] = npu.delegated_paths(m)
+out["paths"] = npu._delegated_paths(m)
 x = torch.randn(3, 4)
 out["forward_shape"] = list(m(x).shape)
 out["calls"] = m[0].calls
-out["same_object"] = npu.delegate_(m, {"2": Fake(nn.Linear(4, 2))}) is m
-out["paths_after"] = npu.delegated_paths(m)
+out["same_object"] = npu._delegate_(m, {"2": Fake(nn.Linear(4, 2))}) is m
+out["paths_after"] = npu._delegated_paths(m)
 
 # -- and it computes what the module it replaced computed -----------------
 ref = nn.Sequential(nn.Linear(4, 4), nn.ReLU(), nn.Linear(4, 2))
@@ -107,22 +125,22 @@ def refusal(fn):
     return None
 
 
-out["refuse_bad_path"] = refusal(lambda: npu.delegate_(m, {"nope": Fake(nn.Identity())}))
-out["refuse_deep_bad_path"] = refusal(lambda: npu.delegate_(m, {"0.inner.zzz": Fake(nn.Identity())}))
-out["refuse_index_range"] = refusal(lambda: npu.delegate_(m, {"9": Fake(nn.Identity())}))
-out["refuse_empty_path"] = refusal(lambda: npu.delegate_(m, {"": Fake(nn.Identity())}))
-out["refuse_not_delegate"] = refusal(lambda: npu.delegate_(m, {"1": nn.Identity()}))
-out["refuse_not_module"] = refusal(lambda: npu.replace_submodule(m, "1", 7))
-out["refuse_empty_plan"] = refusal(lambda: npu.delegate_(m, {}))
-out["refuse_not_dict"] = refusal(lambda: npu.delegate_(m, [("1", Fake(nn.Identity()))]))
+out["refuse_bad_path"] = refusal(lambda: npu._delegate_(m, {"nope": Fake(nn.Identity())}))
+out["refuse_deep_bad_path"] = refusal(lambda: npu._delegate_(m, {"0.inner.zzz": Fake(nn.Identity())}))
+out["refuse_index_range"] = refusal(lambda: npu._delegate_(m, {"9": Fake(nn.Identity())}))
+out["refuse_empty_path"] = refusal(lambda: npu._delegate_(m, {"": Fake(nn.Identity())}))
+out["refuse_not_delegate"] = refusal(lambda: npu._delegate_(m, {"1": nn.Identity()}))
+out["refuse_not_module"] = refusal(lambda: npu._replace_submodule(m, "1", 7))
+out["refuse_empty_plan"] = refusal(lambda: npu._delegate_(m, {}))
+out["refuse_not_dict"] = refusal(lambda: npu._delegate_(m, [("1", Fake(nn.Identity()))]))
 out["refuse_nameless"] = refusal(Nameless)
 out["refuse_no_forward"] = refusal(
-    lambda: type("Bare", (npu.DelegateModule,), {"backend_name": "Bare"})()(x))
+    lambda: type("Bare", (npu._DelegateModule,), {"backend_name": "Bare"})()(x))
 
 # -- a rejected plan must leave the model untouched ----------------------
-before = npu.delegated_paths(m)
-refusal(lambda: npu.delegate_(m, {"1": Fake(nn.Identity()), "nope": Fake(nn.Identity())}))
-out["paths_unchanged_after_refusal"] = npu.delegated_paths(m) == before
+before = npu._delegated_paths(m)
+refusal(lambda: npu._delegate_(m, {"1": Fake(nn.Identity()), "nope": Fake(nn.Identity())}))
+out["paths_unchanged_after_refusal"] = npu._delegated_paths(m) == before
 
 # -- the QNN back end, on a host with no executorch ----------------------
 def qnn_refusal(fn):
@@ -237,7 +255,7 @@ from torchnative.export import npu
 MODEL_ID = "HuggingFaceTB/SmolLM2-135M"
 
 
-class Recorder(npu.DelegateModule):
+class Recorder(npu._DelegateModule):
     '''Stands in for a submodule and forwards to it, counting the calls.
 
     Deliberately *not* an ExecuTorch delegate. This subprocess runs under the
@@ -260,9 +278,16 @@ class Recorder(npu.DelegateModule):
 
 
 try:
-    model = npu.NpuModelForCausalLM.from_pretrained(
-        MODEL_ID,
-        plan=lambda m: {"model.layers.0.mlp": Recorder(m.model.layers[0].mlp)},
+    # Was `npu.NpuModelForCausalLM.from_pretrained(MODEL_ID, plan=...)`.
+    # That name is withdrawn (test_the_withdrawn_npu_names_refuse_by_name
+    # asserts it now refuses), so this spells out what it did: load the real
+    # checkpoint, then swap in place. The claim under test is unchanged --
+    # a real `generate()` still runs with a submodule delegated.
+    from transformers import AutoModelForCausalLM
+
+    model = AutoModelForCausalLM.from_pretrained(MODEL_ID)
+    model = npu._delegate_(
+        model, {"model.layers.0.mlp": Recorder(model.model.layers[0].mlp)}
     )
 except Exception as error:
     out["model"] = None
@@ -278,7 +303,7 @@ out["generate_is_upstreams"] = model.generate.__func__ is GenerationMixin.genera
 out["has_config"] = hasattr(model, "config")
 out["hidden_size"] = int(model.config.hidden_size)
 out["intermediate_size"] = int(model.config.intermediate_size)
-out["delegated"] = npu.delegated_paths(model)
+out["delegated"] = npu._delegated_paths(model)
 out["delegate_type"] = type(model.model.layers[0].mlp).__name__
 out["inner_type"] = type(model.model.layers[0].mlp.inner).__name__
 
@@ -856,7 +881,7 @@ def test_every_bad_plan_is_refused_by_name_and_leaves_the_model_alone():
         "refuse_deep_bad_path": ["'zzz'"],
         "refuse_index_range": ["9"],
         "refuse_empty_path": ["empty submodule path"],
-        "refuse_not_delegate": ["not a DelegateModule"],
+        "refuse_not_delegate": ["not a _DelegateModule"],
         "refuse_not_module": ["nn.Module"],
         "refuse_empty_plan": ["empty plan"],
         "refuse_not_dict": ["must be a dict"],
@@ -1327,6 +1352,92 @@ def test_no_claim_is_made_that_anything_ran_on_an_npu():
         "the QNN ahead-of-time half became available on this host -- "
         "docs/devices/QNN.md §3 and §6.4 both need re-measuring"
     )
+
+
+# --------------------------------------------------------- the withdrawal
+
+#: What `torchnative.export.npu` used to export as the way to run a model.
+#: Written out here rather than read off `npu._WITHDRAWN`, so that quietly
+#: restoring one of them makes this test fail rather than agree (CLAUDE.md §5.5).
+WITHDRAWN_NPU = (
+    "NpuModelForCausalLM",
+    "delegate_",
+    "delegated_paths",
+    "DelegateModule",
+    "replace_submodule",
+    "resolve_submodule",
+)
+
+
+def test_every_withdrawn_npu_name_refuses_by_name_and_names_the_replacement():
+    """Reaching for a withdrawn name says so, why, and what to use instead.
+
+    Refusal at *attribute access*, not at call: `NpuModelForCausalLM` was
+    reached as `NpuModelForCausalLM.from_pretrained(...)`, so anything that let
+    the attribute resolve would have to grow a fake `from_pretrained` to refuse
+    at all.
+    """
+    from torchnative.export import npu
+
+    for name in WITHDRAWN_NPU:
+        try:
+            getattr(npu, name)
+        except npu.DelegateWithdrawn as exc:
+            # Bound to a second name deliberately: Python DELETES the `as`
+            # target when the except block ends, so reading `exc` below would
+            # raise UnboundLocalError -- which is what it did, and the test
+            # then failed for its own bug rather than for the refusal.
+            raised, text = exc, str(exc)
+        else:
+            raise AssertionError(f"npu.{name} did not refuse")
+        assert text.startswith(f"torchnative npu: {name} was withdrawn"), text
+        assert "AutoModelForCausalLM" in text, (name, text)
+        assert "not implemented yet" in text, (name, text)
+        assert isinstance(raised, npu.DelegateRefused), name
+    print(
+        f"ok   npu: {len(WITHDRAWN_NPU)} withdrawn names refuse by name, naming "
+        f"AutoModelForCausalLM and saying it does not exist yet"
+    )
+
+
+def test_the_withdrawn_npu_message_does_not_imply_a_working_device_string():
+    from torchnative.export import npu
+
+    text = npu._withdrawal_message("delegate_")
+    assert 'model.to("npu")' in text, text
+    assert "torch.device" in text and "raises" in text, text
+    assert "_rename_privateuse1_backend" in text, text
+    print("ok   npu: the withdrawal says `npu` is not a device on this shim either")
+
+
+def test_the_swapping_plumbing_is_kept_private_and_qnn_still_builds_on_it():
+    """Withdrawing the API did not delete the mechanism -- `qnn` needs it.
+
+    If this fails with an AttributeError the withdrawal went too far; if it
+    fails because a public name resolved, it did not go far enough.
+    """
+    from torchnative.export import npu
+
+    for name in ("_DelegateModule", "_delegate_", "_delegated_paths",
+                 "_replace_submodule", "_resolve_submodule"):
+        assert getattr(npu, name) is not None, name
+    assert npu.__all__ == ["DelegateRefused", "DelegateWithdrawn"], npu.__all__
+    print("ok   npu: the plumbing survives privately; only the API surface went")
+
+
+def test_an_unknown_npu_name_is_still_a_plain_attribute_error():
+    from torchnative.export import npu
+
+    try:
+        npu.no_such_name_at_all
+    except npu.DelegateWithdrawn as exc:  # noqa: BLE001
+        raise AssertionError(f"a typo was reported as a withdrawal: {exc}")
+    except AttributeError:
+        pass
+    else:
+        raise AssertionError("a missing attribute did not raise")
+    print("ok   npu: an unknown name is an AttributeError, not a withdrawal")
+
 
 
 def _main():
