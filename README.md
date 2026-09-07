@@ -544,6 +544,61 @@ torchnative.nn.federated    rounds · client selection · aggregation · dropout
           └ devices         CPU · Metal · Vulkan · NPU
 ```
 
+### The API this is heading for
+
+**Decided, and none of it is implemented.** It is written down here because the
+shape was argued out rather than guessed, and because two earlier attempts
+shipped API that had to be withdrawn — `NpuModelForCausalLM`,
+`compile_model(model, device="NPU")` and friends now refuse by name and say
+what replaces them.
+
+```python
+- from transformers import AutoModelForCausalLM
++ from torchnative.transformers import AutoModelForCausalLM
+import torchnative
+
+model = AutoModelForCausalLM.from_pretrained("google/gemma-3-4b-it")
+
+loss = model(**batch, labels=labels).loss
+loss.backward()                          # a real nn.Module, so this works
+
+model.to(torchnative.device.npu)         # recompiles for the accelerator
+```
+
+Three decisions, each with its reason:
+
+**The class keeps `transformers`' own name.** The module path already
+disambiguates, so the user's diff is the import line and nothing else.
+`optimum` prefixes its classes (`OVModelForCausalLM`) because `optimum.intel`
+hosts several backends in one namespace; that pressure does not exist here. The
+whole `Auto*` family is intended, and each subclasses its `transformers`
+counterpart — those classes are factories, not `nn.Module`s, so what is
+inherited is the config-to-architecture dispatch that is the entire value of
+`Auto*`.
+
+**`torchnative.device.npu`, not `torch.device("npu")`.** PyTorch has no `npu`
+device type, and making it appear to have one would be a claim about PyTorch
+that is not true. The namespace is this project's own. `npu` RESOLVES per host —
+the Neural Engine on macOS, the Intel NPU on Windows, the Hexagon NPU on
+Android — and it must say which one it resolved to, because a device object
+that cannot say where it ran is how [`docs/graph/NPU2.md`](docs/graph/NPU2.md)'s
+partial offload went unnoticed.
+
+**`.to()` keeps the model a real `nn.Module`.** `optimum` wraps the model in an
+inference object, which is why it cannot backprop; it has no choice, because it
+runs on somebody else's `torch`. This project **ships its own `torch`**, so
+`nn.Module.to()` can be taught what a torchnative device means — recompile for
+an accelerator rather than move parameters — and the model that trains and the
+model that runs on the NPU stay the same object. That is the difference this
+API exists to preserve, and wrapping would give it away.
+
+Note that `cpu`, `mps` and `vulkan` are **eager** devices, dispatching operator
+by operator, while `npu` is a **compiled target**: an NPU takes a whole graph
+ahead of time and cannot dispatch single ops. `torch.empty(2, 2, device=…)` on
+an npu therefore has to refuse rather than half-work.
+
+---
+
 | | what is measured today |
 |---|---|
 | **Device abstraction** | **Done.** `torch.device`, per-device dispatch, and a `Repr` arm per device. Everything below attached here. |
