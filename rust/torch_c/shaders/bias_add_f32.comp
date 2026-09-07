@@ -1,0 +1,30 @@
+#version 450
+
+// The bias half of `aten.addmm.default`: out[m, j] = a[m, j] + bias[j].
+//
+//   a is [M, p1] row-major, n = M * p1
+//   b is the bias, p1 elements, added to every row
+//
+// A separate dispatch from `matmul_f32` rather than a fused epilogue. Fusing
+// would be one submission instead of two and this file makes no performance
+// claim at all (`docs/VULKAN2.md` §4.4 -- the only driver reachable here is a
+// Vulkan-on-Metal translator), so the honest trade is the one that keeps each
+// kernel a single arithmetic operation whose failure mode is legible.
+//
+// One exactly-rounded IEEE addition per element, so this half *is* compared
+// bit-for-bit; the tolerance in `docs/VULKAN4.md` §4 belongs to the matmul.
+
+layout(local_size_x = 64) in;
+
+layout(std430, set = 0, binding = 0) readonly  buffer A { float a[]; };
+layout(std430, set = 0, binding = 1) readonly  buffer B { float bias[]; };
+layout(std430, set = 0, binding = 2) writeonly buffer C { float c[]; };
+
+layout(push_constant) uniform Push { uint n; uint p1; uint p2; uint p3; } pc;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n) return;
+    uint col = i - (i / pc.p1) * pc.p1;
+    c[i] = a[i] + bias[col];
+}

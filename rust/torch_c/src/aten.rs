@@ -1370,7 +1370,17 @@ pub fn aten_dispatch(
             crate::device::mps_host_readback_gate(op)?;
             aten_dispatch_inner(py, op, args, kwargs)?
         }
-        _ => aten_dispatch_inner(py, op, args, kwargs)?,
+        // The upload. `x.to("vulkan")` arrives here as an ordinary CPU
+        // `_to_copy`, and before this round it went on to `resolve()` and got
+        // "device not available in torch._C shim: vulkan" -- so the *only* way
+        // onto that device was a constant factory, and every Vulkan kernel
+        // that had ever been tested had been tested on constants
+        // (docs/VULKAN4.md §1). `maybe_upload` returns `None` for every call
+        // that is not a copy to vulkan, so nothing else changes shape here.
+        _ => match crate::vulkan::maybe_upload(py, op, args, kwargs)? {
+            Some(out) => out,
+            None => aten_dispatch_inner(py, op, args, kwargs)?,
+        },
     };
     // One exit as well as one entrance: every tensor leaving the dispatcher
     // wears the registered Python tensor class (`tensor::promote`). Doing it

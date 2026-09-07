@@ -1,0 +1,44 @@
+#version 450
+
+// `aten.mm.default` and the product half of `aten.addmm.default`, f32.
+//
+//   a is [p1, p2] = [M, K] row-major
+//   b is [p2, p3] = [K, N] row-major
+//   c is [M, N],  n = M * N
+//
+// One invocation per output element, accumulating over K in a local `float`.
+//
+// **This is the first kernel in this directory whose answer is not forced to be
+// bit-identical to the CPU's**, and that is deliberate rather than overlooked.
+// Everything before it (add, sub, mul, div, neg, relu, transpose, copy) is one
+// exactly-rounded IEEE operation or none at all, so a difference could only be
+// plumbing. A dot product is a *sum*, and a sum has an order; candle's CPU gemm
+// blocks and vectorises, this loop does not, and both are correct float32
+// arithmetic. `docs/VULKAN4.md` §4 therefore does not compare this bit-for-bit
+// -- it scores both against upstream's own float64 answer and asks whether the
+// distance is the one float32 costs, the way `docs/AGREE.md` §2 derives its
+// tolerance instead of choosing one.
+//
+// The accumulator is `float`, not `double`: upstream's float32 gemm accumulates
+// in float32, and accumulating wider here would make this kernel *more*
+// accurate than the thing it has to agree with, which is a different defect.
+
+layout(local_size_x = 64) in;
+
+layout(std430, set = 0, binding = 0) readonly  buffer A { float a[]; };
+layout(std430, set = 0, binding = 1) readonly  buffer B { float b[]; };
+layout(std430, set = 0, binding = 2) writeonly buffer C { float c[]; };
+
+layout(push_constant) uniform Push { uint n; uint p1; uint p2; uint p3; } pc;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n) return;
+    uint row = i / pc.p3;
+    uint col = i - row * pc.p3;
+    float acc = 0.0;
+    for (uint k = 0u; k < pc.p2; ++k) {
+        acc += a[row * pc.p2 + k] * b[k * pc.p3 + col];
+    }
+    c[i] = acc;
+}

@@ -1,0 +1,25 @@
+#version 450
+
+// `aten.sub.Tensor` for f32, equal shapes: c[i] = a[i] - b[i].
+//
+// A sibling of `add_f32.comp` rather than a shared shader with a selector
+// push constant. The reason is the reason that file gives for not sharing with
+// the probe's `vecadd`: one arithmetic operation per invocation and nothing
+// else, so a mismatch can only be plumbing -- buffer binding, memory
+// visibility, dispatch size -- and never accumulation order or a mis-selected
+// branch. IEEE-754 single sub.Tensor is exactly rounded, so the test compares this
+// bit-for-bit against the CPU kernel rather than within a tolerance.
+
+layout(local_size_x = 64) in;
+
+layout(std430, set = 0, binding = 0) readonly  buffer A { float a[]; };
+layout(std430, set = 0, binding = 1) readonly  buffer B { float b[]; };
+layout(std430, set = 0, binding = 2) writeonly buffer C { float c[]; };
+
+layout(push_constant) uniform Push { uint n; uint p1; uint p2; uint p3; } pc;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n) return;
+    c[i] = a[i] - b[i];
+}

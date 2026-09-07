@@ -167,10 +167,30 @@ cargo test --release --quiet || exit $?
 # Splitting by topic makes those merges disjoint. The files share helpers by
 # importing `test_shim`, which is why `pytests/` is on PYTHONPATH; each one's
 # `__main__` guard keeps that import from running anything.
+# `TORCHNATIVE_VULKAN_DYLD`: an opt-in way to let the vulkan tests actually run.
+#
+# docs/VULKAN3.md §6.1 recorded the trap and left it: macOS SIP **strips
+# `DYLD_*` from the environment when a protected binary is exec'd**, and
+# `/bin/sh` is one. So `DYLD_LIBRARY_PATH=... sh run.sh` sets a variable that
+# this script can still see and the interpreter it launches cannot -- the
+# vulkan tests skip saying "no loader", on a machine where the caller supplied
+# one. That is the closest thing to a false green this device has produced.
+#
+# Re-exporting it here, immediately before the interpreter is launched, is the
+# fix that document proposed. Under a *different* name, so that a caller who
+# exports `DYLD_LIBRARY_PATH` and watches it vanish is not told twice that it
+# worked; and opt-in, so a run that does not set it behaves exactly as before
+# and the tests skip by name as they always did.
+vk_env=""
+if [ -n "${TORCHNATIVE_VULKAN_DYLD:-}" ]; then
+    vk_env="DYLD_LIBRARY_PATH=$TORCHNATIVE_VULKAN_DYLD"
+    echo "vulkan: re-exporting DYLD_LIBRARY_PATH=$TORCHNATIVE_VULKAN_DYLD (SIP strips it through /bin/sh)"
+fi
+
 suite_failed=0
 for suite in "$crate_dir"/pytests/test_*.py; do
     echo "--- $(basename "$suite") ---"
-    PYTHONPATH="$stage:$crate_dir/pytests" "${PYTHON:-python3}" "$suite" || suite_failed=1
+    env $vk_env PYTHONPATH="$stage:$crate_dir/pytests" "${PYTHON:-python3}" "$suite" || suite_failed=1
 done
 [ "$suite_failed" -eq 0 ] || exit 1
 

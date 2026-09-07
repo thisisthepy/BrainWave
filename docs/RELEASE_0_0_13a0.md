@@ -73,7 +73,7 @@ float32 accumulation over depth. §3 of `AGREE.md` is a ranking of depth, not of
 |---|---|
 | **`loss.backward()` and a real training loop** | The eager autograd engine reaches upstream's own path — `torch/_tensor.py` → `_engine_run_backward` → `_ImperativeEngine.run_backward` — so `loss.backward()`, `optimizer.step()` and `zero_grad()` are the ordinary PyTorch code and not a shim-specific call. A six-step SGD loop over an `nn.Sequential`, driven by the real `torch.optim.SGD`, matches upstream to **2.98e-08** — one float32 ulp — across the loss trajectory, the gradients and the final parameters. `retain_graph=True`, `backward(inputs=...)` and `torch.autograd.grad`'s `allow_unused` semantics land with it (`docs/BACKWARD9.md`) |
 | **Metal computes on the real GPU** | `mps` is candle's Metal backend, on. An `mps` tensor is an ordinary candle tensor, so no kernel had to be taught it (`docs/VULKAN3.md`) |
-| **Vulkan computes on the real GPU** | A fourth arm of `tensor::Repr`, outside candle entirely, with a real `VkBuffer` round-trip on this host. Four ops by name; everything else refuses naming itself, which is what makes a silent CPU fallback structurally unrepresentable rather than merely avoided (`docs/VULKAN3.md`) |
+| **Vulkan computes on the real GPU** | A fourth arm of `tensor::Repr`, outside candle entirely, with a real `VkBuffer` round-trip on this host. **Eighteen ops by name -- eleven compute kernels and seven metadata ops** -- and a `nn.Sequential(Linear, ReLU, Linear)` forwards on it in seven compute shaders with zero host readbacks; everything else refuses naming itself, which is what makes a silent CPU fallback structurally unrepresentable rather than merely avoided (`docs/VULKAN4.md`) |
 | **A CoreML model that executes** | A captured graph serialises to CoreML MIL, macOS compiles the `.mlpackage`, and `MLModel.predict` runs it — agreeing with the replayed trace to **2–3e-08** at float32. Float32 had to be forced: `coremltools` defaults `mlprogram` to float16, which is four orders of magnitude looser (`docs/NPU.md`) |
 | **NNAPI lowering, end to end for one model** | Prims folded back to aten and BatchNorm fused into the preceding convolution, so `mobilenet_v2` lowers with nothing left outside NNAPI's op set (`docs/NPU.md`) |
 | **`torch.distributed` at `world_size >= 3`** | `ProcessGroupLocal` over real loopback TCP in a star, hub at rank 0, folding contributions in ascending rank order so the answer is a property of one process and not of who arrived when. Proper-subset cohorts, a survivor set after a dropout, and `on_missing='average_arrived'` with `min_participants=k` all run (`docs/FEDERATED4.md`) |
@@ -257,8 +257,47 @@ would otherwise count these as features.
   attention block; and **GPT-2 still does not forward**, stopping on Metal's
   inability to allocate a zero-byte buffer, the same wall `docs/MPSFWD.md` §6
   already recorded and left alone.
-- **Vulkan is four ops.** Correctness is testable on this host; performance
-  needs a phone and has not been measured.
+- **Vulkan is eighteen ops, eleven of which are compute kernels — and the
+  sentence that stood here was true in a way that misled.** It said "Vulkan is
+  four ops", and there were exactly four; but asked what each *did*, only
+  `aten.add.Tensor` ever ran a compute shader. `_to_copy` was a memory copy and
+  `detach`/`alias` submitted nothing to the GPU at all, so a count of
+  *reachability* was being read as a count of *computation*
+  (`docs/VULKAN4.md` §1). What the op list could not show at all was worse:
+  **there was no way to put arbitrary data on the device.** The only doors in
+  were `ones`/`zeros`/`empty`, so every Vulkan kernel that had ever been tested
+  had been tested on constants — and a matmul of all-ones cannot distinguish a
+  correct kernel from one that transposed an index. `x.to("vulkan")` now
+  uploads, and that had to land before anything could be measured.
+  The ops taught were chosen by **recording what a real forward pass
+  dispatches** rather than by inventory order: a shrunk BERT traced on upstream
+  is 117 dispatches over 17 keys, and 64% of them are layout
+  (`view` 40, `t` 13, `transpose` 10, `expand` 8), with `addmm` at 13 the
+  dominant arithmetic. Nine new SPIR-V shaders cover `mul`/`sub`/`div`/`neg`/
+  `relu`/`clone`, a materialising 2-D transpose, `mm` and `addmm`.
+  **A whole module forwards on the GPU**: `nn.Sequential(Linear, ReLU, Linear)`
+  runs seven compute shaders with **zero host readbacks**, landing 0.72–0.90×
+  upstream's own float32-vs-float64 error and within about one float32 ulp of
+  the shim's own `cpu` answer. Every exactly-rounded op is held to **bit
+  equality** rather than a tolerance, because `docs/AGREE.md` §2's derivation
+  produces zero for them — 33 of 33 cases are bit-identical to upstream. The
+  matmul is the one place a tolerance is needed, and the residue was **proved**
+  rather than tolerated: the GPU's answer is reproduced bit-for-bit, at every
+  shape, by a host model of sequential float32 accumulation **with FMA
+  contraction**, which a kernel that had lost or misread a term could not
+  survive. That "it ran on the GPU" is asserted from runtime counters placed
+  after `vkWaitForFences` and inside the module's only map-for-reading — not
+  from a source scan, which `docs/MPSATTN.md` §3.1 records itself being able to
+  defeat. **Four qualifications belong to this sentence:** a *transformer*
+  still does not forward — `native_layer_norm`, `_softmax`, `gelu`, `embedding`
+  and `bmm` are all on the measured trace and all still refuse, so row-wise
+  reduction kernels are the remaining distance; the honest summary is
+  "11 kernels + 7 metadata ops", not "18 ops", which is the same counting trap
+  this bullet is correcting; transpose **materialises** here because a
+  `VkTensor` has no strides, which is a real cost difference from upstream; and
+  **performance still needs a phone and still has not been measured** — that
+  half of the old sentence is untouched and remains true, because the only
+  driver reachable on this host is a Vulkan-on-Metal translation layer.
 - **One hardware accelerator has been reached; the graphs credited above were not on it.**
   Both halves now execute (`docs/NPU2.md`). The CoreML models this
   document credited above ran on the **CPU**: `MLComputePlan` reports the

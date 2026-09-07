@@ -42,6 +42,7 @@
 
 use std::collections::HashMap;
 use std::ffi::CStr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use ash::vk;
@@ -62,6 +63,59 @@ use crate::tensor::PyTensorBase;
 /// `test_the_checked_in_spirv_is_not_stale` is the guard that an edit to the
 /// `.comp` was actually compiled.
 const ADD_F32_SPV: &[u8] = include_bytes!("../shaders/add_f32.spv");
+
+macro_rules! spv {
+    ($name:ident, $file:literal) => {
+        const $name: &[u8] = include_bytes!(concat!("../shaders/", $file, ".spv"));
+    };
+}
+spv!(SUB_F32_SPV, "sub_f32");
+spv!(MUL_F32_SPV, "mul_f32");
+spv!(DIV_F32_SPV, "div_f32");
+spv!(RELU_F32_SPV, "relu_f32");
+spv!(NEG_F32_SPV, "neg_f32");
+spv!(COPY_F32_SPV, "copy_f32");
+spv!(TRANSPOSE2D_F32_SPV, "transpose2d_f32");
+spv!(MATMUL_F32_SPV, "matmul_f32");
+spv!(BIAS_ADD_F32_SPV, "bias_add_f32");
+
+// ---------------------------------------------------------------------------
+// The instrument: how "it ran on the GPU" stops being an inference
+// ---------------------------------------------------------------------------
+
+/// Three process-wide counters, incremented at the only three places where
+/// this module can cross the host/device boundary or make the GPU do work.
+///
+/// **Why these exist rather than a source-scanning test.** `docs/MPSATTN.md`
+/// §3.1 records, against its own round, a way to take an op off a refusal list
+/// while keeping its host readback that *both* of that device's derivation
+/// tests would still pass: the per-op scan looks for six helper names in a
+/// kernel body and the classification test looks for three markers, so moving
+/// the readback one call deeper -- into a helper named something else -- is
+/// invisible to both. Every check of that shape reads the source and can be
+/// defeated by moving the thing it greps for.
+///
+/// These counters cannot be defeated that way, because they are not a
+/// description of the code: `SHADER_DISPATCHES` is incremented inside
+/// `dispatch_kernel`, after `vkWaitForFences` has returned success, and
+/// `HOST_DOWNLOADS` is incremented inside `download`, which is the only
+/// `vkMapMemory`-for-reading in the module. An op that computed on the host
+/// would have to read its operands, and reading them goes through `download`
+/// however many helpers deep it is buried. So the test asserts, at runtime and
+/// per op, **`shader_dispatches` went up by the expected number and
+/// `host_downloads` did not move at all** -- which is a statement about what
+/// the process did, not about what the source looks like.
+static SHADER_DISPATCHES: AtomicU64 = AtomicU64::new(0);
+static HOST_UPLOADS: AtomicU64 = AtomicU64::new(0);
+static HOST_DOWNLOADS: AtomicU64 = AtomicU64::new(0);
+
+fn push_bytes(push: [u32; 4]) -> [u8; 16] {
+    let mut out = [0u8; 16];
+    for (i, v) in push.iter().enumerate() {
+        out[i * 4..i * 4 + 4].copy_from_slice(&v.to_ne_bytes());
+    }
+    out
+}
 
 // ---------------------------------------------------------------------------
 // Context
@@ -359,6 +413,7 @@ impl VkContext {
             .map_err(|e| format!("vkMapMemory: {e}"))? as *mut f32;
         std::ptr::copy_nonoverlapping(data.as_ptr(), p, data.len());
         self.device.unmap_memory(buf.memory);
+        HOST_UPLOADS.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
@@ -376,6 +431,7 @@ impl VkContext {
         let mut out = vec![0.0f32; n];
         std::ptr::copy_nonoverlapping(p, out.as_mut_ptr(), n);
         self.device.unmap_memory(buf.memory);
+        HOST_DOWNLOADS.fetch_add(1, Ordering::Relaxed);
         Ok(out)
     }
 
@@ -421,10 +477,17 @@ impl VkContext {
             )
             .map_err(|e| format!("vkCreateDescriptorSetLayout({name}): {e}"))?;
 
+        // Sixteen bytes, not four. Every kernel here declares
+        // `Push { uint n; uint p1; uint p2; uint p3; }` and most of them use
+        // only `n`; a shader that reads fewer bytes than the range declares is
+        // legal, which is why widening this did not require recompiling
+        // `add_f32.spv` -- and `shaders/compile.sh` reproduced that file
+        // byte-for-byte, which is the control that the toolchain here is the
+        // one that produced the committed kernel (docs/VULKAN4.md §3).
         let pc = [vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::COMPUTE)
             .offset(0)
-            .size(4)];
+            .size(16)];
         let set_layouts = [dsl];
         let layout = self
             .device
@@ -487,7 +550,7 @@ impl VkContext {
         name: &'static str,
         spv: &[u8],
         bufs: [&VkBuffer; 3],
-        n: u32,
+        push: [u32; 4],
     ) -> Result<(), String> {
         let k = self.kernel(name, spv)?;
         let pool = self.submit.lock().map_err(|_| "submit lock poisoned")?;
@@ -552,9 +615,11 @@ impl VkContext {
             k.layout,
             vk::ShaderStageFlags::COMPUTE,
             0,
-            &n.to_ne_bytes(),
+            &push_bytes(push),
         );
-        self.device.cmd_dispatch(cb, n.div_ceil(64), 1, 1);
+        // One invocation per output element is the convention every `.comp` in
+        // `shaders/` follows, so the grid is sized from `push[0]` alone.
+        self.device.cmd_dispatch(cb, push[0].div_ceil(64), 1, 1);
         self.device
             .end_command_buffer(cb)
             .map_err(|e| format!("vkEndCommandBuffer: {e}"))?;
@@ -581,6 +646,11 @@ impl VkContext {
         self.device.free_command_buffers(*pool, &cbs);
         let _ = self.device.free_descriptor_sets(k.dpool, &[dset]);
         drop(pool);
+        // After the fence, and only on success: the counter means "a compute
+        // shader ran to completion on the device", not "one was submitted".
+        if result.is_ok() {
+            SHADER_DISPATCHES.fetch_add(1, Ordering::Relaxed);
+        }
         result
     }
 }
@@ -663,24 +733,536 @@ pub fn dispatch(
 ) -> PyResult<Py<PyAny>> {
     match op {
         "aten._to_copy.default" => to_copy(py, op, args, kwargs),
+
+        // Elementwise, equal shapes, f32. One exactly-rounded IEEE operation
+        // per element, so each of these is compared bit-for-bit against the
+        // CPU kernel rather than within a tolerance (docs/VULKAN4.md §4).
         "aten.add.Tensor" => add_tensor(py, op, args, kwargs),
-        // `detach`/`alias`/`clone` share the buffer, which is what the dense
-        // arm does too (a candle clone is an `Arc` clone) and is safe here for
-        // a stronger reason: no op on this device writes in place.
-        "aten.detach.default" | "aten.alias.default" => {
+        "aten.sub.Tensor" => binary(py, op, args, kwargs, "sub_f32", SUB_F32_SPV, true),
+        "aten.mul.Tensor" => binary(py, op, args, kwargs, "mul_f32", MUL_F32_SPV, false),
+        "aten.div.Tensor" => binary(py, op, args, kwargs, "div_f32", DIV_F32_SPV, false),
+
+        // Unary elementwise.
+        "aten.relu.default" => unary(py, op, args, kwargs, "relu_f32", RELU_F32_SPV),
+        "aten.neg.default" => unary(py, op, args, kwargs, "neg_f32", NEG_F32_SPV),
+
+        // `clone` allocates and copies on the device. `detach`/`alias` share
+        // the buffer, which is what the dense arm does too (a candle clone is
+        // an `Arc` clone) and is safe here for a stronger reason: no op on
+        // this device writes in place.
+        "aten.clone.default" => unary(py, op, args, kwargs, "copy_f32", COPY_F32_SPV),
+        "aten.detach.default" | "aten.alias.default" | "aten.contiguous.default" => {
             let input = crate::aten::tensor_arg(op, args, kwargs, 0, "self")?;
             let vk_tensor = input.vk_tensor(op)?.clone();
             let out = PyTensorBase::vulkan(vk_tensor, input.tag());
             crate::tensor::promote(py, out.into_pyobject(py)?.into_any().unbind())
         }
+
+        // Shape-only. Every tensor on this device is contiguous by
+        // construction -- there are no strides to be non-contiguous with --
+        // so a reshape is a new `shape` over the same buffer and moves no
+        // bytes. `_vulkan_counters()` shows zero shader dispatches for these,
+        // which is the honest answer and not a claim that the GPU did work.
+        "aten.view.default" | "aten._unsafe_view.default" | "aten.reshape.default" => {
+            reshape(py, op, args, kwargs)
+        }
+
+        // Transpose *materialises* here, because a `VkTensor` has a shape and
+        // no strides. 2-D only; higher ranks refuse by name (docs/VULKAN4.md §6).
+        "aten.t.default" => t_default(py, op, args, kwargs),
+        "aten.transpose.int" => transpose_int(py, op, args, kwargs),
+
+        // The matmuls -- the ops the measured trace says a forward pass
+        // actually spends itself on (docs/VULKAN4.md §2).
+        "aten.mm.default" => mm(py, op, args, kwargs),
+        "aten.addmm.default" => addmm(py, op, args, kwargs),
+
         other => Err(not_implemented(format!(
             "{other}: not implemented for the vulkan device. This build teaches \
-             the vulkan device four ops by name -- aten.add.Tensor, \
-             aten._to_copy.default, aten.detach.default and aten.alias.default \
-             -- and every other op refuses here rather than falling back to the \
-             CPU (docs/VULKAN3.md). Move the tensor with .cpu() to compute {other}."
+             the vulkan device {} ops by name -- {} -- and every other op \
+             refuses here rather than falling back to the CPU \
+             (docs/VULKAN4.md). Move the tensor with .cpu() to compute {other}.",
+            vulkan_ops().len(),
+            vulkan_ops().join(", ")
         ))),
     }
+}
+
+// ---------------------------------------------------------------------------
+// The taught ops
+// ---------------------------------------------------------------------------
+
+/// Every op here is f32-only, and this is where that is enforced for a whole
+/// tensor list rather than once per call site.
+fn check_all_f32(op: &str, tensors: &[&PyTensorBase]) -> PyResult<()> {
+    for t in tensors {
+        check_dtype(op, t.tag())?;
+    }
+    Ok(())
+}
+
+/// `self` for an op whose only tensor argument is the receiver.
+fn self_vk(
+    op: &str,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<(PyTensorBase, VkTensor)> {
+    let input = crate::aten::tensor_arg(op, args, kwargs, 0, "self")?;
+    check_dtype(op, input.tag())?;
+    let vk = input.vk_tensor(op)?.clone();
+    Ok((input, vk))
+}
+
+/// Wrap a freshly produced buffer as a tensor of `shape` with `tag`.
+fn wrap(
+    py: Python<'_>,
+    buffer: VkBuffer,
+    shape: Vec<usize>,
+    tag: TorchDType,
+) -> PyResult<Py<PyAny>> {
+    let out = PyTensorBase::vulkan(
+        VkTensor {
+            buffer: Arc::new(buffer),
+            shape,
+        },
+        tag,
+    );
+    crate::tensor::promote(py, out.into_pyobject(py)?.into_any().unbind())
+}
+
+/// One input, one output, same shape.
+fn unary(
+    py: Python<'_>,
+    op: &str,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+    name: &'static str,
+    spv: &'static [u8],
+) -> PyResult<Py<PyAny>> {
+    let (input, a) = self_vk(op, args, kwargs)?;
+    let ctx = require(op)?;
+    let n = a.elem_count();
+    let out = unsafe {
+        let out = ctx.alloc(n * 4).map_err(|e| vk_error(op, e))?;
+        // Binding 1 is the input again: the descriptor set layout is three
+        // storage buffers for every kernel here and the shader declares the
+        // slot it does not read (`shaders/*_f32.comp`).
+        ctx.dispatch_kernel(name, spv, [&a.buffer, &a.buffer, &out], [n as u32, 0, 0, 0])
+            .map_err(|e| vk_error(op, e))?;
+        out
+    };
+    wrap(py, out, a.shape.clone(), input.tag())
+}
+
+/// Two inputs of equal shape, one output. `alpha` is accepted only when it is
+/// 1, for the ops that have one.
+fn binary(
+    py: Python<'_>,
+    op: &str,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+    name: &'static str,
+    spv: &'static [u8],
+    has_alpha: bool,
+) -> PyResult<Py<PyAny>> {
+    let lhs = crate::aten::tensor_arg(op, args, kwargs, 0, "self")?;
+    let rhs = crate::aten::tensor_arg(op, args, kwargs, 1, "other")?;
+    if has_alpha {
+        reject_alpha(op, args, kwargs)?;
+    }
+    check_all_f32(op, &[&lhs, &rhs])?;
+    let a = lhs.vk_tensor(op)?.clone();
+    let b = rhs.vk_tensor(op)?.clone();
+    same_shape(op, &a, &b)?;
+    let ctx = require(op)?;
+    let n = a.elem_count();
+    let out = unsafe {
+        let out = ctx.alloc(n * 4).map_err(|e| vk_error(op, e))?;
+        ctx.dispatch_kernel(name, spv, [&a.buffer, &b.buffer, &out], [n as u32, 0, 0, 0])
+            .map_err(|e| vk_error(op, e))?;
+        out
+    };
+    wrap(py, out, a.shape.clone(), lhs.tag())
+}
+
+/// Broadcasting is refused rather than emulated, by name and with both shapes
+/// in the message. `docs/VULKAN3.md` is explicit that reaching for the CPU
+/// implementation half a metre away is exactly the silent fallback this device
+/// exists to make impossible.
+fn same_shape(op: &str, a: &VkTensor, b: &VkTensor) -> PyResult<()> {
+    if a.shape != b.shape {
+        return Err(not_implemented(format!(
+            "{op}: the vulkan kernels are elementwise over equal shapes and do \
+             not broadcast {:?} with {:?} (docs/VULKAN4.md §6).",
+            a.shape, b.shape
+        )));
+    }
+    Ok(())
+}
+
+fn reject_alpha(
+    op: &str,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<()> {
+    if let Some(alpha) = crate::aten::optional(args, kwargs, 2, "alpha")? {
+        if !alpha.is_none() && alpha.extract::<f64>().unwrap_or(1.0) != 1.0 {
+            return Err(not_implemented(format!(
+                "{op}: the vulkan kernel has no alpha (docs/VULKAN4.md §6)."
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// `view` / `_unsafe_view` / `reshape`: a new shape over the same buffer.
+fn reshape(
+    py: Python<'_>,
+    op: &str,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    let (input, a) = self_vk(op, args, kwargs)?;
+    // `aten.view` and `aten._unsafe_view` spell the argument `size`;
+    // `aten.reshape` spells it `shape`. Both are accepted rather than one
+    // being assumed -- the first draft assumed `size` and `t.reshape(-1)`
+    // raised "missing argument 'size'" on a tensor that had one.
+    let requested = match crate::aten::optional(args, kwargs, 1, "size")? {
+        Some(v) if !v.is_none() => Some(v),
+        _ => crate::aten::optional(args, kwargs, 1, "shape")?,
+    };
+    let requested = requested
+        .filter(|v| !v.is_none())
+        .ok_or_else(|| not_implemented(format!("{op}: vulkan: missing argument 'size'")))?;
+    let requested: Vec<i64> = match requested.extract::<Vec<i64>>() {
+        Ok(v) => v,
+        Err(_) => vec![requested.extract::<i64>()?],
+    };
+    let n = a.elem_count();
+    let shape = resolve_shape(op, &requested, n)?;
+    let out = PyTensorBase::vulkan(
+        VkTensor {
+            buffer: a.buffer.clone(),
+            shape,
+        },
+        input.tag(),
+    );
+    crate::tensor::promote(py, out.into_pyobject(py)?.into_any().unbind())
+}
+
+/// The `-1` sentinel and the element-count check, in upstream's words.
+fn resolve_shape(op: &str, requested: &[i64], n: usize) -> PyResult<Vec<usize>> {
+    let mut wild: Option<usize> = None;
+    let mut known: usize = 1;
+    for (i, &d) in requested.iter().enumerate() {
+        if d == -1 {
+            if wild.is_some() {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                    "only one dimension can be inferred",
+                ));
+            }
+            wild = Some(i);
+        } else if d < 0 {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "{op}: invalid shape dimension {d}"
+            )));
+        } else {
+            known = known.saturating_mul(d as usize);
+        }
+    }
+    let mut shape: Vec<usize> = requested
+        .iter()
+        .map(|&d| if d == -1 { 0 } else { d as usize })
+        .collect();
+    match wild {
+        Some(i) => {
+            if known == 0 || n % known != 0 {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "shape {requested:?} is invalid for input of size {n}"
+                )));
+            }
+            shape[i] = n / known;
+        }
+        None => {
+            if known != n {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "shape {requested:?} is invalid for input of size {n}"
+                )));
+            }
+        }
+    }
+    Ok(shape)
+}
+
+/// `aten.t.default`. Rank 0 and 1 are the identity upstream, and are here too;
+/// rank 2 materialises through the transpose kernel; anything else is upstream's
+/// own error rather than a vulkan one.
+fn t_default(
+    py: Python<'_>,
+    op: &str,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    let (input, a) = self_vk(op, args, kwargs)?;
+    match a.shape.len() {
+        0 | 1 => {
+            let out = PyTensorBase::vulkan(a, input.tag());
+            crate::tensor::promote(py, out.into_pyobject(py)?.into_any().unbind())
+        }
+        2 => transpose2d(py, op, &input, &a),
+        rank => Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "t() expects a tensor with <= 2 dimensions, but self is {rank}D"
+        ))),
+    }
+}
+
+/// `aten.transpose.int`. 2-D only on this device -- see `transpose2d`.
+fn transpose_int(
+    py: Python<'_>,
+    op: &str,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    let (input, a) = self_vk(op, args, kwargs)?;
+    let rank = a.shape.len();
+    let dim = |i: usize, name: &str| -> PyResult<isize> {
+        let v = crate::aten::optional(args, kwargs, i, name)?
+            .ok_or_else(|| not_implemented(format!("{op}: vulkan: missing argument '{name}'")))?;
+        v.extract::<isize>()
+    };
+    let extent = rank.max(1) as isize;
+    let norm = |d: isize| -> PyResult<usize> {
+        let i = if d < 0 { d + extent } else { d };
+        if i < 0 || i >= extent {
+            return Err(pyo3::exceptions::PyIndexError::new_err(format!(
+                "Dimension out of range (expected to be in range of [{}, {}], but got {d})",
+                -extent,
+                extent - 1
+            )));
+        }
+        Ok(i as usize)
+    };
+    let d0 = norm(dim(1, "dim0")?)?;
+    let d1 = norm(dim(2, "dim1")?)?;
+    if d0 == d1 || rank < 2 {
+        let out = PyTensorBase::vulkan(a, input.tag());
+        return crate::tensor::promote(py, out.into_pyobject(py)?.into_any().unbind());
+    }
+    if rank != 2 {
+        return Err(not_implemented(format!(
+            "{op}: the vulkan device transposes 2-D tensors and was asked for a \
+             {rank}-D one {:?}. A `VkTensor` carries a shape and no strides, so a \
+             transpose here has to move bytes, and the kernel that moves them is \
+             a 2-D one. Higher ranks refuse rather than being permuted by some \
+             other route (docs/VULKAN4.md §6).",
+            a.shape
+        )));
+    }
+    transpose2d(py, op, &input, &a)
+}
+
+/// The materialising 2-D transpose. Pure data movement, so the result is
+/// bit-identical to the CPU answer by construction.
+fn transpose2d(
+    py: Python<'_>,
+    op: &str,
+    input: &PyTensorBase,
+    a: &VkTensor,
+) -> PyResult<Py<PyAny>> {
+    let (rows, cols) = (a.shape[0], a.shape[1]);
+    let ctx = require(op)?;
+    let n = rows * cols;
+    let out = unsafe {
+        let out = ctx.alloc(n * 4).map_err(|e| vk_error(op, e))?;
+        ctx.dispatch_kernel(
+            "transpose2d_f32",
+            TRANSPOSE2D_F32_SPV,
+            [&a.buffer, &a.buffer, &out],
+            [n as u32, rows as u32, cols as u32, 0],
+        )
+        .map_err(|e| vk_error(op, e))?;
+        out
+    };
+    wrap(py, out, vec![cols, rows], input.tag())
+}
+
+/// The product itself, shared by `mm` and `addmm`.
+fn matmul_into(op: &str, a: &VkTensor, b: &VkTensor) -> PyResult<(VkBuffer, usize, usize)> {
+    if a.shape.len() != 2 || b.shape.len() != 2 {
+        return Err(not_implemented(format!(
+            "{op}: the vulkan matmul kernel is 2-D and was given {:?} and {:?}. \
+             Batched matmul (`aten.bmm.default`) is not taught this device \
+             (docs/VULKAN4.md §6).",
+            a.shape, b.shape
+        )));
+    }
+    let (m, k) = (a.shape[0], a.shape[1]);
+    let (k2, n) = (b.shape[0], b.shape[1]);
+    if k != k2 {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "mat1 and mat2 shapes cannot be multiplied ({m}x{k} and {k2}x{n})"
+        )));
+    }
+    let ctx = require(op)?;
+    let count = m * n;
+    let out = unsafe {
+        let out = ctx.alloc(count * 4).map_err(|e| vk_error(op, e))?;
+        ctx.dispatch_kernel(
+            "matmul_f32",
+            MATMUL_F32_SPV,
+            [&a.buffer, &b.buffer, &out],
+            [count as u32, m as u32, k as u32, n as u32],
+        )
+        .map_err(|e| vk_error(op, e))?;
+        out
+    };
+    Ok((out, m, n))
+}
+
+fn mm(
+    py: Python<'_>,
+    op: &str,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    let lhs = crate::aten::tensor_arg(op, args, kwargs, 0, "self")?;
+    let rhs = crate::aten::tensor_arg(op, args, kwargs, 1, "mat2")?;
+    check_all_f32(op, &[&lhs, &rhs])?;
+    let a = lhs.vk_tensor(op)?.clone();
+    let b = rhs.vk_tensor(op)?.clone();
+    let (out, m, n) = matmul_into(op, &a, &b)?;
+    wrap(py, out, vec![m, n], lhs.tag())
+}
+
+/// `aten.addmm.default(bias, mat1, mat2, *, beta=1, alpha=1)`.
+///
+/// Two dispatches, not one: the product, then the bias. `beta` and `alpha` are
+/// refused unless they are 1 -- `nn.Linear` never sets them, and scaling here
+/// would be a third arithmetic operation with no kernel behind it.
+fn addmm(
+    py: Python<'_>,
+    op: &str,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    let bias = crate::aten::tensor_arg(op, args, kwargs, 0, "self")?;
+    let lhs = crate::aten::tensor_arg(op, args, kwargs, 1, "mat1")?;
+    let rhs = crate::aten::tensor_arg(op, args, kwargs, 2, "mat2")?;
+    for (i, name) in [(3usize, "beta"), (4usize, "alpha")] {
+        if let Some(v) = crate::aten::optional(args, kwargs, i, name)? {
+            if !v.is_none() && v.extract::<f64>().unwrap_or(1.0) != 1.0 {
+                return Err(not_implemented(format!(
+                    "{op}: the vulkan device implements addmm with beta = alpha = 1 \
+                     and was given {name} != 1 (docs/VULKAN4.md §6)."
+                )));
+            }
+        }
+    }
+    check_all_f32(op, &[&bias, &lhs, &rhs])?;
+    let c = bias.vk_tensor(op)?.clone();
+    let a = lhs.vk_tensor(op)?.clone();
+    let b = rhs.vk_tensor(op)?.clone();
+    let (product, m, n) = matmul_into(op, &a, &b)?;
+
+    // A 1-D bias of width `n` is what `nn.Linear` passes. A 2-D `[m, n]` bias
+    // is elementwise and goes through the same kernel with `p1 = n`, because
+    // `col` then indexes the row too. Everything else refuses.
+    let bias_ok = match c.shape.as_slice() {
+        [w] => *w == n,
+        [r, w] => *r == m && *w == n,
+        _ => false,
+    };
+    if !bias_ok {
+        return Err(not_implemented(format!(
+            "{op}: the vulkan device adds a bias of shape [{n}] or [{m}, {n}] and \
+             was given {:?}. Wider broadcasting refuses rather than being \
+             emulated (docs/VULKAN4.md §6).",
+            c.shape
+        )));
+    }
+    let ctx = require(op)?;
+    let count = m * n;
+    let out = unsafe {
+        let out = ctx.alloc(count * 4).map_err(|e| vk_error(op, e))?;
+        ctx.dispatch_kernel(
+            "bias_add_f32",
+            BIAS_ADD_F32_SPV,
+            [&product, &c.buffer, &out],
+            [count as u32, n as u32, 0, 0],
+        )
+        .map_err(|e| vk_error(op, e))?;
+        out
+    };
+    wrap(py, out, vec![m, n], lhs.tag())
+}
+
+/// `x.to("vulkan")` for a tensor that is **not** on Vulkan yet -- the upload
+/// half of `docs/VULKAN2.md` §5.2 item 5, which did not exist until this round.
+///
+/// **Why this had to be added before anything could be measured.** Before it,
+/// the only way onto this device was `torch.ones`/`zeros`/`empty`, so every
+/// tensor that had ever reached a Vulkan kernel was a constant. A matmul of
+/// all-ones agrees with any implementation that sums the right number of ones;
+/// it cannot distinguish a correct kernel from one that transposed an index or
+/// accumulated in the wrong order. Comparing element-wise against upstream on
+/// real data (`docs/VULKAN4.md` §4) needs real data, and this is how it gets
+/// there.
+///
+/// Returns `None` when the call is not a copy *to* vulkan, so the caller falls
+/// through to its ordinary path and nothing else changes.
+pub fn maybe_upload(
+    py: Python<'_>,
+    op: &str,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Option<Py<PyAny>>> {
+    if op != "aten._to_copy.default" {
+        return Ok(None);
+    }
+    let Ok(input) = crate::aten::tensor_arg(op, args, kwargs, 0, "self") else {
+        return Ok(None);
+    };
+    let current = input.device_label();
+    let label = crate::aten::device_arg_or_label(args, kwargs, 3, "device", &current)?;
+    if label.kind != "vulkan" || current.kind == "vulkan" {
+        return Ok(None);
+    }
+    // From here on the call *is* a copy to vulkan, so every remaining problem
+    // refuses by name rather than returning `None` and letting `resolve()`
+    // answer with the generic "device not available", which would say nothing
+    // about which narrowing was hit.
+    let tag = crate::aten::dtype_arg(args, kwargs, 1, "dtype")?.unwrap_or(input.tag());
+    if tag != input.tag() {
+        return Err(not_implemented(format!(
+            "{op}: the vulkan device cannot change dtype on the way in ({} to \
+             {}) -- there is no conversion shader. Cast on the cpu first \
+             (docs/VULKAN4.md §6).",
+            input.tag().name(),
+            tag.name()
+        )));
+    }
+    check_dtype(op, tag)?;
+    if current.kind != "cpu" {
+        return Err(not_implemented(format!(
+            "{op}: the vulkan device accepts a copy from the cpu, not from {} \
+             (docs/VULKAN4.md §6).",
+            current.kind
+        )));
+    }
+    let host = input.tensor()?;
+    let shape: Vec<usize> = host.dims().to_vec();
+    let flat = host
+        .flatten_all()
+        .and_then(|t| t.contiguous())
+        .and_then(|t| t.to_vec1::<f32>())
+        .map_err(|e| crate::err::candle_err(op, e))?;
+    let ctx = require(op)?;
+    let buffer = unsafe {
+        let buf = ctx.alloc(flat.len() * 4).map_err(|e| vk_error(op, e))?;
+        ctx.upload(&buf, &flat).map_err(|e| vk_error(op, e))?;
+        buf
+    };
+    Ok(Some(wrap(py, buffer, shape, tag)?))
 }
 
 /// `.cpu()`, `.to("cpu")` and `.to("vulkan")` for a tensor already on Vulkan.
@@ -756,8 +1338,13 @@ fn add_tensor(
     let n = a.elem_count();
     let out = unsafe {
         let out = ctx.alloc(n * 4).map_err(|e| vk_error(op, e))?;
-        ctx.dispatch_kernel("add_f32", ADD_F32_SPV, [&a.buffer, &b.buffer, &out], n as u32)
-            .map_err(|e| vk_error(op, e))?;
+        ctx.dispatch_kernel(
+            "add_f32",
+            ADD_F32_SPV,
+            [&a.buffer, &b.buffer, &out],
+            [n as u32, 0, 0, 0],
+        )
+        .map_err(|e| vk_error(op, e))?;
         out
     };
     let result = VkTensor {
@@ -814,14 +1401,51 @@ fn vulkan_probe(py: Python<'_>) -> PyResult<Py<PyAny>> {
 fn vulkan_ops() -> Vec<&'static str> {
     vec![
         "aten._to_copy.default",
+        "aten._unsafe_view.default",
         "aten.add.Tensor",
+        "aten.addmm.default",
         "aten.alias.default",
+        "aten.clone.default",
+        "aten.contiguous.default",
         "aten.detach.default",
+        "aten.div.Tensor",
+        "aten.mm.default",
+        "aten.mul.Tensor",
+        "aten.neg.default",
+        "aten.relu.default",
+        "aten.reshape.default",
+        "aten.sub.Tensor",
+        "aten.t.default",
+        "aten.transpose.int",
+        "aten.view.default",
     ]
+}
+
+/// `_C._vulkan_counters()` -- **the runtime answer to "did the GPU do it?"**
+///
+/// Returns the three counters described beside their definitions above:
+///
+/// * `shader_dispatches` -- compute shaders that ran to completion on the
+///   device, counted after `vkWaitForFences` returned success.
+/// * `host_uploads` / `host_downloads` -- crossings of the host boundary,
+///   counted inside the only two `vkMapMemory` sites in the module.
+///
+/// A test asserts the delta across one op. That is a statement about what the
+/// process did rather than about what the source looks like, which is the
+/// distinction `docs/MPSATTN.md` §3.1 says its own evidence failed to make.
+#[pyfunction]
+#[pyo3(name = "_vulkan_counters")]
+fn vulkan_counters(py: Python<'_>) -> PyResult<Py<PyAny>> {
+    let d = PyDict::new(py);
+    d.set_item("shader_dispatches", SHADER_DISPATCHES.load(Ordering::Relaxed))?;
+    d.set_item("host_uploads", HOST_UPLOADS.load(Ordering::Relaxed))?;
+    d.set_item("host_downloads", HOST_DOWNLOADS.load(Ordering::Relaxed))?;
+    Ok(d.into_any().unbind())
 }
 
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(vulkan_probe, m)?)?;
     m.add_function(wrap_pyfunction!(vulkan_ops, m)?)?;
+    m.add_function(wrap_pyfunction!(vulkan_counters, m)?)?;
     Ok(())
 }
