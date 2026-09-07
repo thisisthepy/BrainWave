@@ -2263,6 +2263,291 @@ fn meta_dispatch(
             }
             meta_result(py, dims, input.tag())
         }
+        // ---------------------------------------------------------------
+        // METAFAM.md: the two families VOICE4.md §4 opened one member of
+        // each and explicitly left closed. `aten.sum.default` and
+        // `aten.view.default` had meta kernels; their siblings did not.
+        // Every arm below calls the same shape/dtype helper its dense
+        // sibling already factored out (`reduced_dims`, `sum_natural_tag`,
+        // `resolve_shape`, `normalise_dim`), for the reason META.md §7.1
+        // gives: a meta kernel that promises a different answer than the
+        // dense kernel would compute is worse than no meta kernel, because
+        // nothing downstream can tell the difference until values are read.
+        //
+        // Reduction family (docs/META.md §7.4's 축소 column).
+        "aten.sum.dim_IntList" => {
+            let input = tensor_arg(op, args, kwargs, 0, "self")?;
+            let rank = input.dims().len();
+            let named = reduce_dims(op, args, kwargs, 1, rank)?;
+            let keepdim = bool_arg(args, kwargs, 2, "keepdim")?.unwrap_or(false);
+            let dims = reduce_dims_or_all(named, rank);
+            let natural = sum_natural_tag(input.tag());
+            let tag = dtype_arg(args, kwargs, 3, "dtype")?.unwrap_or(natural);
+            meta_result(py, reduced_dims(input.dims(), &dims, keepdim), tag)
+        }
+        "aten.mean.dim" => {
+            let input = tensor_arg(op, args, kwargs, 0, "self")?;
+            if !input.tag().is_floating_point() {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                    "mean(): could not infer output dtype. Input dtype must be either \
+                     a floating point or complex dtype. Got: "
+                        .to_string()
+                        + input.tag().name(),
+                ));
+            }
+            let rank = input.dims().len();
+            let named = reduce_dims(op, args, kwargs, 1, rank)?;
+            let keepdim = bool_arg(args, kwargs, 2, "keepdim")?.unwrap_or(false);
+            let dims = reduce_dims_or_all(named, rank);
+            let tag = dtype_arg(args, kwargs, 3, "dtype")?.unwrap_or(input.tag());
+            meta_result(py, reduced_dims(input.dims(), &dims, keepdim), tag)
+        }
+        // `aten::mean.default(Tensor self, *, ScalarType? dtype=None)` -- the
+        // whole-tensor sibling of `aten.sum.default`, same rank-0 shape rule,
+        // but `mean` refuses a non-floating input rather than widening it
+        // (`sum_or_mean`'s own rule, called here instead of restated).
+        "aten.mean.default" => {
+            let input = tensor_arg(op, args, kwargs, 0, "self")?;
+            if !input.tag().is_floating_point() {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                    "mean(): could not infer output dtype. Input dtype must be either \
+                     a floating point or complex dtype. Got: "
+                        .to_string()
+                        + input.tag().name(),
+                ));
+            }
+            let tag = dtype_arg(args, kwargs, 1, "dtype")?.unwrap_or(input.tag());
+            meta_result(py, Vec::new(), tag)
+        }
+        // `aten::cumsum.default` -- a running total, so unlike `sum` it does
+        // not reduce rank: the shape is the input's, unchanged. The dtype
+        // widening rule is the same as `sum`'s (`cumsum_default`'s own
+        // comment: "same integral-to-int64 promotion as sum").
+        "aten.cumsum.default" => {
+            let input = tensor_arg(op, args, kwargs, 0, "self")?;
+            normalise_dim(
+                op,
+                dim_arg(args, kwargs, 1, "dim")?.ok_or_else(|| missing(op, "dim"))?,
+                input.dims().len(),
+            )?;
+            let natural = sum_natural_tag(input.tag());
+            let tag = dtype_arg(args, kwargs, 2, "dtype")?.unwrap_or(natural);
+            meta_result(py, input.dims().to_vec(), tag)
+        }
+        // `aten::any.default` -- whole-tensor, rank 0, and `bool_reduce_tag`
+        // is the dense `any_or_all_default`'s own rule: `bool` for every
+        // input except `uint8`, which round-trips as `uint8`.
+        "aten.any.default" => {
+            let input = tensor_arg(op, args, kwargs, 0, "self")?;
+            meta_result(py, Vec::new(), bool_reduce_tag(input.tag()))
+        }
+        // `aten::amax.default` -- dtype is preserved (no `int64` widening,
+        // unlike `sum`), and the empty-input refusals are `amax_default`'s
+        // own, reproduced here because a meta tensor's extents can be zero
+        // just as a dense one's can, and the dense kernel never runs to
+        // catch it.
+        "aten.amax.default" => {
+            let input = tensor_arg(op, args, kwargs, 0, "self")?;
+            let rank = input.dims().len();
+            let named = reduce_dims(op, args, kwargs, 1, rank)?;
+            let keepdim = bool_arg(args, kwargs, 2, "keepdim")?.unwrap_or(false);
+            let all_dims = named.as_ref().map_or(true, |d| d.is_empty());
+            let mut dims: Vec<usize> = match named {
+                Some(d) if !d.is_empty() => d,
+                _ => (0..rank).collect(),
+            };
+            if let Some(repeated) = first_repeat(&dims) {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "dim {repeated} appears multiple times in the list of dims"
+                )));
+            }
+            let extents = input.dims().to_vec();
+            if input.dims().iter().product::<usize>() == 0 {
+                if all_dims {
+                    return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                        "amax(): Expected reduction dim to be specified for input.numel() \
+                         == 0. Specify the reduction dim with the 'dim' argument.",
+                    ));
+                }
+                if let Some(&empty) = dims.iter().find(|&&d| extents[d] == 0) {
+                    return Err(pyo3::exceptions::PyIndexError::new_err(format!(
+                        "amax(): Expected reduction dim {empty} to have non-zero size."
+                    )));
+                }
+            }
+            dims.sort_unstable();
+            dims.dedup();
+            meta_result(py, reduced_dims(&extents, &dims, keepdim), input.tag())
+        }
+        // ---------------------------------------------------------------
+        // View/shape family (docs/META.md §7.4's 뷰·모양 column). Every one
+        // of these is metadata-only even on a dense tensor -- no element
+        // moves -- so unlike the reduction family above there is no
+        // "compute vs. infer" gap to bridge, only the argument parsing and
+        // refusals, taken from each op's own dense arm.
+        //
+        // `reshape.default` deliberately answers with `view.default`'s own
+        // rule (`resolve_shape` + the numel check) rather than staying
+        // refused. META.md §7.4's note that `reshape` "may copy, so
+        // answering it from view's rule promises a view where upstream
+        // might return a copy" is a promise about *aliasing*, and a meta
+        // tensor carries no storage to alias in the first place -- this
+        // shim's meta tensors do not track strides at all (§7.2's note on
+        // `expand`), so "view" and "copy" are indistinguishable outputs
+        // here: same shape, same dtype, no data either way. Shape and dtype
+        // are the whole of what a meta kernel can promise.
+        "aten.reshape.default" => {
+            let input = tensor_arg(op, args, kwargs, 0, "self")?;
+            let numel: usize = input.dims().iter().product();
+            let requested = shape_arg(op, args, kwargs, 1, "shape")?;
+            let dims = resolve_shape(op, &requested, numel)?;
+            let got: usize = dims.iter().product();
+            if got != numel {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "shape '{requested:?}' is invalid for input of size {numel}"
+                )));
+            }
+            meta_result(py, dims, input.tag())
+        }
+        // `aten::t.default` -- `t_default`'s own rule: 0-D/1-D unchanged,
+        // 2-D swaps, 3-D+ refuses.
+        "aten.t.default" => {
+            let input = tensor_arg(op, args, kwargs, 0, "self")?;
+            let rank = input.dims().len();
+            if rank > 2 {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "t() expects a tensor with <= 2 dimensions, but self is {rank}D"
+                )));
+            }
+            let mut dims = input.dims().to_vec();
+            if rank == 2 {
+                dims.swap(0, 1);
+            }
+            meta_result(py, dims, input.tag())
+        }
+        // `aten::transpose.int` -- `transpose_int`'s own rule: swap the two
+        // named axes, both normalised against the input's rank.
+        "aten.transpose.int" => {
+            let input = tensor_arg(op, args, kwargs, 0, "self")?;
+            let rank = input.dims().len();
+            let dim0 = normalise_dim(
+                op,
+                dim_arg(args, kwargs, 1, "dim0")?.ok_or_else(|| missing(op, "dim0"))?,
+                rank,
+            )?;
+            let dim1 = normalise_dim(
+                op,
+                dim_arg(args, kwargs, 2, "dim1")?.ok_or_else(|| missing(op, "dim1"))?,
+                rank,
+            )?;
+            let mut dims = input.dims().to_vec();
+            dims.swap(dim0, dim1);
+            meta_result(py, dims, input.tag())
+        }
+        // `aten::permute.default` -- `permute_default`'s own refusals
+        // (wrong length, duplicate axis) and reordering.
+        "aten.permute.default" => {
+            let input = tensor_arg(op, args, kwargs, 0, "self")?;
+            let requested = shape_arg(op, args, kwargs, 1, "dims")?;
+            let rank = input.dims().len();
+            if requested.len() != rank {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "permute(sparse_coo): number of dimensions in the tensor input does \
+                     not match the length of the desired ordering of dimensions i.e. \
+                     input.dim() = {rank} is not equal to len(dims) = {}",
+                    requested.len()
+                )));
+            }
+            let extents = input.dims().to_vec();
+            if rank == 0 {
+                meta_result(py, extents, input.tag())
+            } else {
+                let mut order = Vec::with_capacity(rank);
+                for &value in &requested {
+                    let dim = normalise_dim(op, value, rank)?;
+                    if order.contains(&dim) {
+                        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                            "permute(): duplicate dims are not allowed.",
+                        ));
+                    }
+                    order.push(dim);
+                }
+                let dims = order.iter().map(|&d| extents[d]).collect();
+                meta_result(py, dims, input.tag())
+            }
+        }
+        // `aten::unsqueeze.default` -- `unsqueeze_default`'s own range,
+        // which is one wider than every other dim argument here
+        // (`[-(rank+1), rank]`, the new axis can go after the last one).
+        "aten.unsqueeze.default" => {
+            let input = tensor_arg(op, args, kwargs, 0, "self")?;
+            let rank = input.dims().len();
+            let raw = dim_arg(args, kwargs, 1, "dim")?.ok_or_else(|| missing(op, "dim"))?;
+            let extent = rank as isize + 1;
+            let dim = if raw < 0 { raw + extent } else { raw };
+            if dim < 0 || dim >= extent {
+                return Err(pyo3::exceptions::PyIndexError::new_err(format!(
+                    "{op}: Dimension out of range (expected to be in range of [{}, {}], \
+                     but got {raw})",
+                    -extent,
+                    extent - 1
+                )));
+            }
+            let mut dims = input.dims().to_vec();
+            dims.insert(dim as usize, 1);
+            meta_result(py, dims, input.tag())
+        }
+        // `aten::squeeze.dim` -- a non-1 axis is a no-op, not a refusal
+        // (`squeeze_dim`'s own comment).
+        "aten.squeeze.dim" => {
+            let input = tensor_arg(op, args, kwargs, 0, "self")?;
+            let rank = input.dims().len();
+            let dim = normalise_dim(
+                op,
+                dim_arg(args, kwargs, 1, "dim")?.ok_or_else(|| missing(op, "dim"))?,
+                rank,
+            )?;
+            let mut dims = input.dims().to_vec();
+            if rank > 0 && dims[dim] == 1 {
+                dims.remove(dim);
+            }
+            meta_result(py, dims, input.tag())
+        }
+        // `aten::squeeze.default` -- every axis of size 1 removed.
+        "aten.squeeze.default" => {
+            let input = tensor_arg(op, args, kwargs, 0, "self")?;
+            let dims: Vec<usize> = input.dims().iter().copied().filter(|&e| e != 1).collect();
+            meta_result(py, dims, input.tag())
+        }
+        // `aten::slice.Tensor` -- `slice_tensor`'s own clamping arithmetic,
+        // shape-only: the narrowed extent along `dim`, everything else
+        // unchanged.
+        "aten.slice.Tensor" => {
+            let input = tensor_arg(op, args, kwargs, 0, "self")?;
+            let rank = input.dims().len();
+            let dim = normalise_dim(op, dim_arg(args, kwargs, 1, "dim")?.unwrap_or(0), rank)?;
+            let extent = input.dims()[dim] as i64;
+            let step = int_arg(args, kwargs, 4, "step")?.unwrap_or(1);
+            if step <= 0 {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "step must be greater than zero, got {step}"
+                )));
+            }
+            let clamp = |value: i64| -> i64 {
+                let shifted = if value < 0 { value + extent } else { value };
+                shifted.clamp(0, extent)
+            };
+            let start = clamp(int_arg(args, kwargs, 2, "start")?.unwrap_or(0));
+            let end = match int_arg(args, kwargs, 3, "end")? {
+                Some(value) if value >= extent => extent,
+                Some(value) => clamp(value),
+                None => extent,
+            };
+            let length = ((end - start).max(0) as usize + step as usize - 1) / step as usize;
+            let mut dims = input.dims().to_vec();
+            dims[dim] = length;
+            meta_result(py, dims, input.tag())
+        }
         other => Err(not_implemented(format!(
             "torch._C shim has no meta kernel for {other}. A meta tensor holds shape and \
              dtype and no storage, so this op would have to infer its output shape without \
@@ -2270,6 +2555,18 @@ fn meta_dispatch(
              torch/_meta_registrations.py), not a fallthrough. See docs/META.md §7 for the \
              list that is implemented."
         ))),
+    }
+}
+
+/// `reduce_dims`'s `None`/`Some([])` collapse, shared by every reduction's
+/// meta arm above: an absent `dim` and an explicitly empty list both mean
+/// "every axis" for `sum`/`mean`/`amax` (their empty-list rule -- `squeeze`'s
+/// is the opposite and is written out at its own call site instead of
+/// sharing this).
+fn reduce_dims_or_all(named: Option<Vec<usize>>, rank: usize) -> Vec<usize> {
+    match named {
+        Some(d) if !d.is_empty() => d,
+        _ => (0..rank).collect(),
     }
 }
 

@@ -5657,20 +5657,28 @@ def test_ops_without_a_meta_kernel_name_themselves():
     # `sum.default` and `view.default` left it the same way in docs/VOICE4.md
     # §4 -- voicestudio's BigVGAN normalises each of its 218 resampling filters
     # with `(taps / taps.sum()).view(1, 1, k)` inside `__init__`, which
-    # `from_pretrained` runs on meta. They are two *members* of the two families
-    # named above, not the families: `sum.dim_IntList`, `mean.dim` and the rest
-    # of the reductions are still here, and `reshape` is too -- it may copy,
-    # which `view` never does.
+    # `from_pretrained` runs on meta. They were two *members* of the two
+    # families named above, not the families -- and docs/METAFAM.md closed
+    # the rest of the members named here: `reshape`, `slice.Tensor`,
+    # `sum.dim_IntList`, `mean.dim`, `mean.default`, `cumsum.default`,
+    # `any.default`, `amax.default`, `t.default`, `transpose.int`,
+    # `permute.default`, `unsqueeze.default`, `squeeze.dim` and
+    # `squeeze.default` moved to the answering half below. The boundary moved
+    # again rather than the test being deleted: contractions, most indexing,
+    # the composite ops, combine/split, and the reduction/view members
+    # METAFAM.md left alone (`max.dim`, `argmax`, `topk`, `sort`, `stack`,
+    # `unbind`, `squeeze.dims`, `narrow`, `index.Tensor`, ...) are still here.
     for op, args in (
         ("aten.mm.default", (a, a)),
         ("aten.bmm.default", (a, a)),
-        ("aten.reshape.default", (a, [6])),
-        ("aten.slice.Tensor", (a, 0, 0, 1)),
-        ("aten.sum.dim_IntList", (a, [1])),
-        ("aten.mean.dim", (a, [1])),
         ("aten.cat.default", ([a, b], 0)),
-        ("aten.t.default", (a,)),
-        ("aten.permute.default", (a, [1, 0])),
+        ("aten.max.dim", (a, 0)),
+        ("aten.argmax.default", (a,)),
+        ("aten.topk.default", (a, 1)),
+        ("aten.sort.default", (a,)),
+        ("aten.stack.default", ([a],)),
+        ("aten.squeeze.dims", (a, [0])),
+        ("aten.index.Tensor", (a, [None])),
     ):
         try:
             d(op, *args)
@@ -5692,6 +5700,21 @@ def test_ops_without_a_meta_kernel_name_themselves():
         ("aten.tril.default", (a, 0)),
         ("aten.sum.default", (a,)),
         ("aten.view.default", (a, [3, 2])),
+        # docs/METAFAM.md -- the rest of the two families.
+        ("aten.sum.dim_IntList", (a, [1])),
+        ("aten.mean.dim", (a, [1])),
+        ("aten.mean.default", (a,)),
+        ("aten.cumsum.default", (a, 0)),
+        ("aten.any.default", (a,)),
+        ("aten.amax.default", (a, [1])),
+        ("aten.reshape.default", (a, [6])),
+        ("aten.t.default", (a,)),
+        ("aten.transpose.int", (a, 0, 1)),
+        ("aten.permute.default", (a, [1, 0])),
+        ("aten.unsqueeze.default", (a, 0)),
+        ("aten.squeeze.dim", (a, 0)),
+        ("aten.squeeze.default", (a,)),
+        ("aten.slice.Tensor", (a, 0, 0, 1)),
     ):
         out = d(op, *args)
         assert out.is_meta is True, op
