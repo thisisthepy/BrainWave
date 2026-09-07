@@ -1392,11 +1392,19 @@ def test_every_withdrawn_npu_name_refuses_by_name_and_names_the_replacement():
             raise AssertionError(f"npu.{name} did not refuse")
         assert text.startswith(f"torchnative npu: {name} was withdrawn"), text
         assert "AutoModelForCausalLM" in text, (name, text)
-        assert "not implemented yet" in text, (name, text)
+        # The replacement now EXISTS (this round landed it), so the old
+        # assertion -- "not implemented yet" -- has become false and asserting
+        # it would hold the message to a claim that is no longer true. What
+        # must still be said is the honest remainder: the compile step is not
+        # implemented, so the capability is still unavailable.
+        assert "now EXISTS" in text, (name, text)
+        assert "not implemented" in text, (name, text)
+        assert "compile step" in text, (name, text)
         assert isinstance(raised, npu.DelegateRefused), name
     print(
         f"ok   npu: {len(WITHDRAWN_NPU)} withdrawn names refuse by name, naming "
-        f"AutoModelForCausalLM and saying it does not exist yet"
+        f"AutoModelForCausalLM (which now exists) and saying the compile step "
+        f"still does not"
     )
 
 
@@ -1404,10 +1412,18 @@ def test_the_withdrawn_npu_message_does_not_imply_a_working_device_string():
     from torchnative.export import npu
 
     text = npu._withdrawal_message("delegate_")
-    assert 'model.to("npu")' in text, text
+    # The spelling the message shows must be the one that exists --
+    # `torchnative.device.npu` -- and NOT `.to("npu")`, which would send the
+    # reader at a torch device type this project has deliberately not created.
+    assert "model.to(torchnative.device.npu)" in text, text
+    assert 'model.to("npu")' not in text, text
     assert "torch.device" in text and "raises" in text, text
     assert "_rename_privateuse1_backend" in text, text
-    print("ok   npu: the withdrawal says `npu` is not a device on this shim either")
+    assert "on purpose" in text, text
+    print(
+        "ok   npu: the withdrawal shows torchnative.device.npu, and says "
+        "torch.device('npu') still raises and is a stub on purpose"
+    )
 
 
 def test_the_swapping_plumbing_is_kept_private_and_qnn_still_builds_on_it():

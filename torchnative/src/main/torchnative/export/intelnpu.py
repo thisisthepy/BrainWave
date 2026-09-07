@@ -50,8 +50,10 @@ serialised to OpenVINO IR here, the way `coreml.py` and `nnapi.py` do), it does
 not quantize, and it offers no `torch.compile` backend. Nor does it offer a way
 to run your model: every such entry point was withdrawn, and each refuses by
 name at the bottom of this file. The replacement is
-`torchnative.transformers.AutoModelForCausalLM` and it is **not implemented yet**;
-for int4 on an Intel NPU today the answer is `optimum-intel`.
+`torchnative.transformers.AutoModelForCausalLM`, which now **exists** --- though
+the recompile behind `model.to(torchnative.device.npu)` does not, and refuses by
+name after resolving the NPU. For int4 on an Intel NPU today the answer is still
+`optimum-intel`.
 
 Where the claims in this file were measured. The IR, the C bindings, the weights
 blob, the inference and the numerics were all exercised against a real OpenVINO
@@ -75,6 +77,7 @@ __all__ = [
     "OV_STATUS",
     "EXECUTION_DEVICES",
     "MAX_DIM",
+    "plan_lowering",
     "library_candidates",
     "parse_execution_devices",
     "verdict_execution_devices",
@@ -1125,8 +1128,92 @@ class _NPULinear:
         )
 
 
-def _compile_model(model, device: str = "NPU", library: str | None = None):
+def plan_lowering(model, predicate=None):
+    """What `_compile_model` would lower and what it would leave, without OpenVINO.
+
+    The lowering itself needs an OpenVINO runtime and, for a real claim, an
+    Intel NPU. **The selection does not**, and the selection is where the
+    granularity defect lived: a Qwen3-4B was refused whole because one leaf was
+    oversized. This answers "what would happen" on any machine, which is what
+    makes that defect testable on a host with neither.
+
+    It is **not** evidence that anything ran on an NPU, and nothing here should
+    be read as saying so --- `probe()` and `assert_execution_device()` are the
+    functions that answer that question. This answers a different one: which
+    leaves are eligible, which are not, and how much of the model that is.
+
+    **The eligibility check is not a second copy.** It calls `linear_ir`, the
+    same pure function `_NPULinear.__init__` calls to decide, so the plan and
+    the real lowering cannot drift apart --- a test asserts they agree.
+
+    `predicate(name, module) -> bool` narrows the selection, matching
+    `torchnative.quant.quantize_` and `_compile_model`.
+
+    Returns a dict with `eligible`, `skipped` (`(name, reason)`),
+    `left_on_cpu`, `fully_offloaded`, `parameters_moved`, `parameters_total`
+    and `fraction_moved`.
+    """
+    torch = _torch()
+    eligible, skipped, left = [], [], {}
+    moved = 0
+
+    def walk(parent, prefix):
+        nonlocal moved
+        for name, child in list(parent.named_children()):
+            path = f"{prefix}{name}"
+            if isinstance(child, torch.nn.Linear):
+                if predicate is not None and not predicate(path, child):
+                    skipped.append((path, "excluded by predicate"))
+                    continue
+                try:
+                    linear_ir(
+                        int(child.in_features), int(child.out_features), 1,
+                        getattr(child, "bias", None) is not None,
+                    )
+                except IntelNPUUnsupported as exc:
+                    skipped.append((
+                        path,
+                        f"Linear(out_features={child.out_features}, "
+                        f"in_features={child.in_features}) stays on the CPU: "
+                        f"{str(exc).split(chr(10))[0]}",
+                    ))
+                    continue
+                eligible.append(path)
+                moved += child.weight.numel() + (
+                    child.bias.numel() if getattr(child, "bias", None) is not None else 0
+                )
+                continue
+            grandchildren = list(child.named_children())
+            if not grandchildren:
+                left[type(child).__name__] = left.get(type(child).__name__, 0) + 1
+            else:
+                walk(child, f"{path}.")
+
+    walk(model, "")
+    total = sum(p.numel() for p in model.parameters())
+    return {
+        "eligible": eligible,
+        "skipped": skipped,
+        "left_on_cpu": dict(sorted(left.items())),
+        "fully_offloaded": not left and not skipped,
+        "parameters_moved": moved,
+        "parameters_total": total,
+        "fraction_moved": moved / total if total else 0.0,
+    }
+
+
+def _compile_model(model, device: str = "NPU", library: str | None = None,
+                   predicate=None):
     """Swap every `torch.nn.Linear` in `model` for an `_NPULinear`. In place.
+
+    `predicate(name, module) -> bool` narrows which leaves are lowered; the
+    default takes all of them. **This is deliberately the same signature as
+    `torchnative.quant.quantize_`**, and for the same reason that function
+    gives: `lm_head` is both the largest single weight in a small model and the
+    layer whose error lands directly on the logits with nothing after it to
+    attenuate. Both facts are real and pull opposite ways, so the choice is the
+    caller's. One idea, one spelling -- a second one here would be a second
+    thing to learn for no gain.
 
     This is `intel_npu_acceleration_library.compile` minus everything that is not
     the mechanism: no `torch.compile`, no dynamo, no tracing, no fx, no
@@ -1141,9 +1228,31 @@ def _compile_model(model, device: str = "NPU", library: str | None = None):
     docs/graph/NPU2.md is a whole document about a partial offload that went unnoticed
     because the answers were right.
 
+    **An oversized leaf is left behind and named, not fatal.** A `Linear` whose
+    dimensions exceed `MAX_DIM` used to raise out of the walk and take the whole
+    model with it, which made every real LLM unreachable: `lm_head` in
+    Qwen3-4B-Instruct-2507 is 151936 x 2560 and 151936 > MAX_DIM (131072), so a
+    36-layer model was refused for one layer. Every model with a large
+    vocabulary has that layer and it is usually the single largest weight.
+
+    The archived Intel library draws the same limit (`nn/linear.py:66`) and
+    responds by **silently returning the torch layer unchanged**, which leaves
+    an unannounced CPU layer inside a model the caller believes is on the NPU.
+    That is precisely docs/graph/NPU2.md's failure. So this takes the same
+    outcome and the opposite epistemics: the layer stays on the CPU and the
+    report says so **by name, with its shape and the limit it exceeded**, and
+    `fully_offloaded` goes False.
+
+    That last part is the load-bearing one. A caller who ignores the report
+    must not be able to conclude the model is fully offloaded, so `report`
+    carries `fraction_moved` -- a **value**, parameters lowered over parameters
+    total -- rather than only prose. For Qwen3-4B, dropping `lm_head` alone is
+    about 10% of the parameters, and a number says that where a list of names
+    does not.
+
     Raises:
-        IntelNPUUnsupported: if `device` is not NPU or CPU, or if the model
-            contains no `torch.nn.Linear` at all -- returning an untouched model
+        IntelNPUUnsupported: if `device` is not NPU or CPU, or if no
+            `torch.nn.Linear` was lowered at all -- returning an untouched model
             and calling it compiled is the silent fallback wearing a bow tie.
     """
     torch = _torch()
@@ -1156,14 +1265,40 @@ def _compile_model(model, device: str = "NPU", library: str | None = None):
             f"may place part of the graph elsewhere, which is precisely the outcome "
             f"verdict_execution_devices() refuses."
         )
-    swapped, left = [], {}
+    swapped, left, skipped = [], {}, []
+    moved_parameters = 0
 
     def walk(parent, prefix):
+        nonlocal moved_parameters
         for name, child in list(parent.named_children()):
             path = f"{prefix}{name}"
             if isinstance(child, torch.nn.Linear):
-                parent.add_module(name, _NPULinear.from_torch(child, device, library))
+                if predicate is not None and not predicate(path, child):
+                    skipped.append((path, "excluded by predicate"))
+                    continue
+                # Counted before the swap: after `add_module` the original
+                # tensors are no longer reachable through `parent`.
+                numel = child.weight.numel() + (
+                    child.bias.numel() if child.bias is not None else 0
+                )
+                try:
+                    lowered = _NPULinear.from_torch(child, device, library)
+                except IntelNPUUnsupported as exc:
+                    # Left behind and NAMED. Not fatal: one oversized leaf must
+                    # not make the whole model unreachable. See this function's
+                    # docstring for why, and what the archived library does
+                    # instead.
+                    skipped.append((
+                        path,
+                        f"{type(child).__name__}"
+                        f"(out_features={child.out_features}, "
+                        f"in_features={child.in_features}) stays on the CPU: "
+                        f"{str(exc).split(chr(10))[0]}",
+                    ))
+                    continue
+                parent.add_module(name, lowered)
                 swapped.append(path)
+                moved_parameters += numel
                 continue
             grandchildren = list(child.named_children())
             if not grandchildren:
@@ -1174,9 +1309,12 @@ def _compile_model(model, device: str = "NPU", library: str | None = None):
     walk(model, "")
     if not swapped:
         raise IntelNPUUnsupported(
-            f"torchnative intelnpu: this model has no torch.nn.Linear, so nothing was "
-            f"lowered and nothing runs on {device}. Leaf module types found: "
-            f"{sorted(left) or ['<none>']}. Returning the model unchanged with a "
+            f"torchnative intelnpu: nothing was lowered, so nothing runs on "
+            f"{device}. Leaf module types found: {sorted(left) or ['<none>']}. "
+            f"{len(skipped)} Linear(s) were skipped: {skipped[:4]}. If that list "
+            f"is non-empty the model does have Linears and your predicate "
+            f"excluded all of them, or every one exceeded MAX_DIM={MAX_DIM}. "
+            f"Returning the model unchanged with a "
             f"success message would be the silent CPU fallback this module exists to "
             f"prevent -- see docs/devices/INTELNPU.md section 3.1. Linear is the only leaf "
             f"lowered at this stage; intel_npu_acceleration_library's own lowering "
@@ -1195,11 +1333,27 @@ def _compile_model(model, device: str = "NPU", library: str | None = None):
         first = getattr(first, part) if not part.isdigit() else first[int(part)]
     first._compile_for(1)
 
+    total_parameters = sum(p.numel() for p in model.parameters())
     return model, {
         "device": device,
         "swapped": swapped,
         "left_on_cpu": dict(sorted(left.items())),
-        "fully_offloaded": not left,
+        # `(name, reason)`, the same shape `torchnative.quant.quantize_`'s
+        # report uses. Predicate exclusions and oversized leaves both land
+        # here, and each reason distinguishes which it was.
+        "skipped": skipped,
+        # False if ANYTHING stayed behind -- a non-Linear leaf, a predicate
+        # exclusion, or an oversized Linear. A caller who reads only this flag
+        # must not be told a partially offloaded model is complete.
+        "fully_offloaded": not left and not skipped,
+        # "How much actually moved", as a value rather than prose, so that a
+        # caller who skims the report still cannot mistake a 90% offload for a
+        # whole one.
+        "parameters_moved": moved_parameters,
+        "parameters_total": total_parameters,
+        "fraction_moved": (
+            moved_parameters / total_parameters if total_parameters else 0.0
+        ),
         "execution_devices": list(first.execution_devices),
     }
 
@@ -1324,16 +1478,27 @@ def _withdrawal_message(name):
     return (
         f"torchnative intelnpu: {name} was withdrawn and is not available. It "
         f"was withdrawn because {_WITHDRAWN[name]}.\n"
-        f"The replacement is {REPLACEMENT}, taking optimum's shape:\n"
+        f"The replacement is {REPLACEMENT}, and it now EXISTS:\n"
         f"\n"
+        f"    import torchnative\n"
         f"    from torchnative.transformers import AutoModelForCausalLM\n"
-        f"    model = AutoModelForCausalLM.from_pretrained(model_id, export=True, load_in_4bit=True)\n"
-        f"    model.to(\"npu\")\n"
+        f"    model = AutoModelForCausalLM.from_pretrained(model_id)\n"
+        f"    model.to(torchnative.device.npu)\n"
         f"\n"
-        f"**{REPLACEMENT} is not implemented yet.** Neither is the device "
-        f"string it would take: torch.device(\"npu\") raises on this shim "
-        f"because torch._C._rename_privateuse1_backend is a stub. The snippet "
-        f"above is the intended shape, not a working call.\n"
+        f"`from_pretrained` returns the real model -- a genuine nn.Module that "
+        f"backprops -- not a wrapper. The device is torchnative.device.npu, "
+        f"which RESOLVES per host (Intel NPU on Windows) and says which. It is "
+        f"NOT torch.device(\"npu\"): that spelling still raises on this shim "
+        f"because torch._C._rename_privateuse1_backend is a stub, and it is a "
+        f"stub on purpose -- PyTorch has no npu device type and this project "
+        f"will not pretend it does (docs/devices/DEVICE_NS.md section 1).\n"
+        f"\n"
+        f"**Recompiling for the accelerator is still not implemented.** "
+        f"model.to(torchnative.device.npu) resolves the NPU, names the unit, "
+        f"and then refuses at the compile step rather than handing back an "
+        f"unchanged model. `export=` and `load_in_4bit=` refuse by name too. "
+        f"So the capability this name reached for is still not here; what "
+        f"changed is where the wall is and that it now has a name on it.\n"
         f"\n"
         f"If what you need is int4 on an Intel NPU today, the answer is not in "
         f"this repository -- it is optimum-intel, which HuggingFace and Intel "

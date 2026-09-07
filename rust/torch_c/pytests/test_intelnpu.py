@@ -598,7 +598,7 @@ def test_the_hand_written_ir_is_accepted_by_a_real_openvino():
     assert evidence["execution_devices"] == ["CPU"], evidence
     assert evidence["linear_execution_devices"] == ["CPU"], evidence
     print(
-        f"ok intelnpu: both hand-written IR documents load and compile on a real "
+        f"ok   intelnpu: both hand-written IR documents load and compile on a real "
         f"OpenVINO (devices {payload['devices']}), EXECUTION_DEVICES={evidence['execution_devices']}"
     )
 
@@ -617,7 +617,7 @@ def test_a_linear_runs_through_openvino_and_agrees_with_the_reference():
         f"returning a constant and the agreement would prove nothing"
     )
     print(
-        f"ok intelnpu: a Linear ran through openvino_c and agreed with the reference "
+        f"ok   intelnpu: a Linear ran through openvino_c and agreed with the reference "
         f"to {agreement:g}, while a different input moved it by {control:g}"
     )
 
@@ -642,7 +642,7 @@ def test_compile_model_lowers_a_real_nn_linear_tree_and_the_numbers_agree():
     assert payload["max_abs_diff"] <= 1e-2, payload["max_abs_diff"]
     assert payload["control_diff"] > payload["max_abs_diff"] * 100, payload
     print(
-        f"ok intelnpu: compile_model swapped {report['swapped']}, left "
+        f"ok   intelnpu: compile_model swapped {report['swapped']}, left "
         f"{report['left_on_cpu']} on the CPU, and the lowered model agrees with eager "
         f"to {payload['max_abs_diff']:g} (different input: {payload['control_diff']:g})"
     )
@@ -676,7 +676,7 @@ def test_a_square_linear_pins_the_transpose_that_would_otherwise_be_silent():
         f"*transposed* answer -- transpose_b may be emitting the wrong function"
     )
     print(
-        f"ok intelnpu: a square Linear agrees with x@W.T to "
+        f"ok   intelnpu: a square Linear agrees with x@W.T to "
         f"{payload['square_diff']:g} and differs from x@W by "
         f"{payload['square_wrong_diff']:g} (the two are {visible:g} apart)"
     )
@@ -719,7 +719,7 @@ def test_the_shim_has_no_numpy_bridge_which_is_why_this_packs_bytes():
     if payload["has_from_numpy"] is not None:
         assert payload["has_from_numpy"] is False, payload
     print(
-        f"ok intelnpu: the shim has no .numpy() and no torch.from_numpy "
+        f"ok   intelnpu: the shim has no .numpy() and no torch.from_numpy "
         f"({payload['numpy_error'][:60]}...), so the FFI crossing is bytes"
     )
 
@@ -763,7 +763,7 @@ def test_probe_on_real_hardware():
     assert report["numeric_control_moved"] is True, report
     assert report["execution_devices"] != report["execution_devices_control"], report
     print(
-        f"ok intelnpu: a model compiled for NPU reports EXECUTION_DEVICES="
+        f"ok   intelnpu: a model compiled for NPU reports EXECUTION_DEVICES="
         f"{report['execution_devices']} on {report.get('FULL_DEVICE_NAME')!r}, the CPU "
         f"control reports {report['execution_devices_control']}, and the Linear it ran "
         f"agrees to {report['agreement']:g} with a control of {report['control_diff']:g}"
@@ -803,12 +803,16 @@ def test_every_withdrawn_intelnpu_name_refuses_by_name_and_names_the_replacement
             raise AssertionError(f"intelnpu.{name} did not refuse")
         assert text.startswith(f"torchnative intelnpu: {name} was withdrawn"), text
         assert "AutoModelForCausalLM" in text, (name, text)
-        assert "not implemented yet" in text, (name, text)
+        # See test_qnn.py: the replacement landed, so "not implemented yet" is
+        # no longer true of it. The compile step is what remains unimplemented.
+        assert "now EXISTS" in text, (name, text)
+        assert "not implemented" in text, (name, text)
         assert "optimum-intel" in text or "optimum.intel" in text, (name, text)
         assert "OVModelForCausalLM" in text, (name, text)
     print(
         f"ok   intelnpu: {len(WITHDRAWN_INTELNPU)} withdrawn names refuse by name, "
-        f"naming AutoModelForCausalLM (unimplemented) and optimum-intel"
+        f"naming AutoModelForCausalLM (which now exists, though the compile "
+        f"step does not) and optimum-intel"
     )
 
 
@@ -820,10 +824,158 @@ def test_the_withdrawal_does_not_promise_a_working_npu_device_string():
     send the reader at a second wall with no name on it.
     """
     text = str(intelnpu._withdrawal_message("compile_model"))
-    assert 'model.to("npu")' in text, text
+    assert "model.to(torchnative.device.npu)" in text, text
+    assert 'model.to("npu")' not in text, text
     assert "torch.device" in text and "raises" in text, text
     assert "_rename_privateuse1_backend" in text, text
+    assert "on purpose" in text, text
     print("ok   intelnpu: the withdrawal names the second wall (no `npu` device) too")
+
+
+def _tiny_torch():
+    """`import torch` from the vendored tree, past VENDOR.md wall 1.
+
+    This file's other tests never imported torch, so nothing here had needed
+    `TORCH_USE_RTLD_GLOBAL` before: the vendored tree's `_load_global_deps()`
+    looks for a `libtorch_global_deps` that this build does not ship, and
+    upstream's own escape hatch is that variable.
+    """
+    os.environ.setdefault("TORCH_USE_RTLD_GLOBAL", "1")
+    import torch
+
+    assert hasattr(torch._C, "_aten_implemented"), (
+        "not the torchnative shim -- torch._C has no _aten_implemented"
+    )
+    return torch
+
+
+def test_an_oversized_leaf_is_left_behind_and_named_not_fatal():
+    """The Qwen3-4B wall: one oversized `lm_head` must not refuse a whole model.
+
+    A real user ran Qwen3-4B-Instruct-2507 on an Intel NPU and the whole model
+    was refused because `lm_head` is 151936 x 2560 and 151936 > MAX_DIM. Every
+    model with a large vocabulary has that layer and it is usually the single
+    largest weight, so a fatal refusal makes every real LLM unreachable.
+
+    The fix is the archived Intel library's OUTCOME with the opposite
+    epistemics: the layer stays on the CPU (as `nn/linear.py:66` does) but is
+    **named in the report with its shape and the limit it exceeded**, and
+    `fully_offloaded` goes False -- where the archived library returns the torch
+    layer silently and leaves an unannounced CPU layer inside a model the caller
+    believes is offloaded. That silence is what docs/graph/NPU2.md is about.
+    """
+    torch = _tiny_torch()
+    from torchnative.export.intelnpu import MAX_DIM, plan_lowering
+
+    model = torch.nn.Sequential()
+    model.add_module("ok", torch.nn.Linear(16, 16))
+    model.add_module("lm_head", torch.nn.Linear(64, MAX_DIM + 1, bias=False))
+
+    plan = plan_lowering(model)
+    assert plan["eligible"] == ["ok"], plan["eligible"]
+    assert len(plan["skipped"]) == 1, plan["skipped"]
+    name, reason = plan["skipped"][0]
+    assert name == "lm_head", name
+    assert str(MAX_DIM + 1) in reason, reason          # its shape
+    assert f"MAX_DIM={MAX_DIM}" in reason, reason      # the limit it exceeded
+    assert "stays on the CPU" in reason, reason
+    assert plan["fully_offloaded"] is False, plan
+    print(
+        f"ok   intelnpu: an out_features={MAX_DIM + 1} leaf is left behind and "
+        f"named rather than refusing the model, and fully_offloaded is False"
+    )
+
+
+def test_how_much_moved_is_a_value_and_not_only_prose():
+    """A caller who ignores the list must still not conclude a full offload."""
+    torch = _tiny_torch()
+    from torchnative.export.intelnpu import MAX_DIM, plan_lowering
+
+    model = torch.nn.Sequential()
+    model.add_module("a", torch.nn.Linear(100, 100, bias=False))     # 10000
+    model.add_module("big", torch.nn.Linear(100, MAX_DIM + 1, bias=False))
+
+    plan = plan_lowering(model)
+    assert plan["parameters_total"] == 10000 + 100 * (MAX_DIM + 1), plan
+    assert plan["parameters_moved"] == 10000, plan
+    assert 0.0 < plan["fraction_moved"] < 0.01, plan["fraction_moved"]
+    assert plan["fraction_moved"] == plan["parameters_moved"] / plan["parameters_total"]
+
+    whole = torch.nn.Sequential()
+    whole.add_module("a", torch.nn.Linear(8, 8))
+    full = plan_lowering(whole)
+    assert full["fraction_moved"] == 1.0, full
+    assert full["fully_offloaded"] is True, full
+    print(
+        f"ok   intelnpu: fraction_moved is a value -- {plan['fraction_moved']:.5f} "
+        f"when the largest leaf stays behind, 1.0 when nothing does"
+    )
+
+
+def test_the_predicate_matches_quantize_s_signature_and_narrows_selection():
+    """One idea, one spelling: `predicate(name, module) -> bool`, as quantize_ has."""
+    torch = _tiny_torch()
+    import inspect
+
+    from torchnative.export.intelnpu import _compile_model, plan_lowering
+    from torchnative.quant import quantize_
+
+    assert "predicate" in inspect.signature(quantize_).parameters
+    for fn in (plan_lowering, _compile_model):
+        assert "predicate" in inspect.signature(fn).parameters, fn
+
+    model = torch.nn.Sequential()
+    model.add_module("keep", torch.nn.Linear(8, 8))
+    model.add_module("drop", torch.nn.Linear(8, 8))
+
+    seen = []
+
+    def predicate(name, module):
+        seen.append((name, type(module).__name__))
+        return name != "drop"
+
+    plan = plan_lowering(model, predicate=predicate)
+    assert plan["eligible"] == ["keep"], plan["eligible"]
+    assert plan["skipped"] == [("drop", "excluded by predicate")], plan["skipped"]
+    assert plan["fully_offloaded"] is False, plan
+    assert sorted(seen) == [("drop", "Linear"), ("keep", "Linear")], seen
+    print(
+        "ok   intelnpu: predicate(name, module) narrows the selection and is the "
+        "same spelling torchnative.quant.quantize_ uses"
+    )
+
+
+def test_the_plan_and_the_real_lowering_cannot_drift_apart():
+    """`plan_lowering` must not be a second copy of the eligibility rule.
+
+    It calls `linear_ir` -- the same pure function `_NPULinear.__init__` calls.
+    This asserts they agree on both sides of the limit, so a change to the rule
+    cannot make the plan lie.
+    """
+    torch = _tiny_torch()
+    from torchnative.export.intelnpu import (
+        MAX_DIM,
+        IntelNPUUnsupported,
+        _NPULinear,
+        plan_lowering,
+    )
+
+    for out, expect_eligible in ((16, True), (MAX_DIM + 1, False)):
+        layer = torch.nn.Linear(8, out, bias=False)
+        holder = torch.nn.Sequential()
+        holder.add_module("x", layer)
+        planned = plan_lowering(holder)["eligible"] == ["x"]
+        try:
+            _NPULinear.from_torch(layer, "NPU", None)
+            really = True
+        except IntelNPUUnsupported:
+            really = False
+        assert planned == expect_eligible, (out, planned)
+        assert planned == really, (
+            f"out_features={out}: plan says eligible={planned} but the real "
+            f"constructor says {really} -- the plan has drifted from the rule"
+        )
+    print("ok   intelnpu: the plan agrees with _NPULinear's own refusal at the limit")
 
 
 def test_the_kept_machinery_is_still_exported():

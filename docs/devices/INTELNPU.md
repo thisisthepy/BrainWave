@@ -722,3 +722,90 @@ The seven OpenVINO tests skip **by name** without that variable, saying it is un
 `test_probe_on_real_hardware` skips saying the platform has no NPU plugin.
 docs/devices/VULKAN3.md §6.1 is why every skip line names the missing thing: a skip with a false
 reason is counted as a pass.
+
+---
+
+## The granularity fix — one oversized leaf no longer refuses a whole model
+
+<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/intelnpu.py plan_lowering present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_intelnpu.py test_an_oversized_leaf_is_left_behind_and_named_not_fatal present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_intelnpu.py test_how_much_moved_is_a_value_and_not_only_prose present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_intelnpu.py test_the_predicate_matches_quantize_s_signature_and_narrows_selection present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_intelnpu.py test_the_plan_and_the_real_lowering_cannot_drift_apart present -->
+
+**The report from the field.** A user ran `Qwen/Qwen3-4B-Instruct-2507` on an
+actual Intel NPU and the whole model was refused for one layer:
+
+    IntelNPUUnsupported: out_features=151936 exceeds MAX_DIM=131072,
+    so this Linear is not lowered.
+
+That is `lm_head`, the vocabulary projection. **The refusal was right about the
+silence and wrong about the granularity.** Every model with a large vocabulary
+has that layer, it is usually the single largest weight, and refusing the model
+because of it makes every real LLM unreachable.
+
+`MAX_DIM = 2**17` is the same line the archived library draws
+(`nn/linear.py:66`). The difference was never the limit — it is what happens at
+it. The archived library **silently returns the torch layer unchanged**, which
+leaves an unannounced CPU layer inside a model the caller believes is on the
+NPU. That is `../graph/NPU2.md`'s failure exactly.
+
+**So: the same outcome, the opposite epistemics.** The layer stays on the CPU
+and is **named in the report** with its shape and the limit it exceeded, and
+`fully_offloaded` goes `False`. Nothing stopped being checked; the check stopped
+being fatal and started being announced.
+
+### What changed
+
+* **`predicate(name, module) -> bool`** on `_compile_model` and
+  `plan_lowering`. Deliberately the **same signature** as
+  `torchnative.quant.quantize_`, and for the reason that function's docstring
+  already gives: `lm_head` is both the largest weight and the layer whose error
+  lands on the logits with nothing after it to attenuate. Two true facts pulling
+  opposite ways, so the choice is the caller's. One idea, one spelling.
+* **An oversized leaf is caught per leaf**, recorded as `(name, reason)` in
+  `report["skipped"]` — the same shape `quantize_`'s report uses — and the walk
+  continues.
+* **`fraction_moved` is a value**, `parameters_moved / parameters_total`, so a
+  caller who skims the report cannot mistake a partial offload for a whole one.
+  `fully_offloaded` is `False` if *anything* stayed behind: a non-Linear leaf, a
+  predicate exclusion, or an oversized Linear.
+* **`plan_lowering(model, predicate=None)`** answers "what would be lowered"
+  **without OpenVINO and without an NPU**. It is not evidence that anything ran
+  — `probe()` and `assert_execution_device()` remain the only functions that
+  answer that — but it makes the *selection* testable on a machine with neither,
+  which is where this defect lived and why it survived. It calls `linear_ir`,
+  the same pure function `_NPULinear.__init__` calls, so the plan cannot drift
+  from the rule; `test_the_plan_and_the_real_lowering_cannot_drift_apart`
+  asserts they agree on both sides of the limit.
+
+### What a Qwen3-4B lowering now says
+
+Measured on this arm64 Mac against a Qwen3 of the real widths (vocab 151936,
+hidden 2560, intermediate 9728) cut to **2 layers**, because the full 36-layer
+model is ~4 B parameters and does not fit here in float32:
+
+| | |
+|---|---|
+| Linears lowered | **14 of 15** |
+| skipped | `lm_head` — `Linear(out_features=151936, in_features=2560) stays on the CPU: … exceeds MAX_DIM=131072` |
+| `left_on_cpu` | `Embedding: 1, Qwen3RMSNorm: 9, Qwen3RotaryEmbedding: 1, SiLUActivation: 2` |
+| `fully_offloaded` | **False** |
+| `fraction_moved` | **0.206** (201 850 880 / 979 776 512) |
+
+The 0.206 is dominated by the two-layer cut. For the **real 36 layers** the
+transformer-block Linears are 36 × 100 925 440 ≈ 3.63 B of about 4.41 B total,
+so roughly **82 %** of parameters would move, with `lm_head` (≈ 9 %) and the
+embedding (≈ 9 %) staying behind. **That row is arithmetic from the published
+widths, not a measurement** — no 36-layer model was instantiated here, and no
+Intel NPU was contacted by any of this.
+
+### What is still true
+
+The withdrawn `compile_model` stays withdrawn; this behaviour lives in the
+private `_compile_model` and in `plan_lowering`. `IntelNPUUnsupported` is
+unchanged for what is genuinely unsupportable — a non-2-D weight, an integer
+weight, an unsupported device string — and `verdict_execution_devices` still
+refuses a partial offload by name. The rule this module exists for is intact:
+**an unannounced CPU layer is the failure; the fix was to announce it, not to
+stop checking.**

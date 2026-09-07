@@ -550,11 +550,11 @@ torchnative.nn.federated    rounds · client selection · aggregation · dropout
 
 ### The API this is heading for
 
-**Decided, and none of it is implemented.** It is written down here because the
-shape was argued out rather than guessed, and because two earlier attempts
-shipped API that had to be withdrawn — `NpuModelForCausalLM`,
-`compile_model(model, device="NPU")` and friends now refuse by name and say
-what replaces them.
+**Decided, and now partly implemented — the last line is the part that is not.**
+It was written down here because the shape was argued out rather than guessed,
+and because two earlier attempts shipped API that had to be withdrawn —
+`NpuModelForCausalLM`, `compile_model(model, device="NPU")` and friends refuse
+by name and say what replaces them.
 
 ```python
 - from transformers import AutoModelForCausalLM
@@ -566,8 +566,22 @@ model = AutoModelForCausalLM.from_pretrained("google/gemma-3-4b-it")
 loss = model(**batch, labels=labels).loss
 loss.backward()                          # a real nn.Module, so this works
 
-model.to(torchnative.device.npu)         # recompiles for the accelerator
+model.to(torchnative.device.npu)         # REFUSES: resolves the NPU, names the
+                                         # unit, then says the recompile step
+                                         # is not implemented
 ```
+
+| | what is measured today |
+|---|---|
+| `torchnative.device` | **Done.** `cpu` · `mps` · `vulkan` · `cuda` · `npu`. Availability is measured through the existing probes, and every answer names the probe that produced it. `npu` **resolves per host** — Apple Neural Engine / Intel NPU / Hexagon — and refuses by name where there is none, never falling back to the CPU. Eager and compiled are different *types*, so `torch.empty(..., device=npu)` cannot be spelled. |
+| `nn.Module.to()` | **Done.** Intercepted ahead of `_parse_to`, since `to()` descends to tensors and an npu is not a tensor destination. An eager torchnative device moves parameters through upstream's own path; the model is never wrapped. Upstream semantics are held by two tests — one differential against the unpatched `to`, one asserting byte-identical passthrough of the arguments. |
+| `torchnative.transformers` | **Done.** All **49** `Auto*` classes, enumerated from `transformers` rather than hand-listed. `from_pretrained` returns the real model — `loss.backward()` populated 16/16 grads on a GPT-2 built through it. `export=` and `load_in_4bit=` **refuse by name** rather than being silently dropped. |
+| recompiling for the accelerator | **Not implemented.** `model.to(torchnative.device.npu)` resolves the NPU and then refuses at the compile step rather than returning the model unchanged. The capture layer exists; the step that turns a captured graph into a module leaf does not. |
+
+[`docs/devices/DEVICE_NS.md`](docs/devices/DEVICE_NS.md) and
+[`docs/api/TRANSFORMERS.md`](docs/api/TRANSFORMERS.md) record what was measured,
+including a defect this work found: `torch._C._mps_is_available()` is a
+build-time constant returning `False` on a host where Metal computes.
 
 Three decisions, each with its reason:
 

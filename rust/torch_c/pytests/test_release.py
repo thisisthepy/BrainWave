@@ -262,6 +262,42 @@ def test_the_abi3_wheel_loads_on_later_cpythons():
         print(f"   abi3 on python3.{minor}: {head}")
 
 
+def test_every_suite_prints_its_passes_in_the_one_format():
+    """`ok` + three spaces, everywhere, so a pass can be COUNTED.
+
+    The gate's only defence against a test file that dies at import is
+    comparing the `ok` count against a baseline -- a crashed file reports no
+    FAIL at all, so `FAIL=0` on its own means nothing. That comparison is
+    arithmetic on a grep, and a suite that prints `ok name:` with one space
+    is invisible to it.
+
+    This is not hypothetical and it is not once: `test_intelnpu.py` hid 26
+    passes this way, and `test_devicens.py` and `test_tntransformers.py` hid
+    39 more the same day. Both times the count looked like tests that had
+    silently stopped running.
+    """
+    # Matches the STRING LITERAL, not `print(...)`. The first version of this
+    # check keyed on a line starting `print("ok `, and eleven passes escaped it
+    # by being written as
+    #     print(
+    #         f"ok tntransformers: ..."
+    # -- the literal on its own line. A guard against an uncountable pass that
+    # cannot see half the ways one is written is the same defect one level up.
+    offenders = []
+    for path in sorted((REPO / "rust/torch_c/pytests").glob("test_*.py")):
+        for i, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+            if line.lstrip().startswith("#"):
+                # Prose, not a pass. Without this the check flags its own
+                # comment explaining the bad form -- which it did, twice.
+                continue
+            for m in re.finditer(r'["\']ok (?! )', line):
+                offenders.append(f"{path.name}:{i}")
+    assert not offenders, (
+        "these print a pass in a format the gate's count cannot see -- use "
+        f"`ok` followed by THREE spaces: {offenders}"
+    )
+
+
 def _main():
     failures = 0
     for name, fn in sorted(globals().items()):

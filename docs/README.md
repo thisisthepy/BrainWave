@@ -28,6 +28,7 @@ records; they are the front door.
 | `distributed/` | `torch.distributed`, collectives, transport, and federated rounds. |
 | `platform/` | Building and shipping: cross-builds, wheels, WASM, iOS/Android/Linux/Windows targets, vendoring, release notes. |
 | `perf/` | Measurements of speed and overhead, and the fixes made for speed. Numbers here are only valid unloaded — see CLAUDE.md §4. |
+| `api/` | The user-facing Python API this project offers in its own namespaces: `torchnative.device`, `torchnative.transformers`, and the argument forms and refusals they present. Distinct from `bindings/`, which is the `torch._C` surface we must reproduce; this folder is the surface we chose. |
 | `verification/` | The checkers themselves and the audits of this documentation: DOCWATCH, the golden harness, and what they structurally cannot see. |
 
 This directory holds **documents only**. The three non-Markdown files that

@@ -29,9 +29,18 @@ were exported as the way to run a model. Three separate faults:
   *wrapper* owning a compiled graph and `.to()` recompiles. There was no
   wrapper here.
 
-The replacement is `torchnative.transformers.AutoModelForCausalLM`, taking
-optimum's shape exactly, and it is **not implemented yet**. Nothing in this file
-should be read as saying it exists.
+The replacement is `torchnative.transformers.AutoModelForCausalLM`, and it now
+**exists** (docs/api/TRANSFORMERS.md). It does not take optimum's shape exactly,
+and the difference is the point: `from_pretrained` returns the **real model**,
+so there is no wrapper and `.to()` is `nn.Module.to()` on one object rather than
+a recompiling method on a wrapper. The device is `torchnative.device.npu`, not
+`torch.device("npu")`.
+
+**Recompiling for the accelerator is still not implemented**:
+`model.to(torchnative.device.npu)` resolves the NPU, names the unit, and refuses
+at the compile step. So the capability this file's withdrawn names reached for
+is still unavailable -- the wall moved and acquired a name, and nothing in this
+file should be read as saying the compile step exists.
 
 **What survives, and why.** The plumbing itself is sound and
 `torchnative.export.qnn` builds on it, so it is kept private:
@@ -293,8 +302,10 @@ def _delegated_paths(model):
 # (`nn.Module.to` moves parameters, and a graph-compiling accelerator cannot
 # dispatch eager ops one at a time).
 #
-# The replacement is `torchnative.transformers.AutoModelForCausalLM`, and it is
-# **not implemented yet** -- this file must not be read as saying it exists.
+# The replacement is `torchnative.transformers.AutoModelForCausalLM`, and it
+# now exists. What does NOT exist is the recompile step behind
+# `model.to(torchnative.device.npu)`, which refuses by name after resolving --
+# this file must not be read as saying that step exists.
 # --------------------------------------------------------------------------
 
 #: Named here rather than spelled out at each refusal, so the one place that
@@ -307,20 +318,40 @@ def _withdrawal_message(name):
     return (
         f"torchnative npu: {name} was withdrawn and is not available. It was "
         f"withdrawn because {_WITHDRAWN[name]}.\n"
-        f"The replacement is {REPLACEMENT}, taking optimum's shape:\n"
+        f"The replacement is {REPLACEMENT}, and it now EXISTS:\n"
         f"\n"
+        f"    import torchnative\n"
         f"    from torchnative.transformers import AutoModelForCausalLM\n"
-        f"    model = AutoModelForCausalLM.from_pretrained(model_id, export=True, load_in_4bit=True)\n"
-        f"    model.to(\"npu\")\n"
+        f"    model = AutoModelForCausalLM.from_pretrained(model_id)\n"
+        f"    model.to(torchnative.device.npu)\n"
         f"\n"
-        f"**{REPLACEMENT} is not implemented yet**, and neither is the device "
-        f"string: `torch.device(\"npu\")` raises on this shim, because "
-        f"`torch._C._rename_privateuse1_backend` is a stub. The `.to(\"npu\")` "
-        f"above is the intended shape, not a working call, and when it does "
-        f"land it will be a method on the wrapper that recompiles a graph -- "
-        f"as `OVModel.to()` does -- not `nn.Module.to()` moving parameters. "
-        f"There is no substitute available in this repository today; saying so "
-        f"is the point of this refusal."
+        f"What that gives you today, and what it does not:\n"
+        f"\n"
+        f"* `from_pretrained` returns the **real model** -- a genuine "
+        f"nn.Module on which loss.backward() works. Not a wrapper. That is the "
+        f"correction to this refusal's earlier wording, which said the "
+        f"replacement would be `OVModel.to()`-shaped, a method on a wrapper "
+        f"that recompiles. It is not: it is `nn.Module.to()` on one object, "
+        f"which is what lets the model that trains and the model that runs on "
+        f"the accelerator stay the same model.\n"
+        f"* The device is `torchnative.device.npu`, a namespace this project "
+        f"owns, and it RESOLVES per host -- Neural Engine on macOS, Intel NPU "
+        f"on Windows, Hexagon on Android -- and says which. It is NOT "
+        f"`torch.device(\"npu\")`: that spelling still raises on this shim "
+        f"because `torch._C._rename_privateuse1_backend` is a stub, and it is "
+        f"now a stub **on purpose**. PyTorch has no `npu` device type, and "
+        f"making it appear to have one would be a claim about PyTorch that is "
+        f"not true. See docs/devices/DEVICE_NS.md section 1.\n"
+        f"* **Recompiling the model for the accelerator is still not "
+        f"implemented.** `model.to(torchnative.device.npu)` resolves the NPU, "
+        f"tells you which unit this host has, and then refuses by name at the "
+        f"compile step rather than returning the model unchanged. So the "
+        f"capability {name} was reaching for is still not available here -- "
+        f"what changed is that the road to it is now real and named, and the "
+        f"wall is at a different place. Saying that precisely is the point of "
+        f"this refusal.\n"
+        f"* `export=` and `load_in_4bit=` refuse by name on that "
+        f"`from_pretrained`; they are not silently ignored."
     )
 
 
