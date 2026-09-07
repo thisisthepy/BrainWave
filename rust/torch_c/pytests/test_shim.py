@@ -25576,9 +25576,15 @@ def test_an_mps_op_that_would_compute_on_the_cpu_is_refused_and_names_the_op():
     """The gate, from the caller's side.
 
     `nonzero` is the op docs/VULKAN3.md §3 caught returning a correct value
-    from the CPU under an `mps` label; `_softmax` is the one that matters more,
-    because a transformer on `mps` goes through it on every attention block and
-    nothing said a word.
+    from the CPU under an `mps` label; `gather` is the second name here because
+    it is the one still standing between a plain `BertModel(input_ids)` and an
+    `mps` forward (docs/MPSATTN.md §6).
+
+    **`_softmax` used to be the second name and is deliberately not any more.**
+    It was rewritten onto the device and left the list, and `test_mpsattn.py`
+    is where that is now pinned. Swapping the name rather than deleting the
+    second slot is the point: this test needs two ops so that a gate which
+    refuses exactly one hardcoded op still fails it.
 
     Three things are asserted and each is separately load-bearing: that it
     raises, that the message names the op and the device (a refusal that does
@@ -25586,7 +25592,7 @@ def test_an_mps_op_that_would_compute_on_the_cpu_is_refused_and_names_the_op():
     on the CPU is untouched -- the gate is scoped to Metal arguments, so a
     version of it that fired everywhere would pass the first two.
 
-    **Removing the gate puts `nonzero` and `_softmax` back to answering
+    **Removing the gate puts `nonzero` and `gather` back to answering
     correctly off the CPU with `mps` on the label**, which is what this test
     fails to notice if the arm in `aten_dispatch` is deleted -- verified by
     deleting it, not by assuming.
@@ -25597,9 +25603,12 @@ def test_an_mps_op_that_would_compute_on_the_cpu_is_refused_and_names_the_op():
     d = _C._aten_dispatch
     a = d("aten._to_copy.default", _f32([0, 1, 2, 3], [2, 2]), device=mps)
 
-    for op in ("aten.nonzero.default", "aten._softmax.default"):
+    index = d("aten._to_copy.default",
+              _C._tensor_from_flat([0.0, 1.0, 1.0, 0.0], [2, 2], _C.int64),
+              device=mps)
+    for op in ("aten.nonzero.default", "aten.gather.default"):
         try:
-            d(op, a) if op == "aten.nonzero.default" else d(op, a, 0, False)
+            d(op, a) if op == "aten.nonzero.default" else d(op, a, 1, index)
         except NotImplementedError as e:
             message = str(e)
             assert op in message, message
@@ -25628,9 +25637,16 @@ def test_the_mps_refusal_list_is_not_empty_and_covers_the_named_regressions():
     assert len(ops) > 40, len(ops)
     assert len(set(ops)) == len(ops), "duplicate entries"
     assert ops == sorted(ops), "kept sorted so a diff is readable"
-    for named in ("aten.nonzero.default", "aten._softmax.default",
+    for named in ("aten.nonzero.default", "aten.gather.default",
                   "aten.where.default", "aten.index.Tensor"):
         assert named in ops, named
+    # `_softmax` and `_safe_softmax` were on this list and are not any more:
+    # they were rewritten onto the device (docs/MPSATTN.md), which is the only
+    # way off it. Named here rather than left as an absence so that putting a
+    # readback back into either kernel has to come past this line as well as
+    # past the derivation.
+    for moved in ("aten._softmax.default", "aten._safe_softmax.default"):
+        assert moved not in ops, moved
     # `.item()` and `.cpu()` are transfers the caller asked for and must never
     # be on it -- refusing them would leave no way to read a value off mps.
     assert "aten._local_scalar_dense.default" not in ops

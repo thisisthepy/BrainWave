@@ -27,7 +27,13 @@
 | `aten.pow.Tensor_Scalar` | `side_from_tensor` → `Vec<f64>` → Rust `powf` → `from_vec` | 아니오 (`powf` 는 Metal 에 `powf_f32` 가 있고, `F64` 는 CPU 에서 같은 `f64::powf`) | **예** | `widen_f64` + candle `powf`; 정수 지수는 device 위 제곱-반복 |
 | `aten.neg.default` / `prims.neg.default` | 정수 경로가 `to_vec1::<i64>()` + `wrapping_neg` | 아니오 (candle `neg` 의 정수 arm 은 `todo!()` 라 못 쓴다는 것이 원래 이유였고, `0 - x` 는 된다) | **예** | `int64` 에서 `0 - x`, 같은 wrap |
 | `aten.cumsum.default` | `to_vec1` + 스칼라 루프 | 아니오 (candle `cumsum` 은 삼각행렬 matmul 이라 `I64` 가 안 되는 것이 원래 이유) | **예** | `n-1` 개 `narrow`/`add`, **루프와 같은 순서** |
-| `aten._softmax.default` | (여전히 거절) | — | **아니오, 그럴 필요가 없다** | SmolLM2 는 이 op 을 부르지 않는다 — §3.1 |
+| `aten._softmax.default` | (이 라운드에서는 거절) | — | **아니오, 그럴 필요가 없다** | SmolLM2 는 이 op 을 부르지 않는다 — §3.1. **그러나 eager 어텐션은 부른다: docs/MPSATTN.md** |
+
+> **이 정정 자체가 한 걸음 더 갔습니다 (docs/MPSATTN.md §1).** 아래에서 얻은 것은
+> *"SmolLM2 는 `_softmax` 를 부르지 않는다"* 인데, 이 문서는 그것을 *"어텐션 블록은
+> `_softmax` 를 지나지 않는다"* 로 적었습니다. 둘은 다른 문장이고 두 번째를 뒷받침하는
+> 측정은 없었습니다 — `attn_implementation="eager"` 인 BERT 는 레이어마다 두 번 지납니다.
+> 이 문서 자신의 §2.2("한 입력, 한 아키텍처")가 경고해 둔 바로 그 자리입니다.
 
 `_softmax` 가 이 표에서 빠지는 것이 이 라운드의 첫 번째 정정입니다. `docs/MPS.md` §1.3 은
 *"`mps` 위의 트랜스포머는 어텐션 블록마다 그곳을 지난다"* 고 적었는데, **지나지 않습니다.**

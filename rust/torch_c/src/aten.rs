@@ -3990,6 +3990,20 @@ fn is_matmul_striding_refusal(e: &candle_core::Error) -> bool {
     match e {
         candle_core::Error::MatMulUnexpectedStriding(_) => true,
         candle_core::Error::WithBacktrace { inner, .. } => is_matmul_striding_refusal(inner),
+        // The Metal spelling of the same refusal. candle's CPU backends answer
+        // `MatMulUnexpectedStriding`; `candle-metal-kernels` answers its own
+        // `MetalKernelError::MatMulNonContiguous`, which arrives here as
+        // `Error::Metal` and so did not match the arm above -- so
+        // `gemm_with_layout_fallback`'s retry never ran on `mps` and a BERT
+        // built with `attn_implementation="eager"` stopped inside
+        // `eager_attention_forward` on `query @ key.transpose(2, 3)`, whose
+        // left operand is a `view`+`permute` and not contiguous
+        // (docs/MPSATTN.md §3). Matched on the message because the variant is
+        // in `candle-metal-kernels`, which this crate does not depend on by
+        // name; the message is `MetalKernelError`'s own `#[error(...)]` text.
+        candle_core::Error::Metal(inner) => {
+            inner.to_string().contains("Invalid matmul arguments")
+        }
         _ => false,
     }
 }
@@ -11277,16 +11291,21 @@ fn where_scalar_other(
     checked_convert(&raw, scalar_is_int, tag, 1)?;
 
     let device = lhs.tensor()?.device().clone();
+    // `host_const` rather than `Tensor::full(.., &device)`: the second form
+    // asks the *device* to materialise an `f64` fill, and Metal has no `f64`
+    // at all, so a GPT-2 forward on `mps` died here with
+    // `candle: unsupported const-set f64` in its attention mask
+    // (docs/MPSATTN.md §3). This is a scalar the parser just read out of a
+    // Python object, not a byte of any dispatched tensor.
     let other = if tag == TorchDType::Bool {
-        Tensor::full(u8::from(value.as_f64() != 0.0), (), &device).map_err(|e| candle_err(OP, e))?
+        host_const(u8::from(value.as_f64() != 0.0), &[], &device).map_err(|e| candle_err(OP, e))?
     } else {
         let storage = PyDtype::new(tag).storage(OP)?;
         if storage.is_int() {
-            Tensor::full(value.as_i64(), (), &device)
+            host_const(value.as_i64(), &[storage], &device)
         } else {
-            Tensor::full(value.as_f64(), (), &device)
+            host_const(value.as_f64(), &[storage], &device)
         }
-        .and_then(|t| t.fast_to(storage))
         .map_err(|e| candle_err(OP, e))?
     };
 
@@ -20557,87 +20576,96 @@ fn softmax_default(
         )
     };
 
-    let source = match read_flat(OP, input.tensor()?, tag)? {
-        Flat::Float(v) => v,
-        Flat::Int(_) => unreachable!("the integral dtypes were refused above"),
-    };
+    let _ = (outer, n, inner);
     let storage = PyDtype::new(tag).storage(OP)?;
-    let double_acc = storage == candle_core::DType::F64;
-    let out = softmax_body(&source, outer, n, inner, double_acc, false);
-
-    let device = input.tensor()?.device().clone();
-    let tensor = write_flat(OP, Flat::Float(out), dims, &device, tag)?;
-    finish(py, tensor, tag)
+    let out = softmax_on_device(input.tensor()?, dim, storage, false)
+        .map_err(|e| candle_err(OP, e))?;
+    let _ = dims;
+    finish(py, out, tag)
 }
 
-/// The reduction shared by `_softmax.default` and `_safe_softmax.default`:
-/// max-subtract, exponentiate, normalise, over the `(outer, n, inner)` view of
-/// a dim-`dim` softmax (`outer`/`inner` are the product of the extents on
-/// either side of `dim`; `n` is `dim`'s own extent).
+/// The reduction behind `_softmax.default` and `_safe_softmax.default`, written
+/// out of candle ops so that **no device byte travels to the host** and the op
+/// can leave `MPS_HOST_READBACK_OPS` (docs/MPSATTN.md).
 ///
-/// `safe` is the only difference between the two ops, and it is applied where
-/// the divergence is measured to live: a row whose max is `-inf` (every
-/// element `-inf`, since `-inf` is softmax's own floor) computes `0` for
-/// every element instead of running the usual exponential, which on that row
-/// is a `NaN` produced by `-inf - (-inf)`. `safe=false` skips the check
-/// entirely, so `_softmax.default`'s behaviour (a `NaN` row, matching
-/// upstream, per this file's docs above) is untouched by this refactor.
-fn softmax_body(source: &[f64], outer: usize, n: usize, inner: usize, double_acc: bool, safe: bool) -> Vec<f64> {
-    let mut out = vec![0.0f64; source.len()];
-
-    for o in 0..outer {
-        for i in 0..inner {
-            let at = |j: usize| o * n * inner + j * inner + i;
-            if double_acc {
-                let mut max = f64::NEG_INFINITY;
-                for j in 0..n {
-                    let v = source[at(j)];
-                    if !(v <= max) {
-                        max = v;
-                    }
-                }
-                if safe && max == f64::NEG_INFINITY {
-                    for j in 0..n {
-                        out[at(j)] = 0.0;
-                    }
-                    continue;
-                }
-                let mut sum = 0.0f64;
-                for j in 0..n {
-                    let e = (source[at(j)] - max).exp();
-                    out[at(j)] = e;
-                    sum += e;
-                }
-                for j in 0..n {
-                    out[at(j)] /= sum;
-                }
-            } else {
-                let mut max = f32::NEG_INFINITY;
-                for j in 0..n {
-                    let v = source[at(j)] as f32;
-                    if !(v <= max) {
-                        max = v;
-                    }
-                }
-                if safe && max == f32::NEG_INFINITY {
-                    for j in 0..n {
-                        out[at(j)] = 0.0;
-                    }
-                    continue;
-                }
-                let mut sum = 0.0f32;
-                for j in 0..n {
-                    let e = ((source[at(j)] as f32) - max).exp();
-                    out[at(j)] = e as f64;
-                    sum += e;
-                }
-                for j in 0..n {
-                    out[at(j)] = ((out[at(j)] as f32) / sum) as f64;
-                }
-            }
-        }
+/// This replaces a `read_flat` + scalar loop (`softmax_body`) that was correct
+/// and computed on the CPU under any label. That was the whole reason
+/// `aten._softmax.default` was refused on `mps`, and it is the op every
+/// **eager** attention block goes through -- `docs/MPSFWD.md` measured that
+/// SmolLM2 does *not*, because it takes `scaled_dot_product_attention`, and
+/// concluded from one model that no attention block does. A BERT built with
+/// `attn_implementation="eager"` reaches it twice a layer.
+///
+/// **Why this is the same arithmetic and not an approximation.** The old loop
+/// widened to `f64` on the way in and cast back to `f32` for every operation on
+/// the reduced path, so the arithmetic it actually performed was: `f32` max,
+/// `f32` subtract, `f32::exp`, `f32` sequential sum, `f32` divide. Each of
+/// those is one candle op in the same dtype, and candle's CPU `exp` is the same
+/// `f32::exp`. The one thing not pinned by construction is the **summation
+/// order** inside `sum_keepdim`; the golden corpus is the check on that and it
+/// did not move (docs/MPSATTN.md §4).
+///
+/// `acc` is `opmath_type<scalar_t>` exactly as before -- `f32` for the reduced
+/// float dtypes, `f64` for `float64` -- so `float16`/`bfloat16` still compute
+/// in `f32` and narrow once at the end.
+///
+/// `safe` is `_safe_softmax`'s only divergence: a row whose max is `-inf`
+/// answers `0` rather than the `NaN` that `-inf - (-inf)` produces. It is
+/// applied here with a `where_cond`, which candle's Metal backend has.
+fn softmax_on_device(
+    input: &Tensor,
+    dim: usize,
+    storage: candle_core::DType,
+    safe: bool,
+) -> candle_core::Result<Tensor> {
+    // Two shapes have no reduction to do, and candle's reductions refuse both
+    // rather than answering. The scalar loop this replaced folded them into
+    // its `(outer, n, inner) = (1, 1, 1)` special case and answered upstream's
+    // values; **nine golden cases caught the omission** when it did not
+    // (docs/MPSATTN.md §4), across every float dtype.
+    //
+    //   * rank 0 -- `max: dimension index 0 out of range for shape []`.
+    //     A single element is the whole distribution, so the answer is `1`.
+    //   * zero elements -- `empty tensor for reduce`. Upstream answers the
+    //     empty tensor back, so the input is what is returned.
+    if input.rank() == 0 {
+        return host_const(1f64, &[storage], input.device());
     }
-    out
+    if input.elem_count() == 0 {
+        return input.fast_to(storage);
+    }
+    let acc = opmath_in(storage);
+    let x = input.fast_to(acc)?;
+    let max = x.max_keepdim(dim)?;
+    let exponent = x.broadcast_sub(&max)?.exp()?;
+    let sum = exponent.sum_keepdim(dim)?;
+    let out = exponent.broadcast_div(&sum)?;
+    let out = if safe {
+        // **`max == -inf` is not the test, and finding that out is the reason
+        // this is spelled the long way.** It is what the scalar loop used, and
+        // it is true on the CPU; on Metal `max_keepdim` over a row that is
+        // entirely `-inf` does not answer `-inf`, so the row was not detected,
+        // `exp(-inf - max)` underflowed to `0`, and `0 / 0` handed back the
+        // `NaN` this branch exists to avoid. It was a *value* test that caught
+        // it (docs/MPSATTN.md §5), which is why there is one.
+        //
+        // So the criterion is torch's own decomposition instead --
+        // `torch/_decomp/decompositions.py::safe_softmax` masks where **every**
+        // element along `dim` is `-inf` -- counted here rather than inferred
+        // from the reduction. It is backend-independent because it is a
+        // comparison and a sum of ones, and it is also *stricter* than the max
+        // test in the right direction: a row holding a `NaN` is not all `-inf`,
+        // and upstream answers `NaN` there too.
+        let floor = host_const(f64::NEG_INFINITY, &[acc], x.device())?;
+        let masked = x.broadcast_eq(&floor)?.fast_to(acc)?.sum_keepdim(dim)?;
+        let width = host_const(x.dims()[dim] as f64, &[acc], x.device())?;
+        let dead = masked.broadcast_eq(&width)?.broadcast_as(out.shape())?;
+        let zeros = host_const(0f64, &[acc], x.device())?.broadcast_as(out.shape())?;
+        dead.where_cond(&zeros, &out)?
+    } else {
+        out
+    };
+    out.fast_to(storage)
 }
 
 /// `aten::_safe_softmax(Tensor self, int dim, ScalarType? dtype=None) -> Tensor`
@@ -20706,16 +20734,9 @@ fn safe_softmax_default(
         )
     };
 
-    let source = match read_flat(OP, &tensor, tag)? {
-        Flat::Float(v) => v,
-        Flat::Int(_) => unreachable!("the integral dtypes were refused above"),
-    };
+    let _ = (outer, n, inner, dims);
     let storage = PyDtype::new(tag).storage(OP)?;
-    let double_acc = storage == candle_core::DType::F64;
-    let out = softmax_body(&source, outer, n, inner, double_acc, true);
-
-    let device = tensor.device().clone();
-    let result = write_flat(OP, Flat::Float(out), dims, &device, tag)?;
+    let result = softmax_on_device(&tensor, dim, storage, true).map_err(|e| candle_err(OP, e))?;
     finish(py, result, tag)
 }
 

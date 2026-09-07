@@ -195,6 +195,34 @@ fn walk_data(
 /// inventing an `aten::tensor` call -- `bootstrap.py` builds the data here and
 /// then passes the result through `lift_fresh`, which *is* dispatched.
 ///
+/// Build the literal on the **host**, narrow it there, and then move it.
+///
+/// `Tensor::from_vec(values, shape, device)` materialises the buffer in the
+/// dtype `values` has -- `f64` or `i64` -- and `to_dtype` then asks *that
+/// device* to narrow it. Metal has neither an `f64` buffer nor an `F64 -> F32`
+/// conversion, so `torch.tensor([...], device="mps")` died with
+/// `candle: Metal contiguous to_dtype F64 F32 not implemented`. That is where a
+/// GPT-2 forward on `mps` stopped, in `modeling_gpt2.py`'s attention mask
+/// (docs/MPSATTN.md §3).
+///
+/// Doing both steps on the CPU first is `aten.rs::host_const`'s argument at
+/// literal scale, and it is **not** a host readback: nothing of any dispatched
+/// tensor travels. These bytes were made here, out of a Python list, and they
+/// travel host -> device, which is the direction `.to(device)` already goes.
+///
+/// The CPU path is unchanged value for value -- `from_vec` then `to_dtype` on
+/// `Device::Cpu` is what it already did, with the `to_device` a no-op.
+fn host_built<T: candle_core::WithDType>(
+    values: Vec<T>,
+    shape: Vec<usize>,
+    storage: candle_core::DType,
+    device: &candle_core::Device,
+) -> candle_core::Result<Tensor> {
+    Tensor::from_vec(values, shape, &candle_core::Device::Cpu)?
+        .to_dtype(storage)?
+        .to_device(device)
+}
+
 /// Distinct from `_tensor_from_flat`, which stays what it is: scaffolding due
 /// for deletion that takes an already-flat `f64` list and refuses `torch.bool`
 /// outright (BOOL.md §6.3). This one has to accept booleans, because
@@ -278,7 +306,7 @@ fn _tensor_new_from_data(
                 Leaf::Float(v) => *v as i64,
             })
             .collect();
-        Tensor::from_vec(values, shape, &device).and_then(|t| t.to_dtype(storage))
+        host_built(values, shape, storage, &device)
     } else {
         let values: Vec<f64> = leaves
             .iter()
@@ -288,7 +316,7 @@ fn _tensor_new_from_data(
                 Leaf::Float(v) => *v,
             })
             .collect();
-        Tensor::from_vec(values, shape, &device).and_then(|t| t.to_dtype(storage))
+        host_built(values, shape, storage, &device)
     }
     .map_err(|e| candle_err(OP, e))?;
 

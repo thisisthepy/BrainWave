@@ -620,14 +620,21 @@ fn shim_same_device(left: PyDevice, right: PyDevice) -> bool {
 /// RMSNorm's `x.pow(2)` and the attention mask -- and none of them is a
 /// widening of this gate: the scan re-derives the list from the kernels and
 /// would put them straight back if the readback were still there.
-pub const MPS_HOST_READBACK_OPS: [&str; 87] = [
+///
+/// **Two more left it the same way** (docs/MPSATTN.md): `aten._softmax.default`
+/// and `aten._safe_softmax.default` are now `max_keepdim` / `broadcast_sub` /
+/// `exp` / `sum_keepdim` / `broadcast_div` on the device instead of `read_flat`
+/// and a scalar loop. That pair is the one `docs/RELEASE_0_0_13a0.md` §5 named
+/// as the reason no transformer forwards on `mps`. §5 was **half right**: the
+/// SDPA path does not go through `_softmax` (docs/MPSFWD.md measured that on
+/// SmolLM2 and it still holds), but an **eager** attention block does, twice a
+/// layer, and a BERT with `attn_implementation="eager"` stopped there.
+pub const MPS_HOST_READBACK_OPS: [&str; 85] = [
     "aten._fft_c2c.default",
     "aten._fft_c2r.default",
     "aten._fft_r2c.default",
     "aten._grouped_mm.default",
     "aten._log_softmax.default",
-    "aten._safe_softmax.default",
-    "aten._softmax.default",
     "aten._unique2.default",
     "aten.abs.default",
     "aten.abs_.default",

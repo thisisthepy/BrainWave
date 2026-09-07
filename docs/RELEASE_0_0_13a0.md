@@ -230,8 +230,33 @@ would otherwise count these as features.
   multiple root tensors, `GradientEdge` inputs, `torch.autograd.Function`,
   hooks and `retain_grad` on non-leaves refuse by name. Mutation through a view
   is refused rather than differentiated — deliberately less than upstream.
-- **No transformer forwards on `mps`.** `aten._softmax.default` is in the
-  set of ops refused there, and every attention block passes through it.
+- **A transformer does forward on `mps`, and both halves of this bullet were
+  wrong in opposite directions** — it said the opposite when it was drafted and
+  was re-measured rather than restated (`docs/MPSATTN.md`). "No transformer
+  forwards on `mps`" was **already false when it was written**: `docs/MPSFWD.md`
+  ran SmolLM2-135M there and this bullet was not updated. "Every attention block
+  passes through `aten._softmax.default`" was **true for an eager attention
+  block and false for the SDPA path** — and `docs/MPSFWD.md`, correcting the
+  first half, generalised its own one-model observation into "no attention block
+  reaches it", which is a different sentence and was not measured. A BERT built
+  with `attn_implementation="eager"` reaches it twice a layer, which is exactly
+  where it stopped. `_softmax` and `_safe_softmax` have been rewritten out of a
+  host readback and onto the device (`MPS_HOST_READBACK_OPS` 87 → 85), and three
+  further walls that are **not** refusals were fixed: candle's Metal spelling of
+  a matmul striding refusal was not recognised by the retry that exists for it,
+  and two constants were being materialised by a device that has no `f64`. A
+  shrunk BERT encoder now forwards on `mps` and lands **5.257e-07** from
+  upstream's own `float64` answer against upstream's own `float32` error of
+  **4.320e-07** — 1.22×, inside `docs/AGREE.md`'s derived 4× rule — and differs
+  from the shim's own `cpu` answer by at most **0.72 float32 ulp**.
+  **Three qualifications that belong to that sentence:** it is one model, one
+  input, one dtype, `no_grad`, at a shrunk config, which is the same narrowness
+  that produced the error this bullet is correcting; `token_type_ids` must be
+  supplied, because `BertEmbeddings` otherwise builds them with `torch.gather`,
+  which is still refused on `mps` — that op is in the *embeddings*, not the
+  attention block; and **GPT-2 still does not forward**, stopping on Metal's
+  inability to allocate a zero-byte buffer, the same wall `docs/MPSFWD.md` §6
+  already recorded and left alone.
 - **Vulkan is four ops.** Correctness is testable on this host; performance
   needs a phone and has not been measured.
 - **One hardware accelerator has been reached; the graphs credited above were not on it.**

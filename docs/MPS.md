@@ -244,8 +244,14 @@ $ TORCH_C_DYLD_LIBRARY_PATH=$V VK_DRIVER_FILES=$V/libkosmickrisp_icd.json \
   되읽지 **않도록** 고치는 것이지, 문 앞에서 dtype 을 다시 판단하는 것이 아닙니다.
 * ~~**`_softmax` 를 GPU 로.** 54개 중 이것 하나가 `mps` 에서 모델을 돌리는 것과 못 돌리는 것을
   가릅니다.~~ **그렇지 않았습니다** — §1.3 의 정정을 보십시오. 모델은 이 op 을 부르지 않고,
-  `docs/MPSFWD.md` 가 실제로 가르던 셋을 옮겨 SmolLM2 를 `mps` 에서 돌렸습니다. `_softmax` 는
-  여전히 거절되고, 여전히 `read_flat`/`widen_f64` 를 지나지 않는 경로가 필요합니다.
+  `docs/MPSFWD.md` 가 실제로 가르던 셋을 옮겨 SmolLM2 를 `mps` 에서 돌렸습니다.
+
+  > **재정정 (docs/MPSATTN.md §1).** 위의 취소선이 **너무 멀리 갔습니다.** SmolLM2 가
+  > `_softmax` 를 부르지 않는 것은 맞지만, 그것은 SDPA 경로에 대한 사실이고 **eager 어텐션
+  > 블록은 레이어마다 두 번 지납니다.** 즉 §1.3 의 원래 문장은 "모든 어텐션" 이라고 쓴 것이
+  > 틀렸을 뿐 공백 자체는 실재했고, `docs/MPSATTN.md` 가 그것을 닫았습니다 —
+  > `_softmax` 와 `_safe_softmax` 는 이제 candle op 다섯 개로 device 위에서 계산하고
+  > 거절 목록에 없습니다 (87 → 85).
 * **`f32 -> f64` 가 Metal 에 없다.** `widen_f64` 를 부르는 모든 것의 벽이고, `read_flat` 의
   부동소수 경로가 조용하지 않았던 이유이기도 합니다. candle 쪽 문제입니다.
 * **`mps` 의 f64 `full`** — `VULKAN3.md` §7 이 남긴 그대로입니다.
