@@ -21,6 +21,9 @@ ahead of PyPI.
 
 import pathlib
 import re
+import shutil
+import subprocess
+import sys
 
 REPO = pathlib.Path(__file__).resolve().parents[3]
 PYPROJECT = REPO / "pyproject.toml"
@@ -183,6 +186,65 @@ def test_the_release_notes_state_the_gaps_and_not_only_the_additions():
     assert "ARCH100" in text and "COMPILE" in text, (
         "the notes do not point at the documents that measured the gaps"
     )
+
+
+def test_the_abi3_wheel_loads_on_later_cpythons():
+    """The abi3 promise, exercised rather than asserted.
+
+    `setup.py` passes `py_limited_api = "cp313"` so one wheel serves 3.13 AND
+    every later CPython, and `pyproject.toml` now advertises 3.14 and 3.15 on
+    the strength of that. Until this test there was nothing behind either
+    claim: no gate ran a single line on an interpreter newer than the one it
+    runs on, so "abi3 works" was a sentence in a docstring.
+
+    This loads the BUILT extension under whichever later interpreters exist on
+    the machine and makes it compute. It skips BY NAME when none are present,
+    because the alternative -- passing silently on a host with only 3.13 --
+    is a check that cannot fail (CLAUDE.md §5.5).
+    """
+    artefact = REPO / "torchnative/src/main/torch/_C.abi3.so"
+    if not artefact.exists():
+        print("   (skipped: no built _C.abi3.so; run vendor/install_shim.sh)")
+        return
+
+    floor = (3, 13)
+    later = []
+    for minor in range(floor[1] + 1, floor[1] + 8):
+        exe = shutil.which(f"python3.{minor}")
+        if exe:
+            later.append((minor, exe))
+    if not later:
+        print(
+            f"   (skipped: no CPython newer than 3.{floor[1]} on PATH, so the "
+            "abi3 floor could not be exercised above itself)"
+        )
+        return
+
+    probe = (
+        "import importlib.util, sys, pathlib;"
+        "p = pathlib.Path(sys.argv[1]);"
+        "spec = importlib.util.spec_from_file_location('_C', p);"
+        "m = importlib.util.module_from_spec(spec);"
+        "spec.loader.exec_module(m);"
+        "ops = m._aten_implemented();"
+        "a = m._aten_dispatch('aten.empty.memory_format', [2, 2], m.float32);"
+        "print(sys.version_info[:2], len(ops), tuple(a.shape))"
+    )
+    for minor, exe in later:
+        done = subprocess.run(
+            [exe, "-c", probe, str(artefact)],
+            capture_output=True, text=True, timeout=120,
+        )
+        assert done.returncode == 0, (
+            f"the cp313-abi3 extension failed to load on python3.{minor} "
+            f"({exe}). That is the abi3 promise breaking, and pyproject.toml "
+            f"advertises this interpreter.\n{done.stderr[-800:]}"
+        )
+        head = done.stdout.strip().splitlines()[-1]
+        assert f"(3, {minor})" in head, (done.stdout, done.stderr)
+        count = int(head.split()[2].rstrip(","))
+        assert count > 100, f"python3.{minor} loaded it but sees {count} ops"
+        print(f"   abi3 on python3.{minor}: {head}")
 
 
 def _main():
