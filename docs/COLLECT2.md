@@ -217,6 +217,16 @@ really do have an upstream error of exactly zero. If a future change makes
 
 ## 7. The async surface diverges, and the divergence is pinned rather than hidden
 
+> **Superseded by `docs/ASYNCWORK.md` (later round).** The divergence measured
+> below is **closed**: the collectives are genuinely asynchronous now,
+> `is_completed()` is False before `wait()` on both sides, and the buffer
+> before `wait()` holds the caller's own pre-collective input rather than the
+> answer. The table is kept as the record of what was true when it was taken
+> — it is not a description of the current backend. The test named here was
+> **inverted**, not deleted, and is now
+> `test_async_op_is_genuinely_async_on_both_sides_and_neither_publishes_early`.
+
+
 A collective that is secretly synchronous passes every value test in §6 and is
 still not upstream's contract. So it was measured:
 
@@ -233,16 +243,24 @@ is no window in which one exists. It is a real difference in the *contract*: a
 caller who overlaps a collective with local compute gets no overlap, and a
 caller who polls `is_completed()` gets `True` on the first poll.
 
-`test_async_op_returns_a_work_that_is_already_complete_and_upstreams_is_not`
-asserts **both sides** — that ours is complete on return and that upstream's is
-not. If a later round makes these genuinely asynchronous the test goes red, and
-that is correct: the claim will have changed, not the test.
+That test asserted **both sides** — that ours was complete on return and
+that upstream's was not — specifically so that a later round making these
+genuinely asynchronous would turn it red. That is what happened, and it is the
+claim that changed, not the test that was wrong. It was updated in place, still
+asserting both sides; `docs/ASYNCWORK.md` §6 lists which assertions were
+inverted and why each is still a real check.
 
-Genuine asynchrony is **not built**. It needs a thread per outstanding
-collective or a non-blocking star, and a `Work` that owns the buffer until
-`wait()`; the buffer-ownership half is the part with teeth, because a caller who
-reads early must get something the implementation chose to give them rather than
-a half-written tensor.
+The paragraph that stood here said genuine asynchrony was **not built**, and
+that it would need a `Work` that owns the buffer until `wait()` — "the
+buffer-ownership half is the part with teeth, because a caller who reads early
+must get something the implementation chose to give them rather than a
+half-written tensor". That was the right diagnosis and it is how it was built:
+`AsyncWork` runs the collective against a private staging clone and publishes
+onto the caller's tensor only at a synchronisation point, so an early read is
+deterministically the input rather than a race it happens to win. What it does
+*not* buy is wire parallelism — the star still carries one collective at a
+time, so two async collectives overlap with the caller's compute and not with
+each other. `docs/ASYNCWORK.md` §4.
 
 ## 8. The sabotage
 
@@ -281,7 +299,10 @@ added and the nullification re-run against it.
 
 ## 9. What is still not built, refusing by name
 
-- **Genuine `async_op`.** §7.
+- ~~**Genuine `async_op`.** §7.~~ **Built** in a later round —
+  `docs/ASYNCWORK.md`. What remains unbuilt from that round is wire
+  parallelism (two async collectives still serialise on the star),
+  `get_future()`, and cancelling an exchange already in flight.
 - **`all_to_all` with uneven splits.** Not a harder transpose — a different
   collective. Each rank must know every other rank's split vector before it can
   place its own chunk, and that is an exchange this backend does not do.
@@ -342,7 +363,7 @@ until the harness times out.
 <!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_collect2.py test_the_tolerance_is_derived_from_upstream_and_is_not_a_free_parameter present -->
 <!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_collect2.py test_the_product_fold_is_in_ascending_rank_order_and_says_so present -->
 <!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_collect2.py test_barrier_actually_blocks_rather_than_reporting_that_it_did present -->
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_collect2.py test_async_op_returns_a_work_that_is_already_complete_and_upstreams_is_not present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_collect2.py test_async_op_is_genuinely_async_on_both_sides_and_neither_publishes_early present -->
 <!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_collect2.py test_reduce_leaves_the_non_root_buffers_exactly_as_it_found_them present -->
 <!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_collect2.py test_the_collectives_that_used_to_return_their_own_input_no_longer_do present -->
 <!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_collect2.py test_all_to_all_single_refuses_uneven_splits_by_name present -->

@@ -14214,6 +14214,158 @@ def _install_distributed_c10d(module, spec) -> None:
     class FakeWork(Work):
         pass
 
+    def _tree_clone(obj):
+        """Clone an output argument of any shape a collective uses.
+
+        The collectives here take their destinations as a tensor, a list of
+        tensors, or a list of lists of tensors. Nothing else appears, so
+        nothing else is handled -- a shape this does not know would silently
+        become a shared reference, which is the exact bug this whole file is
+        about, so it raises instead.
+        """
+        if obj is None:
+            return None
+        if isinstance(obj, (list, tuple)):
+            return [_tree_clone(x) for x in obj]
+        if not hasattr(obj, "clone"):
+            raise TypeError(
+                "torch._C._distributed_c10d: cannot take ownership of a %r as "
+                "a collective output" % (type(obj).__name__,))
+        return obj.clone()
+
+    def _tree_copy(dest, src):
+        if dest is None:
+            return
+        if isinstance(dest, (list, tuple)):
+            for d, s in zip(dest, src):
+                _tree_copy(d, s)
+            return
+        dest.copy_(src)
+
+    def _tree_flatten(obj, out=None):
+        out = [] if out is None else out
+        if obj is None:
+            return out
+        if isinstance(obj, (list, tuple)):
+            for x in obj:
+                _tree_flatten(x, out)
+            return out
+        out.append(obj)
+        return out
+
+    class AsyncWork(Work):
+        """A collective that is still running, and that owns its output until `wait()`.
+
+        The threading half of asynchrony is the easy half. The half with teeth
+        is **ownership**, and it is what this class is for: while a collective
+        is in flight, the caller's output tensor must hold something the
+        implementation deliberately chose to give them, never a buffer being
+        written underneath them.
+
+        So the exchange never touches the caller's tensor at all. It runs
+        against a private staging clone that this handle owns, and the only
+        thing that copies staging onto the caller's buffer is **publication**,
+        which happens at a synchronisation point and nowhere else. Two
+        consequences, both deliberate, both tested in
+        `rust/torch_c/pytests/test_asyncwork.py`:
+
+        * Reading the output buffer before `wait()` yields the
+          **pre-collective contents**, deterministically, on every run and at
+          every speed. It is not a race that a fast worker thread happens to
+          win: there is no code path on which that buffer changes without the
+          caller asking for it. A test of this cannot pass by luck, which is
+          the whole reason the design is this way round -- see
+          `docs/ASYNCWORK.md` §3.
+        * `is_completed()` is a synchronisation point too. It reports whether
+          the exchange has finished, and if it has it publishes *before*
+          returning True. So a caller who polls to True may then read the
+          buffer and find the answer there, which is upstream gloo's contract;
+          and a caller who polls to False still holds their own bytes.
+
+        `docs/ASYNCWORK.md` §5 records the one place this is deliberately
+        stricter than gloo: gloo's buffer becomes valid when the work does,
+        whether or not anybody asked. Here it becomes valid when somebody asks.
+        """
+
+        def __init__(self, dest, staged):
+            super().__init__()
+            import threading
+            self._dest = dest
+            self._staged = staged
+            self._finished = threading.Event()
+            self._exception = None
+            self._published = False
+            self._publish_lock = threading.Lock()
+
+        # -- worker side ---------------------------------------------------
+        def _run(self, body):
+            """Runs on the group's worker thread, and never raises out of it.
+
+            A collective that fails takes its exception to whoever calls
+            `wait()`, because that is the thread with a caller to tell. Letting
+            it escape here would kill the worker and hang every later
+            collective on a queue nobody drains.
+            """
+            try:
+                body()
+            except BaseException as exc:
+                self._exception = exc
+            finally:
+                self._finished.set()
+
+        # -- caller side ---------------------------------------------------
+        def _publish(self):
+            with self._publish_lock:
+                if self._published:
+                    return
+                if self._exception is None:
+                    _tree_copy(self._dest, self._staged)
+                self._published = True
+
+        def is_completed(self):
+            if not self._finished.is_set():
+                return False
+            self._publish()
+            return True
+
+        def is_success(self):
+            return self._finished.is_set() and self._exception is None
+
+        def exception(self):
+            return self._exception
+
+        def wait(self, timeout=None):
+            """Block until the collective is done, publish it, return True.
+
+            Idempotent by construction: `_publish` is guarded, and a second
+            `wait()` on a handle that has already completed finds the event set
+            and the buffer published and does nothing but return True. That is
+            upstream's contract for a completed handle -- a no-op, not an
+            error -- and it is tested rather than asserted here.
+            """
+            seconds = None
+            if timeout is not None:
+                seconds = (timeout.total_seconds()
+                           if hasattr(timeout, "total_seconds") else timeout)
+                if seconds is not None and seconds <= 0:
+                    seconds = None
+            if not self._finished.wait(seconds):
+                raise RuntimeError(
+                    "torch._C._distributed_c10d.Work.wait: the collective did "
+                    "not complete within %r" % (timeout,))
+            self._publish()
+            if self._exception is not None:
+                raise self._exception
+            return True
+
+        def synchronize(self):
+            self.wait()
+            return None
+
+        def result(self):
+            self.wait()
+            return _tree_flatten(self._dest)
+
     # -- the options structs ----------------------------------------------
     #
     # Plain records. `distributed_c10d` fills the fields in and hands them to a
@@ -14707,6 +14859,84 @@ def _install_distributed_c10d(module, spec) -> None:
                 return "connection closed" in str(exc)
             return isinstance(exc, cls._GONE)
 
+        def _drain_async(self):
+            """Only one collective may be on the star at a time.
+
+            The star is one socket per peer carrying one length-prefixed frame
+            per collective. Two collectives in flight at once would interleave
+            their frames on that socket and each would read the other's bytes
+            -- so asynchrony here buys *caller* overlap, not wire parallelism,
+            and the queue is served by exactly one worker thread to keep the
+            wire order equal to the issue order that c10d already requires of
+            every rank.
+
+            This is the other half of that invariant: a *synchronous*
+            collective issued from the calling thread while asynchronous ones
+            are still queued would jump the line. It waits for the queue to
+            drain first. Called from the worker itself it is a no-op, or it
+            would wait for the item it is currently running.
+            """
+            import threading
+            queue_ = getattr(self, "_work_queue", None)
+            if queue_ is None:
+                return
+            if threading.current_thread() is getattr(self, "_work_thread", None):
+                return
+            queue_.join()
+
+        def _async_queue(self):
+            """The group's single worker thread, started on first async use.
+
+            Lazy because most groups never issue an `async_op=True` collective
+            and a thread per group that nobody uses is a thread per group that
+            can still deadlock a shutdown. Daemon, so a caller who drops a
+            handle on the floor cannot wedge interpreter exit.
+            """
+            existing = getattr(self, "_work_queue", None)
+            if existing is not None:
+                return existing
+            import queue as _queue, threading
+            pending = _queue.Queue()
+            self._work_queue = pending
+
+            def _pump():
+                while True:
+                    item = pending.get()
+                    if item is None:
+                        pending.task_done()
+                        return
+                    work, body = item
+                    try:
+                        work._run(body)
+                    finally:
+                        pending.task_done()
+
+            thread = threading.Thread(
+                target=_pump, daemon=True,
+                name="ProcessGroupLocal-async-rank%d" % (self._rank,))
+            self._work_thread = thread
+            thread.start()
+            return pending
+
+        def _async_shutdown(self):
+            """Retire the worker thread. Idempotent, and safe if none was started."""
+            pending = getattr(self, "_work_queue", None)
+            if pending is None:
+                return None
+            pending.put(None)
+            thread = getattr(self, "_work_thread", None)
+            if thread is not None:
+                thread.join(timeout=60)
+            self._work_queue = None
+            self._work_thread = None
+            return None
+
+        def shutdown(self):
+            return self._async_shutdown()
+
+        def abort(self):
+            return self._async_shutdown()
+
         def _star_exchange(self, payload, fold, tolerate=False):
             """One collective. Returns ``(result, missing)``.
 
@@ -14727,6 +14957,7 @@ def _install_distributed_c10d(module, spec) -> None:
             separately. With `tolerate=False` a non-empty verdict is still
             returned rather than raised; the caller decides.
             """
+            self._drain_async()
             if self._size == 1:
                 return fold([payload], [0]), ()
             if self._rank == 0:
@@ -15532,6 +15763,97 @@ def _install_distributed_c10d(module, spec) -> None:
 
         def _end_coalescing(self, *args, **kwargs):
             return Work()
+
+    # -- genuine async_op --------------------------------------------------
+    #
+    # Every collective body above is synchronous, and stays exactly as it is.
+    # Asynchrony is added *around* them rather than inside them, for a reason
+    # that is about evidence rather than tidiness: the synchronous bodies are
+    # what `test_collect2.py` proved equal to upstream gloo at world 3 and 4,
+    # and rewriting twelve of them to be re-entrant would have put every one of
+    # those results back in question to buy a property none of them is about.
+    #
+    # So each public collective is renamed `_sync_<name>` and replaced by a
+    # wrapper that either calls it inline -- today's behaviour, unchanged, for
+    # `asyncOp=False` and for world_size 1 -- or hands it to the worker thread
+    # with its **output argument swapped for a staging clone**. See
+    # `AsyncWork` for why the swap is the whole design.
+    #
+    # The value keyed here is the positional index of the output argument.
+    # `barrier` has none. `allreduce_partial` and `allgather_partial` are
+    # deliberately absent: they return `(Work, missing_ranks)`, and the
+    # survivor verdict is not a thing a caller can be handed later, so they
+    # stay synchronous (docs/ASYNCWORK.md §7).
+    _ASYNC_COLLECTIVES = {
+        "allreduce": 0,
+        "reduce": 0,
+        "broadcast": 0,
+        "allgather": 0,
+        "_allgather_base": 0,
+        "gather": 0,
+        "scatter": 0,
+        "reduce_scatter": 0,
+        "_reduce_scatter_base": 0,
+        "alltoall": 0,
+        "alltoall_base": 0,
+        "barrier": None,
+    }
+
+    def _async_opts(args, kwargs):
+        """The options struct among the arguments, wherever it sits.
+
+        `alltoall_base` takes it fifth and `allreduce` second, so it is found
+        by the one attribute that matters rather than by position. Nothing else
+        a collective is passed carries an `asyncOp`.
+        """
+        for value in list(args) + list(kwargs.values()):
+            if hasattr(value, "asyncOp"):
+                return value
+        return None
+
+    def _make_async_collective(method_name, out_index, body):
+        def wrapper(self, *args, **kwargs):
+            opts = _async_opts(args, kwargs)
+            wants_async = bool(getattr(opts, "asyncOp", False))
+            if out_index is not None and len(args) <= out_index:
+                # Called with the output as a keyword. Nothing in this tree
+                # does, and guessing which keyword it was would be the kind of
+                # cleverness that makes ownership unprovable, so it runs
+                # synchronously and says nothing false about itself.
+                wants_async = False
+            if self._size == 1 or not wants_async:
+                # No drain here. `_star_exchange` is the single point every
+                # collective body reaches, and the drain lives there instead.
+                # It was in both places for a while, and the cost of that was
+                # not performance: **neither copy could be nullified on its
+                # own**, because the other one silently covered it, so the
+                # suite could see the property and neither of its two
+                # implementations. One choke point is one thing a test can
+                # delete -- docs/ASYNCWORK.md §8.
+                return body(self, *args, **kwargs)
+            if out_index is None:
+                dest = staged = None
+                call_args = args
+            else:
+                dest = args[out_index]
+                staged = _tree_clone(dest)
+                call_args = list(args)
+                call_args[out_index] = staged
+            work = AsyncWork(dest, staged)
+            self._async_queue().put(
+                (work, lambda: body(self, *call_args, **kwargs)))
+            return work
+
+        wrapper.__name__ = method_name
+        wrapper.__qualname__ = "ProcessGroupLocal." + method_name
+        wrapper.__doc__ = body.__doc__
+        return wrapper
+
+    for _name, _out in _ASYNC_COLLECTIVES.items():
+        _body = ProcessGroupLocal.__dict__[_name]
+        setattr(ProcessGroupLocal, "_sync_" + _name, _body)
+        setattr(ProcessGroupLocal, _name,
+                _make_async_collective(_name, _out, _body))
 
     # The collectives `distributed_c10d` calls on the *group* object, forwarded
     # to whichever backend the group registered. Upstream's ProcessGroup does

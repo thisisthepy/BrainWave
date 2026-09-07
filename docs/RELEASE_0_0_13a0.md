@@ -326,11 +326,15 @@ would otherwise count these as features.
   its own — which for the collectives that move numbers rather than combining
   them comes out at zero, so those are held to bit equality.
   `allreduce` now folds `MIN`, `MAX`, `PRODUCT` and `AVG` beside `SUM`.
-  **Still refusing by name**: genuine `async_op` (these collectives complete
-  inside the call, so the returned `Work` is already done where upstream's is
-  not — `docs/COLLECT2.md` §7), uneven-split `all_to_all`, the bitwise reduce
-  ops, the `_coalesced` spellings, `send`/`recv`, `new_group`, secure
-  aggregation and differential privacy.
+  Genuine `async_op` was listed here as unbuilt when this release was cut and
+  has since been built — `docs/ASYNCWORK.md`. The collectives no longer run
+  inside the call; `is_completed()` is False before `wait()` as upstream's is,
+  and the returned `Work` owns its output buffer until `wait()` publishes it.
+  Two async collectives still serialise on the star, so what this buys is
+  overlap with the caller's own compute rather than with each other.
+  **Still refusing by name**: uneven-split `all_to_all`, the bitwise reduce
+  ops, the `_coalesced` spellings, `send`/`recv`, `new_group`, `get_future()`,
+  secure aggregation and differential privacy.
 
 ## 6. Platform status for this release
 

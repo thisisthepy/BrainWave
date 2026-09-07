@@ -331,14 +331,32 @@ def c2_run(torch, dist, rank, world, DT, shim):
     probe("product_rank_order", product_order)
 
     # -- the async surface --------------------------------------------------
+    #
+    # The stagger is the point of this probe rather than noise in it. Polling
+    # `is_completed()` the instant after issuing a collective that every peer
+    # has *already* reached is a race: the last rank to arrive can legitimately
+    # find the work done, on any backend. So the non-zero ranks are held back
+    # half a second, which makes rank 0 provably the first to arrive and its
+    # poll a question with one right answer -- there is a peer that has not
+    # sent anything yet, so the collective cannot have finished.
+    #
+    # Half a second is far above the skew the rendezvous leaves behind (the
+    # ranks come out of `init_process_group` within milliseconds of each
+    # other) and far below the harness timeout. The later ranks are measured
+    # and reported but not asserted on, because for them the answer really is
+    # unspecified -- see `docs/ASYNCWORK.md` §6.
     def async_probe():
         t = ft(c2_values(rank, 3, "async"))
+        source = t.tolist()
+        if rank != 0:
+            time.sleep(0.5)
         work = dist.all_reduce(t, op=dist.ReduceOp.SUM, async_op=True)
         before = t.tolist()
         completed_before_wait = work.is_completed()
         waited = work.wait()
         return {"completed_before_wait": bool(completed_before_wait),
                 "wait_returned": bool(waited),
+                "source": source,
                 "before_wait": before,
                 "after_wait": t.tolist()}
     probe("async_allreduce", async_probe)
@@ -960,23 +978,43 @@ def test_barrier_actually_blocks_rather_than_reporting_that_it_did():
                 % (world, rank, entry["elapsed"], world - 1))
 
 
-def test_async_op_returns_a_work_that_is_already_complete_and_upstreams_is_not():
-    """The async surface, measured rather than assumed -- and it diverges.
+def test_async_op_is_genuinely_async_on_both_sides_and_neither_publishes_early():
+    """The async surface, re-measured after it was built -- and it now agrees.
 
-    Upstream gloo's `async_op=True` returns a handle whose `is_completed()` is
-    **False** until `wait()`; measured on this host at three and four ranks.
-    This backend's collectives run to completion inside the call, so its handle
-    is already complete and `wait()` is a no-op that returns True.
+    This test is the **inversion** of the one that stood here while
+    `docs/COLLECT2.md` §7 was true. That one pinned a divergence: upstream
+    gloo's handle was incomplete before `wait()` and this backend's was already
+    complete, because every collective ran to completion inside the call. That
+    is no longer the case, so the claim changed and the test changed with it --
+    it was not deleted, and it still asserts **both sides**, so it cannot
+    quietly become a test of nothing if either backend moves.
 
-    That is not a defect in the values -- the buffer is valid at every point a
-    correct caller could look at it, because "before wait" and "after wait" are
-    the same bytes. It is a real difference in the *contract*, and pinning it
-    here is the alternative to leaving a caller to discover it. A caller who
-    overlaps a collective with local compute gets no overlap; a caller who uses
-    `is_completed()` to poll gets True on the first poll.
+    Four assertions, and what each would catch (docs/ASYNCWORK.md §6):
 
-    If a future round makes these genuinely asynchronous, this test goes red,
-    and that is correct: it is the claim changing, not the test being wrong.
+    * upstream is incomplete before `wait()` at rank 0 -- unchanged, and the
+      only assertion here that was already passing. It is what makes the
+      comparison a comparison; if gloo ever ran its collectives inline this
+      goes red and the "same contract" claim below would be vacuous.
+    * **ours is now incomplete too** -- inverted from `is True`. Nullifying the
+      worker thread, so that the collective runs inline again, turns this red.
+    * **the buffer before `wait()` is the rank's own pre-collective input** --
+      inverted from `before_wait == after_wait`. This is the ownership half,
+      and it is the assertion with the sharpest teeth, because it is
+      deterministic rather than timing-dependent: `AsyncWork` never writes the
+      caller's buffer except at a synchronisation point, so a build that
+      published early fails this on every run rather than on a slow day.
+    * `wait()` still returns True and the published value still equals
+      upstream's -- unchanged. Making the collective asynchronous must not have
+      changed a single number, and this is where that is checked at world 3
+      and 4 against the float32 and float64 oracles.
+
+    Rank 0 is the one whose completion is asserted because the probe holds
+    every other rank back half a second, which makes rank 0 provably the first
+    arrival and its poll a question with one right answer. For the later ranks
+    the answer is genuinely unspecified -- the last rank into a collective may
+    find it already done on any backend -- so they are measured and not
+    asserted on. Their *buffers* are asserted on at every rank, because
+    ownership does not depend on who arrived when.
     """
     for world in C2_WORLDS:
         shim, up32 = c2_shim(world), c2_gloo32(world)
@@ -984,21 +1022,32 @@ def test_async_op_returns_a_work_that_is_already_complete_and_upstreams_is_not()
             ours = c2_ok(shim[rank], "async_allreduce")
             theirs = c2_ok(up32[rank], "async_allreduce")
 
-            assert theirs["completed_before_wait"] is False, (
-                "upstream gloo reported a completed work before wait() at "
-                "world %d rank %d; the divergence this test pins is gone from "
-                "the other side" % (world, rank))
-            assert ours["completed_before_wait"] is True, (
-                "this backend's work is no longer complete on return at world "
-                "%d rank %d. If the collectives became genuinely asynchronous "
-                "that is progress -- update docs/COLLECT2.md §6 with it."
-                % (world, rank))
-            assert ours["wait_returned"] is True, ours
+            if rank == 0:
+                assert theirs["completed_before_wait"] is False, (
+                    "upstream gloo reported a completed work before wait() at "
+                    "world %d rank 0, with two peers still asleep. The other "
+                    "side of this comparison is gone" % (world,))
+                assert ours["completed_before_wait"] is False, (
+                    "this backend reported a completed work before wait() at "
+                    "world %d rank 0, with two peers still asleep -- so the "
+                    "collective ran inside the call and async_op is a lie "
+                    "again (docs/ASYNCWORK.md)" % (world,))
 
-            # The values are the whole reason the divergence is tolerable: the
-            # buffer a caller reads before wait() is the buffer they read
-            # after, and both are upstream's answer.
-            assert ours["before_wait"] == ours["after_wait"], (world, rank)
+            assert ours["wait_returned"] is True, ours
+            assert theirs["wait_returned"] is True, theirs
+
+            # Ownership. The handle owns the output until wait(), so what a
+            # caller reads before it is their own pre-collective bytes -- not
+            # the answer, and not a half-written tensor either.
+            assert ours["before_wait"] == ours["source"], (
+                "world %d rank %d read something other than its own input "
+                "from a buffer whose collective had not been waited on. The "
+                "handle published early" % (world, rank))
+            assert ours["before_wait"] != ours["after_wait"], (
+                "world %d rank %d: the collective did not change the buffer, "
+                "so this test would pass on a backend that did nothing"
+                % (world, rank))
+
             c2_assert_matches("async_allreduce.after_wait", world, rank,
                               ours["after_wait"], theirs["after_wait"],
                               c2_ok(c2_gloo64(world)[rank],
