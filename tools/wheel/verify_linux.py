@@ -64,6 +64,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import sys
 import zipfile
 from pathlib import Path
@@ -77,9 +78,59 @@ REPO = Path(__file__).resolve().parents[2]
 # imports are resolved against is the one the tag was derived from.
 TARGET_PYTHON_ROOT = Path(os.environ.get(
     "TORCHNATIVE_TARGET_PYTHON", "/Volumes/macMini/caches/target-python"))
-LINUX_PYTHON = TARGET_PYTHON_ROOT / "x86_64-unknown-linux-gnu"
+
+#: Tag architecture -> the distribution the imports are resolved against, and
+#: the `elf_info` machine the members must be.
+#:
+#: There are two Linux distributions under `target-python/` now, and this file
+#: read one of them by name until there were. That mattered more here than
+#: anywhere else in the tree: `libpython3.13.so` exports the *same names* on
+#: aarch64 as on x86-64, so resolving an aarch64 wheel's undefined symbols
+#: against the x86-64 libpython succeeds and prints "0 unresolved" -- a clean
+#: PASS for a check that ran against the wrong file. An export table is a list
+#: of names with no machine in it, so nothing downstream would have caught it.
+#: The `elf_info` guard in `check_wheel` is what catches the *members* being
+#: the wrong machine; it says nothing about the pool they are resolved against.
+ARCHES = {
+    "x86_64": "x86_64-unknown-linux-gnu",
+    "aarch64": "aarch64-unknown-linux-gnu",
+}
+
+#: The distribution in use. Rebound by `select_arch` from the wheel's own tag
+#: before anything reads it; the x86-64 default is what `--self-test` runs
+#: against, since its fixtures are that distribution's extension modules.
+LINUX_PYTHON = TARGET_PYTHON_ROOT / ARCHES["x86_64"]
+ARCH = "x86_64"
 
 MEMBERS = ("torch/_C.abi3.so", "torch/lib/libtorch_global_deps.so")
+
+
+def select_arch(wheel: Path) -> str:
+    """Point this run at the distribution the wheel's own tag names.
+
+    Read off the filename rather than taken as an argument: the tag is what pip
+    matches on, so it is also the only thing that decides which Linux this
+    wheel claims to be for. A wheel whose tag and members disagree is caught in
+    `check_wheel` by `elf_info`, and that check is left where it is -- this
+    function selects the *pool*, and getting the pool wrong is the failure that
+    passes silently.
+    """
+    global LINUX_PYTHON, ARCH
+    match = re.search(r"-manylinux_\d+_\d+_(\w+?)\.whl$", wheel.name)
+    if not match:
+        _fail(f"{wheel.name} is not a manylinux wheel -- its tag is what "
+              "selects the\n  distribution its symbols are resolved against, "
+              "and there is none to read")
+    arch = match.group(1)
+    if arch not in ARCHES:
+        _fail(f"{wheel.name} is tagged for {arch!r}, which this has no CPython "
+              f"distribution for (it has {sorted(ARCHES)}).\n"
+              "  Refused rather than resolved against another architecture's "
+              "libpython: the\n  export names are identical across "
+              "architectures, so that would PASS.")
+    ARCH = arch
+    LINUX_PYTHON = TARGET_PYTHON_ROOT / ARCHES[arch]
+    return arch
 
 
 def _fail(msg: str) -> None:
@@ -170,6 +221,8 @@ def resolve(data: bytes, what: str, exports: set[str],
 
 
 def check_wheel(wheel: Path) -> None:
+    arch = select_arch(wheel)
+    print(f"tag arch: {arch} -> {LINUX_PYTHON}")
     path, exports = libpython()
     print(f"libpython: {path} ({len(exports):,} exported symbols)")
     print(f"{wheel.name}")
@@ -184,9 +237,9 @@ def check_wheel(wheel: Path) -> None:
             data = zf.read(hit)
             info = elf_info(data)
             if info is None or (info["bits"], info["machine"], info["type"]) != \
-                    (64, "x86_64", "dyn"):
+                    (64, ARCH, "dyn"):
                 _fail(f"{wheel.name}::{hit} is {describe(data)}, expected "
-                      "ELF 64-bit x86_64 dyn")
+                      f"ELF 64-bit {ARCH} dyn")
             dynamic = elf_dynamic(data) or {}
             print(f"\n  {hit}: {describe(data)}")
             print(f"    DT_NEEDED {dynamic.get('needed')}")
@@ -194,7 +247,8 @@ def check_wheel(wheel: Path) -> None:
 
     print()
     print("ladder (docs/LINUX.md §6):")
-    print("  built              yes -- the archive holds ELF x86-64 shared objects")
+    print(f"  built              yes -- the archive holds ELF {ARCH} shared "
+          "objects")
     print("  tagged             yes -- see tools/wheel/build.py LinuxTarget")
     print("  symbols resolve    CPython half yes; glibc half taken on the "
           "linker's word,")

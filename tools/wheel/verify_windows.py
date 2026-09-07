@@ -67,6 +67,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import sys
 import zipfile
 from pathlib import Path
@@ -80,7 +81,53 @@ REPO = Path(__file__).resolve().parents[2]
 # imports are resolved against are the ones the wheel was built for.
 TARGET_PYTHON_ROOT = Path(os.environ.get(
     "TORCHNATIVE_TARGET_PYTHON", "/Volumes/macMini/caches/target-python"))
-WINDOWS_PYTHON = TARGET_PYTHON_ROOT / "x86_64-pc-windows-msvc"
+
+#: Wheel tag -> the distribution the imports are resolved against, and the
+#: `pe_info` machine the member must be.
+#:
+#: There are two Windows distributions under `target-python/` now, and this file
+#: read one of them by name until there were. It is the same silent-pass this
+#: file's Linux counterpart has, and worse here: `python3.dll` is the stable-ABI
+#: forwarder, so its export list is *the same set of names* on ARM64 as on
+#: AMD64 by construction. Resolving an ARM64 `_C.pyd`'s imports against the
+#: AMD64 `python3.dll` therefore reports every symbol accounted for, and the
+#: run reads exactly like a correct one.
+ARCHES = {
+    "win_amd64": ("x86_64-pc-windows-msvc", "x86_64"),
+    "win_arm64": ("aarch64-pc-windows-msvc", "aarch64"),
+}
+
+#: The distribution in use. Rebound by `select_arch` from the wheel's own tag;
+#: the x86-64 default is what `--self-test` runs against.
+WINDOWS_PYTHON = TARGET_PYTHON_ROOT / ARCHES["win_amd64"][0]
+ARCH = "x86_64"
+
+
+def select_arch(wheel: Path) -> str:
+    """Point this run at the distribution the wheel's own tag names.
+
+    The tag is a *name* on Windows rather than a derivation
+    (`build.WindowsTarget`), and this is the other side of that: the name is
+    also the only thing in the wheel that says which Windows it is for, so it
+    is what selects the DLLs to resolve against.
+    """
+    global WINDOWS_PYTHON, ARCH
+    match = re.search(r"-(win_\w+|win32)\.whl$", wheel.name)
+    if not match:
+        _fail(f"{wheel.name} carries no Windows platform tag -- the tag is "
+              "what selects the\n  distribution its imports are resolved "
+              "against, and there is none to read")
+    tag = match.group(1)
+    if tag not in ARCHES:
+        _fail(f"{wheel.name} is tagged {tag!r}, which this has no CPython "
+              f"distribution for (it has {sorted(ARCHES)}).\n"
+              "  Refused rather than resolved against another architecture's "
+              "python3.dll: that DLL\n  is the abi3 forwarder, so its export "
+              "names are identical across architectures and\n  the check "
+              "would PASS without having run.")
+    subdir, ARCH = ARCHES[tag]
+    WINDOWS_PYTHON = TARGET_PYTHON_ROOT / subdir
+    return tag
 
 #: The one binary member of the Windows wheel. There is no global-deps library:
 #: `_load_global_deps()` returns immediately on Windows (docs/WINDOWS.md §4.3).
@@ -197,6 +244,8 @@ def resolve(data: bytes, what: str, exports: dict[str, set[str]]) -> int:
 
 
 def check_wheel(wheel: Path) -> int:
+    tag = select_arch(wheel)
+    print(f"tag: {tag} -> {WINDOWS_PYTHON}")
     exports = available_exports()
     for name in sorted(exports):
         print(f"{name}: {len(exports[name]):,} exported symbols "
@@ -214,8 +263,8 @@ def check_wheel(wheel: Path) -> int:
             info = pe_info(data)
             print(f"  {member}: {describe(data)}")
             if info is None or (info["bits"], info["machine"], info["dll"]) != \
-                    (64, "x86_64", True):
-                _fail(f"{member} is {describe(data)}, expected PE32+ x86_64 dll")
+                    (64, ARCH, True):
+                _fail(f"{member} is {describe(data)}, expected PE32+ {ARCH} dll")
             problems += resolve(data, member, exports)
             print()
         stale = sorted(n for n in names if n.endswith("torch/_C.abi3.so"))
@@ -225,7 +274,7 @@ def check_wheel(wheel: Path) -> int:
                   "dynload_win.c's table that an abi3 build can use")
 
     print("ladder (docs/WINDOWS.md §5):")
-    print("  built              yes -- the archive holds a PE32+ x86-64 DLL")
+    print(f"  built              yes -- the archive holds a PE32+ {ARCH} DLL")
     print("  tagged             yes -- see tools/wheel/build.py WindowsTarget")
     print("  symbols resolve    CPython and the MSVC runtime yes, per DLL;")
     print("                     the Windows half is attributed per DLL but not")

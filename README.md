@@ -29,9 +29,10 @@ model.generate(...)                                # on the device
 > **Pre-alpha.** The operator layer matches upstream PyTorch numerically, 19 of 20 tested
 > architectures reach zero missing operators, real checkpoints load, `transformers` imports and
 > generates, and an Android device runs the built artefact — but there is no accelerator backend,
-> `torch.compile` does not work, and three of six platforms have been executed rather than
-> merely built. See [Status](#status) and [Platform support](#platform-support) before depending
-> on this.
+> `torch.compile` does not work, and of the nine build targets **two have never been executed
+> anywhere** (Windows arm64, iOS device) and one refuses to build at all (Android x86_64). See
+> [Status](#status), [Platform support](#platform-support) and
+> [`docs/WHEELMATRIX.md`](docs/WHEELMATRIX.md) before depending on this.
 
 ---
 
@@ -245,7 +246,7 @@ loads on 3.13, 3.14 and later without a rebuild.
 <!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_agree.py test_the_report_cannot_count_an_unjudgeable_architecture_as_agreeing present -->
 <!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_agree.py test_the_oracle_factor_is_stated_and_is_not_a_free_parameter present -->
 <tr><td>Checkpoints</td><td><code>torch.load</code> and safetensors, round-tripped against upstream</td></tr>
-<tr><td>Build targets</td><td>macOS · Android · iOS · Linux · Windows — <b>all six build a wheel</b> — <code>build.py --target wasm32-emscripten</code> now produces the WASM one, so the sentence that it could not is no longer true. What <i>has not</i> happened is anything importing that <code>build.py</code>-produced wheel under Pyodide: the computing claim for WASM still rests on the earlier hand-built wheel (<a href="#platform-support">table</a>)</td></tr>
+<tr><td>Build targets</td><td>macOS · Android · iOS · Linux · Windows — <b>eight of nine targets build a wheel</b> (the ninth, Android x86_64, refuses by name — <a href="docs/WHEELMATRIX.md">WHEELMATRIX.md</a> §3.3) — <code>build.py --target wasm32-emscripten</code> now produces the WASM one, so the sentence that it could not is no longer true. What <i>has not</i> happened is anything importing that <code>build.py</code>-produced wheel under Pyodide: the computing claim for WASM still rests on the earlier hand-built wheel (<a href="#platform-support">table</a>)</td></tr>
 <tr><td>Training mode</td><td><b>26 of 26</b> forward in <code>.train()</code> as well as <code>.eval()</code>, agreeing with upstream draw for draw — <code>bernoulli_</code> draws in <code>float64</code> for every dtype, so a seeded dropout is comparable. Test-time adaptation runs on real checkpoints — <code>adapt.wrap(model, method=adapt.Tent())</code> drops GPT-2's prediction entropy 39% and transfers to held-out text — in <code>.train()</code> as well as <code>.eval()</code>, with dropout active. A training step moves all 272 SmolLM2 parameters the way upstream moves them — gradients compared element-wise over all 134,515,008 values, sign agreement 99.9987%. <b><code>loss.backward()</code> now works</b>, through upstream's own path (<code>torch/_tensor.py</code> → <code>_engine_run_backward</code> → <code>_ImperativeEngine.run_backward</code>) with no shim-specific call: a six-step SGD loop over an <code>nn.Sequential</code>, driven by the real <code>torch.optim.SGD</code>, matches upstream to <b>2.98e-08</b> — one float32 ulp — across the loss trajectory, the gradients and the final parameters. <b>What it is and is not, re-measured at release time rather than restated:</b> a <b>transformer does now train through <code>loss.backward()</code></b> — a BERT encoder built from a shrunk config runs three <code>zero_grad</code>/<code>backward</code>/<code>step</code> iterations and its loss trajectory matches upstream's to float32 (5.12 → 0.0 → −5.12 on both sides), with a gradient on 21 of 23 parameters and the two without one being the unused pooler, which upstream also leaves ungradiented. That was measured with dropout disabled: with dropout on, the two sides diverge after the first step because the RNG streams differ, which is a sampler difference and not a gradient defect. <b>Convolution backward landed after that sentence was drafted</b>: a small CNN with strided, depthwise and pointwise convolutions, three batch-norms in training mode and a linear head trains end to end through five SGD steps, agreeing with upstream to 2.98e-08 (<a href="docs/TRAIN2.md">TRAIN2.md</a>). Still absent: <code>create_graph=True</code>/double-backward, multiple root tensors, <code>GradientEdge</code> inputs, <code>torch.autograd.Function</code>, hooks and <code>retain_grad</code> on non-leaves all refuse by name. Mutation through a view is refused rather than differentiated, which is deliberately <i>less</i> than upstream (<a href="docs/BACKWARD9.md">BACKWARD9.md</a>, <a href="docs/BACKWARD7.md">BACKWARD7.md</a>) Unlike <code>torch.compile</code>, autograd <b>is reachable under abi3</b> — <code>torch/csrc/autograd</code> defines <code>Py_BUILD_CORE</code> in 0 of 129 files — and a SmolLM2 backward needs 24 ops of which 16 exist and one is a real missing kernel (<a href="docs/AUTOGRAD.md">AUTOGRAD.md</a>)</td></tr>
 <!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_shim.py test_a_real_training_loop_runs_through_loss_backward_and_agrees_with_upstream present -->
 <!-- DOCWATCH: op-implemented aten.native_batch_norm.default -->
@@ -328,22 +329,22 @@ only exists on a platform. Every ✅ has a run behind it.
 
 ### Platforms
 
-| | macOS<br>arm64 | Android<br>arm64 | iOS sim<br>arm64 | iOS device<br>arm64 | Linux<br>x86_64 | Windows<br>x86_64 | WASM |
-|---|:--:|:--:|:--:|:--:|:--:|:--:|:--:|
-| in the target matrix | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | — *deliberately* |
-| rust target installed | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| target CPython | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ *Pyodide 3.14* |
-| candle builds | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| candle **computes** | ✅ | ✅ | ✅ | ⚠️ | ⚠️ | ⚠️ | ✅ *under Node* |
-| extension builds | ✅ | ✅ | ✅ | ✅ | ✅ *`cargo-zigbuild`* | ✅ *`cargo-xwin`* | ✅ *emscripten* |
-| wheel builds | ✅ | ✅ | ✅ | ✅ | ✅ *`manylinux_2_17`* | ✅ *`win_amd64`* | ⚠️ *by hand, not by `build.py`* |
-| symbols resolve | ✅ | ✅ | ✅ | ⚠️ *weaker: ELF names only versioned imports* | ✅ *PE names every one* | ✅ *stub behaviour proven against the real host* |
-| `dlopen` + `PyInit_` runs | — | — | — | — | — | — | ✅ |
-| installs | ✅ | ✅ | ✅ | ⚠️ | ✅ | ✅ | ✅ *mounted, no wheel* |
-| `import torch` | ✅ | ✅ | ✅ | ⚠️ | ✅ | ✅ | ✅ |
-| computes | ✅ | ✅ | ✅ | ⚠️ | ✅ | ✅ | ✅ |
-| **on PyPI `0.0.12a0`** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | — |
-| can be run *here* | ✅ | emulator | simulator | ❌ | CI | CI | ✅ *Node* |
+| | macOS<br>arm64 | Android<br>arm64 | Android<br>x86_64 | iOS sim<br>arm64 | iOS device<br>arm64 | Linux<br>x86_64 | Linux<br>aarch64 | Windows<br>x86_64 | Windows<br>arm64 | WASM |
+|---|:--:|:--:|:--:|:--:|:--:|:--:|:--:|:--:|:--:|:--:|
+| in the target matrix | ✅ | ✅ | ✅ *listed, refuses* | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | — *deliberately* |
+| rust target installed | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| target CPython | ✅ | ✅ | ❌ *none exists, none downloadable* | ✅ | ✅ | ✅ | ✅ *PBS `20260825`* | ✅ | ✅ *PBS `20260825`* | ✅ *Pyodide 3.14* |
+| candle builds | ✅ | ✅ | 🔲 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| candle **computes** | ✅ | ✅ | 🔲 | ✅ | ⚠️ | ✅ *CI* | ✅ *here* | ✅ *CI* | ⚠️ | ✅ *under Node* |
+| extension builds | ✅ | ✅ | 🔲 | ✅ | ✅ | ✅ *`cargo-zigbuild`* | ✅ *`cargo-zigbuild`* | ✅ *`cargo-xwin`* | ✅ *`cargo-xwin`* | ✅ *emscripten* |
+| wheel builds | ✅ | ✅ | ❌ *refuses by name* | ✅ | ✅ | ✅ *`manylinux_2_17_x86_64`* | ✅ *`manylinux_2_17_aarch64`* | ✅ *`win_amd64`* | ✅ *`win_arm64`* | ⚠️ *by hand, not by `build.py`* |
+| symbols resolve | ✅ | ✅ | — | ✅ | ✅ *118 names against the device framework* | ⚠️ *weaker: ELF names only versioned imports* | ⚠️ *same* | ✅ *PE names every one* | ✅ *PE names every one* | ✅ *stub behaviour proven against the real host* |
+| `dlopen` + `PyInit_` runs | — | — | — | — | — | — | — | — | — | ✅ |
+| installs | ✅ | ✅ | — | ✅ | ⚠️ | ✅ | ✅ *pip matched the tag on real aarch64 Linux* | ✅ | ⚠️ | ✅ *mounted, no wheel* |
+| `import torch` | ✅ | ✅ | — | ✅ | ⚠️ | ✅ | ✅ | ✅ | ⚠️ | ✅ |
+| computes | ✅ | ✅ | — | ✅ | ⚠️ | ✅ | ✅ *glibc 2.17 **and** modern* | ✅ | ⚠️ | ✅ |
+| **on PyPI `0.0.12a0`** | ✅ | ✅ | 🔲 | ✅ | ✅ | ✅ | 🔲 *built, not published* | ✅ | 🔲 *built, not published* | — |
+| can be run *here* | ✅ | emulator | ❌ *no x86-64 emulator on Apple Silicon* | simulator | ❌ | CI | ✅ *Docker, native aarch64* | CI | ❌ | ✅ *Node* |
 
 **Linux and Windows now compute, and it is a run rather than an argument.** A hosted runner is the
 machine this project does not have, so `.github/workflows/verify-published-wheel.yml` installs the
@@ -353,6 +354,42 @@ value and not just the label is at stake (`int64(2049) - float16(1.0)` is `2047.
 ran SmolLM2-135M through real `transformers` and produced text **character-identical to macOS
 arm64**. Every expected value is hardcoded from an arm64 run of the same source, so a disagreement
 would have localised to the platform rather than to the check.
+
+**The `candle computes` row for those two was stale, and this is the correction.** It stood at ⚠️
+— *built, never executed* — while the rows underneath it said the wheel installs, imports and
+computes on both, which cannot both be true: `aten.mm.default` on `cpu` is
+`candle_core::Tensor::matmul`, and there is no other compute path for that device. So `mm sum
+24.0` in run
+[34038982934](https://github.com/thisisthepy/torchnative/actions/runs/34038982934) *is* candle
+computing on Linux x86-64 and on Windows amd64, and had been since that run went green on
+2026-09-06. Both cells are now ✅ *CI*. The ⚠️ was left behind when the `computes` row moved and
+nobody came back up the column — the same mechanism [`docs/AUDIT.md`](docs/AUDIT.md) found behind
+six of eleven stale claims.
+
+**Linux aarch64 is the one column verified here rather than by CI, and it went further than CI
+does.** Docker on this machine runs a native aarch64 Linux VM, so `manylinux2014_aarch64` —
+CentOS 7, `ldd (GNU libc) 2.17` — is the wheel's own tagged floor, not an approximation of it. The
+wheel was installed there and `tools/ci/verify_published.py`, the script both CI legs run, answered
+`RESULT: ALL PASS` over 31 checks. Then on a modern aarch64 Linux the same wheel was installed by
+**bare distribution name** from a local directory, so pip had to match `manylinux_2_17_aarch64`
+against the machine to find any candidate at all, and SmolLM2-135M generated text
+character-identical to macOS arm64. Nothing here was timed
+([`docs/WHEELMATRIX.md`](docs/WHEELMATRIX.md) §3.1).
+
+**Windows arm64 builds and stops there, and no machine in this project's reach can move it.** The
+wheel is `win_arm64`, all 241 of its imports are attributed to a named DLL and 125 of them resolve
+against the ARM64 `python3.dll` — but there is no ARM64 Windows here, Docker's VM is Linux, and the
+CI job runs `windows-latest`, which is x86-64. A `windows-11-arm` runner would close it exactly the
+way `ubuntu-latest` closed Linux x86-64.
+
+**Android x86_64 refuses, and the missing piece is not the toolchain.** The NDK's
+`x86_64-linux-android21-clang` runs here under Rosetta and the rust target is installed; what does
+not exist is an x86-64 Android **CPython**, which every wheel tag in this repository is derived
+from. python-build-standalone publishes 871 assets in the release the other four distributions come
+from and not one is Android. And the result could not be checked if it were built: this machine's
+emulator ships only `qemu/darwin-aarch64`, so Apple Silicon runs aarch64 guests and nothing else.
+`--target android-x86_64` therefore refuses **by name**, with that reason, rather than being
+dropped from the registry and looking like a target nobody considered.
 
 Windows had moved once before on a user's report rather than our own run, and that report could not
 carry `computes`: they installed `0.0.5a0` with `uv`, `import torch` succeeded, and `transformers`

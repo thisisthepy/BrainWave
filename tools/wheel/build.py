@@ -3,9 +3,13 @@
 
     python tools/wheel/build.py                            # this machine
     python tools/wheel/build.py --target android-arm64-v8a
+    python tools/wheel/build.py --target android-x86_64    # refuses; see below
     python tools/wheel/build.py --target ios-arm64
     python tools/wheel/build.py --target ios-arm64-sim
-    python tools/wheel/build.py --target linux-x86_64      # refuses; see below
+    python tools/wheel/build.py --target linux-x86_64
+    python tools/wheel/build.py --target linux-aarch64
+    python tools/wheel/build.py --target windows-x86_64
+    python tools/wheel/build.py --target windows-arm64
 
 The distribution on PyPI as `torchnative 0.0.1a0` is `py3-none-any` and holds
 only the `torchnative/` skeleton: no `_C`, no vendored tree. `pip install
@@ -57,19 +61,28 @@ exactly the three that are platform-shaped (§ `TARGETS`):
                   written down here, and cross-checked against what the
                   artefact itself says it needs.
 
-                  `manylinux_<major>_<minor>_x86_64` inverts that, and it is the
+                  `manylinux_<major>_<minor>_<arch>` inverts that, and it is the
                   one case where the distribution is the wrong source: glibc
                   compatibility is not a property of the interpreter build, so
                   the Linux `_sysconfigdata_*.py` has no field for it. The floor
                   comes from the artefact's own `.gnu.version_r`, which is where
                   auditwheel reads it (§ `LinuxTarget`, docs/LINUX.md §5).
 
-`--target linux-x86_64` exists and currently **refuses**: no toolchain on this
-machine can cross-compile the crate to Linux (docs/LINUX.md §2, §4 -- a glibc
-sysroot, target libc headers and a target C driver are all missing, and the last
-of those stops the build before it reaches the linker). It is listed rather than
-omitted so the refusal names what is missing, instead of the target looking like
-one nobody thought about.
+                  `win_amd64` / `win_arm64` are the odd pair: no floor exists to
+                  compute, so the tag is a *name*. It is still not written down
+                  here -- § `WindowsTarget` derives it from the target
+                  distribution's own `sysconfig.get_platform()` branch, because
+                  a name reached by analogy with the other one is a guess, and
+                  `win_aarch64` is exactly as plausible as `win_arm64` to
+                  everybody except pip.
+
+Each non-Apple platform carries two architectures (docs/WHEELMATRIX.md). One of
+the nine targets **refuses**: `--target android-x86_64`, because no
+x86_64-linux-android CPython exists to derive a tag from and none can be
+obtained here -- § `_ANDROID_X86_64_REFUSAL` has the whole reason. It is listed
+rather than omitted so the refusal names what is missing, instead of the target
+looking like one nobody thought about; `--target linux-x86_64` was in that state
+until docs/LINUX.md §9 made cargo-zigbuild work, and is now built and executed.
 
 Then check it for real -- building is not the proof:
 
@@ -764,6 +777,25 @@ class Target:
     # block comment for why this script refuses instead of rebuilding.
     rebuild_hint = "rebuild the cross artefact"
 
+    #: Why this target cannot be built *here*, or `None` if it can.
+    #:
+    #: Not the same thing as a missing artefact, and kept apart from it on
+    #: purpose. "No cross-built extension at <path>, run <hint>" is advice: it
+    #: says the build has not happened yet and names the command that would do
+    #: it. A refusal says no such command exists on this machine, and running
+    #: the hint cannot help -- a different sentence, and the one
+    #: `--target linux-x86_64` needed before docs/LINUX.md §9 made
+    #: cargo-zigbuild work.
+    #:
+    #: Checked in `main` *before* the artefact, so a refusing target answers
+    #: with its reason instead of sending the reader off to run a rebuild hint
+    #: that cannot succeed. A refusing target stays in `TARGETS`, and therefore
+    #: in `--target`'s choices, so `--target <name>` refuses **by name**.
+    #: Dropping it from the registry instead would make it look like a target
+    #: nobody had thought about, which is exactly what the original
+    #: `linux-x86_64` entry existed to avoid.
+    refusal: str | None = None
+
     def sysconfig(self) -> dict[str, object]:
         return target_sysconfig(self.python_root)
 
@@ -796,11 +828,25 @@ class AndroidTarget(Target):
     assumed.
     """
 
-    def __init__(self):
+    def __init__(self, key: str = "android-arm64-v8a",
+                 rust_target: str = "aarch64-linux-android",
+                 elf_machine: str = "aarch64",
+                 refusal: str | None = None):
         super().__init__(
-            "android-arm64-v8a", "aarch64-linux-android",
-            TARGET_PYTHON_ROOT / "aarch64-linux-android" / "prefix", "lib_C.so",
+            key, rust_target,
+            TARGET_PYTHON_ROOT / rust_target / "prefix", "lib_C.so",
         )
+        #: The `elf_info` machine name `check_image` demands. Held rather than
+        #: split off `rust_target` because the two spellings do not always
+        #: agree -- the NDK triple for 32-bit ARM is `armv7a-linux-androideabi`
+        #: and the ELF machine is `arm` -- so deriving one from the other would
+        #: be right for the two ABIs we build and wrong for the two we do not.
+        self.elf_machine = elf_machine
+        #: The NDK's `<triple><api>-clang` prefix, which is the rust triple for
+        #: every ABI except 32-bit ARM. Kept beside `elf_machine` for the same
+        #: reason.
+        self.clang_triple = rust_target
+        self.refusal = refusal
 
     rebuild_hint = "scripts/device_android.sh build"
 
@@ -811,6 +857,21 @@ class AndroidTarget(Target):
         if arch not in _ANDROID_ABIS:
             _fail(f"unknown Android architecture {arch!r} in MULTIARCH="
                   f"{variables['MULTIARCH']!r}")
+        # The distribution has to be the one this target builds against, not
+        # merely *an* Android CPython. Without this, pointing
+        # TORCHNATIVE_TARGET_PYTHON at a tree whose `aarch64-linux-android/`
+        # and `x86_64-linux-android/` differ in nothing but name would tag an
+        # x86-64 extension `android_<api>_arm64_v8a` -- and `check_image`
+        # would not catch it, because it checks the artefact against this
+        # target and both would agree. Same check as `LinuxTarget._multiarch`
+        # and for the same reason.
+        if arch != self.elf_machine:
+            _fail(
+                f"{self.python_root} has MULTIARCH={variables['MULTIARCH']!r}, "
+                f"whose architecture is {arch!r} and not {self.elf_machine!r} "
+                f"-- it is not the\n  Android CPython distribution "
+                f"--target {self.key} builds against"
+            )
         return api, _normalise(_ANDROID_ABIS[arch])
 
     def platform_tag(self, artefact: bytes) -> str:
@@ -825,10 +886,10 @@ class AndroidTarget(Target):
             "ANDROID_NDK_HOME",
             Path.home() / "Library/Android/sdk/ndk/27.1.12297006"))
         found = sorted(ndk.glob(
-            f"toolchains/llvm/prebuilt/*/bin/aarch64-linux-android{api}-clang"))
+            f"toolchains/llvm/prebuilt/*/bin/{self.clang_triple}{api}-clang"))
         if not found:
             _fail(
-                f"no aarch64-linux-android{api}-clang under {ndk} -- set "
+                f"no {self.clang_triple}{api}-clang under {ndk} -- set "
                 "ANDROID_NDK_HOME. Without it the global-deps library would be "
                 "built by the host cc, which puts a Mach-O inside an Android "
                 "wheel and makes `import torch` fail on the device only"
@@ -840,8 +901,10 @@ class AndroidTarget(Target):
         if info is None:
             _fail(f"{what} is not an ELF image ({describe(data)}) -- "
                   "an Android wheel cannot carry it")
-        if (info["bits"], info["machine"], info["type"]) != (64, "aarch64", "dyn"):
-            _fail(f"{what} is {describe(data)}, expected ELF 64-bit aarch64 dyn")
+        want = (64, self.elf_machine, "dyn")
+        if (info["bits"], info["machine"], info["type"]) != want:
+            _fail(f"{what} is {describe(data)}, expected ELF 64-bit "
+                  f"{self.elf_machine} dyn")
 
 
 class IOSTarget(Target):
@@ -972,17 +1035,35 @@ class LinuxTarget(Target):
     """
 
     #: PEP 599's external-library list for manylinux2014, which PEP 600 carries
-    #: forward unchanged for `manylinux_2_17` and later. The dynamic loader
-    #: itself is not in PEP 599's table because it is never a `DT_NEEDED` in the
-    #: usual sense, but it appears as one on x86-64 and is always present.
+    #: forward unchanged for `manylinux_2_17` and later.
+    #:
+    #: **This is the whole list and it is architecture-independent.** PEP 599
+    #: varies its *architectures* (it names x86_64, i686, aarch64, ppc64,
+    #: ppc64le and s390x) but not the table of libraries a conforming wheel may
+    #: link, so nothing here is per-arch and adding an arch must not add an
+    #: entry. The one thing that does vary is the dynamic loader, which is not
+    #: in PEP 599's table at all -- it is never a `DT_NEEDED` in the usual
+    #: sense -- yet appears as one on some architectures. Its name is
+    #: arch-specific, so it lives in `LOADER` and is unioned in per target
+    #: rather than being written into this frozenset, where an x86-64 name
+    #: would silently be "allowed" for an aarch64 wheel.
     POLICY_LIBRARIES = frozenset({
         "libgcc_s.so.1", "libstdc++.so.6", "libm.so.6", "libdl.so.2",
         "librt.so.1", "libc.so.6", "libnsl.so.1", "libutil.so.1",
         "libpthread.so.0", "libresolv.so.2", "libX11.so.6", "libXext.so.6",
         "libXrender.so.1", "libICE.so.6", "libSM.so.6", "libGL.so.1",
         "libgobject-2.0.so.0", "libgthread-2.0.so.0", "libglib-2.0.so.0",
-        "ld-linux-x86-64.so.2",
     })
+
+    #: The dynamic loader's `DT_NEEDED` name per architecture -- glibc's
+    #: `ld.so`, whose soname encodes the ABI. Not in `POLICY_LIBRARIES` (see
+    #: there); only the entry for *this* target's architecture is allowed, so
+    #: an aarch64 artefact that somehow named the x86-64 loader is refused
+    #: rather than waved through.
+    LOADER = {
+        "x86_64": "ld-linux-x86-64.so.2",
+        "aarch64": "ld-linux-aarch64.so.1",
+    }
 
     #: `GLIBC_ABI_DT_RELR` is the one version name in glibc that is not
     #: `GLIBC_<numbers>`; it was added in 2.36 and means exactly that. Mapping it
@@ -993,30 +1074,47 @@ class LinuxTarget(Target):
     #: than guessed at, for the same reason.
     NAMED_VERSIONS = {"GLIBC_ABI_DT_RELR": (2, 36)}
 
-    def __init__(self):
+    def __init__(self, key: str = "linux-x86_64",
+                 rust_target: str = "x86_64-unknown-linux-gnu",
+                 arch: str = "x86_64"):
         super().__init__(
-            "linux-x86_64", "x86_64-unknown-linux-gnu",
+            key, rust_target,
             # No `prefix/` subdirectory: this distribution is
             # python-build-standalone's `install_only` layout, like the iOS ones
             # and unlike the Android one. docs/LINUX.md §3 compares the four.
-            TARGET_PYTHON_ROOT / "x86_64-unknown-linux-gnu", "lib_C.so",
+            TARGET_PYTHON_ROOT / rust_target, "lib_C.so",
         )
-
-    rebuild_hint = (
-        "PYO3_CROSS_LIB_DIR=<target-python>/lib cargo zigbuild --release "
-        "--target x86_64-unknown-linux-gnu.2.17, from rust/torch_c "
-        "(docs/LINUX.md §9.2 has the whole environment; §9.1 installs "
-        "cargo-zigbuild and ziglang, which it needs)"
-    )
+        #: The architecture as three different vocabularies spell it, which all
+        #: happen to agree here and are still not the same word: the ELF
+        #: `e_machine` name `elf_info` reports, the `<arch>` half of a PEP 600
+        #: tag, and the architecture half of CPython's `MULTIARCH`. They agree
+        #: for x86_64 and aarch64; they would not for 32-bit ARM (`arm` vs
+        #: `armv7l`), so this is stored, not derived.
+        self.arch = arch
+        if arch not in self.LOADER:
+            _fail(f"no dynamic-loader name known for {arch!r}; add it to "
+                  f"{type(self).__name__}.LOADER")
+        self.rebuild_hint = (
+            f"PYO3_CROSS_LIB_DIR=<target-python>/lib cargo zigbuild --release "
+            f"--target {rust_target}.{self.GLIBC_TARGET[0]}."
+            f"{self.GLIBC_TARGET[1]}, from rust/torch_c "
+            "(docs/LINUX.md §9.2 has the whole environment; §9.1 installs "
+            "cargo-zigbuild and ziglang, which it needs)"
+        )
 
     def _multiarch(self) -> str:
         variables = self.sysconfig()
         multiarch = str(variables["MULTIARCH"])
-        if multiarch != "x86_64-linux-gnu":
+        want = f"{self.arch}-linux-gnu"
+        if multiarch != want:
             _fail(f"{self.python_root} has MULTIARCH={multiarch!r}, not "
-                  "'x86_64-linux-gnu' -- it is not the x86-64 Linux "
+                  f"{want!r} -- it is not the {self.arch} Linux "
                   "distribution this target builds against")
         return multiarch
+
+    def _policy_libraries(self) -> frozenset[str]:
+        """PEP 599's list plus *this* architecture's loader, and no other's."""
+        return self.POLICY_LIBRARIES | {self.LOADER[self.arch]}
 
     def _glibc_floor(self, artefact: bytes) -> tuple[int, int]:
         """The oldest glibc that can load this image, from its own version needs."""
@@ -1093,7 +1191,7 @@ class LinuxTarget(Target):
                 "manylinux external-library policy (PEP 599) is checked "
                 "against -- are unavailable")
         needed = list(info["needed"])
-        outside = sorted(set(needed) - self.POLICY_LIBRARIES)
+        outside = sorted(set(needed) - self._policy_libraries())
         if outside:
             _fail(
                 f"{self.artefact} links {outside}, which manylinux's external-"
@@ -1108,13 +1206,14 @@ class LinuxTarget(Target):
         self._multiarch()
         needed = self._check_policy(artefact)
         major, minor = self._glibc_floor(artefact)
-        tag = f"manylinux_{major}_{minor}_x86_64"
+        tag = f"manylinux_{major}_{minor}_{self.arch}"
         print(f"  tag floor from the artefact's .gnu.version_r "
               f"(glibc {major}.{minor}), not from CPython -- the distribution "
               f"records no glibc minimum at all")
         print(f"  DT_NEEDED within the PEP 599 policy list: {needed}")
         _confirm_with_packaging(tag, "manylinux")
-        _confirm_pep600_spelling(tag)
+        _confirm_pep600_spelling(tag, self.arch)
+        _confirm_manylinux_with_packaging(tag, self.arch)
         return tag
 
     #: The glibc `cc()` compiles the global-deps stub against, and the number
@@ -1165,18 +1264,25 @@ class LinuxTarget(Target):
         `/usr/bin/clang` execs. So the separate-halves result is a fact about
         the machine, not a route this can take.
         """
-        override = (os.environ.get("CC_x86_64_unknown_linux_gnu")
-                    or os.environ.get("TARGET_CC"))
+        # cc-rs's spelling of the per-target override: the triple uppercased
+        # with hyphens as underscores. Built from `rust_target` rather than
+        # written out, so a second Linux target cannot silently pick up the
+        # first one's compiler -- which is the bug this would otherwise have:
+        # `CC_x86_64_unknown_linux_gnu` set for the x86-64 build would have
+        # built the aarch64 wheel's global-deps stub as x86-64, and
+        # `check_global_deps` is the only thing that would have caught it.
+        env_name = f"CC_{self.rust_target.replace('-', '_')}"
+        override = (os.environ.get(env_name) or os.environ.get("TARGET_CC"))
         if override:
             return [*override.split(), "-shared", "-fPIC"]
         zig = self.zig_command()
         if zig:
             major, minor = self.GLIBC_TARGET
             return [*zig, "cc", "-target",
-                    f"x86_64-linux-gnu.{major}.{minor}", "-shared", "-fPIC"]
+                    f"{self.arch}-linux-gnu.{major}.{minor}", "-shared", "-fPIC"]
         _fail(
-            "no C compiler that targets x86_64-unknown-linux-gnu.\n"
-            "  Tried, in order: $CC_x86_64_unknown_linux_gnu, $TARGET_CC, `zig` "
+            f"no C compiler that targets {self.rust_target}.\n"
+            f"  Tried, in order: ${env_name}, $TARGET_CC, `zig` "
             "on PATH, and\n"
             "  `<python> -m ziglang` -- the same order cargo-zigbuild uses, so "
             "that whatever\n"
@@ -1197,40 +1303,207 @@ class LinuxTarget(Target):
         if info is None:
             _fail(f"{what} is not an ELF image ({describe(data)}) -- "
                   "a Linux wheel cannot carry it")
-        if (info["bits"], info["machine"], info["type"]) != (64, "x86_64", "dyn"):
-            _fail(f"{what} is {describe(data)}, expected ELF 64-bit x86_64 dyn")
+        want = (64, self.arch, "dyn")
+        if (info["bits"], info["machine"], info["type"]) != want:
+            _fail(f"{what} is {describe(data)}, expected ELF 64-bit "
+                  f"{self.arch} dyn")
 
 
-def _confirm_pep600_spelling(tag: str) -> None:
+#: The oldest glibc a manylinux tag may name, **per architecture**, and the one
+#: place where "the same tag with a different arch" is not the same question.
+#:
+#: PEP 600's grammar allows any `manylinux_<major>_<minor>_<arch>`, but a tag no
+#: installer will ever generate is not a tag. `packaging._manylinux.platform_tags`
+#: -- the code pip runs -- floors the search at glibc 2.17 for every architecture
+#: **except** x86-64 and i686, where it goes down to 2.5, because manylinux1 and
+#: manylinux2010 (PEP 513, PEP 571) were x86-only and manylinux2014 (PEP 599) is
+#: where aarch64 and the rest enter the scheme at all.
+#:
+#: So `manylinux_2_12_aarch64` is PEP 600-shaped and matches nothing: pip on an
+#: aarch64 machine never yields that name, whatever its glibc. Checking only the
+#: grammar -- which is what this file did while x86-64 was the only Linux target,
+#: and which was correct for exactly that one architecture -- would have let such
+#: a wheel out.
+_MANYLINUX_ARCH_FLOOR = {"x86_64": (2, 5), "i686": (2, 5)}
+_MANYLINUX_DEFAULT_FLOOR = (2, 17)
+
+
+def _confirm_pep600_spelling(tag: str, arch: str) -> None:
     """The tag has to be a name PEP 600 defines, not merely a plausible one."""
     match = re.fullmatch(r"manylinux_(\d+)_(\d+)_(\w+)", tag)
     if not match:
         _fail(f"{tag!r} is not PEP 600's manylinux_<major>_<minor>_<arch>")
     major, minor = int(match[1]), int(match[2])
-    if (major, minor) < (2, 5):
-        # PEP 600 defines the scheme downwards to manylinux1's 2.5 and no
-        # further; below that there is no manylinux, and pip matches nothing.
-        _fail(f"{tag!r} claims glibc {major}.{minor}, below manylinux1's 2.5 -- "
+    if match[3] != arch:
+        _fail(f"{tag!r} names architecture {match[3]!r}, but this target builds "
+              f"{arch!r}")
+    floor = _MANYLINUX_ARCH_FLOOR.get(arch, _MANYLINUX_DEFAULT_FLOOR)
+    if (major, minor) < floor:
+        # Not one message with a number substituted into it: on x86-64 the
+        # reason is PEP 600 defining the scheme no lower than manylinux1's 2.5,
+        # and on every other architecture the reason is that the architecture
+        # only entered the scheme with manylinux2014. Two different facts.
+        why = ("below manylinux1's 2.5, and PEP 600 defines the scheme no lower"
+               if arch in _MANYLINUX_ARCH_FLOOR else
+               f"below manylinux2014's 2.17 -- {arch} is not in PEP 513 or PEP "
+               "571, so it\n  enters the scheme at PEP 599 and pip generates no "
+               "lower name for it")
+        _fail(f"{tag!r} claims glibc {major}.{minor}, {why} -- "
               "no installer matches that")
-    print(f"  tag {tag} is PEP 600-shaped (glibc {major}.{minor}, x86_64)")
+    print(f"  tag {tag} is PEP 600-shaped (glibc {major}.{minor}, {arch}; "
+          f"floor for {arch} is {floor[0]}.{floor[1]})")
+
+
+def _confirm_manylinux_with_packaging(tag: str, arch: str) -> None:
+    """Ask pip's own manylinux generator whether it would ever yield this name.
+
+    `_confirm_with_packaging` cannot do this one. Its contract is to call
+    `packaging.tags.<family>_platforms(**kwargs)`, and there is no
+    `manylinux_platforms`: `packaging._manylinux.platform_tags` takes only an
+    architecture list and reads the glibc of the **running** interpreter, which
+    on this Mac is no glibc at all -- `_glibc_version_string()` returns None,
+    `_have_compatible_abi` rejects a Mach-O `sys.executable`, and the generator
+    yields nothing. That is why every Linux build so far printed "packaging has
+    no manylinux_platforms -- tag spelling unchecked" and moved on.
+
+    The missing piece is only the *host* half, and it is exactly the half a
+    cross build is entitled to supply: the question is not "does this machine
+    match the tag" but "is this a name pip would generate for a machine that
+    does". So the two host probes are substituted -- the ABI check with True,
+    the glibc version with the floor the tag itself claims -- and the generator
+    is then run unmodified. Everything that decides the *name* (the per-arch
+    floor, the legacy aliases, `_ALLOWED_ARCHS`) is still packaging's code and
+    not a copy of it here.
+
+    Substituting rather than reimplementing matters: the per-arch floor in
+    `_MANYLINUX_ARCH_FLOOR` above is this file's own reading of PEP 599, and
+    this function is what stops that reading from being self-confirming.
+    """
+    try:
+        from packaging import _manylinux as pm
+    except ImportError:
+        print("  ! packaging._manylinux not importable -- manylinux spelling "
+              "unchecked")
+        return
+    match = re.fullmatch(r"manylinux_(\d+)_(\d+)_(\w+)", tag)
+    if not match:                                     # pragma: no cover
+        _fail(f"{tag!r} is not PEP 600's manylinux_<major>_<minor>_<arch>")
+    claimed = (int(match[1]), int(match[2]))
+
+    if arch not in getattr(pm, "_ALLOWED_ARCHS", {arch}):
+        _fail(
+            f"packaging._manylinux does not list {arch!r} among the "
+            "architectures manylinux\n"
+            f"  covers ({sorted(pm._ALLOWED_ARCHS)}), so pip would never "
+            f"generate {tag!r}.")
+
+    saved = {name: getattr(pm, name) for name in
+             ("_have_compatible_abi", "_get_glibc_version")}
+    try:
+        # The host halves, and only those. `_get_glibc_version` is what the
+        # generator counts *down* from, so handing it the tag's own floor asks
+        # the narrowest possible question: on a glibc exactly this old, is this
+        # name one of the answers? A higher number would also yield lower names
+        # and could pass a tag whose floor pip would never emit.
+        pm._have_compatible_abi = lambda executable, archs: True
+        pm._get_glibc_version = lambda: pm._GLibCVersion(*claimed)
+        accepted = list(pm.platform_tags([arch]))
+    finally:
+        for name, value in saved.items():
+            setattr(pm, name, value)
+
+    if tag not in accepted:
+        _fail(
+            f"packaging._manylinux.platform_tags([{arch!r}]) does not yield "
+            f"{tag!r} even when told the\n"
+            f"  host glibc is exactly {claimed[0]}.{claimed[1]}; it starts "
+            f"{accepted[:3] or 'nothing at all'}.\n"
+            "  pip generates the tags it matches against, so a name absent from "
+            "that list matches\n  no installer on any machine.")
+    legacy = [name for name in accepted if not name.startswith("manylinux_")]
+    print(f"  tag {tag} yielded by packaging._manylinux.platform_tags("
+          f"[{arch!r}]) at glibc {claimed[0]}.{claimed[1]}\n"
+          f"      -- {len(accepted)} names in that list, of which the legacy "
+          f"aliases are {legacy or 'none'}")
+
+
+def _confirm_windows_normalisation(name: str) -> str:
+    """`sysconfig.get_platform()`'s answer -> the tag, by packaging's own step.
+
+    The last link of the chain in `WindowsTarget`'s docstring, and the only one
+    that is packaging's code rather than CPython's: `_generic_platforms()` is
+    `yield _normalize_string(sysconfig.get_platform())`, so the tag is that
+    function applied to that string. Calling it here rather than writing
+    `name.replace("-", "_")` is the difference between checking the spelling and
+    asserting it -- `_normalize_string` also folds `.` and spaces, and if
+    packaging ever changed what it folds, this would follow rather than drift.
+
+    Falls back to this file's `_normalise`, loudly, when packaging is missing.
+    That is the same shape of skip `_confirm_with_packaging` prints, and for the
+    same reason: an unavailable check must read as unavailable, not as a pass.
+    """
+    try:
+        from packaging.tags import _normalize_string
+    except ImportError:
+        print("  ! packaging not importable -- the win tag's normalisation is "
+              "this file's own")
+        return _normalise(name)
+    tag = _normalize_string(name)
+    print(f"  packaging.tags._normalize_string({name!r}) -> {tag} -- which is "
+          "all of\n"
+          "      packaging's Windows tag code, because `platform_tags()` falls "
+          "through to\n"
+          "      `_generic_platforms()` on Windows and there is no "
+          "`windows_platforms` at all")
+    return tag
 
 
 class WindowsTarget(Target):
-    """`win_amd64`, which is a name and not a derivation.
+    """`win_amd64` and `win_arm64`, which are names and not derivations.
 
     Every other target here computes a floor from something: Android and iOS
     read a minimum OS out of the target CPython, Linux reads a glibc version out
     of the artefact. **Windows has no floor to compute.** The tag is one of
-    three fixed strings (`win32`, `win_amd64`, `win_arm64`) and carries no
-    version at all; PE records a `MajorSubsystemVersion`, but no installer looks
-    at it and pip will hand a `win_amd64` wheel to any 64-bit Windows. So there
-    is nothing here to get subtly wrong, and correspondingly nothing this can
-    check about the tag beyond the architecture matching.
+    four fixed strings (`win32`, `win_amd64`, `win_arm32`, `win_arm64`) and
+    carries no version at all; PE records a `MajorSubsystemVersion`, but no
+    installer looks at it and pip will hand a `win_amd64` wheel to any 64-bit
+    Windows.
 
-    What it does check instead is the two things Windows *does* make decidable,
-    both in `check_image`: the image is a PE32+ x86-64 DLL, and -- in
-    `verify_windows.py` -- every symbol it imports is attributed to a named DLL
-    by the import table. That second one has no Linux counterpart
+    **A name still has to be looked up, and that is what `_platform_name` does.**
+    Adding the second Windows architecture is where "no floor to compute" stops
+    meaning "nothing to get wrong": `win_arm64` is right, but *by analogy with
+    `win_amd64`* it is a guess, and the same analogy produces `win_aarch64` and
+    `win_arm64ec`, both of which are also plausible and neither of which any
+    installer matches. So it is read out of the distribution instead.
+
+    The chain is short and every link is on disk here:
+
+      * `packaging.tags` has no `windows_platforms`. On Windows it falls through
+        to `_generic_platforms()`, whose entire body is
+        `yield _normalize_string(sysconfig.get_platform())`. So the tag *is*
+        `sysconfig.get_platform()` with hyphens turned to underscores -- there
+        is no Windows-specific tag code in packaging at all, which is also why
+        `_confirm_with_packaging(tag, "windows")` has always printed a skip.
+      * `sysconfig.get_platform()` on `os.name == "nt"` is four lines, and this
+        distribution ships them (`Lib/sysconfig/__init__.py`). They test
+        `sys.version.lower()` for `amd64`, then `(arm)`, then `(arm64)`, and
+        fall back to `sys.platform`. **The order is load-bearing** -- `amd64`
+        wins over everything, so the answer for a given distribution is decided
+        by which of those substrings its own `sys.version` contains.
+      * `sys.version` embeds `Py_GetCompiler()`, which on MSVC is the literal
+        `[MSC v.<n> 64 bit (<arch>)]` compiled into `python3<minor>.dll`. That
+        string is readable without running anything: `AMD64` in the x86-64
+        distribution, `ARM64` in this one.
+
+    So the tag is derived after all -- from the target distribution, like every
+    other target in this file -- and `win_arm64` is the *result* rather than the
+    assumption. `_platform_name` runs CPython's own branch order over the string
+    it finds and refuses if the two distributions ever answer the same thing.
+
+    What `check_image` checks instead of a floor is the two things Windows
+    *does* make decidable: the image is a PE32+ DLL of this target's machine,
+    and -- in `verify_windows.py` -- every symbol it imports is attributed to a
+    named DLL by the import table. That second one has no Linux counterpart
     (docs/LINUX.md §6.1) and is as strong as the iOS device check.
 
     Two structural differences from every other target, both forced by upstream
@@ -1249,22 +1522,50 @@ class WindowsTarget(Target):
     global_deps_name = None
     extension_member = "torch/_C.pyd"
 
-    def __init__(self):
+    #: The `[MSC v.<n> <bits> bit (<arch>)]` substring `sysconfig.get_platform()`
+    #: branches on, lowercased, mapped to the name it returns for it. Keys and
+    #: order are CPython's, not this file's: `Lib/sysconfig/__init__.py` tests
+    #: `amd64` first and `(arm64)` last, and a dict preserves that. The ARM
+    #: entries carry their parentheses because CPython's do -- a bare `arm64`
+    #: would also match `[MSC v.1944 64 bit (ARM64EC)]`, which is a different
+    #: architecture with no wheel tag of its own.
+    #: Values are what `get_platform()` *returns* -- hyphenated, exactly as
+    #: CPython spells them -- and not the tag. Turning `win-arm64` into
+    #: `win_arm64` is packaging's step, not CPython's, and keeping the two
+    #: apart is what lets `_confirm_windows_normalisation` check the join
+    #: instead of this file asserting both halves at once.
+    _PLATFORM_NAMES = {"amd64": "win-amd64", "(arm)": "win-arm32",
+                       "(arm64)": "win-arm64"}
+
+    def __init__(self, key: str = "windows-x86_64",
+                 rust_target: str = "x86_64-pc-windows-msvc",
+                 pe_machine: str = "x86_64",
+                 expected_tag: str = "win_amd64"):
         super().__init__(
-            "windows-x86_64", "x86_64-pc-windows-msvc",
-            TARGET_PYTHON_ROOT / "x86_64-pc-windows-msvc",
+            key, rust_target,
+            TARGET_PYTHON_ROOT / rust_target,
             # cargo names a `cdylib` after the crate with no `lib` prefix on
             # Windows, so this is `_C.dll` and not `lib_C.dll`.
             "_C.dll",
         )
-
-    rebuild_hint = (
-        "PYO3_CROSS_LIB_DIR=<target-python>/libs PYO3_CROSS_PYTHON_VERSION=3.13 "
-        "cargo xwin build --release --target x86_64-pc-windows-msvc, from "
-        "rust/torch_c (docs/WINDOWS.md §3 has the whole environment, including "
-        "the four MSVC tool shims §3.2 installs, which cargo-xwin needs and "
-        "this machine does not otherwise have)"
-    )
+        #: The `pe_info` machine name `check_image` demands, held rather than
+        #: derived for the same reason `AndroidTarget.elf_machine` is: the COFF
+        #: spelling and the rust triple's are not the same vocabulary.
+        self.pe_machine = pe_machine
+        #: What `_platform_name` is expected to *derive*, so that the derivation
+        #: is checked against something rather than merely trusted. Not the
+        #: source of the tag -- if the two disagree, `platform_tag` refuses and
+        #: names both, because a distribution answering something other than
+        #: this means the registry and the tree on disk have come apart.
+        self.expected_tag = expected_tag
+        self.rebuild_hint = (
+            "PYO3_CROSS_LIB_DIR=<target-python>/libs "
+            "PYO3_CROSS_PYTHON_VERSION=3.13 "
+            f"cargo xwin build --release --target {rust_target}, from "
+            "rust/torch_c (docs/WINDOWS.md §3 has the whole environment, "
+            "including the four MSVC tool shims §3.2 installs, which "
+            "cargo-xwin needs and this machine does not otherwise have)"
+        )
 
     def sysconfig(self) -> dict[str, object]:
         """Windows CPython ships no `_sysconfigdata_*.py`, and that is correct.
@@ -1295,18 +1596,81 @@ class WindowsTarget(Target):
                          "python313.dll"):
             if not (self.python_root / relative).exists():
                 _fail(
-                    f"{self.python_root} has no {relative} -- it is not an "
-                    "x86-64 Windows CPython\n"
+                    f"{self.python_root} has no {relative} -- it is not a "
+                    f"{self.pe_machine} Windows CPython\n"
                     "  distribution of the shape this target builds against "
                     "(docs/WINDOWS.md §2)."
                 )
+        # And it has to be the *right* architecture's, not merely a Windows
+        # one. `_check_distribution` above is satisfied by either of the two
+        # trees under target-python/, which differ in no filename -- so without
+        # this, pointing `--target windows-arm64` at the x86-64 distribution
+        # would derive `win_amd64` from it and tag an ARM64 DLL with it.
+        # `check_image` would not catch that: it checks the artefact against
+        # this target, and the artefact is correct. Same trap as
+        # `AndroidTarget._api_and_abi`'s MULTIARCH check.
+        info = pe_info((self.python_root / "python313.dll").read_bytes())
+        if info is None or info["machine"] != self.pe_machine:
+            _fail(
+                f"{self.python_root}/python313.dll is "
+                f"{describe((self.python_root / 'python313.dll').read_bytes())},"
+                f" not a PE {self.pe_machine} image\n"
+                f"  -- it is not the Windows CPython distribution --target "
+                f"{self.key} builds against."
+            )
+
+    def _platform_name(self) -> str:
+        """`sysconfig.get_platform()`'s answer for this distribution, unrun.
+
+        See the class docstring for why the tag is this and nothing else. The
+        input is the `[MSC v.<n> <bits> bit (<arch>)]` string in the target's
+        own `python313.dll`; the branch order below is CPython's, copied from
+        the `os.name == "nt"` block of `Lib/sysconfig/__init__.py` **in this
+        very distribution** rather than from memory.
+        """
+        dll = self.python_root / "python313.dll"
+        pattern = re.compile(rb"\[MSC v\.\d+ \d+ bit \([A-Za-z0-9]+\)\]")
+        found = sorted({m.decode() for m in pattern.findall(dll.read_bytes())})
+        if len(found) != 1:
+            _fail(
+                f"{dll} carries {len(found)} distinct MSVC compiler strings "
+                f"({found or 'none'}), and\n"
+                "  the Windows wheel tag is `sysconfig.get_platform()`, which "
+                "is a test on exactly\n"
+                "  that string (see this class's docstring). One is needed, and "
+                "one is what a\n"
+                "  CPython built by MSVC has. Refused rather than guessed: the "
+                "tag is a name, so a\n"
+                "  wrong one is not a wrong number but a wheel pip never offers "
+                "anybody."
+            )
+        compiler = found[0].lower()
+        for needle, name in self._PLATFORM_NAMES.items():
+            if needle in compiler:
+                print(f"  tag is a NAME, derived not assumed: {dll.name} says "
+                      f"{found[0]},\n"
+                      f"      whose {needle!r} is the branch "
+                      "`sysconfig.get_platform()` takes on this\n"
+                      f"      distribution, so it answers {name!r}")
+                return name
+        _fail(
+            f"{dll} says {found[0]}, which matches none of CPython's Windows "
+            f"branches\n  ({list(self._PLATFORM_NAMES)}). "
+            "`sysconfig.get_platform()` would fall through to `sys.platform` "
+            "and\n  answer 'win32' on a 64-bit machine, which is not a tag this "
+            "wheel may carry."
+        )
 
     def platform_tag(self, artefact: bytes) -> str:
         self._check_distribution()
-        tag = "win_amd64"
-        print("  tag is a fixed name, not a derivation -- Windows wheel tags "
-              "carry no OS version\n"
-              "      floor for either the interpreter or the artefact to supply")
+        tag = _confirm_windows_normalisation(self._platform_name())
+        if tag != self.expected_tag:
+            _fail(
+                f"--target {self.key} expects the tag {self.expected_tag!r}, but "
+                f"{self.python_root}\n  derives {tag!r}. The registry and the "
+                "distribution on disk disagree about which\n  Windows this is; "
+                "one of them is wrong and this cannot tell which."
+            )
         imports = pe_imports(artefact) or {}
         if "python3.dll" not in imports:
             _fail(
@@ -1334,8 +1698,10 @@ class WindowsTarget(Target):
         if info is None:
             _fail(f"{what} is not a PE image ({describe(data)}) -- "
                   "a Windows wheel cannot carry it")
-        if (info["bits"], info["machine"], info["dll"]) != (64, "x86_64", True):
-            _fail(f"{what} is {describe(data)}, expected PE32+ x86_64 dll")
+        if (info["bits"], info["machine"], info["dll"]) != (64, self.pe_machine,
+                                                            True):
+            _fail(f"{what} is {describe(data)}, expected PE32+ "
+                  f"{self.pe_machine} dll")
 
 
 class PyEmscriptenTarget(Target):
@@ -1533,18 +1899,123 @@ def _confirm_with_packaging(tag: str, family: str, **kwargs) -> None:
     print(f"  tag {tag} accepted by packaging.tags.{family}_platforms")
 
 
+#: Why `--target android-x86_64` refuses on this machine. Written out here
+#: rather than inline in the registry because it is the one refusal in the file
+#: with a *measurement* behind it rather than a missing package, and the
+#: measurement is what makes it a refusal instead of a rebuild hint.
+#:
+#: The blocker is not the compiler. The NDK's `x86_64-linux-android21-clang`
+#: is present and runs (its prebuilt directory is `darwin-x86_64`, and Rosetta
+#: executes it), the rust target `x86_64-linux-android` is installed, and
+#: `cargo ndk` is on PATH. What is missing is the **target CPython**: every
+#: other target in this file reads its tag out of one, and
+#: `target-python/x86_64-linux-android/` does not exist.
+#:
+#: It cannot be downloaded. python-build-standalone's 20260825 release -- the
+#: source of the four fetchable distributions in docs/TARGET_PYTHON.md --
+#: publishes 871 assets and no Android target among them (checked, not
+#: assumed). CPython publishes no Android binaries either. The only route is a
+#: local cross-build, which is what docs/TARGET_PYTHON.md §5 records for the
+#: aarch64 one, and §5 also records that that build is the one distribution of
+#: the five whose provenance could not be reconstructed.
+#:
+#: And the wheel could not be checked if it were built. docs/WHEELMATRIX.md
+#: §3.3 has the measurement: this Mac's emulator ships only
+#: `emulator/qemu/darwin-aarch64`, so it runs aarch64 guests and nothing else,
+#: and all four installed system images are `arm64-v8a`. So `verify_android.py`
+#: -- the one script in the repository that *executes* a cross wheel on the
+#: target -- has no machine to execute an x86-64 one on, here or on any Apple
+#: Silicon host.
+_ANDROID_X86_64_REFUSAL = (
+    "no x86_64-linux-android CPython distribution, and none can be obtained "
+    "here.\n"
+    "  The toolchain is present and is not the problem: the NDK's "
+    "x86_64-linux-android21-clang\n"
+    "  runs (darwin-x86_64 prebuilts, under Rosetta), the rust target "
+    "x86_64-linux-android is\n"
+    "  installed, and cargo-ndk is on PATH. The target CPython is the gap, and "
+    "every tag in\n"
+    "  this file is derived from one.\n"
+    "  * It is not downloadable. python-build-standalone 20260825 publishes 871 "
+    "assets and no\n"
+    "    Android target; CPython publishes no Android binaries at all.\n"
+    "  * A local cross-build is the only route, and docs/TARGET_PYTHON.md §5 "
+    "records what that\n"
+    "    bought last time: the aarch64 Android distribution is the one of five "
+    "whose source\n"
+    "    could not be reconstructed afterwards.\n"
+    "  * The result could not be checked. This machine's emulator ships only\n"
+    "    emulator/qemu/darwin-aarch64 and all four installed system images are "
+    "arm64-v8a, so\n"
+    "    verify_android.py -- the only script here that *runs* a cross wheel -- "
+    "has no x86-64\n"
+    "    Android to run it on, and no Apple Silicon host has one "
+    "(docs/WHEELMATRIX.md §3.3).\n"
+    "  Refused by name rather than dropped from the registry, so this reads as "
+    "a target that\n"
+    "  was thought about -- the reason `--target linux-x86_64` was listed while "
+    "it refused."
+)
+
+#: Every target `--target` offers. The registry is the API: a key here is a
+#: `--target` choice, and a target that refuses stays in it with its reason
+#: (see `Target.refusal`) rather than disappearing.
 TARGETS: dict[str, Target] = {
     t.key: t for t in (
         AndroidTarget(),
+        AndroidTarget("android-x86_64", "x86_64-linux-android", "x86_64",
+                      refusal=_ANDROID_X86_64_REFUSAL),
         IOSTarget("ios-arm64", "aarch64-apple-ios", "arm64-iphoneos",
                   "iphoneos", "ios"),
         IOSTarget("ios-arm64-sim", "aarch64-apple-ios-sim",
                   "arm64-iphonesimulator", "iphonesimulator", "iossimulator"),
         LinuxTarget(),
+        LinuxTarget("linux-aarch64", "aarch64-unknown-linux-gnu", "aarch64"),
         WindowsTarget(),
+        WindowsTarget("windows-arm64", "aarch64-pc-windows-msvc", "aarch64",
+                      "win_arm64"),
         PyEmscriptenTarget(),
     )
 }
+
+#: The registry's keys, written down a second time on purpose.
+#:
+#: `TARGETS` is a dict comprehension keyed on `t.key`, so two targets that
+#: disagree about their own key -- a copied constructor call with the key
+#: argument not updated, which is exactly how the second Android, Linux and
+#: Windows entries were written -- collapse into one silently. The dict would
+#: have eight entries instead of nine, `--target` would offer eight choices,
+#: and nothing would say which one had been eaten: the surviving entry is a
+#: valid target that builds a valid wheel, just not the one that was asked for.
+#:
+#: Listed rather than counted, so the failure names the missing key instead of
+#: reporting an arithmetic disagreement.
+EXPECTED_TARGET_KEYS = (
+    "android-arm64-v8a", "android-x86_64",
+    "ios-arm64", "ios-arm64-sim",
+    "linux-aarch64", "linux-x86_64",
+    "wasm32-emscripten",
+    "windows-arm64", "windows-x86_64",
+)
+
+
+def check_registry() -> None:
+    """Refuse to run if the registry lost or gained an entry. See above."""
+    have, want = sorted(TARGETS), sorted(EXPECTED_TARGET_KEYS)
+    if have != want:
+        lost = [k for k in want if k not in have]
+        extra = [k for k in have if k not in want]
+        _fail(
+            "the target registry does not hold what it is declared to hold.\n"
+            + (f"  missing: {lost}\n" if lost else "")
+            + (f"  unexpected: {extra}\n" if extra else "")
+            + "  A missing key is usually two TARGETS entries sharing one "
+            "`key`, which the dict\n"
+            "  comprehension silently collapses -- see EXPECTED_TARGET_KEYS. "
+            "Fix the entry, or\n"
+            "  update EXPECTED_TARGET_KEYS if the target was removed on "
+            "purpose."
+        )
 
 #: Prefixes `verify` will accept as a cross tag. One entry per target family, so
 #: that adding a family and forgetting this is a build failure rather than a
@@ -2140,7 +2611,7 @@ def self_test_linux() -> int:
         f"expected ['libc.so.6'], got {needed}",
     ))
     tag = f"manylinux_{floor[0]}_{floor[1]}_x86_64"
-    spelling = refusal(_confirm_pep600_spelling, tag)
+    spelling = refusal(_confirm_pep600_spelling, tag, "x86_64")
     checks.append((
         f"{tag} accepted as PEP 600-shaped",
         spelling == "",
@@ -2148,12 +2619,55 @@ def self_test_linux() -> int:
     ))
     # ...and a floor below manylinux1's is refused, because no installer matches
     # it. Without this the spelling check only ever sees values that pass.
-    spelling = refusal(_confirm_pep600_spelling, "manylinux_2_4_x86_64")
+    spelling = refusal(_confirm_pep600_spelling, "manylinux_2_4_x86_64", "x86_64")
     checks.append((
         "a floor below manylinux1's glibc 2.5 is refused",
         "below manylinux1's 2.5" in spelling,
         f"got: {spelling[:200]!r}",
     ))
+    # 2b. The floor is **per architecture**, and this is the case that says so.
+    #     `manylinux_2_12_aarch64` is PEP 600-shaped, is not below manylinux1's
+    #     2.5, and matches nothing: aarch64 enters the scheme at manylinux2014,
+    #     so pip's generator floors it at 2.17. Checking only the grammar --
+    #     which is all this did while x86-64 was the only Linux target, and was
+    #     correct for exactly that one architecture -- would let it out.
+    spelling = refusal(_confirm_pep600_spelling, "manylinux_2_12_aarch64",
+                       "aarch64")
+    checks.append((
+        "manylinux_2_12_aarch64 is refused though 2.12 is fine on x86-64",
+        "below manylinux2014's 2.17" in spelling,
+        f"got: {spelling[:200]!r}",
+    ))
+    checks.append((
+        "...and the same floor is accepted on x86_64, so it is the arch and "
+        "not the number",
+        refusal(_confirm_pep600_spelling, "manylinux_2_12_x86_64", "x86_64") == "",
+        "manylinux_2_12_x86_64 was refused",
+    ))
+    # 2c. And a tag whose arch is not the one the target builds. The two Linux
+    #     targets share this function, so a copied call passing the wrong arch
+    #     is a real way to tag an aarch64 wheel `..._x86_64`.
+    spelling = refusal(_confirm_pep600_spelling, "manylinux_2_17_x86_64",
+                       "aarch64")
+    checks.append((
+        "a tag naming another architecture than the target's is refused",
+        "names architecture 'x86_64'" in spelling,
+        f"got: {spelling[:200]!r}",
+    ))
+    # 2d. pip's own generator, asked the cross question directly. This is what
+    #     `_confirm_manylinux_with_packaging` exists for, and the two archs are
+    #     both run so the per-arch floor above is confirmed by packaging's code
+    #     rather than only by this file's reading of PEP 599.
+    for probe, arch, want_ok in (("manylinux_2_17_aarch64", "aarch64", True),
+                                 ("manylinux_2_17_x86_64", "x86_64", True),
+                                 ("manylinux_2_12_aarch64", "aarch64", False)):
+        said = refusal(_confirm_manylinux_with_packaging, probe, arch)
+        checks.append((
+            f"packaging._manylinux "
+            f"{'yields' if want_ok else 'does not yield'} {probe}",
+            (said == "") is want_ok,
+            f"got: {said[:200]!r}",
+        ))
 
     # 3. An image that links something off the list is refused *by name*. This
     #    one links `$ORIGIN/../lib/libpython3.13.so.1.0`, which is exactly the
@@ -2610,6 +3124,7 @@ def self_test_pyemscripten() -> int:
 
 
 def main() -> None:
+    check_registry()
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--python", default=sys.executable,
                     help="interpreter whose pip/setuptools drive the build")
@@ -2640,6 +3155,16 @@ def main() -> None:
         return
 
     target = None if args.target == "host" else TARGETS[args.target]
+
+    # Before anything else this target might need, including the vendored tree
+    # and the host shim: a refusal is about the *machine*, and none of those
+    # would change it. Answering with the reason here is what "refuses by name"
+    # means -- `--target android-x86_64` says why, rather than either failing on
+    # a missing artefact with a rebuild hint that cannot succeed, or not being
+    # a choice at all. See `Target.refusal`.
+    if target is not None and target.refusal:
+        _fail(f"--target {target.key} cannot be built on this machine.\n"
+              f"  {target.refusal}")
 
     # The host preflight runs for cross builds too, unchanged: `pip wheel` walks
     # the same source tree either way, so a missing vendored tree or a missing

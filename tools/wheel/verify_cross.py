@@ -83,6 +83,41 @@ TARGET_PYTHON_ROOT = Path(os.environ.get(
     "TORCHNATIVE_TARGET_PYTHON", "/Volumes/macMini/caches/target-python"))
 
 
+def _interpreters_for(machine: str, pattern: str,
+                      kinds: tuple[type, ...]) -> list[Path]:
+    """The target CPython of the registry entry whose machine is `machine`.
+
+    Read out of `build.TARGETS` rather than written here, and this is the one
+    thing in this file that had to change when each platform grew its second
+    architecture. Every branch below used to hardcode one triple -- the Android
+    one globbed `aarch64-linux-android/prefix`, the Linux one had a
+    single-entry dict, the Windows one an `x86_64-pc-windows-msvc` literal --
+    which was correct while there was exactly one distribution per platform and
+    silently wrong afterwards.
+
+    Silently, because the failure is not an error. `libpython3.13.so` exports
+    the same names on aarch64 as on x86-64, and `python3.dll` the same on ARM64
+    as on AMD64: resolving an aarch64 wheel's undefined symbols against the
+    x86-64 interpreter's export table *succeeds*, and prints "0 unresolved"
+    for a check that was never run against the right file. There is no
+    architecture check to catch it either, because an export table is a list of
+    names with no machine in it.
+
+    So the root is selected by the target's own machine, and the empty list --
+    "no interpreter for this architecture on disk" -- is what a caller sees
+    when there genuinely is none. `Expectation` already reports that as a
+    weaker verdict rather than as a pass.
+    """
+    for target in _build.TARGETS.values():
+        if not isinstance(target, kinds):
+            continue
+        if getattr(target, "arch", None) == machine or \
+                getattr(target, "elf_machine", None) == machine or \
+                getattr(target, "pe_machine", None) == machine:
+            return sorted(target.python_root.glob(pattern))
+    return []
+
+
 class Expectation:
     """What a given platform tag implies about the archive behind it."""
 
@@ -160,9 +195,10 @@ class AndroidExpectation(Expectation):
             raise SystemExit(f"malformed android tag {plat!r}")
         self.api = int(m.group(1))
         self.abi = m.group(2)
-        self.interpreters = sorted(
-            (TARGET_PYTHON_ROOT / "aarch64-linux-android" / "prefix" / "lib")
-            .glob("libpython3.*.so"))
+        self.interpreters = _interpreters_for(
+            {"arm64_v8a": "aarch64", "armeabi_v7a": "arm",
+             "x86_64": "x86_64", "x86": "i686"}.get(self.abi, ""),
+            "lib/libpython3.*.so", (_build.AndroidTarget,))
 
     def check_tag(self, problems: list[str]) -> None:
         _packaging_accepts(self, problems, api_level=self.api, abi=self.abi)
@@ -274,6 +310,20 @@ class LinuxExpectation(Expectation):
     #: PEP 599's external-library list, read from the builder rather than copied
     #: so the two cannot drift into disagreeing about what manylinux promises.
     POLICY_LIBRARIES = _build.LinuxTarget.POLICY_LIBRARIES
+    #: PEP 599's list is architecture-independent; the dynamic loader is not,
+    #: and is not in the list at all (`build.LinuxTarget.LOADER`). Unioned in
+    #: per architecture here for the same reason it is there: an x86-64 loader
+    #: named by an aarch64 image would otherwise be "allowed".
+    #:
+    #: This is exactly the drift the class comment above warns about, arriving.
+    #: When the loader moved out of `POLICY_LIBRARIES` in the builder so that a
+    #: second architecture could not inherit the first one's, this file kept
+    #: reading only `POLICY_LIBRARIES` -- and started refusing the *x86-64*
+    #: wheel it had passed for weeks, naming `ld-linux-x86-64.so.2` as an
+    #: off-policy dependency. Reading the builder rather than copying it is
+    #: what made that a loud failure on the next run instead of a quiet
+    #: divergence.
+    LOADER = _build.LinuxTarget.LOADER
     NAMED_VERSIONS = _build.LinuxTarget.NAMED_VERSIONS
 
     #: Tag arch -> ELF machine, for the archs this repository has a CPython for.
@@ -291,9 +341,8 @@ class LinuxExpectation(Expectation):
         self.arch = m.group(3)
         if self.arch not in self.MACHINES:
             raise SystemExit(f"unknown manylinux arch {self.arch!r} in {plat!r}")
-        triple = {"x86_64": "x86_64-unknown-linux-gnu"}.get(self.arch)
-        lib = TARGET_PYTHON_ROOT / triple / "lib" if triple else None
-        self.interpreters = sorted(lib.glob("libpython3.*.so")) if lib else []
+        self.interpreters = _interpreters_for(
+            self.arch, "lib/libpython3.*.so", (_build.LinuxTarget,))
 
     def check_tag(self, problems: list[str]) -> None:
         if self.glibc < (2, 5):
@@ -305,9 +354,23 @@ class LinuxExpectation(Expectation):
         print(f"  tag                 {self.plat}  "
               f"(PEP 600-shaped: glibc {self.glibc[0]}.{self.glibc[1]}, "
               f"{self.arch})")
-        print("  ! packaging has no manylinux_platforms, so unlike the android "
-              "and ios tags\n"
-              "    this spelling is not confirmed against pip's own generator")
+        # `packaging.tags` has no `manylinux_platforms` to hand arguments to,
+        # which is what this branch used to report and stop at. But
+        # `packaging._manylinux.platform_tags` is the generator pip actually
+        # runs, and the only reason it cannot answer here is that it reads the
+        # *host* glibc -- a question a cross check is entitled to substitute.
+        # `build._confirm_manylinux_with_packaging` does exactly that, so the
+        # spelling is confirmed against pip's own code after all, and this
+        # branch is no longer a step weaker than android and ios.
+        #
+        # It earns its keep on the second architecture in particular:
+        # `manylinux_2_12_aarch64` passes every check above it -- PEP 600
+        # grammar, a floor above manylinux1's 2.5 -- and pip generates no such
+        # name, because aarch64 enters the scheme at manylinux2014.
+        try:
+            _build._confirm_manylinux_with_packaging(self.plat, self.arch)
+        except SystemExit as exc:
+            problems.append(str(exc).replace("\n", "\n    "))
 
     def check_binary(self, name: str, data: bytes, problems: list[str]) -> None:
         info = elf_info(data)
@@ -329,7 +392,9 @@ class LinuxExpectation(Expectation):
                 "against the tag")
             return
 
-        outside = sorted(set(dynamic["needed"]) - self.POLICY_LIBRARIES)
+        allowed = self.POLICY_LIBRARIES | {self.LOADER[self.arch]} \
+            if self.arch in self.LOADER else self.POLICY_LIBRARIES
+        outside = sorted(set(dynamic["needed"]) - allowed)
         if outside:
             problems.append(
                 f"{name} links {outside}, which PEP 599's external-library "
@@ -415,11 +480,17 @@ class WindowsExpectation(Expectation):
                 f"unknown Windows tag {plat!r}; the only ones pip generates are "
                 f"{sorted(self.MACHINES)}")
         self.arch = self.MACHINES[plat]
-        root = TARGET_PYTHON_ROOT / "x86_64-pc-windows-msvc"
+        # Per tag, not one hardcoded root. There are two Windows distributions
+        # under `target-python/` now and they differ in no filename, so a
+        # hardcoded x86-64 root would have resolved a `win_arm64` wheel's
+        # imports against an **amd64** python313.dll -- which mostly works,
+        # because the abi3 export set is the same on both, and would therefore
+        # have reported a clean run against the wrong interpreter.
         # python313.dll, not python3.dll: the dynload table is a set of string
         # constants compiled into the interpreter, and python3.dll is only a
         # forwarder with no code of its own.
-        self.interpreters = sorted(root.glob("python3??.dll"))
+        self.interpreters = _interpreters_for(
+            self.arch, "python3??.dll", (_build.WindowsTarget,))
 
     def global_deps_name(self) -> str | None:
         return None
