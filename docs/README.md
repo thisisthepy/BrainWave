@@ -30,9 +30,10 @@ records; they are the front door.
 | `perf/` | Measurements of speed and overhead, and the fixes made for speed. Numbers here are only valid unloaded — see CLAUDE.md §4. |
 | `verification/` | The checkers themselves and the audits of this documentation: DOCWATCH, the golden harness, and what they structurally cannot see. |
 
-Three non-Markdown files (`_profile_decode.py`, `_profile_sdpa_shapes.py`,
-`int8-candle-0.11.0-cpu.patch`) remain at this level; they are attachments to
-documents rather than documents.
+This directory holds **documents only**. The three non-Markdown files that
+used to sit here have moved to where the thing they are is kept:
+`_profile_decode.py` and `_profile_sdpa_shapes.py` to `tools/bench/` (they are
+run, not read), and `int8-candle-0.11.0-cpu.patch` to `vendor/`.
 
 ## The check that keeps this true
 

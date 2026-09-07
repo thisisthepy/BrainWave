@@ -54,7 +54,7 @@ Nine sites inside `candle-core/src/tensor.rs` build a shallow view by writing
 `broadcast_as`, `detach`, and `slice_scatter`'s helper. None of them is
 expressible from outside the crate. A candle patch exposing one
 `from_storage_and_layout` would remove this whole document; `vendor/` already
-carries `int8-candle-0.11.0-cpu.patch`, so the mechanism exists.
+carries `int8-candle-0.11.0-cpu.patch`, so the mechanism exists **— which is FALSE, corrected 2026-09-07.** The patch file is carried (now in `vendor/`, previously in `docs/`), but NOTHING APPLIES IT: `vendor/*.sh`, `vendor/*.py`, `Cargo.toml` and `build.rs` contain no patch step and no `[patch.crates-io]`. Carrying a diff is not a mechanism, and three documents used this sentence to argue that a candle fork would be cheap.
 
 Nor is the view expressible as a composition of the ops candle does export.
 `longformer`'s chunking asks for **overlapping** windows — `_chunk` halves the

@@ -262,7 +262,7 @@ be deleted the day the gap closes.
 **Sizing it properly** means the same work `slice.Tensor` and `view.dtype` need, and doing it once
 would close all three: either a stride-carrying tensor wrapper in this crate that owns the
 `Arc<Storage>` and its own `Layout`, or a candle patch exposing a storage-sharing constructor
-(`vendor/` already carries `int8-candle-0.11.0-cpu.patch`, so the mechanism exists). Estimate: the
+(`vendor/` already carries `int8-candle-0.11.0-cpu.patch`, so the mechanism exists **— which is FALSE, corrected 2026-09-07.** The patch file is carried (now in `vendor/`, previously in `docs/`), but NOTHING APPLIES IT: `vendor/*.sh`, `vendor/*.py`, `Cargo.toml` and `build.rs` contain no patch step and no `[patch.crates-io]`. Carrying a diff is not a mechanism, and three documents used this sentence to argue that a candle fork would be cheap). Estimate: the
 wrapper touches every kernel that calls `read_flat`/`write_flat`; the patch is perhaps twenty lines
 of candle and a re-vendor. Neither is a `longformer`-shaped task.
 

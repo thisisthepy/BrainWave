@@ -185,4 +185,4 @@ overhead, not arithmetic.
 
 ---
 
-*Reproduce §0 with `docs/_profile_decode.py` and `docs/_profile_sdpa_shapes.py`.*
+*Reproduce §0 with `tools/bench/profile_decode.py` and `tools/bench/profile_sdpa_shapes.py`.*

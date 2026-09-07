@@ -120,7 +120,7 @@ precondition attached
 Closing it still means what §6 said: a stride-carrying tensor wrapper in this
 crate that owns the `Arc<Storage>` and its own `Layout`, or a candle patch
 exposing a storage-sharing constructor (`vendor/` already carries
-`int8-candle-0.11.0-cpu.patch`, so the mechanism exists). What this round adds
+`int8-candle-0.11.0-cpu.patch`, so the mechanism exists **— which is FALSE, corrected 2026-09-07.** The patch file is carried (now in `vendor/`, previously in `docs/`), but NOTHING APPLIES IT: `vendor/*.sh`, `vendor/*.py`, `Cargo.toml` and `build.rs` contain no patch step and no `[patch.crates-io]`. Carrying a diff is not a mechanism, and three documents used this sentence to argue that a candle fork would be cheap). What this round adds
 is the smaller thing that would be *enough for a read-only view*: **one
 `bool`/`Option<...>` field on `PyTensorBase` that survives aliasing**, plus
 propagation through the view-producing ops. That is a `tensor.rs` change, and

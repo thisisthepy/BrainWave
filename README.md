@@ -687,8 +687,7 @@ Start with [`DESIGN.md`](docs/design/DESIGN.md); [`SURFACE_HONESTY.md`](docs/des
 
 ## License
 
-**Apache-2.0** — see [LICENSE](LICENSE). This project's own
-code was MIT through `0.0.12a0` and is Apache-2.0 from `0.0.13a0` onward.
+**Apache-2.0** — see [LICENSE](LICENSE).
 
 **The repository and the wheel are not the same thing, and they carry different
 licences.** This repository contains only this project's code: the vendored

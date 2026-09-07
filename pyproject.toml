@@ -13,12 +13,11 @@ readme = { file = "README.md", content-type = "text/markdown" }
 # describe a few thousand lines of this distribution and misdescribe two
 # million.
 #
-# Our code moved from MIT to Apache-2.0 (LICENSE, from 0.0.13a0 onward), and
-# that move does not change one character of this line -- upstream's expression
-# already contains BOTH terms, so the set is identical either way. Worth
-# writing down rather than discovering later: this field cannot express which
-# term is ours, and the previous comment here claimed MIT was "ours" while the
-# rest was upstream's, which was never true.
+# This field CANNOT EXPRESS WHICH TERM IS OURS -- upstream's expression already
+# contains Apache-2.0 and MIT both, so ours is indistinguishable inside it and
+# changing our licence does not change one character of this line. Worth
+# writing down rather than rediscovering: the comment that stood here before
+# claimed MIT was "ours" while the rest was upstream's, which was never true.
 #
 # The upstream licence texts themselves ride along -- `tools/wheel/build.py`
 # injects torch's dist-info, third-party notices included -- so this line is
