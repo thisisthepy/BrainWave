@@ -9020,7 +9020,18 @@ def test_a_packet_reports_the_overloads_the_file_declares():
     # declares `clamp_min.out`, `sigmoid.out`, `all.out`, `all.dims_out` and
     # `all.all_out` itself (checked in the file), so those packets could
     # already resolve every overload this shim lists for them.
-    assert r["registry"] == 1008, r["registry"]
+    #
+    # 1009 with docs/EXPORT4.md's `empty_strided`, for the FIFTH time by the
+    # same mechanism as `zeros_like`, `ones_like` and `flip` above:
+    # `overloads.json` carries `aten::empty_strided.out`, and
+    # `native_functions.yaml` declares `empty_strided` while producing
+    # `empty_strided.out` only through `autogen:` (checked in the file, line
+    # 2450), which this scan does not count as a declaration. So
+    # `register_decomposition(aten.empty_strided)` has a schema to resolve and
+    # reaches one more overload. `registry_default` is again unchanged, because
+    # the new one is `.out` -- which is the check that this is that mechanism
+    # and not a regression of the `["default"]` bug.
+    assert r["registry"] == 1009, r["registry"]
     assert r["registry_default"] == 461, r["registry_default"]
 
 
@@ -9363,7 +9374,17 @@ def test_core_ops_and_op_tags_agree():
     # increment is that absence ending, and if it ever goes back to 132 the
     # thing to check is whether `as_strided` was reverted rather than whether
     # upstream retagged something.
-    assert r["tag_core_count"] == 133, r["tag_core_count"]
+    # 133 -> 134 with docs/EXPORT4.md's one new key, `empty_strided.default`,
+    # and the delta is one because the round added exactly one aten key:
+    #
+    #     empty_strided.default   ['core', 'pt2_compliant_tag']   <- counted
+    #
+    # It is core, read off its own `.tags` in `native_functions.yaml` (line
+    # 2451, `tags: core`) like every entry above, and not asserted to be core
+    # because it felt fundamental. The round's other five landings add nothing
+    # here: they are `torch._C` predicates and a per-tensor bit, none of which
+    # is an aten op at all.
+    assert r["tag_core_count"] == 134, r["tag_core_count"]
 
 
 def test_decompose_lowers_the_op_capture_md_named():
@@ -11029,7 +11050,15 @@ def test_schema_text_survives_the_round_trip_through_the_transcribed_tables():
     # The round's other landed change contributes **zero**:
     # `aten::convolution` was already in the tables and what LAST7 gave it is a
     # padding lowering inside the existing kernel, not a new spelling.
-    assert len(keys) == 364, len(keys)
+    # 366 with docs/EXPORT4.md's `empty_strided`. **+2**, and the two are the
+    # check: `overloads.json` gained `aten::empty_strided` and
+    # `aten::empty_strided.out`, and NEITHER was already an identity in
+    # `methods.json` -- upstream has `torch.empty_strided` and no
+    # `Tensor.empty_strided` (measured on 2.13.0), so this is a `torch.<name>`
+    # door that had no method spelling to double with. Getting +1 would mean
+    # the `.out` row had been dropped; getting +3 would mean a method spelling
+    # was invented for a door upstream does not have.
+    assert len(keys) == 366, len(keys)
     from_tables = sorted(
         k for k in keys
         if report["table"][f"{k[0]}|{k[1]}"]["from"] == "tables"
@@ -11059,11 +11088,20 @@ def test_schema_text_survives_the_round_trip_through_the_transcribed_tables():
     # *does* declare `aten::new_zeros`, so it is answered by the file and does
     # not appear here. Two table entries in one round, one generated and one
     # declared, landing on opposite sides of this list is what the list is for.
+    #
+    # `empty_strided.out` is the tenth (docs/EXPORT4.md §4), same mechanism
+    # again: the yaml declares `empty_strided` as a `- func:` and produces
+    # `empty_strided.out` only through `autogen:` (line 2450), so the `.out`
+    # half is generated-not-declared and lands here while `empty_strided`
+    # itself is answered by the file. That split across the two halves of one
+    # round's single new op is the check that this is the mechanism and not a
+    # transcription slip -- a slip would have put BOTH halves here.
     assert from_tables == [
         ("aten::div", "Scalar_mode_out"),
         ("aten::div", "Scalar_out"),
         ("aten::embedding", "out"),
         ("aten::empty_like", "out"),
+        ("aten::empty_strided", "out"),
         ("aten::flip", "out"),
         ("aten::floor_divide", "Scalar_out"),
         ("aten::full_like", "out"),

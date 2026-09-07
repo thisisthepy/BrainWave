@@ -259,7 +259,14 @@ has no kernel with that name. It is on the critical path because it is *the*
 constructor `meta_utils.py:2008` uses to make the meta tensor behind every fake
 tensor, so nothing downstream is reachable without it.
 
-<!-- DOCWATCH: op-not-implemented aten.empty_strided.default -->
+**Correction (docs/EXPORT4.md §4, 2026-09-07): this is closed.**
+`aten.empty_strided.default` has a kernel and an `overloads.json` row. It serves
+the contiguous case and **refuses a non-contiguous stride by name**, because
+neither `Repr::Meta` nor a dense candle tensor can carry a caller-supplied
+stride; EXPORT4.md §4 is the argument that refusing beats returning a contiguous
+tensor while claiming it is strided. The marker below moved with the fact.
+
+<!-- DOCWATCH: op-implemented aten.empty_strided.default -->
 
 ### 3.2 `torch._C._set_throw_on_mutable_data_ptr` — a per-tensor bit
 
@@ -268,6 +275,13 @@ raises on it. There is nowhere in `PyTensorBase` to put that bit, and a Python
 side-table keyed by identity would be a different guarantee (a `FakeTensor` is
 not necessarily weak-referenceable, and the bit has to survive `_make_subclass`).
 Rust.
+
+**Correction (docs/EXPORT4.md §6.4, 2026-09-07): this is closed, and in Rust as
+this section said.** It is an `AtomicBool` field on `PyTensorBase`; `data_ptr()`
+checks it and refuses with upstream's own message. The reasoning above about the
+side-table is why it is a field and not a dict. Its softer sibling
+`_set_warn_deprecated_on_mutable_data_ptr` — which warns and still answers — was
+the wall immediately behind it and is closed too.
 
 ### 3.3 A meta tensor has no storage to memoise
 

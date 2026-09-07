@@ -780,17 +780,38 @@ def _install_inference_mode(C, put) -> None:
             self._saved = None
 
         def __enter__(self):
-            self._saved = getattr(_TLS, "inference_mode", False)
-            _TLS.inference_mode = self.mode
+            self._saved = _read()
+            _write(self.mode)
             return self
 
         def __exit__(self, *exc):
-            _TLS.inference_mode = self._saved
+            _write(self._saved)
             return False
 
+    # One source of truth, and it is the bootstrap's.  `bootstrap.py`'s
+    # `_install_grad_mode` now owns the flag, because `torch.is_inference_mode_enabled`
+    # is harvested off `_VariableFunctions` before this module can run and
+    # `fake_tensor.py:1801` calls it on every cached dispatch.  Writing through
+    # to it -- rather than keeping a second flag on `_TLS` -- is what stops the
+    # guard and the predicate from answering differently, which is
+    # docs/EXPORT.md §2.2's failure with the operands swapped.
+    #
+    # The `_TLS` fallback is not dead code: it is what runs against a bootstrap
+    # that predates the setter, and it keeps this module importable there.
+    def _read():
+        fn = getattr(C, "is_inference_mode_enabled", None)
+        if fn is not None:
+            return bool(fn())
+        return getattr(_TLS, "inference_mode", False)
+
+    def _write(value):
+        _TLS.inference_mode = value
+        setter = getattr(C, "_set_inference_mode_enabled", None)
+        if setter is not None:
+            setter(bool(value))
+
     put(C, "_InferenceMode", _InferenceMode)
-    put(C, "_is_inference_mode_enabled",
-        lambda: getattr(_TLS, "inference_mode", False))
+    put(C, "_is_inference_mode_enabled", _read)
 
 
 # --------------------------------------------------------------------------
@@ -864,10 +885,29 @@ def _install_raii_guards(C, put) -> None:
                 if counts is None:
                     counts = _TLS.guards = {}
                 counts[name] = counts.get(name, 0) + 1
+                # `_DisableTorchDispatch` is `no_dispatch()`, and it is the ONE
+                # guard in this family that the dispatcher door has to see.  The
+                # counter above is this module's own bookkeeping; the write
+                # below is the one that actually suppresses, and it lives in
+                # `torch._C` because `aten.rs` reads it there.  See
+                # `bootstrap.py::_install_dispatch_suppression` and
+                # docs/EXPORT4.md §5.
+                #
+                # The others stay counters on purpose: `_DisableFuncTorch` and
+                # friends name subsystems this shim does not have, and making
+                # them suppress dispatch would be a guess about what they mean.
+                if name == "_DisableTorchDispatch":
+                    push = getattr(C, "_shim_push_dispatch_suppression", None)
+                    if push is not None:
+                        push()
                 return self
 
             def __exit__(self, *exc):
                 _TLS.guards[name] -= 1
+                if name == "_DisableTorchDispatch":
+                    pop = getattr(C, "_shim_pop_dispatch_suppression", None)
+                    if pop is not None:
+                        pop()
                 return False
 
         _Guard.__name__ = name

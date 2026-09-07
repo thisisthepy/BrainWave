@@ -235,6 +235,40 @@ pub struct PyTensorBase {
     /// meaningful. docs/TAIL4.md §1.2 rejected an address-keyed poison set
     /// precisely because it had no such handle.
     strided: Option<std::sync::Arc<crate::storage::StridedBarrier>>,
+    /// `torch._C._set_throw_on_mutable_data_ptr(t)` -- the per-tensor bit that
+    /// makes `t.data_ptr()` refuse.
+    ///
+    /// `fake_tensor.py:943` sets it on every `FakeTensor` at construction: a
+    /// fake tensor has no bytes, so handing back an address for them would be
+    /// worse than refusing, and upstream would rather the caller fail at the
+    /// `data_ptr()` than at whatever it did with the number.
+    ///
+    /// docs/EXPORT.md §3.2 called this "Rust" and it was right about the
+    /// reason: a Python side-table keyed by identity is a *different*
+    /// guarantee. A `FakeTensor` is not reliably weak-referenceable, and the
+    /// bit has to survive `Tensor._make_subclass`, which builds a new Python
+    /// object around the same `PyTensorBase`. As a field it survives both by
+    /// construction.
+    ///
+    /// `AtomicBool` rather than `bool` because the setter runs on an object
+    /// Python already holds -- `_set_throw_on_mutable_data_ptr` takes `&self`,
+    /// so there is no `&mut` to be had -- and `Cell` is not `Sync`.
+    /// `Relaxed` is the right ordering: the bit guards nothing but its own
+    /// read, and it is written once at construction before the tensor is
+    /// shared.
+    throw_on_mutable_data_ptr: std::sync::atomic::AtomicBool,
+    /// `torch._C._set_warn_deprecated_on_mutable_data_ptr(t)` -- the *softer*
+    /// half of the pair above, and a genuinely different behaviour rather than
+    /// a second name for it.
+    ///
+    /// Upstream **returns the pointer and warns**; it does not refuse. Measured
+    /// on 2.13.0, the warning is a `UserWarning` beginning "Accessing the data
+    /// pointer of FakeTensor is deprecated". `fake_tensor.py` uses this one for
+    /// tensors whose `data_ptr()` is legal-but-suspect and the throwing one for
+    /// tensors that have no storage at all, so collapsing the two into a single
+    /// refusal would turn a warning into an error for callers upstream still
+    /// serves.
+    warn_deprecated_on_mutable_data_ptr: std::sync::atomic::AtomicBool,
 }
 
 /// Hand-written rather than derived: `backward_hooks` is a `Py<PyAny>`, and
@@ -267,6 +301,18 @@ impl Clone for PyTensorBase {
             // the barrier here would let `y = x.as_strided(...)` be laundered
             // into a writable tensor by any path that clones the wrapper.
             strided: self.strided.clone(),
+            // Carried, for `strided`'s reason rather than `grad`'s. The bit
+            // says "these bytes are not real"; a clone points at the same
+            // (absent) bytes, so laundering it through `.clone()` into a
+            // tensor whose `data_ptr()` answers would defeat the refusal.
+            throw_on_mutable_data_ptr: std::sync::atomic::AtomicBool::new(
+                self.throw_on_mutable_data_ptr
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            ),
+            warn_deprecated_on_mutable_data_ptr: std::sync::atomic::AtomicBool::new(
+                self.warn_deprecated_on_mutable_data_ptr
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            ),
         })
     }
 }
@@ -354,6 +400,8 @@ impl PyTensorBase {
             from_op: None,
             retains_grad: false,
             strided: None,
+            throw_on_mutable_data_ptr: std::sync::atomic::AtomicBool::new(false),
+            warn_deprecated_on_mutable_data_ptr: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -375,6 +423,8 @@ impl PyTensorBase {
             from_op: None,
             retains_grad: false,
             strided: None,
+            throw_on_mutable_data_ptr: std::sync::atomic::AtomicBool::new(false),
+            warn_deprecated_on_mutable_data_ptr: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -404,6 +454,8 @@ impl PyTensorBase {
             from_op: None,
             retains_grad: false,
             strided: None,
+            throw_on_mutable_data_ptr: std::sync::atomic::AtomicBool::new(false),
+            warn_deprecated_on_mutable_data_ptr: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -423,6 +475,8 @@ impl PyTensorBase {
             from_op: None,
             retains_grad: false,
             strided: None,
+            throw_on_mutable_data_ptr: std::sync::atomic::AtomicBool::new(false),
+            warn_deprecated_on_mutable_data_ptr: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -480,6 +534,8 @@ impl PyTensorBase {
             from_op: None,
             retains_grad: false,
             strided: None,
+            throw_on_mutable_data_ptr: std::sync::atomic::AtomicBool::new(false),
+            warn_deprecated_on_mutable_data_ptr: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -537,6 +593,8 @@ impl PyTensorBase {
             from_op: None,
             retains_grad: false,
             strided: None,
+            throw_on_mutable_data_ptr: std::sync::atomic::AtomicBool::new(false),
+            warn_deprecated_on_mutable_data_ptr: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -2027,6 +2085,13 @@ impl PyTensorBase {
     /// a guess that happens to be right for contiguous meta tensors and wrong
     /// for the transposed ones upstream's meta does model.
     fn storage_offset(&self) -> PyResult<usize> {
+        // A meta tensor has no storage, so it cannot be offset into one, and 0
+        // is the only representable answer rather than a chosen one. Upstream
+        // answers 0 here too for a freshly built meta tensor. See `stride`
+        // below for why meta is answered rather than refused at all.
+        if let Repr::Meta { .. } = self.inner {
+            return Ok(0);
+        }
         Ok(self.tensor()?.layout().start_offset())
     }
 
@@ -2048,6 +2113,50 @@ impl PyTensorBase {
     /// answering would invent one.
     #[pyo3(signature = (dim = None))]
     fn stride<'py>(&self, py: Python<'py>, dim: Option<isize>) -> PyResult<Bound<'py, PyAny>> {
+        // **A meta tensor answers its contiguous stride, and that is derived,
+        // not guessed.**
+        //
+        // `Repr::Meta` stores a shape and no stride (docs/META.md §6 records
+        // the narrowing), so the obvious reading is that `stride()` cannot be
+        // answered and must refuse -- which is what it did, via `tensor()?`,
+        // and the refusal was `Cannot copy out of meta tensor; no data!`. That
+        // message is about *bytes*, and a stride is not bytes; it was the wrong
+        // refusal for the question, and it stopped `torch.export` at
+        // `meta_utils.py:2066`.
+        //
+        // The answer is available because of a fact the type already asserts:
+        // `is_contiguous()` returns `true` for every `Repr::Meta`, since no
+        // kernel in this tree can produce a non-contiguous one, and
+        // `aten.empty_strided.default` refuses by name rather than build one.
+        // A contiguous tensor's stride is a function of its shape alone. So
+        // this is the same value the dense path would compute, arrived at
+        // without a storage to read it off.
+        //
+        // The invariant this rests on is checked, not assumed:
+        // `test_export4.py::test_a_meta_tensor_is_contiguous_so_its_stride_is_derivable`
+        // fails if a meta tensor ever becomes non-contiguous, which is exactly
+        // the day this answer would start lying.
+        if let Repr::Meta { shape } = &self.inner {
+            let mut contiguous = vec![0i64; shape.len()];
+            let mut acc: i64 = 1;
+            for i in (0..shape.len()).rev() {
+                contiguous[i] = acc;
+                acc *= shape[i] as i64;
+            }
+            let Some(dim) = dim else {
+                return Ok(PyTuple::new(py, &contiguous)?.into_any());
+            };
+            let rank = contiguous.len() as isize;
+            let at = if dim < 0 { dim + rank } else { dim };
+            if at < 0 || at >= rank {
+                return Err(pyo3::exceptions::PyIndexError::new_err(format!(
+                    "Dimension out of range (expected to be in range of [{}, {}], but got {dim})",
+                    -rank,
+                    rank - 1
+                )));
+            }
+            return contiguous[at as usize].into_bound_py_any(py);
+        }
         let stride = self.tensor()?.layout().stride().to_vec();
         let Some(dim) = dim else {
             return Ok(PyTuple::new(py, &stride)?.into_any());
@@ -2077,6 +2186,41 @@ impl PyTensorBase {
     /// (`torch/serialization.py:1224`), and `torch/_tensor.py:462` compares it
     /// against `0` to detect a storage-less subclass.
     fn data_ptr(&self) -> PyResult<usize> {
+        // The bit `torch._C._set_throw_on_mutable_data_ptr` sets, checked
+        // before anything reads storage. Upstream's message, from
+        // `torch/csrc/autograd/python_variable.cpp`.
+        if self
+            .throw_on_mutable_data_ptr
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "Cannot access data pointer of Tensor that doesn't have storage",
+            ));
+        }
+        // The softer bit: upstream warns and still answers. Emitted before the
+        // storage is read so the warning appears even if the read then fails.
+        if self
+            .warn_deprecated_on_mutable_data_ptr
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            Python::attach(|py| {
+                pyo3::PyErr::warn(
+                    py,
+                    &py.get_type::<pyo3::exceptions::PyUserWarning>(),
+                    std::ffi::CString::new(
+                        "Accessing the data pointer of FakeTensor is deprecated and will \
+                         error in PyTorch 2.5. This is almost definitely a bug in your code \
+                         and will cause undefined behavior with subsystems like \
+                         torch.compile. Please wrap calls to tensor.data_ptr() in an opaque \
+                         custom op; If all else fails, you can guard accesses to \
+                         tensor.data_ptr() on isinstance(tensor, FakeTensor).",
+                    )
+                    .expect("literal has no interior nul")
+                    .as_c_str(),
+                    1,
+                )
+            })?;
+        }
         let tensor = self.tensor()?;
         let (guard, layout) = tensor.storage_and_layout();
         let storage: &candle_core::Storage = &guard;
@@ -3276,6 +3420,61 @@ pub fn has_storage(value: &Bound<'_, PyAny>) -> PyResult<bool> {
 /// dispatches does both under the GIL.
 static GRAD_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
+/// `torch._C._set_throw_on_mutable_data_ptr(tensor)`.
+///
+/// `fake_tensor.py:943` calls this on every `FakeTensor` as it is constructed,
+/// so `torch.export` reaches it once per input. It sets the per-tensor bit that
+/// `data_ptr()` refuses on -- see the field's own comment on `PyTensorBase`.
+///
+/// It takes the tensor by `PyRef` rather than by value because upstream's
+/// mutates the object the caller passed; taking a clone would set the bit on a
+/// copy and leave the caller's `FakeTensor` answering an address.
+///
+/// **One-way, and deliberately.** Upstream has no un-setter, and adding one
+/// here would let a caller launder a fake tensor into one whose `data_ptr()`
+/// answers. There is nothing to restore: the bit is set at construction and the
+/// tensor is fake for the whole of its life.
+#[pyfunction]
+#[pyo3(name = "_set_throw_on_mutable_data_ptr")]
+pub fn set_throw_on_mutable_data_ptr(tensor: PyRef<'_, PyTensorBase>) {
+    tensor
+        .throw_on_mutable_data_ptr
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `torch._C._shim_throws_on_mutable_data_ptr(tensor)` -- readable so a test
+/// can assert the bit rather than infer it from a raised exception.
+/// `torch._C._set_warn_deprecated_on_mutable_data_ptr(tensor)`.
+///
+/// The sibling of `_set_throw_on_mutable_data_ptr`, and **not** an alias for
+/// it: this one leaves `data_ptr()` answering and adds a `UserWarning`. See the
+/// field comment on `PyTensorBase` for why the two are kept apart.
+#[pyfunction]
+#[pyo3(name = "_set_warn_deprecated_on_mutable_data_ptr")]
+pub fn set_warn_deprecated_on_mutable_data_ptr(tensor: PyRef<'_, PyTensorBase>) {
+    tensor
+        .warn_deprecated_on_mutable_data_ptr
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `torch._C._shim_warns_on_mutable_data_ptr(tensor)` -- readable so a test can
+/// assert the bit rather than catch a warning.
+#[pyfunction]
+#[pyo3(name = "_shim_warns_on_mutable_data_ptr")]
+pub fn warns_on_mutable_data_ptr(tensor: PyRef<'_, PyTensorBase>) -> bool {
+    tensor
+        .warn_deprecated_on_mutable_data_ptr
+        .load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[pyfunction]
+#[pyo3(name = "_shim_throws_on_mutable_data_ptr")]
+pub fn throws_on_mutable_data_ptr(tensor: PyRef<'_, PyTensorBase>) -> bool {
+    tensor
+        .throw_on_mutable_data_ptr
+        .load(std::sync::atomic::Ordering::Relaxed)
+}
+
 #[pyfunction]
 #[pyo3(name = "_shim_set_grad_enabled_flag")]
 pub fn set_grad_enabled_flag(value: bool) {
@@ -3909,6 +4108,10 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(set_size_class, m)?)?;
     m.add_function(wrap_pyfunction!(has_storage, m)?)?;
     m.add_function(wrap_pyfunction!(set_grad_enabled_flag, m)?)?;
+    m.add_function(wrap_pyfunction!(set_throw_on_mutable_data_ptr, m)?)?;
+    m.add_function(wrap_pyfunction!(throws_on_mutable_data_ptr, m)?)?;
+    m.add_function(wrap_pyfunction!(set_warn_deprecated_on_mutable_data_ptr, m)?)?;
+    m.add_function(wrap_pyfunction!(warns_on_mutable_data_ptr, m)?)?;
     m.add_function(wrap_pyfunction!(grad_enabled_flag, m)?)?;
     m.add_function(wrap_pyfunction!(complex_ops::complex_ops_list, m)?)?;
     Ok(())

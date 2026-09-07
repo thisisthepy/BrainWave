@@ -6328,6 +6328,19 @@ def _install_grad_mode(module, varfns) -> None:
         # what they read -- so, like `grad`, they have to round-trip.
         "multithreading": True,
         "layout_enforcement": False,
+        # `torch.is_inference_mode_enabled()`. Upstream spells this ONLY at
+        # torch level -- there is no `torch._C._is_inference_mode_enabled` on
+        # 2.13.0 -- and it is harvested off `_VariableFunctions`, so leaving it
+        # as the table-less refusal made `fake_tensor.py:1801` stop the whole of
+        # `torch.export` on a predicate that has an obvious answer.
+        #
+        # It lives HERE, in the same dict as `grad`, rather than as a constant,
+        # because docs/EXPORT.md §2.2 is about exactly the other choice: a
+        # constant `False` would make `with torch.inference_mode():` a block
+        # that enters, reports itself absent, and changes nothing. The setter
+        # below is what `_InferenceMode.__enter__` writes through, so the guard
+        # and the predicate cannot drift apart.
+        "inference": False,
     }
 
     def is_grad_enabled():
@@ -6344,6 +6357,15 @@ def _install_grad_mode(module, varfns) -> None:
         state["grad"] = bool(mode)
         module._shim_set_grad_enabled_flag(bool(mode))
 
+    def is_inference_mode_enabled():
+        return state["inference"]
+
+    def _set_inference_mode_enabled(mode):
+        # Not an upstream spelling. It exists so the `_InferenceMode` guard has
+        # somewhere to write that the predicate can read, instead of each
+        # keeping its own flag and agreeing only by luck.
+        state["inference"] = bool(mode)
+
     def _is_multithreading_enabled():
         return state["multithreading"]
 
@@ -6359,6 +6381,8 @@ def _install_grad_mode(module, varfns) -> None:
     for name, fn in (
         ("is_grad_enabled", is_grad_enabled),
         ("_set_grad_enabled", _set_grad_enabled),
+        ("is_inference_mode_enabled", is_inference_mode_enabled),
+        ("_set_inference_mode_enabled", _set_inference_mode_enabled),
         ("_is_multithreading_enabled", _is_multithreading_enabled),
         ("_set_multithreading_enabled", _set_multithreading_enabled),
         ("_is_grad_layout_enforcement_enabled", _is_grad_layout_enforcement_enabled),
@@ -6368,6 +6392,10 @@ def _install_grad_mode(module, varfns) -> None:
         fn.__qualname__ = f"torch._C.{name}"
         setattr(module, name, fn)
     varfns.is_grad_enabled = is_grad_enabled
+    # Same reason as `is_grad_enabled` above: `torch/__init__.py` harvests this
+    # name off `_VariableFunctions`, and the harvested copy is the one
+    # `torch.is_inference_mode_enabled` ends up being.
+    varfns.is_inference_mode_enabled = is_inference_mode_enabled
     # Readable so the state can be inspected rather than inferred.
     module._shim_grad_state = state
 
@@ -7736,6 +7764,195 @@ def _install_fx_node_base(module) -> None:
     module._NodeIter = _NodeIter
     module._fx_map_arg = _fx_map_arg
     module._fx_map_aggregate = _fx_map_aggregate
+
+
+def _install_dispatch_suppression(module) -> None:
+    """The counter behind `no_dispatch()`, read by the dispatcher door itself.
+
+    docs/EXPORT.md §2.4 wrote this function's specification as a prediction:
+
+        "Entering a counter is a correct implementation **only because this shim
+        never consults the mode stack in the first place** ... When
+        `_aten_dispatch` learns to consult the stack, this guard stops being a
+        counter and starts being load-bearing, and the counter is here so that
+        change is a body to fill rather than a hole to find."
+
+    `_aten_dispatch` has since learned to consult the stack (EXPORT.md §6 step
+    1), so that day arrived, and the counter had indeed stopped being correct.
+    The symptom was not a missing name: `torch/_subclasses/meta_utils.py:2009`
+    builds the meta tensor behind every fake tensor under `no_dispatch()`, that
+    suppression did nothing, and so `aten.empty_strided.default` was dispatched
+    **into** the `FakeTensorMode` that called it.  It died in
+    `_find_common_device` -- a factory has no tensor arguments to take a device
+    from -- several frames from the guard that should have prevented the
+    re-entry.  docs/EXPORT4.md §5.
+
+    So the state lives here, where both halves can reach it: the guard writes it
+    and `aten.rs`'s `any_dispatch_mode_active` reads it.  Keeping it in the
+    guard's own module instead would leave the door unable to see it, which is
+    the arrangement that just failed.
+
+    Thread-local, because the mode stack is: suppressing dispatch on one thread
+    must not suppress it on another.  The depth is a *count*, not a flag,
+    because `no_dispatch()` nests -- `fake_tensor.py` enters it inside code that
+    is already inside it, and a boolean would be cleared by the inner exit.
+    """
+    import threading
+
+    _local = threading.local()
+
+    def _depth():
+        return getattr(_local, "depth", 0)
+
+    def _shim_dispatch_suppressed():
+        return _depth() > 0
+
+    def _shim_push_dispatch_suppression():
+        _local.depth = _depth() + 1
+        return _local.depth
+
+    def _shim_pop_dispatch_suppression():
+        d = _depth()
+        if d <= 0:
+            # Not defensive padding: an unbalanced pop means some guard's
+            # `__exit__` ran without its `__enter__`, and silently clamping to
+            # zero would leave dispatch suppressed or unsuppressed at random for
+            # the rest of the process.  Better to say so at the pop.
+            raise RuntimeError(
+                "torch._C._shim_pop_dispatch_suppression: popped with depth 0 -- "
+                "a dispatch-suppression guard exited without entering"
+            )
+        _local.depth = d - 1
+        return _local.depth
+
+    for name, fn_ in (
+        ("_shim_dispatch_suppressed", _shim_dispatch_suppressed),
+        ("_shim_push_dispatch_suppression", _shim_push_dispatch_suppression),
+        ("_shim_pop_dispatch_suppression", _shim_pop_dispatch_suppression),
+    ):
+        fn_.__name__ = name
+        fn_.__qualname__ = f"torch._C.{name}"
+        setattr(module, name, fn_)
+
+
+def _install_dispatcher_kernel_predicates(module) -> None:
+    """`torch._C._dispatch_has_computed_kernel_for_dispatch_key(name, key)`.
+
+    `fake_impls.py:1568`'s `has_meta` asks this once per fake dispatch, and
+    `fake_tensor.py:3077` calls it an *optimization*: a `True` answer means "run
+    the meta kernel, and if it raises `NotImplementedError` fall back", which is
+    what would happen anyway; a `False` answer means "skip trying".  So the
+    direction of the risk is not symmetric, and it is worth saying which way:
+
+    * a wrong `True` costs a raised-and-caught `NotImplementedError`;
+    * a wrong `False` **skips a kernel that exists** and sends the op down
+      `maybe_run_unsafe_fallback`, which raises `UnsupportedOperatorException`
+      outright when sizes are symbolic -- i.e. under `torch.export`, always.
+
+    **The rule was measured, not assumed.**  Every one of the 1783 `aten`
+    overloads on torch 2.13.0 answers `True` for `"Meta"`, with no exceptions,
+    and `prims` does too; the predicate distinguishes builtin operators from
+    custom-library ones that never registered a meta kernel.  So the rule is the
+    namespace, and `test_export4.py::test_has_computed_kernel_matches_upstream_across_the_whole_aten_surface`
+    re-derives it against upstream rather than trusting this paragraph.
+
+    **It answers for `Meta` and `CPU` and refuses every other key by name.**
+    Those two are the keys this shim can speak for: its kernels are reached
+    through one door (`_aten_dispatch`) that serves both, and an operator it
+    lacks raises `NotImplementedError` there, which is precisely the condition
+    the `True` answer promises the caller will handle.  For `CUDA`, `Autograd`,
+    `SparseCPU` and the rest, this shim has no kernels and no registry to
+    consult, and the two available lies are both bad -- `False` would say "no
+    such kernel exists" about upstream's dispatcher, and `True` would promise a
+    CUDA kernel that does not exist.  So it refuses, naming the key, rather than
+    guessing.  docs/EXPORT4.md §5.
+    """
+    answerable = ("Meta", "CPU")
+    builtin = ("aten::", "prims::", "prim::")
+
+    def _dispatch_has_computed_kernel_for_dispatch_key(name, dispatch_key):
+        key = str(dispatch_key)
+        if key not in answerable:
+            raise NotImplementedError(
+                "not implemented in torch._C shim: "
+                "_dispatch_has_computed_kernel_for_dispatch_key("
+                f"{name!r}, {key!r}) -- this shim can answer for "
+                f"{' and '.join(answerable)} only, because those are the keys "
+                "its single dispatcher door serves. It keeps no kernel registry "
+                "for other keys, so both available answers would be a claim it "
+                "cannot support. docs/EXPORT4.md §5"
+            )
+        return str(name).startswith(builtin)
+
+    _dispatch_has_computed_kernel_for_dispatch_key.__name__ = (
+        "_dispatch_has_computed_kernel_for_dispatch_key"
+    )
+    _dispatch_has_computed_kernel_for_dispatch_key.__qualname__ = (
+        "torch._C._dispatch_has_computed_kernel_for_dispatch_key"
+    )
+    module._dispatch_has_computed_kernel_for_dispatch_key = (
+        _dispatch_has_computed_kernel_for_dispatch_key
+    )
+    module._shim_has_computed_kernel_keys = answerable
+
+
+def _install_arg_parser_predicates(module) -> None:
+    """`torch._C._should_allow_numbers_as_tensors` -- a fixed table, not a policy.
+
+    `fake_tensor.py:2648` asks this on **every** dispatch that reaches a fake
+    tensor, so with it left as a synthesised `_Unimplemented` the whole of
+    `torch.export` stopped here.  It is the third wall docs/EXPORT4.md measured
+    and the cheapest of the three, because it is pure data.
+
+    Upstream's is a `static std::unordered_set<std::string>` in
+    `torch/csrc/utils/python_arg_parser.cpp`, consulted by
+    `should_allow_numbers_as_tensors(name)`.  It answers one question: for this
+    operator, may a Python number bind to a `Tensor` parameter?  That is true of
+    the arithmetic ops that have a `Scalar` overload and of the conversion ops,
+    and false of everything else -- `torch.relu(2)` is not a thing, while
+    `torch.add(t, 2)` is.
+
+    **The table below was derived by enumerating upstream, not transcribed from
+    the C++.**  Every name in `dir(torch.ops.aten)`, plus its `_` and `_out`
+    spellings, was passed to the real
+    `torch._C._should_allow_numbers_as_tensors` on torch 2.13.0 and the ones
+    answering `True` are exactly these 31.  The derivation is rerun by
+    `test_export4.py::test_should_allow_numbers_as_tensors_matches_upstream_name_for_name`,
+    which compares this table against upstream directly and so fails if a torch
+    upgrade adds a name -- a transcription would go stale silently instead.
+
+    Note the shape of the set: `add`/`sub`/`mul`/`div` and their long spellings
+    (`subtract`, `multiply`, `divide`, `true_divide`, `floor_divide`), each in
+    three forms (plain, in-place, `_out`), plus `to`, `copy`, `copy_` and
+    `_to_copy`.  `rsub` and `pow` are NOT in it, which is worth knowing before
+    anyone assumes "binary op" is the rule.
+    """
+    allowed = frozenset({
+        "_to_copy",
+        "add", "add_", "add_out",
+        "copy", "copy_",
+        "div", "div_", "div_out",
+        "divide", "divide_", "divide_out",
+        "floor_divide", "floor_divide_", "floor_divide_out",
+        "mul", "mul_", "mul_out",
+        "multiply", "multiply_", "multiply_out",
+        "sub", "sub_", "sub_out",
+        "subtract", "subtract_", "subtract_out",
+        "to",
+        "true_divide", "true_divide_", "true_divide_out",
+    })
+
+    def _should_allow_numbers_as_tensors(name):
+        return name in allowed
+
+    _should_allow_numbers_as_tensors.__name__ = "_should_allow_numbers_as_tensors"
+    _should_allow_numbers_as_tensors.__qualname__ = (
+        "torch._C._should_allow_numbers_as_tensors"
+    )
+    module._should_allow_numbers_as_tensors = _should_allow_numbers_as_tensors
+    # Readable so a test can diff the table against upstream rather than
+    # probing it one name at a time.
+    module._shim_numbers_as_tensors_names = tuple(sorted(allowed))
 
 
 def _install_dispatch_keys(module) -> None:
@@ -11136,6 +11353,9 @@ def _install_behaviour(module, dispatch, transcribed) -> None:
     module._set_generator_metaclass = _set_generator_metaclass
 
     _install_dispatch_keys(module)
+    _install_arg_parser_predicates(module)
+    _install_dispatcher_kernel_predicates(module)
+    _install_dispatch_suppression(module)
     _install_fx_node_base(module)
     # Seeded with the schemas that exist only in C++ upstream, or only in
     # torchgen's build-time generation -- this tree carries neither -- then

@@ -115,6 +115,7 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.embedding.default",
     "aten.empty.memory_format",
     "aten.empty_like.default",
+    "aten.empty_strided.default",
     "aten.eq.Scalar",
     "aten.eq.Tensor",
     "aten.erf.default",
@@ -542,10 +543,48 @@ fn any_dispatch_mode_active(py: Python<'_>) -> bool {
         // Nothing can have entered a mode, and the failure is not cached.
         Err(_) => return false,
     };
-    match module
+    let entered = match module
         .bind(py)
         .getattr(intern!(py, "_is_in_torch_dispatch_mode"))
     {
+        Ok(flag) => flag.is_truthy().unwrap_or(false),
+        Err(_) => false,
+    };
+    // `no_dispatch()` -- and it is checked only when a mode is actually
+    // entered, so the ordinary path (no mode anywhere) pays nothing for it.
+    //
+    // Upstream's `no_dispatch()` is `torch._C._DisableTorchDispatch`, and it
+    // exists so that code running *underneath* a mode can call operators
+    // without re-entering it. `fake_tensor.py:502` and
+    // `meta_utils.py:2009` both rely on this to build the meta tensor behind a
+    // `FakeTensor`: without the suppression, the constructor is dispatched back
+    // into the very `FakeTensorMode` that is trying to build it.
+    //
+    // Before the door consulted the mode stack at all there was nothing to
+    // suppress and the guard was a bare counter (docs/EXPORT.md §2.4 says so in
+    // as many words). Now there is, and this is the read half of that counter.
+    // docs/EXPORT4.md §5.
+    if !entered {
+        return false;
+    }
+    !dispatch_suppressed(py)
+}
+
+/// Is a `no_dispatch()` guard currently held on this thread?
+///
+/// Read through `torch._C`, not through any state of this crate, for
+/// `innermost_dispatch_mode`'s reason: the guard is Python-side bookkeeping and
+/// a second copy here could disagree with it.
+///
+/// A missing name answers `false` -- "nothing is suppressing" -- which is the
+/// pre-existing behaviour, so a bootstrap without the counter keeps working
+/// rather than losing its mode stack entirely.
+#[inline]
+fn dispatch_suppressed(py: Python<'_>) -> bool {
+    let Ok(c) = torch_c_module(py) else {
+        return false;
+    };
+    match c.bind(py).call_method0(intern!(py, "_shim_dispatch_suppressed")) {
         Ok(flag) => flag.is_truthy().unwrap_or(false),
         Err(_) => false,
     }
@@ -2438,6 +2477,7 @@ fn aten_dispatch_inner(
         "aten.scalar_tensor.default" => scalar_tensor_default(py, args, kwargs),
         "aten.embedding.default" => embedding_default(py, args, kwargs),
         "aten.empty.memory_format" => empty_memory_format(py, args, kwargs),
+        "aten.empty_strided.default" => empty_strided_default(py, args, kwargs),
         "aten.full.default" => full_default(py, args, kwargs),
         "aten.full_like.default" => full_like_default(py, args, kwargs),
         "aten.is_floating_point.default" => is_floating_point_default(py, args, kwargs),
@@ -5906,6 +5946,121 @@ fn ones_default(
     kwargs: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<Py<PyAny>> {
     zeros_or_ones(py, args, kwargs, "aten.ones.default", true)
+}
+
+/// `aten::empty_strided(SymInt[] size, SymInt[] stride, *, ScalarType? dtype=None,
+/// Layout? layout=None, Device? device=None, bool? pin_memory=None) -> Tensor`
+///
+/// This is the constructor behind every fake tensor: `meta_utils.py:2009` builds
+/// the meta tensor for a `FakeTensor` with it, so `torch.export` reaches it
+/// before it reaches anything interesting. docs/EXPORT.md §3.1 named it as the
+/// wall past the census, and docs/EXPORT4.md §4 is what it turned out to be.
+///
+/// **It serves the contiguous case and refuses every other stride by name.**
+/// That split is forced, not chosen, and both halves of it are in the type:
+///
+/// * `Repr::Meta { shape }` (tensor.rs) stores a shape and no stride. That is a
+///   deliberate narrowing recorded in docs/META.md §6 -- upstream's meta *does*
+///   carry stride -- and it means a meta tensor here cannot remember a stride it
+///   was asked for.
+/// * A dense tensor cannot carry an arbitrary caller-supplied stride either.
+///   `Tensor::from_storage` always allocates contiguous strides, and the
+///   constructor that would pair a custom `candle_core::Layout` with a storage
+///   is not public. `as_strided` works around this by *materialising* -- it
+///   gathers the requested elements out of an existing base into fresh
+///   contiguous storage -- and that trick is unavailable here, because
+///   `empty_strided` has no base to gather from.
+///
+/// So a non-contiguous request has no representation on either path, and the
+/// choice is between refusing it and returning a contiguous tensor while
+/// claiming it is strided. The second is the failure this repository keeps
+/// meeting: the caller asked for a layout, got a different one silently, and
+/// every later `.stride()` answer disagrees with what it asked for. `FakeTensor`
+/// exists precisely to reason about layout, so a fake tensor with a quietly
+/// wrong stride would make export's own metadata wrong rather than merely
+/// incomplete.
+///
+/// **The refusal names the op, the requested stride, and the contiguous stride
+/// it would have had to be**, so the reader is not left to work out why. It is
+/// pinned by `test_export4.py::test_empty_strided_refuses_a_non_contiguous_stride_by_name`.
+///
+/// The contiguous case is not a narrow one: a fake tensor built from a
+/// contiguous real tensor asks for exactly the contiguous stride, which is why
+/// closing only this half moves `torch.export` at all.
+///
+/// Zeros rather than uninitialised memory, for `zeros_or_ones`' reason -- the
+/// contract permits any bytes, and deterministic ones are the safe direction.
+fn empty_strided_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.empty_strided.default";
+    let size = shape_arg(OP, args, kwargs, 0, "size")?;
+    let stride = shape_arg(OP, args, kwargs, 1, "stride")?;
+    let dtype = dtype_arg(args, kwargs, 2, "dtype")?.unwrap_or(default_float());
+    reject_unsupported(OP, args, kwargs, &[(3, "layout"), (5, "pin_memory")])?;
+    let label = device_arg_or_label(args, kwargs, 4, "device", &PyDevice::cpu())?;
+
+    // Upstream's own length check, and its message, before anything else reads
+    // a dimension. Matched to `as_strided`'s next door, which was read off real
+    // refusals on 2.13.0.
+    if size.len() != stride.len() {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "mismatch in length of strides and shape",
+        ));
+    }
+    if size.iter().any(|&s| s < 0) {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "Trying to create tensor with negative dimension: sizes={size:?}"
+        )));
+    }
+    if stride.iter().any(|&s| s < 0) {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "empty_strided: Negative strides are not supported at the moment, \
+             got strides: {stride:?}"
+        )));
+    }
+
+    let dims: Vec<usize> = size.iter().map(|&s| s as usize).collect();
+
+    // The contiguous stride for this shape, right to left. A zero- or
+    // one-extent axis makes its own stride unobservable -- no two distinct
+    // index tuples differ in it -- so those axes are not allowed to decide the
+    // refusal. Upstream is likewise indifferent there, and being stricter would
+    // refuse shapes that are in fact perfectly contiguous, which is how a
+    // "narrow but honest" refusal turns into a wrong one.
+    let mut contiguous = vec![0isize; dims.len()];
+    let mut acc: isize = 1;
+    for i in (0..dims.len()).rev() {
+        contiguous[i] = acc;
+        acc *= dims[i] as isize;
+    }
+    let representable = dims
+        .iter()
+        .zip(stride.iter())
+        .zip(contiguous.iter())
+        .all(|((&d, &s), &c)| d <= 1 || s == c);
+
+    if !representable {
+        return Err(not_implemented(format!(
+            "{OP}: a non-contiguous stride is not representable in this shim -- \
+             asked for size={size:?} stride={stride:?}, and the only stride this \
+             shim can build for that size is the contiguous {contiguous:?}. \
+             A meta tensor here stores a shape and no stride (docs/META.md §6), \
+             and a dense tensor cannot be given a caller-supplied stride at all, \
+             so returning a contiguous tensor would silently answer a different \
+             layout than the one requested. docs/EXPORT4.md §4"
+        )));
+    }
+
+    if label.is_meta() {
+        return meta_result(py, dims, dtype);
+    }
+    let device = label.resolve()?;
+    let storage = PyDtype::new(dtype).storage(OP)?;
+    let tensor = Tensor::zeros(dims, storage, &device).map_err(|err| candle_err(OP, err))?;
+    finish(py, tensor, dtype)
 }
 
 fn empty_memory_format(

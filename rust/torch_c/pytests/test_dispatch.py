@@ -539,13 +539,23 @@ def test_fake_tensor_mode_is_reached_and_names_what_stops_it_returning_a_fake():
     """The harder half, and the honest state of it.
 
     The entrance is landed: `FakeTensorMode.__torch_dispatch__` runs and its
-    return value would be the result.  What it cannot yet do is *build* a fake,
-    and the reason is not the dispatcher -- it is `docs/EXPORT.md` §3.1, the
-    missing `aten.empty_strided` that `meta_utils.py:2008` uses to make the meta
-    tensor behind every fake.
+    return value would be the result.  What it cannot yet do is *build* a fake.
 
-    Written to demand more when that lands: the moment a fake comes back this
-    stops accepting a refusal.
+    **The named reason has moved once, and that is this test working.**  It was
+    `docs/EXPORT.md` §3.1's missing `aten.empty_strided`; `docs/EXPORT4.md`
+    closed that and five more behind it, and the reason is now `docs/EXPORT.md`
+    §3.3 -- `meta_utils.py:2071` asks a meta tensor for `untyped_storage()` so
+    two views of one base can share a fake storage, and `Repr::Meta` has no
+    storage handle to give.  That is a storage-model question rather than a
+    missing name, which is why it outlasted the six.
+
+    The accepted reasons are a list rather than a wildcard so that each move has
+    to be looked at.  Adding to it is the cheap thing to do and it is only
+    correct when the new reason has been read; a wildcard here would let the
+    fake-tensor road regress to name #0 silently.
+
+    Written to demand more when the wall falls: the moment a fake comes back
+    this stops accepting a refusal.
     """
     if not _available():
         return
@@ -565,11 +575,17 @@ def test_fake_tensor_mode_is_reached_and_names_what_stops_it_returning_a_fake():
         "entrance, not the fake tensor machinery"
     )
     assert shim["fake_refusal"] is not None
-    assert "empty_strided" in shim["fake_refusal"] or "is_inference_mode" in shim[
-        "fake_refusal"
-    ], (
-        "FakeTensorMode now fails for a reason docs/EXPORT.md §3 did not name: "
-        + str(shim["fake_refusal"])
+    accepted = (
+        # docs/EXPORT.md §3.3 / docs/EXPORT4.md §7 -- the current wall
+        "Cannot copy out of meta tensor",
+        # the earlier ones, kept so a regression names itself rather than
+        # merely failing
+        "empty_strided",
+        "is_inference_mode",
+    )
+    assert any(a in shim["fake_refusal"] for a in accepted), (
+        "FakeTensorMode now fails for a reason docs/EXPORT.md §3 and "
+        "docs/EXPORT4.md §7 did not name: " + str(shim["fake_refusal"])
     )
 
 
