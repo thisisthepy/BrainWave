@@ -33,6 +33,16 @@ side's executed claim was a **CPU** claim until §2 of that document put a graph
 on the Neural Engine. Executed and structurally validated are different claims
 and every one of these modules is careful about which it is making.
 
+`torchnative.export.qnn` and `torchnative.export.qnn_device` are the Android
+pair and are likewise not imported here: the first needs upstream ExecuTorch
+and the second needs `adb` and an `ANDROID_SERIAL`. They are also the one place
+in this package where the lowering is **not** ours -- docs/QNN.md §2 puts the
+whole ahead-of-time half on a Linux x86-64 host running upstream torch and
+upstream executorch, and keeps only the loading of the resulting `.pte` on this
+side. `torchnative.export.npu` is what carries the loaded artefact back into a
+real `transformers` model, and it is deliberately vendor-neutral so that the
+Apple, Android and Windows back ends share one front end rather than three.
+
 So a pass has to stand between the two, and `decompose` is it. The rules it
 applies are upstream's, read out of the vendored tree rather than restated
 here: see `torchnative.export.decompose` for which table, and for the list of
