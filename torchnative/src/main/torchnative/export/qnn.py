@@ -382,12 +382,20 @@ def lower(module, example_inputs, soc_model, out_path, fp16=True,
     if refusal is not None:
         raise QnnRefused(f"torchnative qnn: cannot lower here -- {refusal}")
 
-    torch = _import("torch")
+    # No `_import("torch")` here any more: nothing in this function touches
+    # `torch.` since the export moved inside executorch's helper, and
+    # executorch cannot import without torch, so the check below covers it.
     utils = _import("executorch.backends.qualcomm.utils.utils")
     specs = compiler_spec(soc_model, fp16=fp16, profile_level=profile_level)
-    exported = torch.export.export(module.eval(), tuple(example_inputs))
+    # `to_edge_transform_and_lower_to_qnn` takes the eager MODULE and calls
+    # `torch.export.export` itself (executorch/backends/qualcomm/utils/utils.py
+    # :450). Exporting first and handing it the ExportedProgram raises
+    # `Expected `mod` to be an instance of `torch.nn.Module``. Found by the
+    # first CI run -- it cannot be found here, because `lower()` refuses on
+    # every host this project can reach (docs/QNN.md §1.3).
+    module = module.eval()
     edge = utils.to_edge_transform_and_lower_to_qnn(
-        exported, tuple(example_inputs), specs
+        module, tuple(example_inputs), specs
     )
     report = delegation_report(edge)
     program = edge.to_executorch()

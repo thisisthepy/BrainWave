@@ -103,21 +103,41 @@ jobs:
           nvidia-smi || echo "no GPU here, as expected"
 
       - name: Install the CUDA toolkit
-        uses: Jimver/cuda-toolkit@v0.2.19
         id: cuda
-        with:
-          cuda: ${{ inputs.cuda_version || '12.6.0' }}
-          method: network
-          # `linux-local` would download the full ~4 GB installer. The network
-          # method fetches the packages, and the driver is deliberately not one
-          # of them: there is no GPU to drive. `cudarc`'s `dynamic-linking`
-          # links `-lcuda` against the toolkit's **stub** at
-          # `$CUDA_PATH/lib64/stubs/libcuda.so`, which its build script already
-          # puts on the link search path (cudarc 0.19.8, `link_searches`), and
-          # which is precisely why a link is possible on a machine with no
-          # driver while a *run* is not.
-          use-github-cache: false
-          use-local-cache: false
+        env:
+          # The human-facing form, e.g. `12.6.0`. apt wants `12-6` and the
+          # install prefix wants `12.6`; both are derived below rather than
+          # being three inputs that can disagree.
+          CUDA_VERSION: ${{ inputs.cuda_version || '12.6.0' }}
+        run: |
+          set -eux
+          # NOT the `cuda` meta-package, and not `Jimver/cuda-toolkit`'s
+          # default either. The first run of this job proved why: both pull in
+          # `nvidia-driver-560-open` and `nvidia-dkms-560-open`, whose DKMS
+          # build fails on a runner with no GPU, and dpkg then exits 100.
+          #
+          # The same log also showed `cuda-toolkit-12-6` SETTING UP CLEANLY
+          # before that failure, so this is the package the evidence points at:
+          # nvcc, the headers, the math libraries, and the driver stub -- and
+          # no kernel module.
+          #
+          # `cudarc`'s `dynamic-linking` links `-lcuda` against the toolkit's
+          # STUB at `$CUDA_PATH/lib64/stubs/libcuda.so`, which its build script
+          # already puts on the link search path (cudarc 0.19.8,
+          # `link_searches`). That stub is precisely why a LINK is possible on
+          # a machine with no driver while a RUN is not.
+          . /etc/os-release
+          distro="ubuntu${VERSION_ID//./}"
+          wget -q "https://developer.download.nvidia.com/compute/cuda/repos/${distro}/x86_64/cuda-keyring_1.1-1_all.deb"
+          sudo dpkg -i cuda-keyring_1.1-1_all.deb
+          sudo apt-get update -qq
+          mm="${CUDA_VERSION%.*}"          # 12.6.0 -> 12.6
+          sudo apt-get install -y --no-install-recommends "cuda-toolkit-${mm/./-}"
+          cuda_home="/usr/local/cuda-${mm}"
+          test -x "$cuda_home/bin/nvcc"
+          echo "CUDA_PATH=$cuda_home"       >> "$GITHUB_ENV"
+          echo "CUDA_HOME=$cuda_home"       >> "$GITHUB_ENV"
+          echo "$cuda_home/bin"             >> "$GITHUB_PATH"
 
       - name: The toolkit answers, and cudarc's version detection will work
         run: |
