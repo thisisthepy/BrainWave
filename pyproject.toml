@@ -1,3 +1,7 @@
+# Why the non-obvious fields are what they are: PROJECT.md.
+# Several of them have been set to the "obvious" value before and broke the
+# wheel; PROJECT.md has a section per field saying what broke.
+
 [build-system]
 requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
@@ -7,55 +11,14 @@ name = "torchnative"
 version = "0.0.13a0"
 description = "Run the real PyTorch ecosystem on device, not reimplementing it"
 readme = { file = "README.md", content-type = "text/markdown" }
-# This is upstream PyTorch's own `License-Expression` (torch 2.13.0) VERBATIM,
-# and our own code's licence is already one of its members. A platform wheel
-# carries the upstream Python tree, so declaring our licence alone would
-# describe a few thousand lines of this distribution and misdescribe two
-# million.
-#
-# This field CANNOT EXPRESS WHICH TERM IS OURS -- upstream's expression already
-# contains Apache-2.0 and MIT both, so ours is indistinguishable inside it and
-# changing our licence does not change one character of this line. Worth
-# writing down rather than rediscovering: the comment that stood here before
-# claimed MIT was "ours" while the rest was upstream's, which was never true.
-#
-# The upstream licence texts themselves ride along -- `tools/wheel/build.py`
-# injects torch's dist-info, third-party notices included -- so this line is
-# about the metadata being true, not about supplying attribution that was
-# missing.
+# Upstream torch 2.13.0's own License-Expression, verbatim. PROJECT.md.
 license = "Apache-2.0 AND Apache-2.0 WITH LLVM-exception AND BSD-2-Clause AND BSD-3-Clause AND BSL-1.0 AND MIT"
 license-files = ["LICENSE"]
 requires-python = ">=3.13"
 
-# `torch` itself is deliberately absent from this list. This distribution
-# **provides** `torch` -- the upstream Python tree with `_C` replaced
-# (DESIGN.md §2) -- rather than consuming somebody else's, so requiring it here
-# would be a package declaring a dependency on itself.
-#
-# Two earlier attempts at that line were both wrong, in opposite directions.
-# Empty with a module-scope `from torch import nn` installed cleanly and then
-# failed on import. Requiring `torch` unconditionally was unresolvable on
-# Android and iOS, where upstream publishes no wheel at all -- which is to say
-# on exactly the platforms this project exists for. The mistake underneath both
-# was reading upstream torch as a runtime dependency when it is a *comparison
-# baseline*: the golden harness needs one installed to diff against, and nothing
-# at runtime does.
-#
-# It follows that this cannot coexist with an installed PyTorch once the wheels
-# carry the tree. That is not a defect to route around; there is one `torch` on
-# a given interpreter, and this is a build of it.
-#
-# What *is* listed is upstream torch's own pure-Python dependency set, copied
-# from the `Requires-Dist` lines of the vendored `torch-2.13.0.dist-info`.
-# Shipping the tree means inheriting them: `torch/__init__.py:35` imports
-# `typing_extensions` before it reaches anything of ours, so the list being
-# empty is not a smaller promise, it is a wheel that installs and then raises
-# ModuleNotFoundError -- which is what the first platform wheel built here did.
-#
-# Upstream's CUDA and triton requirements are *not* copied. They are all guarded
-# `platform_system == "Linux"`, and this build has no CUDA path at all; carrying
-# them would drag ~2 GB of nvidia wheels onto every Linux install, including the
-# aarch64 boards that are the point of the exercise.
+# `torch` is absent on purpose -- this distribution PROVIDES it. What is listed
+# is upstream torch's own pure-Python `Requires-Dist`, minus its CUDA/triton
+# entries. PROJECT.md.
 dependencies = [
     "filelock",
     "typing-extensions>=4.10.0",
@@ -68,27 +31,11 @@ dependencies = [
 authors = [{ name = "thisisthepy" }]
 keywords = ["pytorch", "on-device", "edge", "federated-learning", "test-time-adaptation"]
 
-# Pre-alpha on purpose. The Python surface here is still a skeleton; the working
-# part of this project is the `torch._C` replacement under `rust/torch_c`. That
-# is built into the platform wheels (docs/platform/WHEEL.md) -- it was *not* in the
-# `0.0.1a0` `py3-none-any` distribution, which is why that one cannot
-# `import torch`. See the README's Status section.
-#
-# `Python :: 3.13` is the abi3 floor, not a ceiling: one `cp313-abi3` wheel is
-# loadable by 3.13 and every later CPython. It is listed alone because 3.13 is
-# the only version the suites have actually been run against.
+# 3.13 is the abi3 floor, not a ceiling: one `cp313-abi3` wheel serves 3.13 and
+# every later CPython. PROJECT.md.
 classifiers = [
     "Development Status :: 2 - Pre-Alpha",
     "Intended Audience :: Developers",
-    # 3.13 is the abi3 FLOOR, not the ceiling. One `cp313-abi3` wheel installs
-    # on 3.13 and on every later CPython -- that is what `setup.py`'s
-    # `py_limited_api` buys, and building a `cp314-abi3` wheel beside it would
-    # NARROW support rather than widen it.
-    #
-    # Measured, not assumed: the 0.0.12a0 macOS arm64 wheel installs and
-    # computes on 3.14.7 and on 3.15.0rc1 -- same wheel, `a @ b` sums to 134.0
-    # on both, `_aten_implemented()` answers on both.
-    # `test_release.py::test_the_abi3_wheel_loads_on_later_cpythons` holds it.
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
     "Programming Language :: Python :: 3.15",
@@ -97,18 +44,6 @@ classifiers = [
     "Operating System :: Android",
     "Operating System :: iOS",
     "Operating System :: MacOS",
-    # These two are now declared because the wheels exist and pip will hand
-    # them to a Linux or Windows user. Shipping a `manylinux_2_17_x86_64` and a
-    # `win_amd64` wheel while withholding the classifier would be the more
-    # misleading of the two options -- the platform tag already made the claim.
-    #
-    # What they have NOT had is an execution: no Linux box, no Windows box, and
-    # no container runtime on this machine. Verification stops at the artefact
-    # -- every import resolved, `tools/wheel/verify_linux.py` and
-    # `verify_windows.py` -- and the README's platform table marks them ⚠️
-    # rather than ✅ for exactly this reason. The earlier revision of this
-    # comment said they "have never been built", which was true when written
-    # and has not been since.
     "Operating System :: POSIX :: Linux",
     "Operating System :: Microsoft :: Windows",
 ]
@@ -119,72 +54,26 @@ Documentation = "https://github.com/thisisthepy/torchnative/tree/develop/docs"
 Source = "https://github.com/thisisthepy/torchnative"
 
 [project.optional-dependencies]
-# Aggregation, transport and privacy live behind this extra so that using
-# adaptation alone does not pull in the federated stack. See docs/design/DESIGN.md §10.
 federated = []
-
-# Backend selection, and the shape of it is forced by packaging rather than
-# chosen (docs/platform/WHEEL.md §13). A wheel filename carries no backend axis -- pip
-# selects on the python, abi and platform tags alone, and the `build tag` slot
-# it does have is a tie-breaker it never selects on -- so CPU, GPU and NPU
-# builds cannot sit side by side under one platform tag. Upstream torch hits
-# exactly this and answers it by leaving PyPI: its 24 files for one version are
-# 4 platforms by 6 pythons, and the CUDA builds live on a separate index.
-#
-# So one binary carries all three and chooses at runtime. That is possible here
-# because the accelerator paths are dlopened rather than linked: docs/devices/VULKAN.md
-# measured `libvulkan` absent from NEEDED, so a device with no driver loses the
-# GPU path and not `import torch`, and NNAPI and CoreML compile at runtime with
-# the same property.
-#
-# **These three install the same wheel.** An extra cannot change what is in it;
-# it can only add dependencies. What belongs here is whatever a backend needs on
-# the Python side at runtime -- and nothing does yet, because no accelerator has
-# left `cpu`: torch.device("vulkan") still refuses by name. The names are
-# declared so that `torchnative[gpu]` resolves rather than errors, and so the
-# eventual contents have somewhere to land. They are deliberately empty, not
-# accidentally.
+# cpu/gpu/npu install the SAME wheel and are empty deliberately: a wheel
+# filename has no backend axis, so one binary carries all three and selects at
+# runtime. PROJECT.md.
 cpu = []
 gpu = []
 npu = []
-
-# Upstream PyTorch, as the thing the golden harness diffs against -- not as a
-# runtime dependency. Pinned to what is actually compared: this shim implements
-# one release's `_C` surface, so a tree from another release expects different
-# symbols from it. Installing this alongside the wheels that carry our own tree
-# will conflict, which is why it is an extra and not a dependency.
+# Upstream torch as the golden harness's comparison baseline, not a runtime
+# dependency. Conflicts with the platform wheels by design. PROJECT.md.
 test = ["torch>=2.13,<2.14"]
 
-# Without this, setuptools auto-discovery treats `src` as the root and ships
-# `main/` and `test/` as importable packages -- which is what it did, so a wheel
-# built before this section answered `import main.torchnative` and not
-# `import torchnative`. The source-set layout has to be spelled out.
+# Without package-dir, auto-discovery ships `main/` and a wheel answers
+# `import main.torchnative`. PROJECT.md.
 [tool.setuptools]
 package-dir = { "" = "torchnative/src/main" }
 
+# Three upstream packages, not one -- `torch` alone looked fine for a long time
+# because PYTHONPATH shadowed only that one. PROJECT.md.
 [tool.setuptools.packages.find]
 where = ["torchnative/src/main"]
-# `torch` **is** shipped from this distribution, and that is the whole point:
-# the `dependencies = []` note above already says this cannot coexist with an
-# installed PyTorch "once the wheels carry the tree". This is the build that
-# carries it. The earlier revision of this line excluded `torch` on the grounds
-# that writing into another distribution's package breaks its uninstall -- true,
-# but it describes a *graft onto somebody else's torch*, which is not what
-# `src/main/torch` is. `vendor/vendor_torch.sh` assembles the whole upstream
-# Python tree here and `vendor/install_shim.sh` puts our `_C` in the hole it
-# leaves. Excluding it is what produced the `py3-none-any` distribution on PyPI,
-# which installs and then cannot `import torch`. See docs/platform/WHEEL.md.
-#
-# The tree is not in git (/.gitignore), so this has nothing to find until those
-# two scripts have run. `tools/wheel/build.py` refuses to build in that state
-# rather than quietly emitting the empty shell again.
-#
-# Three upstream packages, not one: `torch-<v>.dist-info/top_level.txt` names
-# `functorch`, `torch` and `torchgen`, and `import torch` reaches the second of
-# those (`torch/utils/_python_dispatch.py:13`) 2254 lines into
-# `torch/__init__.py`. Shipping only `torch` looked fine for a long time because
-# the PYTHONPATH workflow shadows site-packages for `torch` alone and let the
-# other two resolve to the reference installation underneath.
 include = [
     "torchnative*",
     "torch", "torch.*",
@@ -192,37 +81,18 @@ include = [
     "functorch", "functorch.*",
 ]
 
-# Everything under the package roots that is not a `.py` module: the `_C`
-# extension, upstream's `.pyi` stubs (note `torch/_C/` is a *directory* beside
-# the `torch/_C.abi3.so` extension -- importlib resolves the extension first,
-# and upstream ships exactly this shape), `py.typed`, the inductor Jinja
-# templates and linker script, the CMake config, and the
-# `_dynamo/graph_break_registry.json` read at runtime. A per-extension list was
-# tried first and silently dropped files, so this is a recursive catch-all with
-# an exclusion list instead.
-# `torchgen` in particular is mostly *not* Python: `torchgen/packaged/ATen/
-# native/native_functions.yaml` and the rest of `packaged/` are data files that
-# a per-extension list would have to enumerate.
+# A recursive catch-all, because a per-extension list silently dropped files.
+# PROJECT.md.
 [tool.setuptools.package-data]
 torch = ["**/*"]
 torchgen = ["**/*"]
 functorch = ["**/*"]
 torchnative = ["**/*"]
 
-# Byte-code caches are build droppings: running the test suite in the source
-# tree leaves ~400 of them under the vendored tree. `.pyc` compiled by the
-# *building* interpreter would also pin the wheel to that interpreter's magic
-# number, which is the one thing an abi3 wheel must not do.
+# `.pyc` would pin an abi3 wheel to the building interpreter's magic number;
+# `.DS_Store` is here because one reached a published wheel. PROJECT.md.
 [tool.setuptools.exclude-package-data]
-# `.DS_Store` is here because one got into a wheel. Finder writes it into any
-# directory it displays, `.gitignore` cannot help -- the vendored tree is not in
-# git -- and `build.py` skipped it only on the path that copies the tree, not on
-# the one setuptools takes. The copy at `torchnative/src/main/.DS_Store` is the
-# package root, so it landed at the archive root, and it was caught by the iOS
-# check comparing the two wheels member by member: 2,566 shared, 1 differing.
 "*" = ["**/__pycache__/**", "**/*.pyc", "**/*.pyo", "**/.DS_Store", ".DS_Store"]
 
 [tool.ppp]
-# Platform source sets follow the pypackpack layout: src/main is scanned for
-# top-level Python packages, which is what lets one package provide both
-# `torch` and `torchnative`. See docs/design/DESIGN.md §10.
+# pypackpack source-set layout; PROJECT.md.
