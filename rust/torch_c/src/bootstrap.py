@@ -75,6 +75,7 @@ import sys
 # *different* semantics that happens to agree in a single-threaded process --
 # docs/BACKWARD2.md §4.3.
 import threading
+import traceback as _traceback
 import types
 
 # ---------------------------------------------------------------------------
@@ -3739,6 +3740,29 @@ def install(module, surface_json: str, overloads_json: str, methods_json: str) -
     _install_repr_surface(module, varfns, module.TensorBase)
     _install_serialization(module)
 
+    # ---- docs/EXPORT.md §8's hand-off ------------------------------------
+    #
+    # **Last, and the position is load-bearing.** These eight install the 32
+    # `torch.export` census names over the placeholders that the stub tables
+    # and the submodule synthesiser leave behind, so they have to run after
+    # every one of those. The first attempt put them beside
+    # `_install_dispatch_keys` -- which is where docs/EXPORT.md §8 proposed
+    # them -- and `_install_dynamo_bool` was silently undone: the name was in
+    # `torch._C._dynamo.guards.__dict__` afterwards and its value was the
+    # `_Unimplemented` the submodule pass had written over it. Nothing raised;
+    # `torch.export` simply stopped at that name again. That is the same
+    # install-order hazard as the `_len_torch_dispatch_stack` table row §8 item
+    # 3 deletes, arriving from the other side, and it is why this block is
+    # here rather than three thousand lines earlier.
+    _install_tls(module, _put)
+    _install_mode_stack(module, _put)
+    _install_tensor_predicates(module, _put)
+    _install_functorch(module, _put)
+    _install_profiler(module, _put)
+    _install_dynamo_bool(module, _put)
+    _install_inference_mode(module, _put)
+    _install_raii_guards(module, _put)
+
     # PyO3 emits `__all__` on `#[pymodule]` modules, so `from torch._C import *`
     # -- which is how most of the `torch` namespace comes into being
     # (`torch/__init__.py:445`) -- copies only what is listed. Setting an
@@ -4826,7 +4850,7 @@ def _install_tensor_conversions(module, tensorbase, dispatch) -> None:
         kwargs = dict(kwargs)
         copy = bool(kwargs.pop("copy", False))
         kwargs.pop("non_blocking", None)
-        kwargs.pop("memory_format", None)
+        _refuse_unrepresentable_memory_format("TensorBase.to", kwargs)
         dtype = kwargs.pop("dtype", None)
         device = kwargs.pop("device", None)
         other = kwargs.pop("other", None)
@@ -4973,9 +4997,10 @@ def _install_tensor_conversions(module, tensorbase, dispatch) -> None:
 
     def type_(self, dtype=None, non_blocking=False, **kwargs):
         # `non_blocking` is accepted and ignored for `to`'s reason: there is no
-        # async copy engine here. `memory_format` likewise -- upstream accepts
-        # it keyword-only and this shim is contiguous-only.
-        kwargs.pop("memory_format", None)
+        # async copy engine here. `memory_format` is accepted only for the two
+        # formats that ask for what the result already is; the channels-last
+        # pair refuses rather than being dropped (docs/EXPORT5.md §3).
+        _refuse_unrepresentable_memory_format("TensorBase.type", kwargs)
         kwargs.pop("async", None)
         if kwargs:
             raise TypeError(
@@ -7429,7 +7454,15 @@ _DISCOVERED_RETURNS = {
     "_has_torch_function_unary": False,
     "_has_torch_function_variadic": False,
     # The *dispatch*-mode stack, which `torch/utils/_python_dispatch.py`
-    # consults. Nothing pushes onto it here, so it is empty and disabled.
+    # consults. **Its `_len_torch_dispatch_stack: 0` row used to be here and is
+    # gone** -- docs/EXPORT.md §8 item 3. The comment that stood here said
+    # "nothing pushes onto it here, so it is empty and disabled", which was true
+    # when it was written and stopped being true the moment `torch.export`
+    # arrived: `FakeTensorMode` and `ProxyTorchDispatchMode` both push.
+    # `_install_mode_stack` below installs the real stack, and leaving the row
+    # would have let a constant `0` win over it depending on install order --
+    # making `with FakeTensorMode():` a block that entered, reported itself
+    # absent, and changed nothing (docs/EXPORT.md §2.2).
     #
     # Its torch-*function* sibling used to be beside it as another pair of
     # constants (`_len_torch_function_stack: 0`,
@@ -7439,7 +7472,6 @@ _DISCOVERED_RETURNS = {
     # answered zero would have made `with torch.device("meta"):` a block that
     # succeeded and changed nothing. docs/META.md §8.
     "_is_torch_function_all_disabled": False,
-    "_len_torch_dispatch_stack": 0,
 }
 
 # Build-configuration flags: plain `bool` *values* upstream, not callables, so
@@ -11553,6 +11585,10 @@ def _install_behaviour(module, dispatch, transcribed) -> None:
 
     _install_autocast(module)
     _install_default_generator(module)
+    _install_backend_flag_toggles(module)
+    _install_functionality_to_backend_keys(module)
+    _install_dispatch_key_set(module)
+
 
 
 # Upstream's own device vocabulary for the autocast entry points, transcribed
@@ -11565,6 +11601,1160 @@ _AUTOCAST_DEVICE_TYPES = (
     "ve", "fpga", "maia", "xla", "lazy", "vulkan", "mps", "meta", "hpu",
     "mtia", "privateuseone",
 )
+
+
+def _refuse_unrepresentable_memory_format(op, kwargs):
+    """Pop `memory_format`, and **refuse the two this build cannot produce.**
+
+    `contiguous_format` and `preserve_format` are accepted and dropped, which is
+    honest: every tensor this shim can build is contiguous, so both of them ask
+    for what the result already is.
+
+    `channels_last` and `channels_last_3d` were being dropped in the same
+    breath, and that was a silent wrong answer on the public surface --
+    `x.to(memory_format=torch.channels_last)` returned a contiguous tensor and
+    said nothing, so a caller held something it believed was channels-last and
+    every later `is_contiguous(memory_format=channels_last)` disagreed with what
+    it had asked for.
+
+    It was found by `test_export5.py::test_channels_last_is_false_as_a_fact_
+    because_the_build_cannot_make_one`, which is a test written to check the
+    *premise* of an answer rather than the answer -- the premise being "no
+    tensor in this build can be in that layout" (docs/EXPORT5.md §3). The
+    premise was false by way of this door, and nothing else in the suite could
+    have noticed, because dropping an argument raises nothing.
+
+    candle carries a `Layout` and no memory-format tag, and no kernel here reads
+    one, so there is no representation to return. Refusing is the only answer
+    that is not a claim.
+    """
+    fmt = kwargs.pop("memory_format", None)
+    if fmt is None:
+        return
+    name = getattr(fmt, "_shim_name", None) or str(fmt)
+    name = name.rsplit(".", 1)[-1]
+    if name in ("contiguous_format", "preserve_format"):
+        return
+    raise NotImplementedError(
+        f"not implemented in torch._C shim: {op}(memory_format=torch.{name}) -- "
+        f"this build has no channels-last representation at all (candle carries "
+        f"a Layout and no memory-format tag, and no kernel here reads one), so "
+        f"the request cannot be honoured. It is refused rather than dropped: "
+        f"dropping it returned a contiguous tensor while the caller believed it "
+        f"had asked for another layout (bootstrap.py, docs/EXPORT5.md §3)"
+    )
+
+
+def _install_backend_flag_toggles(module) -> None:
+    """The `_get_*` / `_set_*` pairs behind `torch.backends.<name>.flags()`.
+
+    `torch.export` enters several of these context managers before it traces
+    anything, so each was a raising stub that stopped export outright
+    (docs/EXPORT5.md §4).  They are *not* new capabilities: every one of them
+    reports on a backend `_BUILD_FLAGS` above already answers `False` for, and
+    the point of implementing them is that a flag pair is the one shape where
+    a stub and a lie are easy to confuse.
+
+    **Every getter here is derived from `_BUILD_FLAGS`, not from upstream's
+    answer**, and on two of them those differ -- which is the whole reason this
+    docstring exists rather than a table of transcribed constants:
+
+      * `_get_mkldnn_enabled()` is `True` on upstream 2.13.0 *on this machine*,
+        where `torch.backends.mkldnn.is_available()` is `False`.  Upstream's
+        flag is a user **preference** that survives the backend being absent.
+        Here it is `False`, because `_has_mkldnn` is `False` and there is no
+        MKLDNN to prefer; reporting `True` would say a backend exists.
+      * `_get_cudnn_allow_tf32()` is `True` upstream for the same reason, and
+        `False` here for the same reason -- `_has_cudnn` is `False`.
+
+    `_get_onednn_allow_tf32()` answers `None`, and that is upstream's own
+    answer measured on a build without oneDNN, not an invention.
+
+    **Every setter accepts the value the getter already reports and refuses
+    every other value by name.**  That asymmetry is the load-bearing part.  A
+    setter that quietly accepted `True` would let
+    `torch.backends.mkldnn.flags(_enabled=True)` return having changed nothing,
+    which is `docs/COMPILE.md` §5's silent-fallback shape and exactly what
+    `_len_torch_dispatch_stack`'s constant `0` did (docs/EXPORT.md §2.2): a
+    block that entered, reported itself absent, and changed nothing.  Refusing
+    means a caller that really wants MKLDNN is told it is not here.
+
+    The accept-the-current-value half is not a loophole, it is what makes the
+    save/restore pattern work: `torch/backends/mkldnn/__init__.py::set_flags`
+    reads the four getters on entry and writes them back on exit, so the exit
+    write is always a no-op and must not raise.
+    """
+
+    def _toggle(name, current, *, kind="flag"):
+        """A getter/setter pair reporting `current` and refusing to change it."""
+
+        def getter():
+            return current
+
+        def setter(value):
+            if bool(value) == bool(current):
+                return
+            raise NotImplementedError(
+                f"torch._C._set_{name}({value!r}): this build has no such "
+                f"backend -- torch._C._has_{name.split('_')[0]} and the "
+                f"_BUILD_FLAGS table above both answer that it is absent, so "
+                f"the {kind} cannot be turned on. Refused rather than accepted "
+                f"and ignored, which would let torch.backends flags() return "
+                f"having changed nothing (bootstrap.py, docs/EXPORT5.md §4)"
+            )
+
+        return getter, setter
+
+    for flag, current in (
+        ("mkldnn_enabled", False),
+        ("mkldnn_deterministic", False),
+        ("nnpack_enabled", False),
+        ("cudnn_benchmark", False),
+        ("cudnn_allow_tf32", False),
+    ):
+        getter, setter = _toggle(flag, current)
+        setattr(module, f"_get_{flag}", getter)
+        setattr(module, f"_set_{flag}", setter)
+
+    # oneDNN's tf32 flag answers `None` rather than `False`, and that is
+    # upstream's own answer on a build without oneDNN (measured on 2.13.0,
+    # darwin/arm64: `torch._C._get_onednn_allow_tf32()` is `None`). `None` here
+    # means "not applicable", which is a different claim from "off", and this
+    # build is in the same position that answer describes.
+    def _get_onednn_allow_tf32():
+        return None
+
+    def _set_onednn_allow_tf32(value):
+        if not value:
+            return
+        raise NotImplementedError(
+            "torch._C._set_onednn_allow_tf32(True): there is no oneDNN in this "
+            "build, so there is no tf32 path to allow. The getter answers None "
+            "-- not applicable -- which is upstream's own answer on a build "
+            "without oneDNN (bootstrap.py, docs/EXPORT5.md §4)"
+        )
+
+    module._get_onednn_allow_tf32 = _get_onednn_allow_tf32
+    module._set_onednn_allow_tf32 = _set_onednn_allow_tf32
+
+    # cuDNN's depthwise-convolution kernel selector is a *string*, not a bool
+    # ("auto" on 2.13.0), so it does not fit `_toggle` and gets the same
+    # accept-what-you-report / refuse-the-rest treatment spelled out.
+    def _get_cudnn_depthwise_kernel():
+        return "auto"
+
+    def _set_cudnn_depthwise_kernel(value):
+        if value == "auto":
+            return
+        raise NotImplementedError(
+            f"torch._C._set_cudnn_depthwise_kernel({value!r}): there is no "
+            f"cuDNN in this build, so there is no depthwise kernel to select. "
+            f"Only 'auto' -- the value the getter reports, so that "
+            f"torch.backends' save/restore round trip does not raise -- is "
+            f"accepted (bootstrap.py, docs/EXPORT5.md §4)"
+        )
+
+    module._get_cudnn_depthwise_kernel = _get_cudnn_depthwise_kernel
+    module._set_cudnn_depthwise_kernel = _set_cudnn_depthwise_kernel
+
+    # `_get_fp32_precision_getter(backend, op)` / `_set_fp32_precision_setter(
+    # backend, op, precision)`. Upstream answers "none" for every (backend, op)
+    # pair on this machine, measured; "none" means full fp32 with no reduced
+    # -precision substitution, which is exactly what every kernel in this shim
+    # does -- there is no tf32, no bf16 accumulation and no reduced-precision
+    # GEMM path anywhere in aten.rs. So "none" is a fact about this build and
+    # not a copy of upstream's default.
+    def _get_fp32_precision_getter(backend, op):
+        return "none"
+
+    def _set_fp32_precision_setter(backend, op, precision):
+        if precision == "none":
+            return
+        raise NotImplementedError(
+            f"torch._C._set_fp32_precision_setter({backend!r}, {op!r}, "
+            f"{precision!r}): every kernel in this shim computes fp32 in fp32 "
+            f"-- there is no tf32, bf16-accumulation or other reduced-precision "
+            f"path to select -- so only 'none' can be honoured. Refused rather "
+            f"than accepted and ignored, which would silently promise a "
+            f"precision change that never happens (bootstrap.py, "
+            f"docs/EXPORT5.md §4)"
+        )
+
+    module._get_fp32_precision_getter = _get_fp32_precision_getter
+    module._set_fp32_precision_setter = _set_fp32_precision_setter
+
+
+def _install_dispatch_key_set(module) -> None:
+    """`torch._C._dispatch_key_set(tensor)` -- **a string, and device-only.**
+
+    `fake_tensor.py:2083` is the only reader, and it does exactly one thing with
+    the result:
+
+        synth_key_set = torch._C._dispatch_key_set(synth_output)
+        key_set = torch._C._dispatch_key_set(output)
+        if synth_key_set != key_set:
+            raise _BypassDispatchCache("dispatch_key_set mismatch")
+
+    So the contract is an **equality token**: two tensors that dispatch the same
+    way must compare equal and two that do not must not.  It returns a `str`
+    upstream, not a `DispatchKeySet` -- measured on 2.13.0, and worth stating
+    because the name says otherwise and a `DispatchKeySet` would have been the
+    obvious wrong guess.
+
+    **The rule was measured, not reasoned.**  Ten tensors varying dtype
+    (float32/float64/int64/bool/complex64), rank, `requires_grad` and
+    view-ness across CPU and meta produced exactly two distinct answers, and
+    the only input that changed the answer was the **device**:
+
+        CPU   ->  DispatchKeySet(CPU, ADInplaceOrView, AutogradCPU, AutocastCPU)
+        meta  ->  DispatchKeySet(Meta, ADInplaceOrView, AutogradMeta)
+
+    Note what is *not* in the rule.  `requires_grad=True` does not change it --
+    the Autograd key is on the tensor whether or not it is set -- and neither
+    does dtype.  A version keyed on `requires_grad` would have looked more
+    thorough and been wrong, and it would have failed only as a *cache miss*,
+    which is a silent slowdown rather than an error.  And meta carries **no**
+    Autocast key while CPU does, which is the asymmetry a hand-written table
+    would most likely have smoothed over.
+
+    The strings are upstream's own spelling.  Equality is all the caller needs,
+    so a different spelling would work; matching means a human reading a debug
+    log sees the same text on both sides.
+
+    Only the two devices this shim has are answered, and **every other device
+    refuses by name** rather than being given a plausible key set -- the same
+    reasoning as `_dispatch_has_computed_kernel_for_dispatch_key`
+    (docs/EXPORT4.md §6.3): a wrong key set here is a silently wrong cache
+    entry, and this shim has no kernels behind those devices to describe.
+    """
+
+    def _dispatch_key_set(tensor):
+        device = getattr(getattr(tensor, "device", None), "type", None)
+        if device == "cpu":
+            return "DispatchKeySet(CPU, ADInplaceOrView, AutogradCPU, AutocastCPU)"
+        if device == "meta":
+            return "DispatchKeySet(Meta, ADInplaceOrView, AutogradMeta)"
+        raise NotImplementedError(
+            f"torch._C._dispatch_key_set: this shim can describe the dispatch "
+            f"keys of a cpu or meta tensor and this one is on {device!r}. The "
+            f"answer is used to decide whether two tensors dispatch alike, so a "
+            f"guess here would be a silently wrong fake-tensor cache entry "
+            f"rather than an error (bootstrap.py, docs/EXPORT5.md §4)"
+        )
+
+    module._dispatch_key_set = _dispatch_key_set
+
+
+def _install_functionality_to_backend_keys(module) -> None:
+    """`torch._C._functionality_to_backend_keys(k)` -- derived from the enum.
+
+    `fake_tensor.py` reaches it while building its dispatch-key set.  Upstream
+    returns, for a *functionality* key, the 16 backend-specific keys that
+    functionality has -- `Dense` -> `[CPU, CUDA, HIP, XLA, MPS, IPU, XPU, HPU,
+    VE, Lazy, MTIA, MAIA, PrivateUse1..3, Meta]`, `Sparse` -> the `Sparse*`
+    spellings of the same 16, `AutogradFunctionality` -> the `Autograd*` ones.
+
+    **It is computed from `_install_dispatch_keys`' own enum rather than
+    transcribed**, which is the same choice `_should_allow_numbers_as_tensors`
+    made in docs/EXPORT4.md §6.2 and for the same reason: a transcribed table
+    goes stale silently, and this one is a pure function of a list that already
+    exists three thousand lines above.  The backend order is upstream's, read
+    off the enum's own numeric order rather than re-listed here.
+
+    **A key that is not a functionality key answers `[key]` -- itself -- and not
+    the empty list.** That was written the other way round first, on the
+    reasoning that "no backend spellings" meant "nothing to return"; measuring
+    upstream showed `CPU -> [CPU]`, `Meta -> [Meta]`, `ADInplaceOrView ->
+    [ADInplaceOrView]`, `Undefined -> [Undefined]`, without exception.
+
+    It is not a detail. `torch/utils/_python_dispatch.py::_push_mode` calls this
+    with `DispatchKey.PreDispatch` -- which is a plain key, not a functionality
+    one -- and uses the result to uncache per-dispatch-key handlers. The empty
+    list makes that a cache invalidation that invalidates nothing, which is the
+    "entered and changed nothing" shape docs/EXPORT.md §2.2 is about, on the
+    export path. It was found by
+    `test_export5.py::test_functionality_to_backend_keys_matches_upstream_key_for_key`,
+    which exists because nullifying this whole function went **uncaught**
+    (docs/EXPORT5.md §11).
+    """
+    DispatchKey = module.DispatchKey
+
+    #: The 16 backend suffixes, in upstream's own enum order.
+    _BACKENDS = (
+        "CPU", "CUDA", "HIP", "XLA", "MPS", "IPU", "XPU", "HPU", "VE",
+        "Lazy", "MTIA", "MAIA", "PrivateUse1", "PrivateUse2", "PrivateUse3",
+        "Meta",
+    )
+
+    #: functionality key name -> how a backend spelling of it is written.
+    _SPELLINGS = {
+        "Dense": lambda b: b,
+        "Quantized": lambda b: f"Quantized{b}",
+        "Sparse": lambda b: f"Sparse{b}",
+        "SparseCsr": lambda b: f"SparseCsr{b}",
+        "NestedTensor": lambda b: f"NestedTensor{b}",
+        "AutogradFunctionality": lambda b: f"Autograd{b}",
+    }
+
+    def _functionality_to_backend_keys(key):
+        spell = _SPELLINGS.get(getattr(key, "name", None))
+        if spell is None:
+            return [key]
+        out = []
+        for backend in _BACKENDS:
+            member = getattr(DispatchKey, spell(backend), None)
+            if member is not None:
+                out.append(member)
+        return out
+
+    module._functionality_to_backend_keys = _functionality_to_backend_keys
+
+
+# ---------------------------------------------------------------------------
+# The `torch.export` census names -- docs/EXPORT.md §8's hand-off, paid.
+# ---------------------------------------------------------------------------
+#
+# These 32 `torch._C` names lived in
+# `torchnative/src/main/torchnative/export/upstream.py`, which installed them
+# by monkey-patching `torch._C` *after* `import torch`. docs/EXPORT.md §8 said
+# that was the wrong home and gave the patch; docs/EXPORT4.md §10 listed paying
+# it as the next mechanical task. This is it.
+#
+# **The reason it had to move is not tidiness.** Patching after `import torch`
+# forces a `rebind()` pass over roughly forty `from torch._C import ...`
+# bindings that other torch modules have already made -- including aliases like
+# `torch/utils/_mode_utils.py:15`'s `no_dispatch = torch._C._DisableTorchDispatch`,
+# which is why that pass had to match by object identity rather than by name.
+# Every one of those bindings is made *after* this file runs, so all of it
+# disappears here. `rebind`, `install`, `InstallReport`, `installed_names`,
+# `_is_ours`, `_mark_ours` and `_MARK` existed only to describe and undo a
+# runtime patch and have no meaning in a bootstrap; they are dropped rather
+# than carried.
+#
+# **What was measured before this moved, and is the reason it matters:**
+# `rust/torch_c/pytests/export_sweep.py` run against the shim stopped at census
+# name #0 (`torch._C._unset_dispatch_mode`) on all 25 architectures, because
+# the sweep's subprocess never called `upstream.install()`. Every export
+# measurement in docs/EXPORT.md and docs/EXPORT4.md was taken under that
+# monkey-patch, and docs/EXPORT4.md §1.1 said so. After this, the names are
+# simply there.
+#
+# The functions keep their `(C, put)` signature and are copied **verbatim**
+# rather than rewritten to take `module` alone. docs/EXPORT.md §8 proposed the
+# rewrite, and the verbatim copy is preferred here for one reason: this is a
+# move of nine hundred lines of working, tested behaviour, and a move that
+# changes no line cannot change behaviour. `_put` below is the four-line
+# adapter that buys that. Renaming and re-signaturing them is a separate,
+# reviewable change and should not ride along inside a bisect boundary that is
+# supposed to mean "the same code, in its final home".
+#
+# `set_eval_frame` is not touched -- docs/EXPORT.md §8 item 4, and
+# docs/COMPILE.md §5.1 is why its refusal must outlive any symbol-filling on
+# this path. Nothing below goes near it.
+
+
+def _put(owner, name, value, qual=None, only_if_stub=False):
+    """`upstream.py`'s `put`, with the bookkeeping removed.
+
+    That module installed every name unconditionally and reported which ones
+    had been placeholders, because it was describing a runtime patch that could
+    be inspected and undone. Here there is no report to keep and no patch to
+    undo: this is where the names are defined.
+
+    `only_if_stub` survives because one caller needs it --
+    `_functorch.is_functorch_wrapped_tensor` is already implemented elsewhere in
+    this file and must not be displaced (docs/EXPORT.md §2.2, row 29).
+    """
+    if only_if_stub and not _is_stub(getattr(owner, name, None)):
+        return
+    setattr(owner, name, value)
+
+
+class _Tls(threading.local):
+    """Per-thread dispatcher bookkeeping.
+
+    Upstream keeps these in C++ TLS (`c10::impl::LocalDispatchKeySet`, the
+    `TorchDispatchModeTLS` stack).  `threading.local` is the same lifetime with
+    the same visibility rules, which matters: `torch/utils/_python_dispatch.py`
+    enters and exits these in `with` blocks on whatever thread is running, and
+    a module-level global would leak one thread's mode stack into another's.
+    """
+
+    def __init__(self) -> None:
+        self.included = None      # DispatchKeySet, filled on first use
+        self.excluded = None      # DispatchKeySet
+        self.mode_stack = []      # user dispatch modes, innermost last
+        self.infra_modes = {}     # _TorchDispatchModeKey -> mode
+        self.only_lift_cpu_tensors = False
+        self.reapply_views = False
+        self.meta_in_tls_dispatch_include = False
+        self.inference_mode = False
+
+
+_TLS = _Tls()
+
+
+def _keyset(module):
+    return module.DispatchKeySet
+
+
+def _included(module):
+    if _TLS.included is None:
+        _TLS.included = _keyset(module)()
+    return _TLS.included
+
+
+def _excluded(module):
+    if _TLS.excluded is None:
+        _TLS.excluded = _keyset(module)()
+    return _TLS.excluded
+
+
+def _is_stub(obj) -> bool:
+    """Is this name a placeholder rather than an implementation?
+
+    Three shapes count, and the bootstrap makes all three.  `_Unimplemented` is
+    what it leaves when the stubs say nothing about a name.  `_make_function`
+    leaves an ordinary Python function whose body raises `NotImplementedError`.
+    `_make_property` leaves a `property` whose getter does the same.  None of
+    them may be *called* to find out -- calling raises, and `__bool__` on an
+    `_Unimplemented` raises too -- so this reads the code object's constants
+    instead of probing behaviour.
+    """
+    if obj is None:
+        return True
+    # `upstream.py`'s version had an `_is_ours` branch here, for objects that
+    # module had itself installed. There is no such thing in the bootstrap:
+    # this runs once, before anything could have been installed, so the
+    # question cannot arise and the branch is dropped rather than carried.
+    if type(obj).__name__ == "_Unimplemented":
+        return True
+    if isinstance(obj, property):
+        return _is_stub(obj.fget)
+    try:
+        code = getattr(obj, "__code__", None)
+    except Exception:
+        # `torch/_classes.py` synthesises attributes on access and raises for
+        # anything unregistered.  A module that answers every name is not a
+        # module whose bindings need repointing.
+        return False
+    if code is None:
+        return False
+    return any(
+        isinstance(c, str) and "not implemented in torch._C shim" in c
+        for c in code.co_consts
+    )
+
+
+def _install_tls(C, put) -> None:
+    """`_dispatch_tls_*`, the four names round 19 died on.
+
+    Round 18's `_dispatch_tls_local_exclude_set` returning `None` is the whole
+    of COMPILE.md's stopping point: `meta_utils.py:1061` does
+    ``...local_exclude_set().has(DispatchKey.ADInplaceOrView)``.  A real
+    `DispatchKeySet` -- which `_install_dispatch_keys` already builds -- answers
+    it, and the answer is `False`, which is the truth for a shim that has
+    entered no guard.
+    """
+    KeySet = C.DispatchKeySet
+
+    def _dispatch_tls_local_include_set():
+        return _included(C)
+
+    def _dispatch_tls_local_exclude_set():
+        return _excluded(C)
+
+    def _dispatch_tls_is_dispatch_key_included(key):
+        return _included(C).has(key)
+
+    def _dispatch_tls_is_dispatch_key_excluded(key):
+        return _excluded(C).has(key)
+
+    def _dispatch_tls_set_dispatch_key_included(key, included):
+        """The write half of `_dispatch_tls_is_dispatch_key_included`.
+
+        `DispatchKeySet` is immutable here (bootstrap.py builds it on a
+        `frozenset`, and `add`/`remove` return new sets), so this rebinds
+        `_TLS.included` rather than mutating it -- which is also what makes the
+        key-state guards' save/restore a matter of holding a reference.
+
+        It is a real write and not a counter: with it inert,
+        `_dispatch_tls_is_dispatch_key_included` would keep answering `False`
+        for a key something had just included, which is the read/write pair
+        disagreeing in the same way `_set_conj` would have.
+        """
+        _TLS.included = (
+            _included(C).add(key) if included else _included(C).remove(key)
+        )
+
+    def _functionalization_reapply_views_tls():
+        # Upstream: whether the functionalization pass should re-apply view ops
+        # rather than materialise copies.  A flag read by
+        # `torch/_subclasses/functional_tensor.py`; nothing here sets it, so
+        # `False` is the state, not a stand-in.
+        return _TLS.reapply_views
+
+    def _meta_in_tls_dispatch_include():
+        return _TLS.meta_in_tls_dispatch_include
+
+    def _set_meta_in_tls_dispatch_include(value):
+        _TLS.meta_in_tls_dispatch_include = bool(value)
+
+    put(C, "_dispatch_tls_local_include_set", _dispatch_tls_local_include_set)
+    put(C, "_dispatch_tls_local_exclude_set", _dispatch_tls_local_exclude_set)
+    put(C, "_dispatch_tls_is_dispatch_key_included",
+        _dispatch_tls_is_dispatch_key_included)
+    put(C, "_dispatch_tls_is_dispatch_key_excluded",
+        _dispatch_tls_is_dispatch_key_excluded)
+    put(C, "_dispatch_tls_set_dispatch_key_included",
+        _dispatch_tls_set_dispatch_key_included)
+    put(C, "_functionalization_reapply_views_tls",
+        _functionalization_reapply_views_tls)
+    put(C, "_meta_in_tls_dispatch_include", _meta_in_tls_dispatch_include)
+    put(C, "_set_meta_in_tls_dispatch_include", _set_meta_in_tls_dispatch_include)
+
+    class _ForceDispatchKeyGuard:
+        """`with _ForceDispatchKeyGuard(include, exclude):` -- set both, restore both."""
+
+        __module__ = "torch._C"
+
+        def __init__(self, include=None, exclude=None):
+            self._include = include
+            self._exclude = exclude
+            self._saved = None
+
+        def __enter__(self):
+            self._saved = (_included(C), _excluded(C))
+            if self._include is not None:
+                _TLS.included = KeySet(self._include)
+            if self._exclude is not None:
+                _TLS.excluded = KeySet(self._exclude)
+            return self
+
+        def __exit__(self, *exc):
+            _TLS.included, _TLS.excluded = self._saved
+            return False
+
+    class _ExcludeDispatchKeyGuard:
+        __module__ = "torch._C"
+
+        def __init__(self, keyset):
+            self._keyset = keyset
+            self._saved = None
+
+        def __enter__(self):
+            self._saved = _excluded(C)
+            _TLS.excluded = self._saved | KeySet(self._keyset)
+            return self
+
+        def __exit__(self, *exc):
+            _TLS.excluded = self._saved
+            return False
+
+    class _IncludeDispatchKeyGuard:
+        __module__ = "torch._C"
+
+        def __init__(self, key):
+            self._key = key
+            self._saved = None
+
+        def __enter__(self):
+            self._saved = _included(C)
+            _TLS.included = self._saved | KeySet(self._key)
+            return self
+
+        def __exit__(self, *exc):
+            _TLS.included = self._saved
+            return False
+
+    put(C, "_ForceDispatchKeyGuard", _ForceDispatchKeyGuard)
+    put(C, "_ExcludeDispatchKeyGuard", _ExcludeDispatchKeyGuard)
+    put(C, "_IncludeDispatchKeyGuard", _IncludeDispatchKeyGuard)
+
+
+def _install_mode_stack(C, put) -> None:
+    """`_push_on_torch_dispatch_stack` and friends, as a real stack.
+
+    `_len_torch_dispatch_stack` **used to be** the constant `0` in this file's
+    `_DISCOVERED_RETURNS` table, with the comment "nothing pushes onto it here".
+    That row was deleted when this function moved here (docs/EXPORT.md §8 item
+    3); the sentence below is why.  Under `torch.export` something does push: `FakeTensorMode` and
+    `ProxyTorchDispatchMode` both push, and `torch/utils/_python_dispatch.py`
+    reads the length back to decide whether a mode is active.  A stack that
+    always answered zero would make `with FakeTensorMode():` a block that
+    entered and changed nothing -- the same shape of silent no-op
+    `docs/COMPILE.md` §5 refuses for `torch.compile`.
+
+    Upstream splits the stack in two: *infra* modes (FAKE, PROXY, FUNCTIONAL)
+    live in slots keyed by `_TorchDispatchModeKey` and are not part of the
+    ordinary stack, while user modes are appended.  `mode._mode_key` is what
+    tells the two apart, and this reproduces that split rather than flattening
+    it, because `_get_dispatch_mode(key)` has no meaning otherwise.
+    """
+
+    def _push_on_torch_dispatch_stack(mode):
+        key = getattr(mode, "_mode_key", None)
+        if key is not None:
+            if _TLS.infra_modes.get(key) is not None:
+                raise RuntimeError(
+                    f"torch dispatch mode for {key} is already set"
+                )
+            _TLS.infra_modes[key] = mode
+        else:
+            _TLS.mode_stack.append(mode)
+
+    def _pop_torch_dispatch_stack(mode_key=None):
+        if mode_key is not None:
+            popped = _TLS.infra_modes.pop(mode_key, None)
+            if popped is None:
+                raise AssertionError(
+                    f"no torch dispatch mode set for {mode_key}"
+                )
+            return popped
+        if not _TLS.mode_stack:
+            raise AssertionError("torch dispatch mode stack is empty")
+        return _TLS.mode_stack.pop()
+
+    def _len_torch_dispatch_stack():
+        return len(_TLS.mode_stack)
+
+    def _get_dispatch_stack_at(idx):
+        return _TLS.mode_stack[idx]
+
+    def _set_dispatch_mode(mode):
+        key = getattr(mode, "_mode_key", None)
+        if key is None:
+            raise AssertionError(
+                "_set_dispatch_mode is for infra modes; this one has no _mode_key"
+            )
+        if _TLS.infra_modes.get(key) is not None:
+            raise RuntimeError(f"torch dispatch mode for {key} is already set")
+        _TLS.infra_modes[key] = mode
+
+    def _get_dispatch_mode(mode_key):
+        return _TLS.infra_modes.get(mode_key)
+
+    def _unset_dispatch_mode(mode_key):
+        return _TLS.infra_modes.pop(mode_key, None)
+
+    def _only_lift_cpu_tensors():
+        return _TLS.only_lift_cpu_tensors
+
+    def _set_only_lift_cpu_tensors(value):
+        _TLS.only_lift_cpu_tensors = bool(value)
+
+    def _ensureCUDADeviceGuardSet():
+        # Upstream primes a CUDA device guard so later lifts land on the right
+        # device.  There is no CUDA here (`torch._C._has_cuda` is `False`, and
+        # the bootstrap's build-flag table says why that is a fact rather than a
+        # stand-in), so there is nothing to prime.  Doing nothing is the
+        # implementation, not a no-op standing in for one.
+        return None
+
+    put(C, "_push_on_torch_dispatch_stack", _push_on_torch_dispatch_stack)
+    put(C, "_pop_torch_dispatch_stack", _pop_torch_dispatch_stack)
+    put(C, "_len_torch_dispatch_stack", _len_torch_dispatch_stack)
+    put(C, "_get_dispatch_stack_at", _get_dispatch_stack_at)
+    put(C, "_set_dispatch_mode", _set_dispatch_mode)
+    put(C, "_get_dispatch_mode", _get_dispatch_mode)
+    put(C, "_unset_dispatch_mode", _unset_dispatch_mode)
+    put(C, "_only_lift_cpu_tensors", _only_lift_cpu_tensors)
+    put(C, "_set_only_lift_cpu_tensors", _set_only_lift_cpu_tensors)
+    put(C, "_ensureCUDADeviceGuardSet", _ensureCUDADeviceGuardSet)
+
+
+def _is_definitely_a_view(t) -> bool:
+    """A *sound positive* view detector, built from the storage model this shim has.
+
+    Measured against upstream on the same three tensors (`docs/EXPORT.md` §3.2):
+    `storage_offset`, `stride`, `numel` and `untyped_storage().nbytes()` agree
+    exactly between this shim and upstream for `x`, `x[1:, 1:]` and `x.t()`.
+    So three signals each *prove* a view:
+
+    * a non-zero `storage_offset` -- the tensor starts inside someone else's
+      buffer;
+    * a footprint smaller than the storage -- it covers part of a buffer;
+    * non-contiguous strides -- the layout was rearranged over a buffer that
+      was laid out for something else.
+
+    **What it misses, said plainly:** a view that covers the whole storage
+    contiguously -- `x.view(12)`, `x[:]`, `x.reshape(3, 4)` on a contiguous `x`
+    -- is bit-for-bit indistinguishable from the base under every signal this
+    shim exposes.  Upstream answers `True` there because `TensorImpl` carries a
+    base pointer; nothing in `PyTensorBase` does (`rust/torch_c/src/tensor.rs`
+    has storage identity via `storage.rs::origin`, but no base *tensor*).  This
+    returns `False` for that case, and that is the one wrong answer in the pair.
+
+    Making it right is a Rust change -- a base slot on `PyTensorBase` -- and it
+    is outside this document's territory.  `docs/EXPORT.md` §4.2 records it as
+    the gap rather than papering it.
+    """
+    try:
+        if t.storage_offset() != 0:
+            return True
+        if not t.is_contiguous():
+            return True
+        nbytes = t.untyped_storage().nbytes()
+    except Exception:
+        # A meta, quantised or vulkan tensor has no storage to ask about
+        # (`tensor.rs::no_dense_storage`, `no_host_storage`).  It also has no
+        # base, so "not a detected view" is the right answer, not a dodge.
+        return False
+    return t.numel() * t.element_size() != nbytes
+
+
+# The `torch_module` parameter `upstream.py`'s copy carried is dropped: it was
+# never read in the body (only `C.TensorBase` is), and it existed so that
+# `install(torch_module=...)` could pass the module it had been handed. There
+# is no such caller here.
+def _install_tensor_predicates(C, put) -> None:
+    """`_is_view`, `_base`, `is_mkldnn`, `is_inference`, `is_conj`.
+
+    Three of the five are `False` *as a fact about this build*, not as a
+    placeholder:
+
+    * `is_mkldnn` -- the bootstrap's build-flag table already answers
+      `_has_mkldnn` `False`; a tensor cannot be in a layout the build does not
+      have.
+    * `is_inference` -- inference mode is an autograd TLS state
+      (`InferenceMode`), and this shim has no autograd TLS to be in.
+    * `is_conj` -- the conjugate bit is a dispatch-key bit on `TensorImpl`;
+      candle has no such bit and no `aten::conj` view op reaches it.
+
+    `_is_view` and `_base` are the pair that is **not** a constant, and they are
+    the one place on this path where the shim has to say something it cannot
+    fully know.  Views here are real -- `docs/VIEWS.md` §6 made in-place ops
+    write through a layout into shared storage -- so `False` is not free.  The
+    arrangement:
+
+    * `_is_view()` answers `True` when `_is_definitely_a_view` proves it, and
+      `False` otherwise, missing exactly the full-coverage contiguous case.
+    * `_base` **refuses by name** for a tensor that `_is_view()` called `True`,
+      because there is no base object to return and `None` there would be read
+      as "not a view" by the very caller that just asked.  For everything else
+      it is `None`, which is the fact.
+
+    So a module exported with a sliced input fails loudly at the tensor that
+    caused it, rather than producing a graph whose inputs quietly lost their
+    aliasing.  `docs/COMPILE.md` §5 refuses the same shape of silence for
+    `torch.compile`.
+    """
+    TensorBase = C.TensorBase
+
+    def _is_view(self):
+        return _is_definitely_a_view(self)
+
+    def _base_getter(self):
+        if _is_definitely_a_view(self):
+            raise NotImplementedError(
+                "not implemented in torch._C shim: TensorBase._base. This "
+                "tensor is a view (non-zero storage offset, non-contiguous "
+                "strides, or a footprint smaller than its storage), and the "
+                "shim's PyTensorBase carries no base tensor to return. "
+                "Returning None here would tell the caller it is not a view, "
+                "one line after _is_view() told it that it is."
+            )
+        return None
+
+    def is_inference(self):
+        return False
+
+    def is_conj(self):
+        return False
+
+    put(TensorBase, "_is_view", _is_view, "TensorBase._is_view")
+    put(TensorBase, "_base", property(_base_getter), "TensorBase._base")
+    put(TensorBase, "is_inference", is_inference, "TensorBase.is_inference")
+    put(TensorBase, "is_conj", is_conj, "TensorBase.is_conj")
+    put(TensorBase, "is_mkldnn", property(lambda self: False),
+        "TensorBase.is_mkldnn")
+
+    # `_set_conj` / `_set_neg`, the write halves of two of the bits above.
+    #
+    # `meta_utils.py:2173` calls `torch._C._set_conj(r, t.is_conj)` on every
+    # meta tensor it builds, and `_set_neg` one line later, so `torch.export`
+    # reaches both once per fake tensor.
+    #
+    # **`False` is accepted as a no-op and `True` refuses by name**, and the
+    # asymmetry is the whole implementation.  `is_conj` above answers `False`
+    # as a *fact* -- there is no conjugate bit on `PyTensorBase` and candle has
+    # nothing to carry one -- so `_set_conj(t, False)` is asking for the state
+    # the tensor is already in and has nothing to do.  `_set_conj(t, True)`
+    # asks for a state this shim cannot represent, and accepting it would leave
+    # `is_conj` answering `False` immediately afterwards: a setter whose effect
+    # is invisible to its own getter.  That is the shape docs/EXPORT.md §2.2
+    # names, so it raises instead.
+    #
+    # Note this is reachable in practice and not a hypothetical: it is exactly
+    # how a conjugated or negated input tensor would arrive at export, and it
+    # now stops there by name rather than being traced as if it were neither.
+    def _make_bit_setter(bit):
+        def setter(tensor, value):
+            if not value:
+                return
+            raise NotImplementedError(
+                f"torch._C._set_{bit}(tensor, True): this shim has no {bit} bit "
+                f"-- TensorBase.is_{bit} answers False as a fact, not as a stub "
+                f"(docs/EXPORT.md §2.3), because candle carries no such flag and "
+                f"PyTensorBase has nowhere to put one. Accepting this would make "
+                f"the setter invisible to its own getter, so it is refused "
+                f"(torchnative/export/upstream.py, docs/EXPORT5.md §5)"
+            )
+        return setter
+
+    put(C, "_set_conj", _make_bit_setter("conj"))
+    put(C, "_set_neg", _make_bit_setter("neg"))
+
+
+def _install_functorch(C, put) -> None:
+    """`is_batchedtensor`, `is_legacy_batchedtensor`, `is_gradtrackingtensor`.
+
+    All three ask "is this tensor wrapped by a functorch transform?".  There is
+    no functorch interpreter stack in this shim -- `vmap`, `grad` and `jvp` are
+    not implemented -- so no tensor can be one of these wrappers and `False` is
+    the fact.  If a functorch layer is ever added, these three are where it
+    announces itself, and they are named here so that addition is a change to a
+    body rather than the discovery of a hole.
+    """
+    F = C._functorch
+
+    put(F, "is_batchedtensor", lambda t: False, "_functorch.is_batchedtensor")
+    put(F, "is_legacy_batchedtensor", lambda t: False,
+        "_functorch.is_legacy_batchedtensor")
+    put(F, "is_gradtrackingtensor", lambda t: False,
+        "_functorch.is_gradtrackingtensor")
+    put(F, "is_functorch_wrapped_tensor", lambda t: False,
+        "_functorch.is_functorch_wrapped_tensor", only_if_stub=True)
+
+
+class _GatheredFrames:
+    """The opaque handle `torch._C._profiler.gather_traceback` returns.
+
+    Opaque is the contract: `torch/utils/_traceback.py` never looks inside one.
+    It stores the handle on a `CapturedTraceback` and later hands a *list* of
+    handles to `symbolize_tracebacks`, which is where the frames become
+    readable.  Splitting it that way is upstream's amortisation -- symbolising
+    C++ frames is expensive and worth batching -- and reproducing the split,
+    rather than returning formatted strings from `gather_traceback`, is what
+    keeps `format_all`'s batch path working.
+    """
+
+    __slots__ = ("frames",)
+
+    def __init__(self, frames):
+        #: innermost first, which is the order `_extract_symbolized_tb`
+        #: assumes: it reverses, and it applies `skip` from the *front* to
+        #: elide `CapturedTraceback.extract`'s own frame.
+        self.frames = frames
+
+    def __repr__(self):
+        return f"<CapturedTraceback {len(self.frames)} frames>"
+
+
+def _install_profiler(C, put) -> None:
+    """`gather_traceback` and `symbolize_tracebacks`, to the shape of their caller.
+
+    COMPILE.md's census reached `gather_traceback` at round 14 and no-opped it
+    to `None`; the no-op survived because nothing symbolised it in that run.
+    With the later rounds real, `torch/_logging/_internal.py:1510` does symbolise
+    it, and that is what turned this from "return anything" into a pair with a
+    contract:
+
+        gather_traceback(python, script, cpp)  -> opaque handle
+        symbolize_tracebacks([handle, ...])    -> [[{filename, line, name}, ...], ...]
+
+    read out of `torch/utils/_traceback.py:180` and `:259`.  `line` is a line
+    *number* -- it is passed as `FrameSummary`'s second positional argument --
+    and getting that wrong is a `TypeError` several frames away from here,
+    which is how it was found.
+
+    `script` and `cpp` are accepted and ignored.  There is no TorchScript
+    interpreter and no C++ stack worth naming in this shim, so there are no
+    frames of those kinds to omit; Python frames are the whole traceback here
+    rather than a subset of one.
+    """
+
+    def gather_traceback(python=True, script=False, cpp=False):
+        if not python:
+            return _GatheredFrames([])
+        # `[:-1]` drops this function's own frame: upstream's is C++ and does
+        # not appear in the result, and `CapturedTraceback.extract` passes
+        # `skip=skip+1` counted from a stack that does not contain it.
+        outermost_first = _traceback.extract_stack()[:-1]
+        return _GatheredFrames([
+            {"filename": f.filename, "line": f.lineno, "name": f.name}
+            for f in reversed(outermost_first)
+        ])
+
+    def symbolize_tracebacks(to_symbolize):
+        return [
+            list(t.frames) if isinstance(t, _GatheredFrames) else []
+            for t in to_symbolize
+        ]
+
+    put(C._profiler, "gather_traceback", gather_traceback,
+        "_profiler.gather_traceback")
+    put(C._profiler, "symbolize_tracebacks", symbolize_tracebacks,
+        "_profiler.symbolize_tracebacks")
+
+
+def _install_dynamo_bool(C, put) -> None:
+    """`set_is_in_mode_without_ignore_compile_internals`.
+
+    `docs/COMPILE.md` §1.2 identified this as a two-line bool setter at
+    `dynamo/guards.cpp:134` that touches none of the frame-hook machinery.  It
+    is on the export path because `torch/_dynamo/utils.py` toggles it around
+    mode entry; nothing in this shim reads it back, so it is a cell.
+
+    It lives under `torch._C._dynamo.guards`, which is *not* a reason to think
+    this opens `torch.compile`.  `set_eval_frame`'s refusal is untouched and
+    stays untouched -- see `docs/COMPILE.md` §5.1 for why that refusal must
+    outlive any symbol-filling on this path.
+    """
+    # **`C._dynamo.guards` is not the module this name has to land on**, and
+    # that is the whole difficulty of moving this function into the bootstrap.
+    #
+    # In `upstream.py` this line was fine: that module ran after `import
+    # torch`, by which time `torch/utils/_python_dispatch.py:22` had done
+    # `import torch._C._dynamo.guards` and `_SubmoduleFinder` had created the
+    # real module and put it in `sys.modules`. Here nothing has imported it
+    # yet, so the attribute access falls through `_attach_module_catchall`'s
+    # PEP 562 `__getattr__`, which -- because "guards" starts with a lowercase
+    # letter -- synthesises an `_Unimplemented` and caches it. Installing onto
+    # that object succeeded, changed nothing anybody would ever see, and left
+    # `torch.export` stopping on this exact name with no error to explain it.
+    #
+    # So the module is built and registered here the same way `eval_frame` is
+    # a few hundred lines above, which is the mechanism `_SubmoduleFinder`
+    # would otherwise use later. Registering it in `sys.modules` is what makes
+    # the later `import torch._C._dynamo.guards` find this one rather than
+    # build a second.
+    prefix = C.__name__
+    guards = sys.modules.get(f"{prefix}._dynamo.guards")
+    if guards is None:
+        guards = types.ModuleType(f"{prefix}._dynamo.guards")
+        guards.__path__ = []
+        _attach_module_catchall(guards)
+        sys.modules[f"{prefix}._dynamo.guards"] = guards
+    setattr(C._dynamo, "guards", guards)
+    state = {"value": False}
+
+    def set_is_in_mode_without_ignore_compile_internals(value):
+        state["value"] = bool(value)
+
+    def is_in_mode_without_ignore_compile_internals():
+        return state["value"]
+
+    put(guards, "set_is_in_mode_without_ignore_compile_internals",
+        set_is_in_mode_without_ignore_compile_internals,
+        "_dynamo.guards.set_is_in_mode_without_ignore_compile_internals")
+    put(guards, "is_in_mode_without_ignore_compile_internals",
+        is_in_mode_without_ignore_compile_internals,
+        "_dynamo.guards.is_in_mode_without_ignore_compile_internals")
+
+
+def _install_inference_mode(C, put) -> None:
+    """`torch._C._InferenceMode`, as a context manager that actually enters.
+
+    Not in COMPILE.md's list of 18, and it could not have been: the census
+    stopped at `meta_utils.py:1061`, and this is reached at `:1510`.  The
+    bootstrap leaves it as a `_ShimMeta` synthesised class, which is
+    constructible and has no `__enter__`, so `with torch.inference_mode(...)`
+    fails with `AttributeError` rather than by name.  That is worth fixing
+    independently of export: an `AttributeError` on a dunder points at
+    `grad_mode.py` and says nothing about the shim.
+
+    What it does here is track a flag and nothing else.  Upstream's
+    `InferenceMode` switches a dispatch-key bit that makes new tensors skip
+    autograd bookkeeping and become invalid outside the block; this shim has no
+    autograd bookkeeping to skip (`docs/AUTOGRAD.md`) and no version counter to
+    invalidate, so entering and leaving is the entire behaviour.  It is
+    recorded rather than discarded so `_is_inference_mode_enabled()` can answer
+    from the same place instead of guessing.
+
+    `TensorBase.is_inference` stays `False` even inside the block, and that is
+    deliberate, not an oversight: upstream's per-tensor flag records that a
+    tensor *was created* in inference mode and is therefore unsafe to use
+    outside it.  No tensor here is unsafe in that way, so `True` would be a
+    claim about lifetime that nothing enforces.
+    """
+
+    class _InferenceMode:
+        __module__ = "torch._C"
+        __slots__ = ("mode", "_saved")
+
+        def __init__(self, mode=True):
+            self.mode = bool(mode)
+            self._saved = None
+
+        def __enter__(self):
+            self._saved = _read()
+            _write(self.mode)
+            return self
+
+        def __exit__(self, *exc):
+            _write(self._saved)
+            return False
+
+    # One source of truth, and it is the bootstrap's.  `bootstrap.py`'s
+    # `_install_grad_mode` now owns the flag, because `torch.is_inference_mode_enabled`
+    # is harvested off `_VariableFunctions` before this module can run and
+    # `fake_tensor.py:1801` calls it on every cached dispatch.  Writing through
+    # to it -- rather than keeping a second flag on `_TLS` -- is what stops the
+    # guard and the predicate from answering differently, which is
+    # docs/EXPORT.md §2.2's failure with the operands swapped.
+    #
+    # The `_TLS` fallback is not dead code: it is what runs against a bootstrap
+    # that predates the setter, and it keeps this module importable there.
+    def _read():
+        fn = getattr(C, "is_inference_mode_enabled", None)
+        if fn is not None:
+            return bool(fn())
+        return getattr(_TLS, "inference_mode", False)
+
+    def _write(value):
+        _TLS.inference_mode = value
+        setter = getattr(C, "_set_inference_mode_enabled", None)
+        if setter is not None:
+            setter(bool(value))
+
+    put(C, "_InferenceMode", _InferenceMode)
+    put(C, "_is_inference_mode_enabled", _read)
+
+
+_RAII_GUARDS = {
+    "_DisableTorchDispatch":
+        "suppresses the torch-dispatch mode stack for the block",
+    "_DisableFuncTorch":
+        "pops the functorch interpreter stack; there is none here",
+    "_DisableAutocast":
+        "turns off autocast; this build has no autocast dispatch key",
+    "_AutoDispatchBelowAutograd":
+        "excludes the autograd keys so a call lands on the backend directly",
+    "_RestorePythonTLSSnapshot":
+        "restores a saved dispatcher TLS snapshot",
+    "_DisablePythonDispatcher": "turns off the Python dispatcher",
+    "_EnablePythonDispatcher": "turns on the Python dispatcher",
+    "_EnablePreDispatch": "routes through the PreDispatch key",
+    "_PreserveDispatchKeyGuard": "saves and restores the whole TLS key state",
+    "_SetExcludeDispatchKeyGuard": "sets one key's excluded bit for the block",
+}
+
+
+_KEY_STATE_GUARDS = frozenset({
+    "_PreserveDispatchKeyGuard",
+    "_ForceDispatchKeyGuard",
+    "_ExcludeDispatchKeyGuard",
+    "_IncludeDispatchKeyGuard",
+    "_SetExcludeDispatchKeyGuard",
+})
+
+
+def _is_guard_active(name) -> bool:
+    """Is a named RAII guard currently entered on this thread?"""
+    return getattr(_TLS, "guards", {}).get(name, 0) > 0
+
+
+def _install_raii_guards(C, put) -> None:
+    """Give the guard family a real `__enter__`/`__exit__`.
+
+    Read the honesty limit here carefully, because it is the one that matters
+    on this path and `docs/EXPORT.md` §4.1 is about it.  `_DisableTorchDispatch`
+    is the guard `torch/_subclasses/fake_tensor.py:502` uses to build a meta
+    tensor *without re-entering the fake mode*.  Entering and leaving a counter
+    is a correct implementation **only because this shim never consults the mode
+    stack in the first place** -- `_aten_dispatch` records ops after the fact
+    (`aten.rs`, the capture hook) and never asks a Python mode to handle one.
+    There is therefore nothing for `no_dispatch()` to suppress.
+
+    That is not a happy accident, it is the wall: see `docs/EXPORT.md` §4.  When
+    `_aten_dispatch` learns to consult the stack, this guard stops being a
+    counter and starts being load-bearing, and the counter is here so that
+    change is a body to fill rather than a hole to find.
+    """
+
+    def _make(name, why):
+        class _Guard:
+            __module__ = "torch._C"
+            __slots__ = ()
+            __doc__ = f"torch._C.{name} -- upstream {why}."
+
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def __enter__(self):
+                counts = getattr(_TLS, "guards", None)
+                if counts is None:
+                    counts = _TLS.guards = {}
+                counts[name] = counts.get(name, 0) + 1
+                # **The key-state family saves the TLS key state here and
+                # restores it on exit, and that is not bookkeeping.**
+                #
+                # `_PreserveDispatchKeyGuard`'s one-line description in
+                # `_RAII_GUARDS` above is "saves and restores the whole TLS key
+                # state", and until docs/EXPORT5.md it saved and restored
+                # nothing.  That is not a cosmetic gap, because upstream
+                # *delegates* a restore to it:
+                # `fake_tensor.py::in_kernel_invocation_manager` sets
+                # `_set_meta_in_tls_dispatch_include(True)` inside this guard and
+                # leaves the matching reset **commented out**, with the guard
+                # named as the thing that undoes it.  With the guard inert the
+                # flag latched `True` after the first kernel invocation and the
+                # *next* entry died on that function's own
+                # `assert meta_in_tls == prev_in_kernel` -- `AssertionError:
+                # True, False`, several frames from anything that mentions a
+                # guard.  Same shape as docs/EXPORT4.md §5: no name was missing,
+                # no stub was raising, and every existing test passed.
+                #
+                # The snapshot is by reference because `DispatchKeySet` is
+                # immutable (bootstrap.py: `frozenset`, and `add`/`remove`
+                # return new sets), so holding the object *is* holding the value.
+                if name in _KEY_STATE_GUARDS:
+                    saved = getattr(_TLS, "key_state", None)
+                    if saved is None:
+                        saved = _TLS.key_state = []
+                    saved.append((
+                        _TLS.included,
+                        _TLS.excluded,
+                        _TLS.meta_in_tls_dispatch_include,
+                    ))
+                # `_DisableTorchDispatch` is `no_dispatch()`, and it is the ONE
+                # guard in this family that the dispatcher door has to see.  The
+                # counter above is this module's own bookkeeping; the write
+                # below is the one that actually suppresses, and it lives in
+                # `torch._C` because `aten.rs` reads it there.  See
+                # `bootstrap.py::_install_dispatch_suppression` and
+                # docs/EXPORT4.md §5.
+                #
+                # The others stay counters on purpose: `_DisableFuncTorch` and
+                # friends name subsystems this shim does not have, and making
+                # them suppress dispatch would be a guess about what they mean.
+                if name == "_DisableTorchDispatch":
+                    push = getattr(C, "_shim_push_dispatch_suppression", None)
+                    if push is not None:
+                        push()
+                return self
+
+            def __exit__(self, *exc):
+                _TLS.guards[name] -= 1
+                if name in _KEY_STATE_GUARDS:
+                    (
+                        _TLS.included,
+                        _TLS.excluded,
+                        _TLS.meta_in_tls_dispatch_include,
+                    ) = _TLS.key_state.pop()
+                if name == "_DisableTorchDispatch":
+                    pop = getattr(C, "_shim_pop_dispatch_suppression", None)
+                    if pop is not None:
+                        pop()
+                return False
+
+        _Guard.__name__ = name
+        _Guard.__qualname__ = name
+        return _Guard
+
+    for name, why in _RAII_GUARDS.items():
+        put(C, name, _make(name, why))
 
 
 def _install_autocast(module) -> None:

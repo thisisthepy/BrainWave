@@ -597,6 +597,14 @@ struct ActiveMode<'py> {
     /// which lives in a slot keyed by `_TorchDispatchModeKey` rather than on
     /// the ordinary stack. The key is needed to unset and re-set the slot.
     infra_key: Option<Bound<'py, PyAny>>,
+    /// **The mode lives on the pre-dispatch stack in `torch/_ops.py`, not in
+    /// `torch._C` at all**, and this is the flag that says so.
+    ///
+    /// It exists because `torch.export` puts its `ProxyTorchDispatchMode`
+    /// there and nowhere else -- see `pre_dispatch_mode` for the measurement.
+    /// When it is set, `infra_key` is meaningless and the pop/restore pair is
+    /// `torch._ops._pop_mode_from_pre_dispatch` / `_set_mode_pre_dispatch`.
+    pre_dispatch: bool,
 }
 
 /// Upstream's `TorchDispatchModeTLS::pop_stack` order, reproduced.
@@ -609,7 +617,53 @@ struct ActiveMode<'py> {
 /// Both halves are read through the installed `torch._C` names rather than
 /// through any state of this crate's own, because those names are the
 /// bookkeeping `torch/utils/_python_dispatch.py` writes.
+/// The mode on `torch/_ops.py`'s **pre-dispatch** stack, if any.
+///
+/// **This is the stack `torch.export` actually uses, and nothing in
+/// `torch._C` can see it.** The finding, measured rather than reasoned
+/// (docs/EXPORT5.md §6): `torch/utils/_python_dispatch.py::_push_mode` branches
+/// on `mode._dispatch_key`, *not* on `mode._mode_key`, and
+/// `ProxyTorchDispatchMode.__init__` is handed `DispatchKey.PreDispatch` by
+/// export's tracer. So the proxy mode never reaches
+/// `_push_on_torch_dispatch_stack` or `_set_dispatch_mode`; it goes to
+/// `torch._ops._set_mode_pre_dispatch`, which keeps it in an ordinary Python
+/// object in that module.
+///
+/// The symptom of not reading it is the one `docs/EXPORT.md` §4.2 predicted in
+/// full: `torch.export.export()` **succeeds**, returns an `ExportedProgram`,
+/// prints, serialises -- and its graph holds a placeholder, an output and
+/// **no operators**, because only `FakeTensorMode` ever saw the ops and the
+/// traced result was folded into a lifted constant. It does not look wrong.
+///
+/// It is consulted **before** the user stack and the infra slots because
+/// upstream's `PreDispatch` key sits above the `Python` key, so a pre-dispatch
+/// mode runs first and re-dispatches into the ones below it. Precedence
+/// *within* the pre-dispatch stack (FUNCTIONAL over PROXY) is not reimplemented
+/// here -- `_get_current_dispatch_mode_pre_dispatch` already encodes it and is
+/// called for exactly that reason.
+///
+/// Every failure to reach `torch._ops` is `None` rather than an error: the
+/// standalone `_C` that `tools/golden/loader.py` imports has no `torch` package
+/// around it, and there a pre-dispatch stack cannot exist.
+fn pre_dispatch_mode<'py>(py: Python<'py>) -> Option<Bound<'py, PyAny>> {
+    let ops = py.import("torch._ops").ok()?;
+    let mode = ops
+        .call_method0(intern!(py, "_get_current_dispatch_mode_pre_dispatch"))
+        .ok()?;
+    if mode.is_none() {
+        return None;
+    }
+    Some(mode)
+}
+
 fn innermost_dispatch_mode<'py>(py: Python<'py>) -> PyResult<Option<ActiveMode<'py>>> {
+    if let Some(mode) = pre_dispatch_mode(py) {
+        return Ok(Some(ActiveMode {
+            mode,
+            infra_key: None,
+            pre_dispatch: true,
+        }));
+    }
     let c = torch_c_module(py)?.bind(py);
     let depth: i64 = match c.call_method0(intern!(py, "_len_torch_dispatch_stack")) {
         Ok(n) => n.extract().unwrap_or(0),
@@ -620,6 +674,7 @@ fn innermost_dispatch_mode<'py>(py: Python<'py>) -> PyResult<Option<ActiveMode<'
         return Ok(Some(ActiveMode {
             mode,
             infra_key: None,
+            pre_dispatch: false,
         }));
     }
     // The infra slots. `_len_torch_dispatch_stack` counts only the ordinary
@@ -639,6 +694,7 @@ fn innermost_dispatch_mode<'py>(py: Python<'py>) -> PyResult<Option<ActiveMode<'
                 return Ok(Some(ActiveMode {
                     mode,
                     infra_key: Some(key),
+                    pre_dispatch: false,
                 }));
             }
         }
@@ -740,11 +796,23 @@ fn dispatch_through_mode(
     kwargs: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<Py<PyAny>> {
     let c = torch_c_module(py)?.bind(py).clone();
-    match active.infra_key.as_ref() {
-        Some(key) => {
+    // A pre-dispatch mode is popped through `torch._ops`, which is the module
+    // that owns that stack. Its own `_pop_mode_from_pre_dispatch` is used
+    // rather than a direct poke at `mode_stack_state_for_pre_dispatch` because
+    // that function encodes which of the two slots to clear.
+    let ops = if active.pre_dispatch {
+        Some(py.import("torch._ops")?)
+    } else {
+        None
+    };
+    match (&ops, active.infra_key.as_ref()) {
+        (Some(ops), _) => {
+            ops.call_method0(intern!(py, "_pop_mode_from_pre_dispatch"))?;
+        }
+        (None, Some(key)) => {
             c.call_method1(intern!(py, "_unset_dispatch_mode"), (key,))?;
         }
-        None => {
+        (None, None) => {
             c.call_method0(intern!(py, "_pop_torch_dispatch_stack"))?;
         }
     }
@@ -756,9 +824,14 @@ fn dispatch_through_mode(
             .call_method1(intern!(py, "__torch_dispatch__"), (func, types, args, kwargs))
             .map(|value| value.unbind())
     })();
-    let restored = match active.infra_key.as_ref() {
-        Some(_) => c.call_method1(intern!(py, "_set_dispatch_mode"), (&active.mode,)),
-        None => c.call_method1(intern!(py, "_push_on_torch_dispatch_stack"), (&active.mode,)),
+    let restored = match (&ops, active.infra_key.as_ref()) {
+        (Some(ops), _) => {
+            ops.call_method1(intern!(py, "_set_mode_pre_dispatch"), (&active.mode,))
+        }
+        (None, Some(_)) => c.call_method1(intern!(py, "_set_dispatch_mode"), (&active.mode,)),
+        (None, None) => {
+            c.call_method1(intern!(py, "_push_on_torch_dispatch_stack"), (&active.mode,))
+        }
     };
     // The mode's own error wins; a failure to restore is only reported when
     // there is no error to lose by reporting it.
@@ -2250,6 +2323,26 @@ fn meta_dispatch(
         // only consults `numel` when it has a wildcard to fill. On a meta
         // tensor there is no candle call afterwards to catch it, so a
         // mismatched `view` would silently answer the wrong shape.
+        // `aten::zeros_like` on a meta input -- **delegated, not reimplemented.**
+        //
+        // The dense kernel already does every part of this correctly: it reads
+        // the dtype rule, rejects the layout/pin_memory/memory_format arguments
+        // it cannot honour, resolves the device, and returns a meta tensor when
+        // the device is meta. The only thing that had made it unreachable from
+        // here was that it asked `tensor()` for a shape (see `zeros_or_empty_like`),
+        // so the fix belongs there and this arm is a delegation.
+        //
+        // Writing a second shape-and-dtype rule here would have been the easy
+        // move and the wrong one: `zeros_like`'s dtype rule would then exist
+        // twice, and the two copies would diverge the first time one was
+        // corrected. docs/EXPORT5.md §4.
+        //
+        // It is reached because `check_meta` routes a meta input to this table
+        // before the dense entry, and both branches of the delegate are live on
+        // the export path -- `device="cpu"` really is passed with a meta input.
+        "aten.zeros_like.default" => {
+            zeros_or_empty_like(py, args, kwargs, "aten.zeros_like.default")
+        }
         "aten.view.default" => {
             let input = tensor_arg(op, args, kwargs, 0, "self")?;
             let numel: usize = input.dims().iter().product();
@@ -2261,7 +2354,20 @@ fn meta_dispatch(
                     "shape '{requested:?}' is invalid for input of size {numel}"
                 )));
             }
-            meta_result(py, dims, input.tag())
+            // **The storage identity is inherited, not freshly minted.**
+            // `view` is the one meta kernel here that is a view, and upstream's
+            // view shares its input's storage -- `_cdata` is equal on both
+            // sides, measured on 2.13.0. A fresh id would make
+            // `meta_utils.py`'s `storage_memo` see a tensor and its own view as
+            // two unrelated storages, which is precisely the aliasing the memo
+            // exists to preserve. tensor.rs::`Repr::Meta`.
+            let storage_id = input
+                .meta_storage_id()
+                .expect("a meta kernel's input is a meta tensor");
+            Ok(PyTensorBase::meta_with_storage_id(dims, input.tag(), storage_id)
+                .into_pyobject(py)?
+                .into_any()
+                .unbind())
         }
         // ---------------------------------------------------------------
         // METAFAM.md: the two families VOICE4.md §4 opened one member of
@@ -6310,7 +6416,21 @@ fn empty_strided_default(
     let size = shape_arg(OP, args, kwargs, 0, "size")?;
     let stride = shape_arg(OP, args, kwargs, 1, "stride")?;
     let dtype = dtype_arg(args, kwargs, 2, "dtype")?.unwrap_or(default_float());
-    reject_unsupported(OP, args, kwargs, &[(3, "layout"), (5, "pin_memory")])?;
+    // `layout` goes through `reject_layout`, not `reject_unsupported`.
+    //
+    // The difference is that `reject_unsupported` refuses the argument's
+    // *presence* while `reject_layout` refuses every layout except the one this
+    // shim actually produces -- `torch.strided`. `torch.export` passes
+    // `layout=torch.strided` explicitly (`_export/non_strict_utils.py:1205`
+    // forwards the full kwarg set), so the blanket refusal was rejecting a call
+    // that asked for exactly what it was going to be handed. That is
+    // `reject_layout`'s own stated purpose, and every other layout -- sparse,
+    // mkldnn, jagged -- still refuses by name through it.
+    //
+    // `pin_memory` keeps the blanket refusal: unlike `layout` there is no value
+    // of it this shim honours, since there is no pinned allocator here at all.
+    reject_layout(OP, args, kwargs, 3)?;
+    reject_unsupported(OP, args, kwargs, &[(5, "pin_memory")])?;
     let label = device_arg_or_label(args, kwargs, 4, "device", &PyDevice::cpu())?;
 
     // Upstream's own length check, and its message, before anything else reads
@@ -17173,7 +17293,24 @@ fn zeros_or_empty_like(
     // the wall a user hits would have stopped naming the thing that is missing.
     reject_memory_format(op, args, kwargs, 5)?;
     let label = device_arg_or_label(args, kwargs, 3, "device", &input.device_label())?;
-    let shape = input.tensor()?.dims().to_vec();
+    // **`input.dims()`, not `input.tensor()?.dims()`, and that one word is the
+    // whole of this op's meta support.**
+    //
+    // `_like` needs its input's *shape*; it never reads an element. Going
+    // through `tensor()` asked the enum for a candle tensor first, so a meta
+    // input was refused with `Cannot copy out of meta tensor; no data!` -- a
+    // message about bytes, in answer to a question about a shape. That is the
+    // same mismatch `stride()` had (docs/EXPORT4.md §6.5) and it is why
+    // `torch.export` stopped here: `proxy_tensor.py` builds a zero tensor
+    // shaped like a value that is still fake, and `_export/non_strict_utils.py`
+    // forwards `device="cpu"` with it, so both branches below are live on the
+    // export path.
+    //
+    // Note this reaches the **non-meta** branch too, which is the interesting
+    // half: `zeros_like(meta_tensor, device="cpu")` returns a real cpu tensor
+    // of zeros upstream (measured on 2.13.0), and it can here as well, because
+    // a shape is all that was ever needed to allocate one.
+    let shape = input.dims().to_vec();
     if label.is_meta() {
         return meta_result(py, shape, tag);
     }

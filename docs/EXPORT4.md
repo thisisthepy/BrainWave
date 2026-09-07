@@ -37,7 +37,7 @@ develop `976a01b`.
 | Nullifications attempted / caught | **9 / 9** (§8) |
 | New measurement tool | `rust/torch_c/pytests/export_sweep.py` (§9) |
 
-<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_export4.py test_export_still_stops_and_it_stops_at_the_storage_handle present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_export4.py test_export_no_longer_stops_at_the_storage_handle_and_returns_a_real_graph present -->
 <!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_export4.py test_no_dispatch_actually_suppresses_now_that_the_door_reads_the_stack present -->
 <!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_export4.py test_empty_strided_refuses_a_non_contiguous_stride_by_name present -->
 
@@ -118,12 +118,20 @@ Three claims, and they are not the same claim. `docs/EXPORT.md` §4.2 is the
 argument that the first can be true while the others are false and **it would not
 look wrong**:
 
-| claim | status |
-|---|---|
-| `torch.export.export()` returns an `ExportedProgram` | **No** (§7) |
-| the graph it holds contains the module's operators | not reached |
-| the graph REPLAYS to the same numbers as eager | not reached |
-| the replay agrees with **upstream** element-wise | not reached |
+**Correction (docs/EXPORT5.md, 2026-09-07): all four are now yes on small
+modules, and still no on every real architecture.** The table as this round
+measured it, with EXPORT5's answer beside it:
+
+| claim | EXPORT4 | EXPORT5 |
+|---|---|---|
+| `torch.export.export()` returns an `ExportedProgram` | **No** (§7) | **yes** |
+| the graph it holds contains the module's operators | not reached | **yes** — and it held *none* until the pre-dispatch wall fell (EXPORT5 §6) |
+| the graph REPLAYS to the same numbers as eager | not reached | **yes** |
+| the replay agrees with **upstream** element-wise | not reached | **yes, bit-identical**, on 4 modules |
+
+The scope of that "yes" is four hand-written modules. On 40 `transformers`
+architectures, upstream exports, replays and agrees on 10, and this shim on
+**0** — docs/EXPORT5.md §8 is the measurement and §10 the walls that remain.
 
 **Nothing in this round is evidence for any of the four.** The six walls are on
 the road to the first, and the first is the weakest of them — an
@@ -397,7 +405,14 @@ Attempting it inside the remaining budget of this round would have meant landing
 a design change without room to verify it, which is the failure the brief warns
 about. §10 leaves it open with its reason.
 
-`test_export_still_stops_and_it_stops_at_the_storage_handle` pins it, and fails
+**Correction (docs/EXPORT5.md §2, 2026-09-07): this wall is closed.** A meta
+tensor answers `untyped_storage()` with a handle carrying a size and an
+identity and no bytes; the test named below was rewritten into
+`test_export_no_longer_stops_at_the_storage_handle_and_returns_a_real_graph`,
+which is the rewrite the sentence after this one demanded. The paragraph is
+kept because its reasoning is what EXPORT5 §2 built on.
+
+`test_export_still_stops_and_it_stops_at_the_storage_handle` pinned it, and failed
 in **both** directions — if export regresses to an earlier wall, and if it starts
 succeeding. The second is deliberate: an `ExportedProgram` appearing there must
 be met with an element-wise replay comparison (§3) before anyone calls it

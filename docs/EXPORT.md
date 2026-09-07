@@ -298,6 +298,14 @@ kernel reads bytes that are not there. What is missing is a *storage handle*
 that carries identity and size without bytes. Rust, and a design question rather
 than a line.
 
+**Correction (docs/EXPORT4.md §7 confirmed this unclosed; docs/EXPORT5.md §2
+closed it, 2026-09-07).** The handle exists: `storage::meta` builds a
+`StorageBase` with `device="meta"`, the byte size the tensor would occupy, an
+identity token carried by `Repr::Meta` and propagated by the meta `view`
+kernel, and `filled=false` so `set_` still refuses it. Every door that would
+need bytes refuses by name. The paragraph above is left standing because it is
+the specification the handle was built to, and it was right.
+
 ---
 
 ## 4. The wall

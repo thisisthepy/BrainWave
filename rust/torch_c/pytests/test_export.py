@@ -50,6 +50,57 @@ out["is_shim"] = hasattr(torch._C, "_aten_implemented")
 
 from torchnative.export import upstream
 
+# --- the census names, BEFORE anything is installed -------------------------
+#
+# docs/EXPORT5.md §7 moved every one of these into `bootstrap.py`, so the
+# question this probe asks changed direction: it used to be "did install()
+# replace the placeholders", and it is now "**are they already implemented
+# before anyone calls anything**". That is the stronger claim and it is the one
+# the hand-off is for, so it is measured first, before `install()` is touched.
+def _stubbed_now(owner, name):
+    return upstream._is_stub(getattr(owner, name, None))
+
+out["stubbed_before_any_install"] = sorted(
+    n for n in upstream.installed_names() if _stubbed_now(torch._C, n)
+)
+out["census_stubbed_before_any_install"] = sorted(
+    n for n in (
+        "_unset_dispatch_mode", "_only_lift_cpu_tensors",
+        "_set_only_lift_cpu_tensors", "_ensureCUDADeviceGuardSet",
+        "_push_on_torch_dispatch_stack", "_pop_torch_dispatch_stack",
+        "_dispatch_tls_is_dispatch_key_included",
+        "_functionalization_reapply_views_tls",
+        "_dispatch_tls_local_exclude_set", "_dispatch_tls_local_include_set",
+    ) if _stubbed_now(torch._C, n)
+)
+_owners = {
+    "TensorBase._is_view": (torch._C.TensorBase, "_is_view"),
+    "TensorBase.is_mkldnn": (torch._C.TensorBase, "is_mkldnn"),
+    "TensorBase.is_inference": (torch._C.TensorBase, "is_inference"),
+    "TensorBase.is_conj": (torch._C.TensorBase, "is_conj"),
+    "_functorch.is_batchedtensor": (torch._C._functorch, "is_batchedtensor"),
+    "_functorch.is_legacy_batchedtensor": (torch._C._functorch, "is_legacy_batchedtensor"),
+    "_functorch.is_gradtrackingtensor": (torch._C._functorch, "is_gradtrackingtensor"),
+    "_profiler.gather_traceback": (torch._C._profiler, "gather_traceback"),
+    "_dynamo.guards.set_is_in_mode_without_ignore_compile_internals": (
+        torch._C._dynamo.guards, "set_is_in_mode_without_ignore_compile_internals"),
+}
+out["census_stubbed_before_any_install"] += sorted(
+    q for q, (owner, leaf) in _owners.items() if _stubbed_now(owner, leaf)
+)
+# Every name the probe actually interrogated, so a test can assert that its
+# census is covered rather than assuming it was.
+out["names_checked"] = sorted(
+    set(upstream.installed_names())
+    | {"_unset_dispatch_mode", "_only_lift_cpu_tensors",
+       "_set_only_lift_cpu_tensors", "_ensureCUDADeviceGuardSet",
+       "_push_on_torch_dispatch_stack", "_pop_torch_dispatch_stack",
+       "_dispatch_tls_is_dispatch_key_included",
+       "_functionalization_reapply_views_tls",
+       "_dispatch_tls_local_exclude_set", "_dispatch_tls_local_include_set"}
+    | set(_owners)
+)
+
 # --- what install() reports -------------------------------------------------
 report = upstream.install()
 out["replaced"] = sorted(report.replaced)
@@ -278,29 +329,49 @@ def test_install_leaves_no_stub_among_the_names_it_claims():
 def test_install_is_idempotent_in_the_only_sense_that_matters():
     """A second `install()` must find nothing left to replace.
 
-    Checked on `replaced` rather than on the whole report: the second call does
-    displace its own objects, which is what `overridden` counts, and asserting
-    that were empty would be asserting that `install()` refuses to run twice --
-    a different and less useful property.
+    Since docs/EXPORT5.md §7 this holds for a stronger reason than it used to:
+    the **first** call finds nothing to replace either, because the names are
+    installed by `bootstrap.py` before anything imports them. The assertion is
+    unchanged; what changed underneath it is that it can no longer pass by
+    `install()` having done the work.
     """
     if not _available():
         return
     r = _fixture()
     assert r["second_replaced"] == [], r["second_replaced"]
+    assert r["replaced"] == [], (
+        "install() replaced something, so a census name was still a placeholder "
+        "at import time -- docs/EXPORT5.md §7's hand-off is incomplete: "
+        f"{r['replaced']}"
+    )
 
 
-def test_the_census_names_were_placeholders_not_implementations():
-    """The re-derived census, as a test rather than as prose.
+def test_the_census_names_are_implemented_by_the_bootstrap_with_no_install_call():
+    """The re-derived census, as a test rather than as prose -- **inverted.**
 
-    Every name in `docs/EXPORT.md` §2's "was a raising stub" column must appear
-    in `install()`'s `replaced` list.  If one of them were quietly implemented
-    later, this fails and the census line has to be corrected -- which is the
-    point: `docs/COMPILE.md` §5.3's complaint is that counts drift from what
-    they counted.
+    This used to assert that every name in `docs/EXPORT.md` §2's "was a raising
+    stub" column appeared in `install()`'s `replaced` list, which was the right
+    claim while `torchnative/export/upstream.py` installed them at runtime.
+
+    `docs/EXPORT5.md` §7 moved them into `bootstrap.py`, so `replaced` is now
+    empty and that assertion would pass vacuously if it were merely relaxed.
+    The claim is therefore turned around into the stronger one the hand-off is
+    actually for: **each census name is already an implementation before
+    anything calls `install()`.** It fails if any of them regresses to a
+    placeholder, which is the same protection pointed the other way.
+
+    Why this is not a weakening: the old test could be satisfied by a name that
+    was a stub and then got patched; this one cannot be satisfied by a stub at
+    all.
     """
     if not _available():
         return
     r = _fixture()
+    assert r["census_stubbed_before_any_install"] == [], (
+        "these census names were still placeholders at import time, before any "
+        "install() call -- the bootstrap hand-off (docs/EXPORT5.md §7) does not "
+        f"cover them: {r['census_stubbed_before_any_install']}"
+    )
     census = {
         "_unset_dispatch_mode",
         "_only_lift_cpu_tensors",
@@ -322,8 +393,20 @@ def test_the_census_names_were_placeholders_not_implementations():
         "_profiler.gather_traceback",
         "_dynamo.guards.set_is_in_mode_without_ignore_compile_internals",
     }
-    missing = sorted(census - set(r["replaced"]))
-    assert not missing, missing
+    # `census` is kept as the explicit list of the twenty names docs/EXPORT.md
+    # §1 enumerated, so that this test still names *what* it is checking rather
+    # than deferring entirely to `installed_names()`. Every one of them must be
+    # covered by the probe above, and none of them may be a placeholder.
+    uncovered = sorted(census - set(upstream_names_checked(r)))
+    assert not uncovered, (
+        "the probe did not check these census names at all, so their status is "
+        f"unknown rather than good: {uncovered}"
+    )
+
+
+def upstream_names_checked(r):
+    """Every name the probe asked `_is_stub` about, stubbed or not."""
+    return set(r["names_checked"])
 
 
 # ---------------------------------------------------------------------------

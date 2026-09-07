@@ -56,7 +56,18 @@ pub enum Repr {
     /// label is a constant. If a device kind ever arrives where the index
     /// *survives*, this is the field that has to appear, and
     /// docs/DEVICE_ABS.md §3.2 is the argument for it.
-    Meta { shape: Vec<usize> },
+    ///
+    /// `storage_id` is the identity of the storage this meta tensor would
+    /// have. It is **not** an address: upstream's meta storage answers
+    /// `data_ptr() == 0` (measured on 2.13.0 -- every meta storage, base or
+    /// view, answers zero), so there is no address to carry. What upstream
+    /// *does* carry is a distinct `_cdata` per storage which two views of one
+    /// base share, and that is what this token is. It is drawn from a
+    /// process-wide counter at construction and **propagated by the one meta
+    /// kernel that is a view** (`aten.view.default`), so `x` and `x.view(-1)`
+    /// answer with one storage here as they do upstream, and two separately
+    /// constructed meta tensors do not. docs/EXPORT5.md §2.
+    Meta { shape: Vec<usize>, storage_id: usize },
     /// A GGML block-quantised weight.
     ///
     /// **The reason this is a third arm and not a `Tensor` wearing a label is
@@ -382,7 +393,32 @@ pub fn no_real_storage(tag: TorchDType) -> PyErr {
     ))
 }
 
+/// Identities for meta storages, handed out in sequence.
+///
+/// A counter rather than an address because a meta storage **has** no address
+/// -- upstream answers `data_ptr() == 0` for every one of them. What the number
+/// has to do is be distinct per storage and shared between a tensor and its
+/// views, and a counter does both without pretending to be a pointer. It starts
+/// at 1 so that `0` stays available as "not a meta storage", the same
+/// convention `PyStorageBase::origin` already uses.
+static META_STORAGE_IDS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
+
+fn next_meta_storage_id() -> usize {
+    META_STORAGE_IDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 impl PyTensorBase {
+    /// The identity of the storage this tensor would have, if it is a meta
+    /// tensor. `None` for every other representation -- a dense tensor's
+    /// storage identity is candle's buffer address and comes from
+    /// `storage_snapshot`.
+    pub fn meta_storage_id(&self) -> Option<usize> {
+        match &self.inner {
+            Repr::Meta { storage_id, .. } => Some(*storage_id),
+            _ => None,
+        }
+    }
+
     /// A tensor whose torch dtype is whatever candle is already storing.
     pub fn new(inner: Tensor) -> PyResult<Self> {
         let tag = TorchDType::from_storage(inner.dtype()).ok_or_else(|| {
@@ -414,8 +450,19 @@ impl PyTensorBase {
     /// CPU counterpart is not, which is also true upstream on a build without a
     /// kernel for a dtype. docs/META.md §6.
     pub fn meta(shape: Vec<usize>, tag: TorchDType) -> Self {
+        Self::meta_with_storage_id(shape, tag, next_meta_storage_id())
+    }
+
+    /// A meta tensor sharing an existing meta storage identity.
+    ///
+    /// The view half of `meta`. Upstream's `view` shares storage, so its meta
+    /// counterpart must answer the same `_cdata` as its input; allocating a
+    /// fresh id there would make `meta_utils.py`'s `storage_memo` treat a
+    /// tensor and its own view as two unrelated storages, which is the
+    /// aliasing information the memo exists to preserve.
+    pub fn meta_with_storage_id(shape: Vec<usize>, tag: TorchDType, storage_id: usize) -> Self {
         Self {
-            inner: Repr::Meta { shape },
+            inner: Repr::Meta { shape, storage_id },
             tag,
             requires_grad: false,
             backward_hooks: None,
@@ -672,7 +719,7 @@ impl PyTensorBase {
     pub fn dims(&self) -> &[usize] {
         match &self.inner {
             Repr::Dense(tensor) => tensor.dims(),
-            Repr::Meta { shape } => shape,
+            Repr::Meta { shape, .. } => shape,
             Repr::Quantized(q) => q.shape().dims(),
             Repr::Vulkan(v) => &v.shape,
             // `re.dims()` **is** the complex tensor's shape -- that is the
@@ -687,7 +734,7 @@ impl PyTensorBase {
     pub fn elem_count(&self) -> usize {
         match &self.inner {
             Repr::Dense(tensor) => tensor.elem_count(),
-            Repr::Meta { shape } => shape.iter().product(),
+            Repr::Meta { shape, .. } => shape.iter().product(),
             Repr::Quantized(q) => q.shape().elem_count(),
             Repr::Vulkan(v) => v.elem_count(),
             // `numel` counts *complex* elements, not floats, which is
@@ -1683,6 +1730,55 @@ impl PyTensorBase {
         crate::dtype::interned(py, self.tag)
     }
 
+    /// `t.grad_dtype` -- **the tensor's own dtype, because that is where this
+    /// shim accumulates gradients.**
+    ///
+    /// Reached by `torch.export` on every parameter of a module that has any
+    /// (`nn.Linear` was the first module in this round's sweep to need it), so
+    /// it stopped export for anything with weights.
+    ///
+    /// Upstream's default is the tensor's dtype -- measured across float32,
+    /// float64, bfloat16, int64 and bool on 2.13.0, with and without
+    /// `requires_grad` -- and it exists to let a low-precision parameter
+    /// accumulate its gradient in a wider dtype. **This shim has no such
+    /// machinery**: `tape.rs` accumulates into `grad` at the tensor's own
+    /// dtype and there is no second dtype anywhere to report.
+    ///
+    /// So the getter is `self.dtype` and it is a fact, not a default.
+    #[getter]
+    fn grad_dtype(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        crate::dtype::interned(py, self.tag)
+    }
+
+    /// **The setter accepts the dtype it already reports and refuses the rest.**
+    ///
+    /// Upstream's is a real setter: `t.grad_dtype = torch.float64` on a float32
+    /// tensor takes, and the backward pass then accumulates in float64. Here
+    /// there is nowhere to put that intent and nothing that would honour it, so
+    /// accepting a different dtype would leave the backward pass accumulating
+    /// in the old one while the attribute claimed otherwise -- a setter
+    /// invisible to its own effect, which is the shape `_set_conj` refuses for
+    /// the same reason (docs/EXPORT5.md §5).
+    ///
+    /// Assigning the tensor's own dtype is a no-op and is allowed, so that
+    /// save/restore round trips do not raise.
+    #[setter]
+    fn set_grad_dtype(&self, py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<()> {
+        let mine = crate::dtype::interned(py, self.tag)?;
+        if value.eq(mine.bind(py))? {
+            return Ok(());
+        }
+        Err(not_implemented(format!(
+            "TensorBase.grad_dtype = {value}: this shim accumulates a gradient in \
+             the tensor's own dtype ({}) and has no separate gradient dtype to \
+             set. Upstream honours this attribute in its backward pass; here \
+             nothing would, so accepting it would leave the attribute claiming a \
+             precision the backward pass does not use (tensor.rs, \
+             docs/EXPORT5.md §5)",
+            self.tag.name()
+        )))
+    }
+
     #[getter]
     fn device(&self) -> PyDevice {
         self.device_label()
@@ -1701,6 +1797,28 @@ impl PyTensorBase {
     /// A stub property raising by name stopped `load_state_dict` outright,
     /// which is the right behaviour for a hole and the wrong answer for a
     /// question the shim can answer.
+    /// `t._has_symbolic_sizes_strides` -- **`False`, as a fact, not a stub.**
+    ///
+    /// `fake_tensor.py:1293`'s `extract_tensor_metadata` reads it on every
+    /// tensor it hashes, so `torch.export` reaches it once per cached dispatch.
+    ///
+    /// It is `False` for the same reason `is_conj` is (docs/EXPORT.md §2.3):
+    /// there is nothing here that could make it `True`. A symbolic size is a
+    /// `SymInt` living in a `TensorImpl`'s sizes-and-strides field; this shim's
+    /// shapes are `Vec<usize>` on the dense side and `Repr::Meta`'s `shape` on
+    /// the meta side, both concrete integers by construction, and there is no
+    /// representation for anything else. Answering `True` would promise
+    /// upstream a symbolic-shape path that does not exist; answering `False` is
+    /// what is true of every tensor this shim can build.
+    ///
+    /// Note what this does **not** say: `torch.export`'s dynamic-shape support
+    /// is a separate question and is untouched by this. This is about the
+    /// *tensor*, and no tensor here carries a symbol.
+    #[getter]
+    fn _has_symbolic_sizes_strides(&self) -> bool {
+        false
+    }
+
     #[getter]
     fn is_meta(&self) -> bool {
         self.device_label().kind == "meta"
@@ -2066,6 +2184,28 @@ impl PyTensorBase {
     /// for it before reaching here), and a quantised one has blocks that are
     /// not a flat storage in any dtype torch could name in a record.
     fn untyped_storage(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        // **A meta tensor answers with a handle, and that is docs/EXPORT.md
+        // §3.3 closed.**
+        //
+        // The refusal it used to give -- `Cannot copy out of meta tensor; no
+        // data!`, out of `tensor()` -- was right about the bytes and wrong
+        // about the question, the same mismatch `stride()` had one line
+        // earlier (docs/EXPORT4.md §6.5). `meta_utils.py:2071` is not asking
+        // for bytes; it is asking for something to key an aliasing memo on,
+        // and it never reads through what it gets. So the answerable part of
+        // the question is a size and an identity, and both are available: the
+        // size from shape and dtype, the identity from `Repr::Meta`'s
+        // `storage_id`.
+        //
+        // What it is NOT is a zero-length CPU storage wearing a meta label.
+        // `storage::meta` leaves `filled` false, so `set_` still refuses it,
+        // and every byte door on it refuses by name rather than answering over
+        // an empty buffer. docs/EXPORT5.md §2 is the table of which of
+        // upstream's expectations that meets and which it refuses.
+        if let Some(storage_id) = self.meta_storage_id() {
+            let nbytes = self.numel() * self.tag.itemsize();
+            return crate::storage::meta(py, nbytes, storage_id);
+        }
         let (bytes, origin) = self.storage_snapshot("TensorBase.untyped_storage")?;
         crate::storage::snapshot(py, bytes, origin)
     }
@@ -2136,7 +2276,7 @@ impl PyTensorBase {
         // `test_export4.py::test_a_meta_tensor_is_contiguous_so_its_stride_is_derivable`
         // fails if a meta tensor ever becomes non-contiguous, which is exactly
         // the day this answer would start lying.
-        if let Repr::Meta { shape } = &self.inner {
+        if let Repr::Meta { shape, .. } = &self.inner {
             let mut contiguous = vec![0i64; shape.len()];
             let mut acc: i64 = 1;
             for i in (0..shape.len()).rev() {
@@ -2469,7 +2609,61 @@ impl PyTensorBase {
     /// produce a transposed one, so every meta tensor this shim can make *is*
     /// contiguous. It stops being true the day a meta `t`/`permute` kernel
     /// lands, and that kernel is the thing that has to add the stride field.
-    fn is_contiguous(&self) -> bool {
+    /// **`memory_format` is keyword-only and is answered, not ignored.**
+    ///
+    /// `fake_tensor.py:1295`'s `extract_tensor_metadata` calls
+    /// `t.is_contiguous(memory_format=...)` on every tensor it hashes, so
+    /// `torch.export` reaches it once per cached dispatch. Measured on 2.13.0,
+    /// and the signature is measured too -- upstream refuses a *positional*
+    /// memory format (`is_contiguous() takes 0 positional arguments`), so this
+    /// is `*, memory_format` rather than an optional first argument:
+    ///
+    /// | asked | upstream | here |
+    /// |---|---|---|
+    /// | `contiguous_format` | the ordinary answer | the ordinary answer |
+    /// | `preserve_format` | the ordinary answer (measured: `False` on a permuted tensor, not an unconditional `True`) | the ordinary answer |
+    /// | `channels_last` / `channels_last_3d` | `True` only for a tensor actually in that layout | **`False`, as a fact** |
+    ///
+    /// The last row is a fact rather than a stand-in, in the same sense as
+    /// `is_mkldnn` (docs/EXPORT.md §2.3): **there is no channels-last
+    /// representation in this build at all.** candle carries a `Layout` and no
+    /// memory-format tag, no kernel here accepts `memory_format=channels_last`,
+    /// and `grep channels_last rust/torch_c/src/*.rs` finds only upsample
+    /// *error message* strings. A tensor cannot be in a layout the build cannot
+    /// construct, so `False` is true of every tensor this shim can make -- and
+    /// `test_export5.py` asserts that non-constructibility rather than trusting
+    /// this paragraph, because the day a channels-last kernel lands is the day
+    /// this answer starts lying.
+    ///
+    /// An unrecognised memory format **refuses by name** rather than falling
+    /// through to the ordinary answer: silently treating an unknown label as
+    /// `contiguous_format` is how a caller gets a `True` it did not ask for.
+    #[pyo3(signature = (*, memory_format = None))]
+    fn is_contiguous(&self, memory_format: Option<&Bound<'_, PyAny>>) -> PyResult<bool> {
+        if let Some(mf) = memory_format {
+            let label = mf
+                .getattr("_shim_name")
+                .and_then(|n| n.extract::<String>())
+                .unwrap_or_else(|_| mf.str().map(|s| s.to_string()).unwrap_or_default());
+            let label = label.rsplit('.').next().unwrap_or(&label).to_string();
+            match label.as_str() {
+                "contiguous_format" | "preserve_format" => {}
+                "channels_last" | "channels_last_3d" => return Ok(false),
+                other => {
+                    return Err(not_implemented(format!(
+                        "TensorBase.is_contiguous(memory_format={other}): this shim knows \
+                         torch.contiguous_format, torch.preserve_format, \
+                         torch.channels_last and torch.channels_last_3d, and this is none \
+                         of them. Refused rather than answered as if it were \
+                         contiguous_format (tensor.rs)"
+                    )))
+                }
+            }
+        }
+        Ok(self.is_contiguous_inner())
+    }
+
+    fn is_contiguous_inner(&self) -> bool {
         match &self.inner {
             Repr::Dense(tensor) => tensor.is_contiguous(),
             Repr::Meta { .. } => true,

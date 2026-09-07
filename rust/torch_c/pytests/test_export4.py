@@ -641,39 +641,54 @@ def test_no_dispatch_nests_and_is_released_rather_than_latched():
 # 8. where export stops, by name
 # ---------------------------------------------------------------------------
 
-def test_export_still_stops_and_it_stops_at_the_storage_handle():
-    """The current wall, pinned so that moving it is a decision and not a drift.
+def test_export_no_longer_stops_at_the_storage_handle_and_returns_a_real_graph():
+    """**The wall this file pinned has fallen, and this is the rewrite it asked for.**
 
-    Two ways to fail, both wanted:
+    The test that stood here refused to be quietly deleted:
 
-    * export stops somewhere EARLIER -- a regression in one of the six things
-      this round landed, and the frame list says which;
-    * export SUCCEEDS -- then this round's headline claim ("export does not yet
-      return an `ExportedProgram`") is stale, and docs/EXPORT4.md §3 has to be
-      rewritten rather than quietly left saying the wrong thing.
+        "Do not simply delete this assertion: confirm the graph REPLAYS to the
+         same numbers as eager, element-wise against upstream
+         (rust/torch_c/pytests/export_sweep.py), then rewrite EXPORT4.md §3."
 
-    The second is the direction docs/EXPORT.md §4.2 warns about: a graph that
-    builds is not a graph that computes, and an `ExportedProgram` appearing here
-    must be met with an element-wise replay comparison before anyone calls it
-    working. `export_sweep.py` is the tool for that and this test is the alarm.
+    That was done -- `docs/EXPORT5.md` §2 closed the meta storage handle, §6
+    closed the pre-dispatch wall behind it, and §8 is the three-verdict
+    measurement, bit-identical against upstream on four modules at a tolerance
+    derived from upstream's own float32-vs-float64 error. So the alarm is
+    replaced by the assertion it was guarding *for*, not removed.
+
+    It still fails in two directions, which is why it is worth keeping:
+
+    * export stops again -- a regression in anything docs/EXPORT4.md or
+      docs/EXPORT5.md landed;
+    * export succeeds and the graph is **empty**. That second one is the whole
+      reason this test is shaped this way. Before §6, `torch.export.export()`
+      returned an `ExportedProgram` that printed, serialised and held a
+      placeholder, an output and **no operators** -- exactly the failure
+      docs/EXPORT.md §4.2 predicted in prose. An assertion that only checked
+      "did it export" passed on that graph. This one counts the operators.
     """
     if not _available():
         return
     r = _shim()
     e = r["export"]
-    if e["status"] == "ok":
-        raise AssertionError(
-            "torch.export.export() now returns an ExportedProgram with ops "
-            f"{e['value']['ops']}. That is further than docs/EXPORT4.md claims. "
-            "Do not simply delete this assertion: confirm the graph REPLAYS to "
-            "the same numbers as eager, element-wise against upstream "
-            "(rust/torch_c/pytests/export_sweep.py), then rewrite EXPORT4.md §3."
-        )
-    assert e["type"] == "NotImplementedError", e
-    assert "Cannot copy out of meta tensor" in e["message"], e["message"]
-    frames = " | ".join(e.get("last_frames", []))
-    assert "meta_utils.py" in frames, frames
-    assert "untyped_storage" in (e.get("last_line") or ""), e.get("last_line")
+    assert e["status"] == "ok", (
+        "torch.export.export() stopped again. docs/EXPORT5.md §8 recorded it "
+        f"working on this module: {e}"
+    )
+    ops = e["value"]["ops"]
+    assert ops, (
+        "torch.export.export() returned an ExportedProgram whose graph holds "
+        "NO operators. That is docs/EXPORT.md §4.2's failure exactly -- it "
+        "prints, it serialises, and it computes nothing. Do not relax this to "
+        "'did it export'; find why the tracing mode stopped seeing operators "
+        "(docs/EXPORT5.md §6 is the last time this happened)."
+    )
+    # The module is `(x * 2 + 1).relu()`, so the operators are fixed. The
+    # *overload* spellings are deliberately not asserted here -- they are the
+    # known `.Scalar`/`.Tensor` disagreement with upstream (docs/EXPORT.md §5,
+    # docs/EXPORT5.md §9), and `test_dispatch.py` is where that is pinned.
+    packets = [o.rsplit(".", 1)[0] for o in ops]
+    assert packets == ["aten.mul", "aten.add", "aten.relu"], ops
 
 
 def test_the_walls_this_round_closed_are_not_reachable_again():

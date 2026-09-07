@@ -18782,7 +18782,20 @@ refuse("setitem", lambda: snap.__setitem__(0, 3))
 refuse("copy_", lambda: snap.copy_(snap))
 refuse("resize_", lambda: snap.resize_(8))
 refuse("shim_fill", lambda: snap._shim_fill(b"\x00" * snap.nbytes()))
-refuse("meta_storage", lambda: torch.zeros(2, device="meta").untyped_storage())
+# A meta tensor now ANSWERS `untyped_storage()` with a size-and-identity
+# handle (docs/EXPORT5.md §2), so the thing to check is no longer that the
+# call refuses -- it is that the handle refuses every door that would need
+# bytes. That is strictly more surface than the single refusal this replaced.
+_meta_storage = torch.zeros(2, device="meta").untyped_storage()
+refusals["meta_storage_nbytes"] = _meta_storage.nbytes()
+refusals["meta_storage_device"] = str(_meta_storage.device)
+refusals["meta_storage_filled"] = _meta_storage._shim_filled
+refusals["meta_storage_data_ptr"] = _meta_storage.data_ptr()
+refuse("meta_storage_getitem", lambda: _meta_storage[0])
+refuse("meta_storage_setitem", lambda: _meta_storage.__setitem__(0, 3))
+refuse("meta_storage_copy_", lambda: _meta_storage.copy_(_meta_storage))
+refuse("meta_storage_resize_", lambda: _meta_storage.resize_(8))
+refuse("meta_storage_bytes", lambda: _meta_storage._shim_bytes())
 refuse("storage_pickle", lambda: snap.__getstate__())
 result["refusals"] = refusals
 
@@ -19063,7 +19076,15 @@ def test_save_refuses_the_legacy_container_and_every_write_into_a_snapshot():
     for door in ("setitem", "copy_", "resize_", "shim_fill"):
         assert r[door], f"{door} did not refuse a write into a snapshot"
         assert "snapshot" in r[door], (door, r[door])
-    assert r["meta_storage"], "a meta tensor handed out a storage"
+    # A meta tensor's storage handle: it answers a size and an identity, and
+    # every door that would need bytes refuses. docs/EXPORT5.md §2.
+    assert r["meta_storage_nbytes"] == 8, r["meta_storage_nbytes"]
+    assert r["meta_storage_device"] == "meta", r["meta_storage_device"]
+    assert r["meta_storage_filled"] is False, "a meta storage claimed to be filled"
+    assert r["meta_storage_data_ptr"] == 0, r["meta_storage_data_ptr"]
+    for door in ("getitem", "setitem", "copy_", "resize_", "bytes"):
+        key = f"meta_storage_{door}"
+        assert r[key], f"{door} did not refuse on a meta storage"
     assert r["storage_pickle"], "a storage pickled itself"
 
 

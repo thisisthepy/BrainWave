@@ -100,9 +100,16 @@ pub struct PyStorageBase {
     /// the guard that makes the copy/alias difference loud instead of silent.
     /// Allocation does not set it; only delivering bytes does.
     filled: bool,
-    /// Storages are CPU-only here. `torch.load` asks for `device="meta"` when
-    /// it is loading under a fake mode, and that is refused at construction
-    /// rather than answered with a CPU buffer.
+    /// `"cpu"` or `"meta"`. Everything else is refused at construction rather
+    /// than answered with a CPU buffer.
+    ///
+    /// A **meta** storage is the one kind here that has a size and no bytes:
+    /// `buf` is empty, `len` is what the tensor's bytes *would* occupy, and
+    /// `filled` is false and stays false. It exists because
+    /// `torch/_subclasses/meta_utils.py:2071` asks a meta tensor for its
+    /// storage in order to key an aliasing memo, and a size-and-identity
+    /// handle is exactly what that question wants -- see docs/EXPORT5.md §2 for
+    /// which of upstream's expectations it meets and which it refuses by name.
     device: String,
 }
 
@@ -122,6 +129,28 @@ impl PyStorageBase {
         } else {
             self.buf.as_ptr() as usize
         }
+    }
+
+    fn is_meta(&self) -> bool {
+        self.device == "meta"
+    }
+
+    /// The refusal a meta storage gives to anything that wants its bytes.
+    ///
+    /// Separate from `snapshot_is_read_only` because it is a different fact
+    /// about a different object: a snapshot has bytes and may not be written
+    /// through, a meta storage has **no bytes at all**. Sharing the message
+    /// would tell a caller to "write to the tensor instead", and for a meta
+    /// tensor there is nothing to write to.
+    fn meta_has_no_bytes(&self, op: &str) -> PyErr {
+        not_implemented(format!(
+            "torch._C shim: {op} on a storage of a meta tensor. A meta storage \
+             here carries a size ({} bytes) and an identity and no bytes at all, \
+             which is what meta_utils.py's aliasing memo asks of it; it is not a \
+             buffer of zeros standing in for one. Refused rather than answered \
+             (docs/EXPORT5.md §2, storage.rs)",
+            self.len
+        ))
     }
 
     /// The refusal every write door gives. Two messages, because the two cases
@@ -194,6 +223,46 @@ pub fn snapshot(py: Python<'_>, bytes: Vec<u8>, origin: usize) -> PyResult<Py<Py
         me.buf = Arc::new(bytes);
         me.origin = origin;
         me.filled = true;
+    }
+    Ok(obj.unbind())
+}
+
+/// The storage handle of a meta tensor: a size and an identity, and no bytes.
+///
+/// `TensorBase.untyped_storage()`'s meta half, and the answer to
+/// `docs/EXPORT.md` §3.3. `nbytes` is what the tensor's elements *would*
+/// occupy, `storage_id` is `Repr::Meta`'s token (see `tensor.rs`), and `buf`
+/// stays empty -- there is nothing to put in it.
+///
+/// `filled` is **false**, and that is load-bearing rather than incidental: the
+/// module docstring's invariant is that only something which actually
+/// delivered bytes may set it, nothing ever delivers bytes here, and `set_`
+/// refuses on an unfilled storage. So a meta storage cannot be laundered into
+/// a real tensor's bytes by the one path that would produce silent zeros.
+pub fn meta(py: Python<'_>, nbytes: usize, storage_id: usize) -> PyResult<Py<PyAny>> {
+    let obj = match STORAGE_CLASS.get() {
+        Some(cls) => cls.bind(py).call1((0usize,))?,
+        None => Bound::new(
+            py,
+            PyStorageBase {
+                buf: Arc::new(Vec::new()),
+                off: 0,
+                len: 0,
+                origin: 0,
+                filled: false,
+                device: "cpu".to_string(),
+            },
+        )?
+        .into_any(),
+    };
+    {
+        let mut me = obj.cast::<PyStorageBase>()?.borrow_mut();
+        me.buf = Arc::new(Vec::new());
+        me.off = 0;
+        me.len = nbytes;
+        me.origin = storage_id;
+        me.filled = false;
+        me.device = "meta".to_string();
     }
     Ok(obj.unbind())
 }
@@ -393,6 +462,14 @@ impl PyStorageBase {
     ) -> PyResult<Bound<'py, PyAny>> {
         let me = slf.borrow();
         let len = me.len;
+        if me.is_meta() {
+            // Upstream's own message, verbatim: reading or slicing a meta
+            // storage raises `NotImplementedError: Not available for 'meta'
+            // device type` on 2.13.0. Measured, not transcribed from prose --
+            // a slice is refused there too, so this is before the slice arm
+            // rather than inside the integer one.
+            return Err(not_implemented("Not available for 'meta' device type"));
+        }
         if let Ok(slice) = idx.cast::<PySlice>() {
             let step = slice.getattr("step")?;
             if !step.is_none() && step.extract::<i64>()? != 1 {
@@ -451,11 +528,17 @@ impl PyStorageBase {
     /// which cannot be fixed where it lives. `UntypedStorage(torch._C.StorageBase,
     /// _StorageBase)` puts these first in the MRO.
     fn __setitem__(&self, _idx: &Bound<'_, PyAny>, _value: &Bound<'_, PyAny>) -> PyResult<()> {
+        if self.is_meta() {
+            return Err(self.meta_has_no_bytes("UntypedStorage.__setitem__"));
+        }
         Err(self.snapshot_is_read_only("UntypedStorage.__setitem__"))
     }
 
     #[pyo3(signature = (*_args, **_kwargs))]
     fn copy_(&self, _args: &Bound<'_, PyAny>, _kwargs: Option<&Bound<'_, PyAny>>) -> PyResult<()> {
+        if self.is_meta() {
+            return Err(self.meta_has_no_bytes("UntypedStorage.copy_"));
+        }
         Err(self.snapshot_is_read_only("UntypedStorage.copy_"))
     }
 
@@ -465,6 +548,23 @@ impl PyStorageBase {
         _args: &Bound<'_, PyAny>,
         _kwargs: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<()> {
+        // Upstream's meta storage *does* resize (measured: 2.13.0 resizes a
+        // meta storage to 8 bytes and reports it). This one refuses, and that
+        // is a divergence rather than a gap: `len` here is derived from the
+        // meta tensor's shape and dtype at the moment the handle was made, so
+        // a resize would leave the storage and the tensor disagreeing about a
+        // number the tensor is the authority on. docs/EXPORT5.md §2 lists it
+        // among the expectations this handle refuses by name.
+        if self.is_meta() {
+            return Err(not_implemented(format!(
+                "torch._C shim: UntypedStorage.resize_ on a storage of a meta \
+                 tensor. Upstream resizes one; this handle's size ({} bytes) is \
+                 derived from the meta tensor's shape and dtype and is not \
+                 independently settable, so resizing would leave the storage and \
+                 the tensor disagreeing (docs/EXPORT5.md §2)",
+                self.len
+            )));
+        }
         Err(self.snapshot_is_read_only("UntypedStorage.resize_"))
     }
 
@@ -530,6 +630,16 @@ impl PyStorageBase {
     /// later, `_cdata`'s record key) both ask it "same storage?", and a copy's
     /// own address would answer "no" for two views of one buffer.
     fn data_ptr(&self) -> usize {
+        // **A meta storage answers 0, and that is upstream's answer, measured.**
+        // On torch 2.13.0 every meta storage -- base or view, any size --
+        // answers `data_ptr() == 0`, because there is no allocation to point
+        // at. Answering `origin` here would hand out a number that looks like
+        // an address and is a counter, which is the shape of lie this file
+        // exists to refuse. Identity is asked for through `_cdata`, and that is
+        // where it is answered.
+        if self.is_meta() {
+            return 0;
+        }
         self.base_address() + self.off
     }
 
@@ -543,6 +653,13 @@ impl PyStorageBase {
     /// `untyped_storage()` builds a *fresh* Python object on every call
     /// (upstream caches one per storage), so object identity would make every
     /// tensor look like it had a storage of its own.
+    ///
+    /// **For a meta storage this is the whole of its identity**, since
+    /// `data_ptr()` is 0 there and carries none. It is `Repr::Meta`'s
+    /// `storage_id` -- distinct per meta storage, shared between a meta tensor
+    /// and its views -- which is the relation upstream's `_cdata` has,
+    /// measured: `b.untyped_storage()._cdata == b[1:,1:].untyped_storage()._cdata`
+    /// and differs from an unrelated meta tensor's.
     #[getter]
     fn _cdata(&self) -> usize {
         self.base_address()
@@ -583,6 +700,9 @@ impl PyStorageBase {
 
     #[getter]
     fn device(&self) -> PyDevice {
+        if self.is_meta() {
+            return PyDevice::meta();
+        }
         PyDevice::cpu()
     }
 
@@ -638,8 +758,15 @@ impl PyStorageBase {
 
     /// `bytes(storage)`, for tests and for anything that wants the payload back
     /// without going through a tensor.
-    fn _shim_bytes<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
-        PyBytes::new(py, self.bytes())
+    fn _shim_bytes<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        // A meta storage's `bytes()` is an empty slice, and handing that back
+        // would say "this storage is empty" where the truth is "this storage
+        // has `len` bytes and none of them exist". Those are different claims
+        // and the second one has to be a refusal.
+        if self.is_meta() {
+            return Err(self.meta_has_no_bytes("UntypedStorage._shim_bytes"));
+        }
+        Ok(PyBytes::new(py, self.bytes()))
     }
 }
 
