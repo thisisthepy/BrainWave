@@ -1,4 +1,4 @@
-"""Tests for docs/QNN.md -- ExecuTorch's Qualcomm backend as a subgraph delegate.
+"""Tests for docs/devices/QNN.md -- ExecuTorch's Qualcomm backend as a subgraph delegate.
 
 The round's shape, and therefore this file's:
 
@@ -13,12 +13,12 @@ The round's shape, and therefore this file's:
   pipeline with the XNNPACK partitioner, and that is used as the control: the
   loading and running machinery is executed, and `QnnModule` is then required
   to **refuse the very same file by name**.
-* **nothing here claims anything ran on an NPU.** docs/QNN.md §6.4. The
+* **nothing here claims anything ran on an NPU.** docs/devices/QNN.md §6.4. The
   evidence that would be needed is written down in §6 and none of it was
   observed, because no Snapdragon device was attached.
 
 Three environments, three fixtures, and each skips **by name** when its
-environment is absent -- docs/VULKAN3.md §6.1, a skip with a false reason is
+environment is absent -- docs/devices/VULKAN3.md §6.1, a skip with a false reason is
 counted as a pass:
 
 | fixture | interpreter | needs |
@@ -300,7 +300,7 @@ print(json.dumps(out))
 def _shim_subprocess(script, extra_env=None):
     env = dict(os.environ)
     env["PYTHONPATH"] = _CKPT_VENDOR_DIR
-    env["TORCH_USE_RTLD_GLOBAL"] = "1"  # docs/VENDOR.md wall 1
+    env["TORCH_USE_RTLD_GLOBAL"] = "1"  # docs/platform/VENDOR.md wall 1
     env.update(extra_env or {})
     proc = subprocess.run(
         [sys.executable, "-c", script],
@@ -698,7 +698,7 @@ def _vendor_ready():
 
 
 def test_the_qnn_ahead_of_time_half_refuses_here_and_names_the_missing_module():
-    """docs/QNN.md §3's headline, measured on whichever host runs this.
+    """docs/devices/QNN.md §3's headline, measured on whichever host runs this.
 
     The refusal must name
     `executorch.backends.qualcomm.python.PyQnnManagerAdaptor`, because that is
@@ -734,7 +734,7 @@ def test_the_qnn_ahead_of_time_half_refuses_here_and_names_the_missing_module():
     # adaptor check entirely was not caught by this test until this block
     # existed. The refusal then fell through to the partitioner import, which
     # also fails, so `aot_available` stayed False and every other assertion
-    # here still passed while the sentence docs/QNN.md §3 leads with had
+    # here still passed while the sentence docs/devices/QNN.md §3 leads with had
     # stopped being produced. This reads the same function on the interpreter
     # that *does* have executorch, which is the only one where the distinction
     # is observable.
@@ -773,7 +773,7 @@ def test_lowering_refuses_before_it_touches_the_module():
 def test_the_qnn_sdk_version_is_read_from_executorch_not_transcribed():
     """`qnn_sdk_version()` must come out of the installed package.
 
-    docs/DECOMP.md §12.6 named the trap for operator lists and this is the same
+    docs/graph/DECOMP.md §12.6 named the trap for operator lists and this is the same
     trap one size smaller: a version number copied into this repository is
     wrong the first release after somebody bumps it, and nothing here would
     notice. The assertion is on the *shape* of the answer rather than its
@@ -961,7 +961,7 @@ def test_the_qnn_module_refuses_the_very_file_the_generic_one_runs():
 
     `ExecuTorchModule` loads the control artefact and returns the right
     numbers. If `QnnModule` did too, then `QnnModule` would be a synonym and
-    every sentence in docs/QNN.md that distinguishes "delegated" from
+    every sentence in docs/devices/QNN.md that distinguishes "delegated" from
     "delegated to QNN" would be unfounded. So the same file must be **refused**,
     and the refusal must name the backends the artefact actually has.
     """
@@ -972,7 +972,7 @@ def test_the_qnn_module_refuses_the_very_file_the_generic_one_runs():
     assert refusal, "QnnModule accepted an XNNPACK artefact"
     assert "no QnnBackend delegate" in refusal, refusal
     assert "XnnpackBackend" in refusal, refusal
-    assert "docs/QNN.md" in refusal, refusal
+    assert "docs/devices/QNN.md" in refusal, refusal
 
 
 def test_the_artefact_reader_decodes_the_htp_plan_out_of_the_compile_spec():
@@ -1077,7 +1077,7 @@ def test_a_malformed_or_foreign_artefact_is_refused_by_name():
 def test_the_delegated_submodule_agrees_with_upstream_at_a_derived_tolerance():
     """SmolLM2-135M's layer-0 MLP, lowered and executed, against upstream eager.
 
-    The tolerance is docs/AGREE.md §2's, not a number chosen here. Upstream
+    The tolerance is docs/numerics/AGREE.md §2's, not a number chosen here. Upstream
     runs the *same* submodule in float64 and the float32 answer is scored
     against it; the tolerance is the p90 of that error floored at 8 ulp, and
     its defence is that anything tighter would have to call upstream wrong on a
@@ -1088,15 +1088,15 @@ def test_the_delegated_submodule_agrees_with_upstream_at_a_derived_tolerance():
     distance from the float64 truth for the same output. Here the ratio comes
     out well **below** one -- the artefact's answer is nearer the float64 truth
     than upstream's own float32 path is -- which is what two independent
-    float32 truncation orders look like, and is the same shape docs/AGREE.md
+    float32 truncation orders look like, and is the same shape docs/numerics/AGREE.md
     §3 measured across 285 architectures.
 
     **What this cannot mean.** This is the *XNNPACK* artefact, on this Mac's
     CPU, in float32. It says the export/lower/serialise/load/execute pipeline
     preserves the function. It says **nothing** about QNN, whose HTP path is
-    `kHtpFp16` or `kHtpQuantized` -- docs/QNN.md §7 is why a float32 agreement
+    `kHtpFp16` or `kHtpQuantized` -- docs/devices/QNN.md §7 is why a float32 agreement
     and an HTP execution are two different claims that cannot be made on one
-    run, exactly as docs/NPU2.md §1.1 found for the Neural Engine.
+    run, exactly as docs/graph/NPU2.md §1.1 found for the Neural Engine.
     """
     result = _qnn_et_fixture()
     if result is None:
@@ -1129,7 +1129,7 @@ def test_the_delegated_submodule_agrees_with_upstream_at_a_derived_tolerance():
     )
     worst_ratio = max(row["ratio"] for row in rows if row["ratio"] is not None)
     assert worst_ratio <= 4.0, (
-        f"worst oracle ratio {worst_ratio:.2f} exceeds docs/AGREE.md §2's 4x "
+        f"worst oracle ratio {worst_ratio:.2f} exceeds docs/numerics/AGREE.md §2's 4x "
         "rule -- the artefact is further from the float64 truth than upstream "
         "is by more than that factor"
     )
@@ -1151,7 +1151,7 @@ def test_the_delegated_submodule_agrees_with_upstream_at_a_derived_tolerance():
 def test_the_device_module_refuses_to_guess_which_device_to_use():
     """`ANDROID_SERIAL` or nothing. The devices on this machine are shared.
 
-    docs/NPU2.md's `nnapi_device` earned this rule and this module inherits it
+    docs/graph/NPU2.md's `nnapi_device` earned this rule and this module inherits it
     verbatim. The refusal has to name the variable, because "no device" reads
     like "unplug and replug" and the actual fix is one `export`.
     """
@@ -1222,7 +1222,7 @@ def test_the_htp_stub_names_are_derived_from_the_architecture_not_listed():
 
 
 def test_an_absent_soc_table_is_not_reported_as_an_unrecognised_chipset():
-    """The defect real hardware found. docs/QNN.md §5.1.
+    """The defect real hardware found. docs/devices/QNN.md §5.1.
 
     The first version of `device_soc` returned `chipset=None` for both "the
     device reported something ExecuTorch's table does not have" and "this
@@ -1302,11 +1302,11 @@ def test_the_fastrpc_check_stats_named_paths_rather_than_listing_dev():
 def test_no_claim_is_made_that_anything_ran_on_an_npu():
     """The claim this round does **not** make, pinned so it cannot drift.
 
-    docs/QNN.md §6.4. No QNN artefact was produced (the host cannot), no
+    docs/devices/QNN.md §6.4. No QNN artefact was produced (the host cannot), no
     Snapdragon device was attached, and `QnnBackend` is not registered in any
     ExecuTorch runtime reachable from here. So there is no run to attribute,
     and this test asserts the *absence* rather than leaving it to prose --
-    docs/NPU2.md is what a round costs when "executed" and "executed on the
+    docs/graph/NPU2.md is what a round costs when "executed" and "executed on the
     NPU" are allowed to blur.
 
     If a future round lands the device half, this goes red and the sentence it
@@ -1318,14 +1318,14 @@ def test_no_claim_is_made_that_anything_ran_on_an_npu():
             return _skip("vendored tree has no _C.abi3.so")
         shim = _qnn_shim_fixture()
         assert shim["aot_available"] is False, \
-            "this host can lower to QNN -- docs/QNN.md §6.4 needs rewriting"
+            "this host can lower to QNN -- docs/devices/QNN.md §6.4 needs rewriting"
         return
     assert "QnnBackend" not in result["runtime_backends"], result["runtime_backends"]
     assert result["control_backends"] == ["XnnpackBackend"], result["control_backends"]
     assert result["probe"]["qnn_backend_registered"] is False
     assert result["probe"]["qnn_aot_available"] is False, (
         "the QNN ahead-of-time half became available on this host -- "
-        "docs/QNN.md §3 and §6.4 both need re-measuring"
+        "docs/devices/QNN.md §3 and §6.4 both need re-measuring"
     )
 
 

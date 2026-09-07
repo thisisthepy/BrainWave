@@ -1,4 +1,4 @@
-"""docs/TAIL1.md: the eight one-architecture ops of docs/ARCH100.md's tail,
+"""docs/kernels/TAIL1.md: the eight one-architecture ops of docs/architectures/ARCH100.md's tail,
 plus `linalg_qr`.
 
 Every value here is held against **upstream torch**, not against a number
@@ -10,7 +10,7 @@ and nothing here does except the two reachability tests at the bottom, which
 have to.
 
 What each op's cases are shaped to catch is the point, and it is different per
-op (docs/TAIL1.md §2):
+op (docs/kernels/TAIL1.md §2):
 
   * `logical_and`  -- integers, where `bitwise_and` gives a different answer
                       and a different dtype. A bool-only test passes on both.
@@ -363,7 +363,7 @@ def test_argsort_stable_overload_agrees_with_the_default_one_in_both_settings():
             assert _flat(t_res) == _flat(plain), (
                 f"upstream's argsort.stable(stable={stable}) no longer agrees with "
                 f"argsort() -- this shim shares one implementation between them and "
-                f"docs/TAIL1.md §3 records why that was licensed"
+                f"docs/kernels/TAIL1.md §3 records why that was licensed"
             )
 
 
@@ -451,7 +451,7 @@ def test_max_pool1d_accepts_float16_and_bfloat16_which_max_pool2d_here_refuses()
         refused = True
     assert refused, (
         "max_pool2d now accepts float16 here -- if that is deliberate, the "
-        "asymmetry docs/TAIL1.md §2 records is gone and this test should say so"
+        "asymmetry docs/kernels/TAIL1.md §2 records is gone and this test should say so"
     )
 
 
@@ -649,7 +649,7 @@ def test_linalg_qr_answers_plus_i_for_the_identity_not_minus_i():
     assert [t_r[i][i].item() for i in range(3)] == [1.0, 1.0, 1.0]
     assert [c_r[i][i].item() for i in range(3)] == [1.0, 1.0, 1.0], (
         "R's diagonal is not +1 for the identity -- dlarfg's xnorm == 0 short "
-        "circuit is missing (docs/TAIL1.md §5)"
+        "circuit is missing (docs/kernels/TAIL1.md §5)"
     )
     _same(t_q, c_q, "Q(eye)", atol=0.0, rtol=0.0)
 
@@ -681,7 +681,7 @@ def test_linalg_qr_batches_over_the_leading_dimensions():
 
 
 def test_linalg_qr_on_a_rank_deficient_matrix_is_checked_by_property_not_value():
-    """docs/TAIL1.md §5. On `[[1,2],[2,4],[3,6]]` the second column of Q is
+    """docs/kernels/TAIL1.md §5. On `[[1,2],[2,4],[3,6]]` the second column of Q is
     determined by rounding noise -- upstream's own R[1][1] is 8.8e-07 at
     float32 -- so an element-wise comparison there compares two arbitrary
     answers. What *is* determined is checked instead: R upper-triangular, Q's
@@ -757,7 +757,7 @@ def test_linalg_qr_refusals_are_two_different_ones_because_upstream_has_two():
 # upstream reaches them through `torch._C._nn` / `torch._C._linalg` submodule
 # bindings that live in `bootstrap.py`. This round did not own that file, so
 # the state below is pinned rather than fixed: each assertion fails when the
-# binding lands, which is when docs/TAIL1.md §4 should be rewritten.
+# binding lands, which is when docs/kernels/TAIL1.md §4 should be rewritten.
 
 _VENDOR_PROBE = r"""
 import json, sys
@@ -818,7 +818,7 @@ def _vendor_probe():
 
 def test_the_new_torch_level_spellings_reach_their_kernels_in_the_vendored_tree():
     """A kernel with no spelling is invisible from Python -- the shape
-    `docs/SPELLINGS.md` exists for. This runs the *vendored* torch (the shim
+    `docs/bindings/SPELLINGS.md` exists for. This runs the *vendored* torch (the shim
     wearing torch's name) in a subprocess and calls each op the way a model
     would."""
     if not os.path.isfile(_CKPT_VENDOR_SHIM):
@@ -845,14 +845,14 @@ def test_the_two_submodule_bindings_landed_and_mse_loss_is_the_one_still_open():
     """This test used to pin the *opposite* -- that `torch._C._nn.
     upsample_nearest2d` and `torch._C._linalg.linalg_qr` had kernels and no way
     to call them, because the round that wrote the kernels did not own
-    `bootstrap.py`. docs/TAIL1.md §4 said it would fail the moment the bindings
+    `bootstrap.py`. docs/kernels/TAIL1.md §4 said it would fail the moment the bindings
     landed, and it did. They are inverted here rather than deleted: the
     coverage that mattered was never "the gap exists", it was "somebody checks
     these two names through the vendored tree", and that is worth keeping now
-    that they answer. docs/BINDINGS.md.
+    that they answer. docs/bindings/BINDINGS.md.
 
     `mse_loss` is the one still open, and it is a `bootstrap.py` stub of the
-    same shape -- docs/BACKWARD9.md §1's hand-spelled criterion stands until it
+    same shape -- docs/training/BACKWARD9.md §1's hand-spelled criterion stands until it
     lands."""
     if not os.path.isfile(_CKPT_VENDOR_SHIM):
         return
@@ -867,8 +867,8 @@ def test_the_two_submodule_bindings_landed_and_mse_loss_is_the_one_still_open():
     # the *next* wall is `torch._C._nn.mse_loss`, also a bootstrap.py stub.
     assert r["mse_loss"][0] == "raised", (
         "nn.MSELoss now computes -- the _nn.mse_loss binding landed. "
-        "docs/BACKWARD9.md §1 can stop spelling its criterion out by hand, and "
-        "docs/TAIL1.md §4 should say so"
+        "docs/training/BACKWARD9.md §1 can stop spelling its criterion out by hand, and "
+        "docs/kernels/TAIL1.md §4 should say so"
     )
     assert "mse_loss" in r["mse_loss"][2], r["mse_loss"]
 

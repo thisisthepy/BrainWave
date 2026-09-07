@@ -1,10 +1,10 @@
 """The dispatcher entrance -- `_aten_dispatch` consulting the mode stack.
 
-`docs/EXPORT.md` §6 item 1, and only item 1.  Before this round a
+`docs/graph/EXPORT.md` §6 item 1, and only item 1.  Before this round a
 `TorchDispatchMode` entered, `torch._C._len_torch_dispatch_stack()` reported 1
 inside the block, and `__torch_dispatch__` was never called: the single door did
 not read the stack, and `aten.rs`'s capture hook ran *after* the kernel, so it
-could record a result and could not replace one.  `docs/DISPATCH3.md` is what
+could record a result and could not replace one.  `docs/design/DISPATCH3.md` is what
 this measures.
 
 Every claim here is checked **against upstream in a separate process**, not
@@ -20,7 +20,7 @@ Written so that closing the remaining gap makes these demand more rather than
 go quiet.  Two do that explicitly:
 
 * `test_the_overload_spelling_is_the_only_remaining_disagreement_with_upstream`
-  pins the `.Scalar` / `.Tensor` split that `docs/EXPORT.md` §5 found between
+  pins the `.Scalar` / `.Tensor` split that `docs/graph/EXPORT.md` §5 found between
   `capture.rs` and upstream, and asserts the operators agree -- so a round that
   fixes overload resolution has to come here and say so.
 * `test_fake_tensor_mode_is_reached_and_names_what_stops_it_returning_a_fake`
@@ -70,7 +70,7 @@ class _Log(TorchDispatchMode):
 # --- 1. does a mode see the operators, and which ---------------------------
 # `x` is built *outside* the block on purpose: a factory call inside it is an
 # operator too (upstream reports `aten.ones.default`), and this comparison is
-# about the three in `docs/EXPORT.md` §4.2.
+# about the three in `docs/graph/EXPORT.md` §4.2.
 x = torch.ones(3)
 log = _Log()
 with log:
@@ -78,7 +78,7 @@ with log:
 out["seen"] = log.seen
 out["result"] = y.tolist()
 
-# The operator without the overload, which is the half `docs/EXPORT.md` §5 says
+# The operator without the overload, which is the half `docs/graph/EXPORT.md` §5 says
 # the two front ends already agree on.
 out["seen_operators"] = [".".join(s.split(".")[:2]) for s in log.seen]
 
@@ -309,7 +309,7 @@ def _available():
 
 
 # ---------------------------------------------------------------------------
-# 1. The measurement `docs/EXPORT.md` §4.2 made, made again
+# 1. The measurement `docs/graph/EXPORT.md` §4.2 made, made again
 # ---------------------------------------------------------------------------
 
 def test_a_mode_sees_the_same_operators_as_upstream_in_the_same_order():
@@ -334,13 +334,13 @@ def test_a_mode_sees_the_same_operators_as_upstream_in_the_same_order():
 def test_the_overload_spelling_is_the_only_remaining_disagreement_with_upstream():
     """`aten.mul.Scalar` where upstream says `aten.mul.Tensor`, in two of three.
 
-    `docs/EXPORT.md` §5 found exactly this between `capture.rs` and upstream's
+    `docs/graph/EXPORT.md` §5 found exactly this between `capture.rs` and upstream's
     `make_fx`, and a mode now reports it too -- which is the point: the mode
     sees the key overload resolution picked, so the disagreement is one thing
     in one place and not two.  It is **not** the dispatcher entrance: it is
     `torch.Tensor.__mul__` resolving `(Tensor, Number)` to the `.Scalar`
     overload where upstream's argument parser binds the number to the `Tensor`
-    parameter and wraps it.  `docs/DISPATCH3.md` §5 sizes the change.
+    parameter and wraps it.  `docs/design/DISPATCH3.md` §5 sizes the change.
 
     Pinned rather than described so a round that closes it has to come here.
     """
@@ -439,7 +439,7 @@ def test_a_raising_mode_leaves_the_stack_as_it_found_it():
 
     That is strictly worse than the error, because the next block enters,
     reports itself active, and returns eager results -- the exact shape
-    `docs/COMPILE.md` §5 refuses.
+    `docs/graph/COMPILE.md` §5 refuses.
     """
     if not _available():
         return
@@ -471,7 +471,7 @@ def test_with_no_mode_on_the_stack_the_answers_are_upstreams():
 
 
 def test_autograd_runs_the_same_with_and_without_a_mode_on_the_stack():
-    """The eager tape rides this path (`docs/BACKWARD7.md`) and must be unmoved.
+    """The eager tape rides this path (`docs/training/BACKWARD7.md`) and must be unmoved.
 
     Without a mode, `mark_from_op` and `eager_record` run exactly where they
     did.  With one, the mode's own `func(...)` re-entry is what reaches them --
@@ -490,7 +490,7 @@ def test_autograd_runs_the_same_with_and_without_a_mode_on_the_stack():
 
 
 def test_capture_records_each_operator_once_while_a_mode_is_on_the_stack():
-    """`docs/CAPTURE.md` is a contract and a second hook must not disturb it.
+    """`docs/graph/CAPTURE.md` is a contract and a second hook must not disturb it.
 
     The mode answers by re-entering the door with itself popped, so the kernel
     runs once and the recorder fires once.  A consult placed *after* the
@@ -542,8 +542,8 @@ def test_fake_tensor_mode_is_reached_and_names_what_stops_it_returning_a_fake():
     return value would be the result.  What it cannot yet do is *build* a fake.
 
     **The named reason has moved once, and that is this test working.**  It was
-    `docs/EXPORT.md` §3.1's missing `aten.empty_strided`; `docs/EXPORT4.md`
-    closed that and five more behind it, and the reason is now `docs/EXPORT.md`
+    `docs/graph/EXPORT.md` §3.1's missing `aten.empty_strided`; `docs/graph/EXPORT4.md`
+    closed that and five more behind it, and the reason is now `docs/graph/EXPORT.md`
     §3.3 -- `meta_utils.py:2071` asks a meta tensor for `untyped_storage()` so
     two views of one base can share a fake storage, and `Repr::Meta` has no
     storage handle to give.  That is a storage-model question rather than a
@@ -576,7 +576,7 @@ def test_fake_tensor_mode_is_reached_and_names_what_stops_it_returning_a_fake():
     )
     assert shim["fake_refusal"] is not None
     accepted = (
-        # docs/EXPORT.md §3.3 / docs/EXPORT4.md §7 -- the current wall
+        # docs/graph/EXPORT.md §3.3 / docs/graph/EXPORT4.md §7 -- the current wall
         "Cannot copy out of meta tensor",
         # the earlier ones, kept so a regression names itself rather than
         # merely failing
@@ -584,8 +584,8 @@ def test_fake_tensor_mode_is_reached_and_names_what_stops_it_returning_a_fake():
         "is_inference_mode",
     )
     assert any(a in shim["fake_refusal"] for a in accepted), (
-        "FakeTensorMode now fails for a reason docs/EXPORT.md §3 and "
-        "docs/EXPORT4.md §7 did not name: " + str(shim["fake_refusal"])
+        "FakeTensorMode now fails for a reason docs/graph/EXPORT.md §3 and "
+        "docs/graph/EXPORT4.md §7 did not name: " + str(shim["fake_refusal"])
     )
 
 

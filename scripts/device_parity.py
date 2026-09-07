@@ -13,7 +13,7 @@ That bet paid, on the original 33-case battery: 30 of 32 comparable cases came
 out bit-identical, and the two that did not are `tanh.default` and
 `_softmax.default` (whose kernel calls `expf`) -- by exactly 1 ULP. `cos`,
 `sin`, `gelu`, `silu`, `rsqrt` and `pow` were identical, so the divergence is
-per-function, not a blanket libm effect. docs/DEVICE.md records that run and
+per-function, not a blanket libm effect. docs/devices/DEVICE.md records that run and
 the reference-value analysis, and the runs after each battery expansion.
 
 Inputs avoid exactly-representable values on purpose. `1.5 + 2.25 = 3.75` is
@@ -233,7 +233,7 @@ def _(a, b):
 
 @case("sum.dim_IntList (dim=[])")
 def _(a, b):
-    # The fix docs/DECOMP.md §6.1 records: an empty `dim` list means "reduce
+    # The fix docs/graph/DECOMP.md §6.1 records: an empty `dim` list means "reduce
     # every dimension", not "reduce none". `rust/torch_c/src/aten.rs` is
     # ordinary CPU-only Rust with no platform-conditional code in this
     # function, so there is no reason to expect the device to disagree with
@@ -352,7 +352,7 @@ def _(a, b):
     return net(a)
 
 
-# --- expansion: the "repr" kernels (docs/DECOMP.md's naming) -----------------
+# --- expansion: the "repr" kernels (docs/graph/DECOMP.md's naming) -----------------
 #
 # `abs`, `ceil`, `gt`, `masked_select`, `min` and `unbind` landed together and
 # were never run on the device before this expansion.
@@ -407,7 +407,7 @@ def _(a, b):
 def _(a, b):
     # torch's "legacy empty" rule: a 1-D tensor of shape exactly (0,) is
     # skipped by `cat` regardless of the other operands' rank; anything else
-    # empty (e.g. shape (0, 5)) is NOT exempt. `docs/E2E_REAL.md` -- every
+    # empty (e.g. shape (0, 5)) is NOT exempt. `docs/models/E2E_REAL.md` -- every
     # transformers KV cache's first decoder step concatenates against
     # exactly this shape, so getting the *rule*, not just the ordinary case
     # `cat.default` above already covers, right matters on device too.

@@ -7,7 +7,7 @@ to be before the harness calls it a mismatch.
 
 Every name in ``TOLERANCES`` must exist as an attribute with the same
 spelling on *both* ``torch`` and the built ``_C`` module -- see
-docs/TORCH_C.md §1 ("dtype 은 파이썬 상수가 아니라 _C 가 소유하는 타입이다")
+docs/design/TORCH_C.md §1 ("dtype 은 파이썬 상수가 아니라 _C 가 소유하는 타입이다")
 for why the shim's dtype names were chosen to match torch's exactly.
 """
 
@@ -41,16 +41,16 @@ TOLERANCES: dict[str, Tolerance] = {
 
 # Dtypes the harness exercises by default.
 #
-# `float8_e4m3fn` was excluded from 2026-08-24 until docs/FLOAT8B.md, on the
+# `float8_e4m3fn` was excluded from 2026-08-24 until docs/numerics/FLOAT8B.md, on the
 # stated ground that construction hung on both sides independently. **That
-# ground was wrong, and docs/FLOAT8.md had already disproved it**: construction
+# ground was wrong, and docs/numerics/FLOAT8.md had already disproved it**: construction
 # works on both sides and always did. The hang was in `to_dtype(F64)` --
 # candle 0.11.0's `WithDType for f8e4m3::to_f64` recursing into itself, which
 # release-mode LLVM collapses to `.L1: jmp .L1` -- and construction never calls
 # it. An exclusion reason nobody could check outlived the fact it named.
 #
 # It is included now because the two things that made it uncheckable are gone
-# (docs/FLOAT8B.md): 48 ops that computed answers upstream refuses to produce,
+# (docs/numerics/FLOAT8B.md): 48 ops that computed answers upstream refuses to produce,
 # and 37 that hung. Every op now either matches upstream's value or matches
 # upstream's refusal, so `expect="match"` is a real question for this dtype --
 # a case where one side refuses and the other computes is a SILENT DIVERGENCE

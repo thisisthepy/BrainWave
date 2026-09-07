@@ -1,4 +1,4 @@
-"""docs/AGREE.md -- what holds down the agreement sweep's own machinery.
+"""docs/numerics/AGREE.md -- what holds down the agreement sweep's own machinery.
 
 `agree_sweep.py` is a measurement, not an invariant, and it is deliberately not
 wired into `run.sh`: it needs both interpreters and a long time. But three
@@ -160,7 +160,7 @@ def test_verdict_calls_an_underflowed_output_degenerate_rather_than_exact():
 
 
 def test_verdict_accepts_a_difference_upstream_itself_incurs():
-    """docs/DEMAND8.md §1.4's standard, as code.
+    """docs/architectures/DEMAND8.md §1.4's standard, as code.
 
     `mobilenet_v2` differs from upstream by 1.59e-04 relative while upstream's
     own float32 answer is 9.85e-05 from the float64 truth. That is not a defect;

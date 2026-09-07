@@ -17,7 +17,7 @@ Usage
 Needs a Python environment with real upstream torch installed (this repo's
 scratch venv has it: /Volumes/macMini/caches/spike-venv, torch 2.13.0), and
 a built host artefact for `_C` (default host build location per
-docs/TORCH_C.md §7: /Volumes/macMini/caches/cargo-target/release/lib_C.dylib,
+docs/design/TORCH_C.md §7: /Volumes/macMini/caches/cargo-target/release/lib_C.dylib,
 or built fresh via `cd rust/torch_c && ./pytests/run.sh` first).
 
     /Volumes/macMini/caches/spike-venv/bin/python tools/golden/compare.py
@@ -141,7 +141,7 @@ def _as_list(result):
     """`result.tolist()`, except for `float8_e4m3fn`, which is read through a
     lossless widening to `float32` first.
 
-    This shim refuses `tolist` on `float8_e4m3fn` outright (docs/FLOAT8.md):
+    This shim refuses `tolist` on `float8_e4m3fn` outright (docs/numerics/FLOAT8.md):
     candle 0.11.0's `f8e4m3 -> f64` conversion does not terminate, so the
     refusal is the only safe answer and it is not going away in this round.
     Without this helper that refusal would make the dtype permanently
@@ -169,7 +169,7 @@ def _as_list(result):
 # `sys.path`-independent) while pyo3 spells its classes `torch._C.TensorBase`,
 # so the class's own `__module__` names a module that is *not* the one holding
 # the dtype constants. And the two `float32` objects are deliberately not
-# interchangeable -- docs/TORCH_C.md §1 is about `_C` owning its own dtype type.
+# interchangeable -- docs/design/TORCH_C.md §1 is about `_C` owning its own dtype type.
 _DTYPE_OWNERS: list = []
 
 
@@ -379,7 +379,7 @@ def _run_one_body(case: Case, inject_fault: str | None, tag_box: list[str]) -> O
 #                        broken RNG takes, and what a pure range check misses
 #   chunk-count          a chunk dropped
 #   chunk-pad            the last chunk PADDED to full width instead of left
-#                        short. docs/GPT2.md names this as the most plausible
+#                        short. docs/models/GPT2.md names this as the most plausible
 #                        misimplementation of `split`, and it is invisible to
 #                        any element-by-element comparison
 #
@@ -973,7 +973,7 @@ def self_test(artefact: str | None, verbose: bool, scan_limit: int) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--artefact", default=None, help="path to the built lib_C.dylib/.so (default: TORCH_C_ARTEFACT env var, then docs/TORCH_C.md §7 default host path)")
+    parser.add_argument("--artefact", default=None, help="path to the built lib_C.dylib/.so (default: TORCH_C_ARTEFACT env var, then docs/design/TORCH_C.md §7 default host path)")
     parser.add_argument("-v", "--verbose", action="store_true", help="print every case, not just failures")
     parser.add_argument(
         "--inject-fault",

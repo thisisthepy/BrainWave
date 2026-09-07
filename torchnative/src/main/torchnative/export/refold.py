@@ -2,8 +2,8 @@
 
 ## Why this pass exists at all
 
-docs/DECOMP.md §12.4 counted what blocked NNAPI and found thirteen missing
-`prims.*` kernels. Those landed (docs/PRIMS.md), upstream's decomposition table
+docs/graph/DECOMP.md §12.4 counted what blocked NNAPI and found thirteen missing
+`prims.*` kernels. Those landed (docs/kernels/PRIMS.md), upstream's decomposition table
 now runs to completion against this build, and **the number of ops outside
 NNAPI did not fall**. For `vit` it rose, 10 to 11.
 
@@ -27,7 +27,7 @@ direction: after lowering has finished, rewrite the prims nodes back to the
 
 ## Direction matters, and it is not symmetric
 
-`prims.transpose` is **stricter** than `aten.permute`. docs/PRIMS.md §1
+`prims.transpose` is **stricter** than `aten.permute`. docs/kernels/PRIMS.md §1
 measured it against upstream 2.13.0: `prims.transpose(t, [-1, 0])` raises
 `ValueError: Received an invalid permutation, [-1, 0]!` while
 `aten.permute(t, [-1, 0])` computes. `prims.split_dim` rejects a negative
@@ -50,7 +50,7 @@ This module only ever goes prims -> aten. A pass that went the other way --
 the caller says which axis of the *result* each input axis becomes, so an axis
 can be inserted in the middle and a size-3 axis can be broadcast against a
 size-2 one. `aten.expand` is right-aligned and cannot express
-`broadcast_in_dim(ones(3), [3, 2], [0])` at all -- docs/PRIMS.md §1 keeps that
+`broadcast_in_dim(ones(3), [3, 2], [0])` at all -- docs/kernels/PRIMS.md §1 keeps that
 as the control case.
 
 There is a *composite* that computes it (`view` to insert the size-1 axes, then
@@ -73,8 +73,8 @@ composition in the only order that has a fixed point.
 
 ## What it is worth, measured
 
-docs/REFOLD.md leads with the before/after table per model. The short version
-is that it recovers the regression docs/PRIMS.md §3 reported and does not
+docs/graph/REFOLD.md leads with the before/after table per model. The short version
+is that it recovers the regression docs/kernels/PRIMS.md §3 reported and does not
 invent progress beyond it: `vit` goes back from 11 ops outside NNAPI to 10,
 `smollm2_llama` and `mobilenet_v2` are unchanged at 15 and 6. Two of those
 three numbers not moving is the result, not a bug in the pass -- the ops still
@@ -122,7 +122,7 @@ class RefoldRefused(NotImplementedError):
 def _same_name(aten_name: str):
     """`prims.f(a) -> aten.f(a)`: nine of the thirteen are this.
 
-    docs/PRIMS.md §1: nine of the prims kernels are the aten kernel under
+    docs/kernels/PRIMS.md §1: nine of the prims kernels are the aten kernel under
     another key -- upstream's own `impl_aten` for `prims.cos` *is* `torch.cos`.
     So this is not an approximation, it is the same function reached by its
     other name.
@@ -160,7 +160,7 @@ def _clone(node, args, kwargs):
 def _view_of(node, args, kwargs):
     """`prims.view_of(a)` -> `aten.alias.default(a)`.
 
-    docs/PRIMS.md §1 states the identity directly: `prims.view_of` *is*
+    docs/kernels/PRIMS.md §1 states the identity directly: `prims.view_of` *is*
     `aten.alias`. The separate kernel exists only because the parameter is
     named `a` rather than `self`.
     """
@@ -181,7 +181,7 @@ def _transpose(node, args, kwargs):
     This is the direction that is safe. `aten.permute` accepts every
     permutation `prims.transpose` accepts and computes the same result for it;
     the converse fails on negative entries -- `prims.transpose(t, [-1, 0])`
-    raises where `aten.permute(t, [-1, 0])` computes (docs/PRIMS.md §1). See
+    raises where `aten.permute(t, [-1, 0])` computes (docs/kernels/PRIMS.md §1). See
     the module docstring.
     """
     if len(args) != 2 or kwargs:
@@ -233,7 +233,7 @@ def _split_dim(node, args, kwargs):
 
 #: `prims.<op>.<overload>` -> rule. Everything else is refused by name.
 REFOLDABLE: dict[str, Any] = {
-    # -- nine that are the aten kernel under another key (docs/PRIMS.md §1)
+    # -- nine that are the aten kernel under another key (docs/kernels/PRIMS.md §1)
     "prims.cos.default": _same_name("cos"),
     "prims.sin.default": _same_name("sin"),
     "prims.erf.default": _same_name("erf"),
@@ -259,7 +259,7 @@ UNREFOLDABLE_PRIMS: dict[str, str] = {
         "which axis of the result each input axis becomes, so it can insert an "
         "axis in the middle and broadcast a size-3 axis against a size-2 one. "
         "aten.expand is right-aligned and has no spelling for "
-        "broadcast_in_dim(ones(3), [3, 2], [0]) at all (docs/PRIMS.md §1). A "
+        "broadcast_in_dim(ones(3), [3, 2], [0]) at all (docs/kernels/PRIMS.md §1). A "
         "view+expand composite computes it, but that is a decomposition rather "
         "than a re-spelling and this pass does not write decompositions"
     ),

@@ -1,14 +1,14 @@
 //! Layer-3 executable probe: does the layer-1 candle code actually *run* on
 //! wasm, as opposed to merely linking?
 //!
-//! docs/WASM.md §1/§2 could only answer "compiles" and "links" because the first
+//! docs/platform/WASM.md §1/§2 could only answer "compiles" and "links" because the first
 //! pass had no runtime it was willing to use. There is one: the emsdk on this
 //! machine bundles Node 24, and `wasm32-unknown-emscripten` produces a `.js`
 //! loader plus a `.wasm` that Node can execute directly.
 //!
 //! It prints *values*, not "ok". An exit code alone would not distinguish
 //! "candle ran" from "the runtime started and the code was gc'd away", which is
-//! exactly the false positive docs/WASM.md §2b and §7.1 both hit. Every number
+//! exactly the false positive docs/platform/WASM.md §2b and §7.1 both hit. Every number
 //! below is checked against a value computed by hand, so a silently wrong
 //! kernel is a visible diff and not a green tick.
 //!
@@ -85,7 +85,7 @@ fn main() {
         }
     }
 
-    // 4. The quantised path -- the part docs/WASM.md §1b singled out, and the
+    // 4. The quantised path -- the part docs/platform/WASM.md §1b singled out, and the
     //    part that on other targets dispatches to hand-written SIMD kernels.
     //    Here it must take the scalar fallback (§1d), so this is also a check
     //    that the scalar fallback is *correct*, not just present.

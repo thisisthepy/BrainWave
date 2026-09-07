@@ -1,4 +1,4 @@
-"""Spike -- NOT part of the crate.  docs/DYNAMO.md §17 item 2, left unmeasured.
+"""Spike -- NOT part of the crate.  docs/graph/DYNAMO.md §17 item 2, left unmeasured.
 
 `torch.export` is the other front door to a graph.  Does it need the PEP 523
 eval-frame hook (abi3-impossible) or does it get there another way?

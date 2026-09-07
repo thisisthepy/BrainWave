@@ -1,11 +1,11 @@
 """Vulkan, widened from four ops to eighteen -- and what the four actually were.
 
-docs/RELEASE_0_0_13a0.md §5 says:
+docs/platform/RELEASE_0_0_13a0.md §5 says:
 
     Vulkan is four ops. Correctness is testable on this host; performance
     needs a phone and has not been measured.
 
-**That sentence was re-measured before it was widened** (docs/VULKAN4.md §1),
+**That sentence was re-measured before it was widened** (docs/devices/VULKAN4.md §1),
 because four §5 gap statements in this repository have turned out to be wrong
 when re-checked. This one is not wrong. It is *true and misleading*, in a way
 that only shows up when you ask each of the four what it does:
@@ -26,20 +26,20 @@ This file holds the widening down. Every assertion here is one of three kinds,
 and the kinds are kept apart on purpose:
 
   * **value** -- element-wise against upstream torch, at a tolerance *derived*
-    from upstream's own float32-vs-float64 error the way docs/AGREE.md §2
+    from upstream's own float32-vs-float64 error the way docs/numerics/AGREE.md §2
     derives its own. For every exactly-rounded op that derivation comes out at
     zero, so those are held to **bit equality**.
   * **device** -- that the GPU did the work, asserted from `_vulkan_counters()`
     at runtime. Not inferred from the answer being right, and deliberately not
-    a source scan: docs/MPSATTN.md §3.1 records a way to defeat exactly that
-    shape of evidence, and §5 of docs/VULKAN4.md explains why a counter placed
+    a source scan: docs/devices/MPSATTN.md §3.1 records a way to defeat exactly that
+    shape of evidence, and §5 of docs/devices/VULKAN4.md explains why a counter placed
     after `vkWaitForFences` cannot be defeated the same way.
   * **refusal** -- that everything not taught still refuses naming itself, and
     that the narrowings (broadcast, alpha, non-f32, rank > 2) refuse rather
     than reach for the CPU implementation half a metre away.
 
 Everything that needs a Vulkan loader skips **by name**, printing the loader's
-own words. docs/VULKAN3.md §6.1 is the reason that matters: macOS strips
+own words. docs/devices/VULKAN3.md §6.1 is the reason that matters: macOS strips
 `DYLD_*` when `/bin/sh` execs, so running this through `run.sh` skips these
 even when the loader was pointed at correctly. A skip that says "no vulkan"
 when a loader was supplied is the closest thing to a false green this device
@@ -60,7 +60,7 @@ REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__)))))
 VENDOR_DIR = os.path.join(REPO, "torchnative", "src", "main")
 
-# The four ops docs/VULKAN3.md landed, so this file can state the widening as a
+# The four ops docs/devices/VULKAN3.md landed, so this file can state the widening as a
 # difference rather than a number, and so a later round that removes one is a
 # failure here rather than a silently smaller list.
 VULKAN3_OPS = (
@@ -70,7 +70,7 @@ VULKAN3_OPS = (
     "aten.detach.default",
 )
 
-# Of those four, the only one that ever ran a compute shader (docs/VULKAN4.md §1).
+# Of those four, the only one that ever ran a compute shader (docs/devices/VULKAN4.md §1).
 VULKAN3_OPS_THAT_COMPUTED = ("aten.add.Tensor",)
 
 FLOAT32_EPS = 2.0 ** -23
@@ -83,7 +83,7 @@ FLOAT32_EPS = 2.0 ** -23
 def _vulkan_or_skip(what):
     """A live Vulkan device, or None having said why not -- in the loader's words.
 
-    Deliberately not shared with `test_shim.py`'s helper, for docs/VULKAN3.md
+    Deliberately not shared with `test_shim.py`'s helper, for docs/devices/VULKAN3.md
     §6.1's reason: the skip line is the thing this file promises to keep
     truthful, so it names the file that skipped and quotes the probe's own
     `error` rather than paraphrasing it.
@@ -171,14 +171,14 @@ def test_the_taught_list_grew_and_kept_everything_it_had():
 
     `ge` rather than `eq` on the length, so a later round that teaches a
     nineteenth op does not have to edit this file; but every one of
-    docs/VULKAN3.md's four is asserted by name, so a round that *drops* one
+    docs/devices/VULKAN3.md's four is asserted by name, so a round that *drops* one
     fails here. A count alone could not tell those two apart.
     """
     ops = _C._vulkan_ops()
     assert len(ops) == len(set(ops)), f"duplicate entries in _vulkan_ops(): {ops}"
     assert ops == sorted(ops), "_vulkan_ops() is meant to be a sorted, closed list"
     for op in VULKAN3_OPS:
-        assert op in ops, f"docs/VULKAN3.md taught {op} and it is no longer taught"
+        assert op in ops, f"docs/devices/VULKAN3.md taught {op} and it is no longer taught"
     assert len(ops) >= 18, f"expected at least 18 taught ops, got {len(ops)}: {ops}"
 
 
@@ -212,7 +212,7 @@ def test_an_op_that_is_not_taught_refuses_and_names_itself():
 
 
 def test_the_four_ops_of_the_previous_round_were_one_shader_and_three_that_were_not():
-    """docs/VULKAN4.md §1's re-measurement of §5, as an assertion.
+    """docs/devices/VULKAN4.md §1's re-measurement of §5, as an assertion.
 
     This is the finding that made "Vulkan is four ops" misleading rather than
     wrong, and it is checked here so that it cannot quietly stop being true:
@@ -247,7 +247,7 @@ def test_arbitrary_data_reaches_the_device_and_returns_unchanged():
 
     Until it existed the only tensors on this device were `ones` and `zeros`,
     so no numerical claim about a Vulkan kernel could have been stronger than
-    "it handles constants" (docs/VULKAN4.md §1). The values here are chosen to
+    "it handles constants" (docs/devices/VULKAN4.md §1). The values here are chosen to
     have nothing in common with each other or with 1.0, and the comparison is
     on **bits**: an upload followed by a download changes no arithmetic, so
     anything less than bit equality would be a defect and not a tolerance.
@@ -288,7 +288,7 @@ def test_a_dtype_that_has_no_shader_refuses_on_the_way_in():
 # The exactly-rounded ops. Each is one IEEE-754 single operation per element
 # (or none at all), and IEEE-754 specifies those to the last bit, so upstream's
 # own float32-vs-float64 error *is* the shim's: the derivation in
-# docs/AGREE.md §2, applied to this population, produces a tolerance of zero
+# docs/numerics/AGREE.md §2, applied to this population, produces a tolerance of zero
 # and these are held to bit equality. Anything looser here would be a
 # tolerance hiding a defect, not measuring a precision.
 EXACT_OPS = ("add", "sub", "mul", "div", "neg", "relu", "clone",
@@ -336,7 +336,7 @@ def test_the_exactly_rounded_ops_are_bit_identical_to_upstream():
     """Eleven ops, on real data, compared as bit patterns.
 
     The data is `randn`, not constants -- which only became possible this round
-    (docs/VULKAN4.md §1). `div`'s divisor is pushed away from zero so the case
+    (docs/devices/VULKAN4.md §1). `div`'s divisor is pushed away from zero so the case
     measures division rather than the representation of infinity.
     """
     if _vulkan_or_skip("the bit-equality sweep") is None:
@@ -372,7 +372,7 @@ def test_the_exactly_rounded_ops_are_bit_identical_to_upstream():
 
 
 def _derived_tolerance(upstream_rel_errors):
-    """docs/AGREE.md §2's rule, recomputed here from this round's population.
+    """docs/numerics/AGREE.md §2's rule, recomputed here from this round's population.
 
     The p90 of upstream's own float32-vs-float64 relative error, floored at
     8 float32 ulp. The floor is AGREE's, and its reason is AGREE's: a
@@ -454,7 +454,7 @@ def _host_model_of_the_matmul_kernel(a, b, m, k, n):
 
     This is not a re-implementation for its own sake. It is the instrument that
     settles whether the matmul's disagreement with upstream is precision or a
-    defect (docs/VULKAN4.md §4.2): a kernel that had transposed an index or
+    defect (docs/devices/VULKAN4.md §4.2): a kernel that had transposed an index or
     lost a term would not be reproduced by a model of the arithmetic it claims
     to do, at every shape, to the bit.
     """
@@ -546,7 +546,7 @@ EXPECTED_DISPATCHES = {
 def test_every_taught_op_ran_on_the_gpu_or_says_it_did_not():
     """The device assertion, from `_vulkan_counters()` at runtime.
 
-    **Why not a source scan.** docs/MPSATTN.md §3.1 records, against its own
+    **Why not a source scan.** docs/devices/MPSATTN.md §3.1 records, against its own
     round, that an op could have been taken off the `mps` refusal list while
     keeping its host readback and *both* of that device's derivation tests
     would still have passed: the per-op scan looks for six helper names in a
@@ -666,7 +666,7 @@ json.dump(out, sys.stdout)
 def test_a_whole_module_forwards_on_the_gpu_and_agrees_with_upstream():
     """`nn.Sequential(Linear, ReLU, Linear)`, forward, on the Vulkan device.
 
-    **This is the claim docs/VULKAN4.md §5 makes and the one it stops at.** A
+    **This is the claim docs/devices/VULKAN4.md §5 makes and the one it stops at.** A
     module, not an op: `nn.Linear` dispatches `aten.t.default` and then
     `aten.addmm.default`, so the forward really does go through the transpose
     and the matmul rather than around them, and `m.to("vulkan")` really does
@@ -674,14 +674,14 @@ def test_a_whole_module_forwards_on_the_gpu_and_agrees_with_upstream():
 
     It is **not** a transformer. `native_layer_norm`, `_softmax`, `gelu`,
     `embedding` and `bmm` are all still refused, and every one of them is on
-    the measured trace of a BERT forward (docs/VULKAN4.md §2), so a transformer
+    the measured trace of a BERT forward (docs/devices/VULKAN4.md §2), so a transformer
     stops at the first of them. Saying "an MLP forwards" is the honest size of
     this result.
 
     Three assertions, and the third is the one that is not about the answer:
 
       1. the output really is a vulkan tensor;
-      2. it agrees with upstream inside docs/AGREE.md's derived rule, and with
+      2. it agrees with upstream inside docs/numerics/AGREE.md's derived rule, and with
          the shim's own cpu answer to about one float32 ulp;
       3. **seven compute shaders ran and nothing was read back** -- 2x(t,
          matmul, bias) + 1 relu, which is what the two Linears and the ReLU
@@ -737,12 +737,12 @@ def test_a_whole_module_forwards_on_the_gpu_and_agrees_with_upstream():
     backends = max(abs(a - b) for a, b in zip(got["vulkan"], got["cpu"]))
     ulp = scale * FLOAT32_EPS
 
-    # docs/AGREE.md §2's second rule: a difference is not a defect if it is
+    # docs/numerics/AGREE.md §2's second rule: a difference is not a defect if it is
     # within 4x upstream's own distance from the float64 truth on the same
-    # output. Measured at 0.90x (docs/VULKAN4.md §4.3).
+    # output. Measured at 0.90x (docs/devices/VULKAN4.md §4.3).
     assert vk_err <= 4 * up_err, (
         f"vulkan is {vk_err:.3e} from the float64 truth against upstream's own "
-        f"{up_err:.3e}; docs/AGREE.md's rule allows 4x")
+        f"{up_err:.3e}; docs/numerics/AGREE.md's rule allows 4x")
     assert cpu_err <= 4 * up_err, (cpu_err, up_err)
     assert backends <= 2 * ulp, (
         f"vulkan and the shim's own cpu differ by {backends:.3e}, more than "
@@ -769,7 +769,7 @@ def test_a_whole_module_forwards_on_the_gpu_and_agrees_with_upstream():
 def test_a_transformer_still_does_not_forward_and_the_wall_is_named():
     """The other half of the honest answer.
 
-    docs/VULKAN4.md §2 measured what a BERT forward dispatches. Five of those
+    docs/devices/VULKAN4.md §2 measured what a BERT forward dispatches. Five of those
     ops are not taught this device, and this asserts they still refuse -- so
     that "an MLP forwards, a transformer does not" cannot quietly become
     stale in either direction. If a later round teaches one, this test says so
@@ -782,7 +782,7 @@ def test_a_transformer_still_does_not_forward_and_the_wall_is_named():
              "aten.gelu.default", "aten.embedding.default", "aten.bmm.default")
     still = [op for op in walls if op not in taught]
     assert still == list(walls), (
-        f"these are taught now and docs/VULKAN4.md §5 needs updating: "
+        f"these are taught now and docs/devices/VULKAN4.md §5 needs updating: "
         f"{sorted(set(walls) - set(still))}")
 
 
@@ -794,7 +794,7 @@ def test_every_narrowing_refuses_by_name_rather_than_being_emulated():
     """The property the whole `Repr::Vulkan` design exists to protect.
 
     Each of these has a perfectly good CPU implementation a few lines away, and
-    reaching for one would be the silent fallback docs/VULKAN.md §5 calls the
+    reaching for one would be the silent fallback docs/devices/VULKAN.md §5 calls the
     worst available outcome. They refuse, and the message says which narrowing
     was hit -- a generic "not implemented" would leave the reader unable to
     tell a missing broadcast from a missing dtype.
@@ -859,7 +859,7 @@ def test_a_vulkan_tensor_still_has_no_cpu_storage_to_read():
 # ---------------------------------------------------------------------------
 
 def test_the_checked_in_spirv_is_not_stale_for_any_shader():
-    """docs/VULKAN3.md's guard, extended from one shader to all of them.
+    """docs/devices/VULKAN3.md's guard, extended from one shader to all of them.
 
     The `.spv` words are checked in and `include_bytes!`d rather than built by
     a `build.rs`, so an edit to a `.comp` does nothing until

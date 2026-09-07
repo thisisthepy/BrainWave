@@ -19,7 +19,7 @@ directly instead:
            artefact and is taken from the interpreter it is built against.
            Linux is the other way round -- `elf_dynamic` below reads `DT_NEEDED`
            and the `.gnu.version_r` symbol-version requirements, and the highest
-           `GLIBC_x.y` in there *is* the manylinux floor (docs/LINUX.md §5.2).
+           `GLIBC_x.y` in there *is* the manylinux floor (docs/platform/LINUX.md §5.2).
            There is no Mach-O analogue for that, and no Android one either.
   wasm     no symbol table at all. The import and export sections *are* the
            answer -- every name the host must resolve and every name offered,
@@ -179,7 +179,7 @@ def elf_info(data: bytes) -> dict | None:
 # counterpart: it records, per needed library, which *symbol versions* the image
 # requires. For a glibc target the highest `GLIBC_x.y` in it is what auditwheel
 # calls the policy floor, and it is the only place that number exists -- CPython's
-# `_sysconfigdata_*.py` has no field for it (docs/LINUX.md §3), unlike
+# `_sysconfigdata_*.py` has no field for it (docs/platform/LINUX.md §3), unlike
 # `ANDROID_API_LEVEL` and `IPHONEOS_DEPLOYMENT_TARGET`.
 SHT_DYNSYM = 11
 SHT_DYNAMIC = 6
@@ -430,7 +430,7 @@ def elf_symbols(data: bytes) -> dict | None:
 # searches for: it is an entry in a table that is indexed by DLL, so every
 # undefined symbol arrives already attached to the file that has to provide it.
 # That is the same guarantee Mach-O's two-level namespace gives and the one
-# `.gnu.version_r` gives only for versioned symbols (docs/LINUX.md §6.1).
+# `.gnu.version_r` gives only for versioned symbols (docs/platform/LINUX.md §6.1).
 #
 # The layout read here, from PE/COFF:
 #
@@ -629,7 +629,7 @@ def pe_exports(data: bytes) -> set[str] | None:
 #                 whether the module is loadable by `dlopen` at all -- a side
 #                 module imports its memory and function table, a main module
 #                 defines them, and Emscripten's `dlopen` refuses a main-module
-#                 link (docs/WASM.md §9.2). Not `dylink.0`, which both have.
+#                 link (docs/platform/WASM.md §9.2). Not `dylink.0`, which both have.
 #                 wasm32 vs wasm64, from the memory type's limits flags
 #
 #   NOT answerable  the platform, the way `LC_BUILD_VERSION` gives it. A wasm
@@ -661,7 +661,7 @@ WASM_SECTIONS = {
 
 # External kinds, shared by the import and export sections (§5.5.5, §5.5.10).
 # `tag` is the exception-handling proposal's, which matters here: every module
-# in this process is built `-fwasm-exceptions` (docs/WASM.md §7.4a), so a real
+# in this process is built `-fwasm-exceptions` (docs/platform/WASM.md §7.4a), so a real
 # artefact does carry kind 4 and a reader that stopped at 3 would fail on it.
 WASM_KINDS = {0: "func", 1: "table", 2: "memory", 3: "global", 4: "tag"}
 
@@ -765,7 +765,7 @@ def wasm_info(data: bytes) -> dict | None:
     three formats' `info` dicts, because in those formats "is this loadable"
     is a type field in the header. A main-module link cannot be `dlopen`ed --
     and therefore cannot be a `ctypes.CDLL` or an extension module
-    (docs/WASM.md §9.2) -- so this is the wasm spelling of PE's `dll` bit.
+    (docs/platform/WASM.md §9.2) -- so this is the wasm spelling of PE's `dll` bit.
 
     It is **not** the presence of `dylink.0`, which was the first guess here and
     is wrong: Pyodide's own `pyodide.asm.wasm` is a `-sMAIN_MODULE` link and

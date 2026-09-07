@@ -1,6 +1,6 @@
 """Build the `torch._C` *name* surface, at `_C` import time, inside the `.so`.
 
-Read docs/IMPORT_TORCH.md first; this is the file that document describes.
+Read docs/models/IMPORT_TORCH.md first; this is the file that document describes.
 
 Why this file exists
 --------------------
@@ -73,7 +73,7 @@ import sys
 # `threading` for `_install_thread_local_store` only. Upstream's
 # `_stash_obj_in_tls` is a C++ thread-local, and a module-level dict would be a
 # *different* semantics that happens to agree in a single-threaded process --
-# docs/BACKWARD2.md §4.3.
+# docs/training/BACKWARD2.md §4.3.
 import threading
 import traceback as _traceback
 import types
@@ -82,7 +82,7 @@ import types
 # Deliberate default: scripting reports itself unavailable
 # ---------------------------------------------------------------------------
 #
-# There is no TorchScript frontend here (docs/TORCHSCRIPT.md has the size of
+# There is no TorchScript frontend here (docs/graph/TORCHSCRIPT.md has the size of
 # what is missing -- upstream's `torch/csrc/jit/` is ~213k lines of C++, and
 # the first symbol the frontend needs, `SourceRangeFactory.make_range`, is
 # where this shim has always stopped, naming itself). That is not going to
@@ -96,7 +96,7 @@ import types
 # upstream's own documented fallback, not a behaviour invented here. A
 # `@torch.jit.script` at module scope (`transformers/models/gpt_bigcode/
 # modeling_gpt_bigcode.py:54`, and five other modeling files -- see
-# docs/TORCHSCRIPT.md §5) then imports as a plain function instead of running
+# docs/graph/TORCHSCRIPT.md §5) then imports as a plain function instead of running
 # a compiler frontend that is not built.
 #
 # `setdefault`, not an unconditional set: a caller who explicitly asks for
@@ -149,7 +149,7 @@ EXTRA_OFF_SWITCHES = frozenset(
 # surface generator guessing.
 #
 # `_c10d_init` is the switch for `torch.distributed`
-# (`torch/distributed/__init__.py:28`). docs/DISTRIBUTED.md is what it costs and
+# (`torch/distributed/__init__.py:28`). docs/distributed/DISTRIBUTED.md is what it costs and
 # what it buys; `_install_distributed_c10d` is the implementation. Answering it
 # is not free: with it off, `torch.distributed` is a five-line stub, and with it
 # on the tree walks straight into `_C._distributed_c10d` while `import torch`
@@ -842,7 +842,7 @@ class _Schema:
         Being a property was only half of it. The value stayed constant -- now
         always *False* -- because the argument list it reads was empty for every
         aten op: `_get_schema` handed out a placeholder and `any([])` is False
-        (docs/DISTRIBUTED.md §8.1). The schemas are real now, so the `any` below
+        (docs/distributed/DISTRIBUTED.md §8.1). The schemas are real now, so the `any` below
         reads something. The placeholder branch is written out rather than left
         to `any([])` because it is a *different* statement -- "answered from no
         text" rather than "read the arguments and found no writer" -- and
@@ -935,7 +935,7 @@ def _parse_argument(chunk: str, kwarg_only: bool) -> _Argument:
 # The vendored tree carries `torchgen/packaged/ATen/native/native_functions.yaml`
 # -- 2584 `- func:` lines, each an aten schema, shipped in the wheel as a data
 # file (pyproject.toml) and already read at runtime for the Core ATen tag set
-# (`torchnative/export/decompose.py`, docs/DECOMP.md §2). It is the source of
+# (`torchnative/export/decompose.py`, docs/graph/DECOMP.md §2). It is the source of
 # the schema text: it is upstream's own file rather than a transcription, and it
 # needs no upstream torch, which a wheel does not have.
 #
@@ -1167,7 +1167,7 @@ def _native_functions_source() -> str:
     answer = found or (
         "no native_functions.yaml on this path: looked for "
         f"{_NATIVE_FUNCTIONS_RELPATH} beside torch/ and along sys.path. Every "
-        "aten schema is a placeholder in this process (docs/SCHEMA.md)"
+        "aten schema is a placeholder in this process (docs/bindings/SCHEMA.md)"
     )
     del _SCHEMA_SOURCE_CELL[:]
     _SCHEMA_SOURCE_CELL.extend((answer, roots))
@@ -1228,7 +1228,7 @@ _ATEN_SCHEMA_NAMES: set = set()
 #: `aten::<name>` -> the overload names the file declares for it, `""` for the
 #: unnamed one (upstream's spelling; `OpOverloadPacket.overloads()` turns it
 #: into `"default"`). Built with the index, and the reason it exists is
-#: docs/DECOMP.md §3: `_jit_get_operation` used to answer `["default"]` for
+#: docs/graph/DECOMP.md §3: `_jit_get_operation` used to answer `["default"]` for
 #: every packet, and `aten::transpose` has no `default` overload.
 _ATEN_OVERLOADS_BY_NAME: dict = {}
 
@@ -1385,7 +1385,7 @@ def _has_out_argument(signature: str) -> bool:
 def _aten_tags(module, qualname: str, overload: str) -> list:
     """`OpOverload.tags`, as `_C.Tag` members, from the file.
 
-    This answered `[]` for every op and docs/DECOMP.md §2 measured what that
+    This answered `[]` for every op and docs/graph/DECOMP.md §2 measured what that
     cost: `torch.Tag.core in op.tags` was False for all 120 implemented ops, so
     a classifier built on it would call nothing Core ATen and refuse whole
     programs. `decompose.core_ops()` went around it by reading the same file
@@ -1520,7 +1520,7 @@ def _scan_dispatch_registrations() -> dict:
 def _dispatch_registrations(key: str) -> list:
     """`torch._C._dispatch_get_registrations_for_dispatch_key`, from the file.
 
-    docs/DECOMP.md §3 named this function as what costs the decomposition table
+    docs/graph/DECOMP.md §3 named this function as what costs the decomposition table
     its CompositeImplicitAutograd half: `CustomDecompTable.__init__` enumerates
     every CIA registration through it, so `core_aten_decompositions()` raised
     here and the pass fell back to the post-autograd table.
@@ -1683,7 +1683,7 @@ class _RecordFunction:
 # whole justification. `torch.optim` wraps every `step()` and every
 # `zero_grad()` in `with torch.autograd.profiler.record_function(...)`, so these
 # two names gate **every optimiser in `torch.optim`, SGD included** — and
-# neither is arithmetic. `docs/AUTOGRAD.md` §7 measured that:
+# neither is arithmetic. `docs/training/AUTOGRAD.md` §7 measured that:
 #
 #     optimiser.zero_grad()   FAIL  profiler._record_function_enter_new.default
 #
@@ -1732,7 +1732,7 @@ def _op_callable(dispatch, qualname: str, overload: str):
     `aten::add` + `Tensor` becomes the dispatch key `aten.add.Tensor`, which is
     exactly what `_C._aten_dispatch` takes and exactly the spelling
     `_C._aten_implemented()` reports. Overload is part of the key on purpose
-    (docs/TORCH_C.md §1): folding `add.Tensor` and `add.Scalar` together would
+    (docs/design/TORCH_C.md §1): folding `add.Tensor` and `add.Scalar` together would
     make one implementation look like two.
 
     `_PROFILER_MARKERS` is consulted first, and it is two entries. See the note
@@ -1884,9 +1884,9 @@ class _TypeChecker:
                     # `_base`'s scalar-Tensor arm is deliberately NOT open for
                     # list ELEMENTS: that would accept a Tensor in every
                     # `SymInt[]` position table-wide, which is the scoping
-                    # docs/ARGFORM.md §2 forbids and which
+                    # docs/bindings/ARGFORM.md §2 forbids and which
                     # `_coerce_symint_size_tensors` handles for the two
-                    # spellings that were measured (docs/BIND5.md §1.2).
+                    # spellings that were measured (docs/bindings/BIND5.md §1.2).
                     # Mirrors `predicate_for`'s `int_list_ok`, which is the
                     # arm that actually runs.
                     return all(
@@ -1922,7 +1922,7 @@ class _TypeChecker:
     # 1.80 us, transpose 1.52 vs 1.51) and it needed a second copy of the twelve
     # `_base` rules with a different return shape, so it was dropped: two
     # spellings of the zero-dim-tensor-satisfies-Scalar rule is a real hazard
-    # bought with no measurable time. See docs/BIND.md.
+    # bought with no measurable time. See docs/bindings/BIND.md.
     #
     # Built lazily, on the first call that needs it, for the same reason the
     # `_TypeChecker` itself is: `layout` and `memory_format` do not exist when
@@ -1961,7 +1961,7 @@ class _TypeChecker:
             #
             # The Tensor arm is upstream's `ParameterType::INT64` check and is
             # what `vilt` needs: `torch.multinomial(probs, num_samples)` with a
-            # Tensor `num_samples` (docs/BIND5.md §7). It is NOT multinomial-
+            # Tensor `num_samples` (docs/bindings/BIND5.md §7). It is NOT multinomial-
             # specific -- measured on `select`, `narrow`, `transpose`,
             # `unsqueeze`, `sum(dim=)` and `repeat_interleave` as well, which
             # is why it is here rather than in a per-op wrapper. `bool` is
@@ -2033,9 +2033,9 @@ class _TypeChecker:
                 # `expand`, `sum(dim=...)`. Worth not paying a call per element.
                 # A single-element integral Tensor sitting **inside** the list
                 # is upstream's `SymInt` rule applied per element, and it is
-                # the same rule docs/BIND5.md §7 landed one position over for
+                # the same rule docs/bindings/BIND5.md §7 landed one position over for
                 # a *scalar* `SymInt`. Measured on torch 2.13.0
-                # (docs/REPEAT.md §4):
+                # (docs/kernels/REPEAT.md §4):
                 #
                 #     x.as_strided(size=(2, tensor(2)),   ...)  -> works
                 #     x.as_strided(size=(2, tensor([2])), ...)  -> works
@@ -2431,7 +2431,7 @@ class _Overloads:
         The per-candidate parse used to be a separate `_bind` method. It had
         exactly one caller, this loop, so folding it in removes a Python frame
         per candidate -- 1651 of them per SmolLM2-135M forward pass -- and
-        duplicates nothing. docs/BIND.md §6 priced "merging the frames" against
+        duplicates nothing. docs/bindings/BIND.md §6 priced "merging the frames" against
         "a second copy of the resolution loop"; that price is real for `fn` and
         `method`, which are two call sites into `resolve`, and it was not real
         here.
@@ -2557,7 +2557,7 @@ def _describe_call(args, kwargs) -> str:
 # `TensorBase.requires_grad_` has always carried it, and `backward()` is where
 # the absence is reported.
 #
-# **It used to be refused here, and docs/BACKWARD2.md §4.1 is why it is not.**
+# **It used to be refused here, and docs/training/BACKWARD2.md §4.1 is why it is not.**
 # The refusal's stated ground was that "returning a tensor that quietly records
 # nothing would be worse than refusing", and that ground does not survive being
 # measured, for one reason:
@@ -2583,7 +2583,7 @@ def _describe_call(args, kwargs) -> str:
 # kwargs` reads a container that exists at definition time.
 _PY_DTYPE_MODULE = [None]
 
-# docs/ARGFORM.md. `dtype=bool`/`dtype=int`/`dtype=float` (the *Python* types,
+# docs/bindings/ARGFORM.md. `dtype=bool`/`dtype=int`/`dtype=float` (the *Python* types,
 # not `torch.bool`/`torch.int64`/`torch.float32`) are upstream's own overload
 # resolver accepting a `type` wherever a schema takes `ScalarType` -- measured
 # on 2.13.0 with `torch.ones(2, dtype=bool)`, `.to(dtype=int)`, and
@@ -2601,9 +2601,9 @@ _PY_TYPE_TO_DTYPE_NAME = {
     float: "float64",
 }
 
-# docs/ARGFORM.md. `axis=`/`keepdims=` are numpy's spellings of `dim=`/
+# docs/bindings/ARGFORM.md. `axis=`/`keepdims=` are numpy's spellings of `dim=`/
 # `keepdim=`, and upstream accepts them on some reductions and not others --
-# docs/SCALAR2.md found the same "per-op, no principle" shape for scalar
+# docs/numerics/SCALAR2.md found the same "per-op, no principle" shape for scalar
 # dispatch. Each key here was measured against torch 2.13.0 directly
 # (`x.mean(axis=1, keepdim=True)`, `torch.mean(x, axis=1, keepdim=True)`) and
 # accepted; nothing is added on the strength of "this is probably fine
@@ -2670,7 +2670,7 @@ def _strip_python_only_kwargs(name: str, kwargs: dict):
 # Upstream's factory wording, transcribed from torch 2.13.0 by running the
 # failing case. It is a *third* spelling of one rule -- `TensorBase.requires_grad
 # = True` says "only Tensors of ...", `requires_grad_(True)` says "only Tensors
-# of floating point dtype ...", and this one capitalises. docs/BACKWARD2.md §4.2
+# of floating point dtype ...", and this one capitalises. docs/training/BACKWARD2.md §4.2
 # records all three, measured side by side; reproducing each at the door that
 # produces it is what lets a caller grep for the text upstream gave them.
 _FACTORY_REQUIRES_GRAD_REFUSAL = (
@@ -2682,7 +2682,7 @@ def _refuse_non_floating_requires_grad(tensor, mode, message):
     """Upstream's one rule: only a float or complex tensor may require grad.
 
     Stated at three doors because upstream states it at three doors with three
-    different wordings (docs/BACKWARD2.md §4.2). `mode` is checked because
+    different wordings (docs/training/BACKWARD2.md §4.2). `mode` is checked because
     upstream only objects to `True` -- `requires_grad = False` goes through on
     an integer tensor, and `nn.Module._apply` writes exactly that over integer
     buffers.
@@ -2733,7 +2733,7 @@ _C_TENSORBASE = [None]
 
 # The dtypes upstream's `SymInt[]` argument parser will take a Tensor element
 # in. Measured against real torch 2.13.0 in a separate process, one dtype at a
-# time (docs/BIND5.md §1), NOT inferred from `zeros` alone: every integral
+# time (docs/bindings/BIND5.md §1), NOT inferred from `zeros` alone: every integral
 # dtype is accepted and `bool` is not, which is why `bool` is absent from a
 # list that would otherwise be spelled "integral".
 _SIZE_LIST_TENSOR_DTYPES = ("uint8", "int8", "int16", "int32", "int64")
@@ -2755,7 +2755,7 @@ def _symint_from_tensor(value):
     (`torch/csrc/utils/pybind.cpp`) then asserts `scalar.isIntegral(false)`,
     which bool fails. So the predicate says yes and this says no, in that
     order, and the two exception classes fall out of it rather than being
-    chosen. docs/BIND5.md §7 has the measurement for both.
+    chosen. docs/bindings/BIND5.md §7 has the measurement for both.
     """
     dtypes = _C_SYMINT_TENSOR_DTYPES[0]
     if dtypes is not None and value.dtype == dtypes[1]:
@@ -2806,7 +2806,7 @@ def _coerce_symint_list(values):
     `longformer` and `led` are the callers that made this general rather than
     a per-composite helper: `_sliding_chunks_matmul_attn_probs_value` spells
     `padded_value.as_strided(size=(..., seq_len // window, ...), ...)` where
-    one element arrives as a 0-dim tensor. docs/REPEAT.md §4.
+    one element arrives as a 0-dim tensor. docs/kernels/REPEAT.md §4.
     """
     tensorbase = _C_TENSORBASE[0]
     for item in values:
@@ -2836,14 +2836,14 @@ def _coerce_symint_size_tensors(module, name, size):
 
     A single-element integral Tensor sitting in a size list is taken for its
     value, the way a bare Python int is. This is upstream's own argument
-    parser rule and not a `zeros` accident -- docs/BIND4.md §3 measured it for
-    `zeros`, `ones`, `empty` and `view`, and docs/BIND5.md §1 measured the
+    parser rule and not a `zeros` accident -- docs/bindings/BIND4.md §3 measured it for
+    `zeros`, `ones`, `empty` and `view`, and docs/bindings/BIND5.md §1 measured the
     `new_*` family and the REFUSALS, which is the half that was missing.
 
     The refusals are the point. Upstream draws three lines here, and the
-    first version of this rule (docs/BIND4.md §3, `int(item)` applied to
+    first version of this rule (docs/bindings/BIND4.md §3, `int(item)` applied to
     anything that was a Tensor) crossed two of them, making this build **more
-    permissive than the thing it replaces** -- exactly what docs/ARGFORM.md
+    permissive than the thing it replaces** -- exactly what docs/bindings/ARGFORM.md
     forbids. Measured upstream, `torch.zeros((2, X))`:
 
         X = tensor(3)          -> (2, 3)
@@ -2924,7 +2924,7 @@ def install(module, surface_json: str, overloads_json: str, methods_json: str) -
         # `torch._grouped_mm` -- which is what `torch.nn.functional.grouped_mm`
         # calls and therefore what `transformers`' MoE layer calls -- refused
         # with "overload resolution has no table entry" while its entry sat in
-        # the table. docs/GROUPED_MM.md §6.1. The sibling comprehension below
+        # the table. docs/kernels/GROUPED_MM.md §6.1. The sibling comprehension below
         # always spelled the intent correctly; this one now matches it.
         for name, schemas in json.loads(overloads_json).items()
         if not name.startswith("_README")
@@ -2978,9 +2978,9 @@ def install(module, surface_json: str, overloads_json: str, methods_json: str) -
     # The two walls a `Tensor.backward()` reaches, in the order it reaches
     # them. Both are synthesised above as table-less stubs, and both are
     # replaced here -- one because it is not autograd at all, the other because
-    # it is. The second stopped being a wall in docs/BACKWARD9.md: it is the
+    # it is. The second stopped being a wall in docs/training/BACKWARD9.md: it is the
     # engine now, translating upstream's call into `_eager_backward` and back.
-    # docs/BACKWARD2.md §4.3.
+    # docs/training/BACKWARD2.md §4.3.
     _install_thread_local_store(module)
     _install_engine(module)
 
@@ -3083,7 +3083,7 @@ def install(module, surface_json: str, overloads_json: str, methods_json: str) -
     # after creation (`__class__` assignment refuses: `type` is not a heap
     # type). `torch/nn/parameter.py:19` does `class _ParameterMeta(_TensorMeta)`
     # and then uses it as the metaclass of a `torch.Tensor` subclass, which
-    # works either way. Recorded in docs/IMPORT_TORCH.md as a difference,
+    # works either way. Recorded in docs/models/IMPORT_TORCH.md as a difference,
     # because `isinstance(X, _TensorMeta)` is now true of every class.
     module._TensorMeta = type
 
@@ -3123,7 +3123,7 @@ def install(module, surface_json: str, overloads_json: str, methods_json: str) -
     # (which upstream does not expose either -- `torch.linalg.vector_norm` is
     # the public name, a different, Python-level function). `_linalg` has no
     # stub data (`EXTRA_SUBMODULES`, above), so the generic loop just ran left
-    # every name on it as the catch-all `_Unimplemented`. docs/DEMAND.md §0.1
+    # every name on it as the catch-all `_Unimplemented`. docs/architectures/DEMAND.md §0.1
     # rank 3: this replaces the one name it asks for with a real resolving
     # function, sharing the exact overload machinery `torch.<op>` uses --
     # `overloads["linalg_vector_norm"]` is the same table
@@ -3134,8 +3134,8 @@ def install(module, surface_json: str, overloads_json: str, methods_json: str) -
         "linalg_vector_norm", dispatch, overloads
     )
 
-    # `torch._C._fft.fft_fftn` -- `fnet`'s wall (docs/ARCH200.md,
-    # docs/BIND3.md §6, docs/COMPLEX3.md §6). `torch/fft/__init__.py` is
+    # `torch._C._fft.fft_fftn` -- `fnet`'s wall (docs/architectures/ARCH200.md,
+    # docs/bindings/BIND3.md §6, docs/kernels/COMPLEX3.md §6). `torch/fft/__init__.py` is
     # `fftn = _add_docstr(_fft.fft_fftn, ...)`, so upstream needs this exact
     # spelling to be a real function; `_fft` has no stub data (`_linalg`'s
     # reason directly above), so the generic submodule loop had left every
@@ -3144,7 +3144,7 @@ def install(module, surface_json: str, overloads_json: str, methods_json: str) -
     # does not help a name upstream never routes through `torch.ops.aten`.
     #
     # The decomposition below is upstream's own, read off a `TorchDispatchMode`
-    # logger (docs/COMPLEX3.md §6.1): widen to complex, optionally slice/pad
+    # logger (docs/kernels/COMPLEX3.md §6.1): widen to complex, optionally slice/pad
     # each transformed axis to match `s`, then `_fft_c2c`. Verified from
     # outside this file, in a probe process supplying these same lines: a full
     # two-layer `FNetModel` forward agrees with upstream element-wise, max
@@ -3193,11 +3193,11 @@ def install(module, surface_json: str, overloads_json: str, methods_json: str) -
     # constructor. There is no `torch.linalg_qr` and no `Tensor.linalg_qr` on
     # 2.13.0 -- checked both directions -- so this cannot be an
     # `overloads.json` row without inventing a door upstream does not have
-    # (docs/SPELLINGS.md). It is a composite here for the same reason
+    # (docs/bindings/SPELLINGS.md). It is a composite here for the same reason
     # `_install_nn`'s `upsample_bilinear2d` is one.
     #
     # The kernel already exists and is golden-compared (`aten.linalg_qr.default`,
-    # docs/TAIL1.md §5); it returns upstream's `linalg_qr(Q=..., R=...)`
+    # docs/kernels/TAIL1.md §5); it returns upstream's `linalg_qr(Q=..., R=...)`
     # namedtuple, including the `mode="r"` one-dimensional empty `Q`, so
     # nothing is reshaped or renamed on the way through.
     #
@@ -3218,7 +3218,7 @@ def install(module, surface_json: str, overloads_json: str, methods_json: str) -
     module._linalg.linalg_qr = linalg_qr
 
     # `torch._C._linalg.linalg_norm` -- `owlv2`'s and `owlvit`'s wall
-    # (docs/COMPLEX.md §6). `torch/linalg/__init__.py:1353` is
+    # (docs/kernels/COMPLEX.md §6). `torch/linalg/__init__.py:1353` is
     # `norm = _add_docstr(_linalg.linalg_norm, ...)`, the same shape as `qr`
     # above, and again with no `torch.linalg_norm` / `Tensor.linalg_norm` to
     # hang a table row on.
@@ -3340,7 +3340,7 @@ def install(module, surface_json: str, overloads_json: str, methods_json: str) -
     # `torch.compile` installs, which this project never calls (DYNAMO.md
     # §3.2). So the only requirement is that the call not raise.
     #
-    # docs/ARCH26.md added a third and fourth: `set_eval_frame` and
+    # docs/architectures/ARCH26.md added a third and fourth: `set_eval_frame` and
     # `set_eval_frame_isolate_recompiles_id`. `torch/_dynamo/__init__.py:133`
     # rebinds `torch.manual_seed = torch._disable_dynamo(torch.manual_seed)`
     # **unconditionally at `torch._dynamo` import time** -- so merely
@@ -3354,8 +3354,8 @@ def install(module, surface_json: str, overloads_json: str, methods_json: str) -
     # caller relies on the return value to restore the prior state, so unlike
     # the two above these cannot be unconditional `None`-returning no-ops:
     # a nested `_fn` call has to see what the outer one set. `deberta`'s toy
-    # forward (docs/ARCH26.md) is what surfaced this -- none of the twenty
-    # architectures in docs/ARCH20.md called `torch.manual_seed` after
+    # forward (docs/architectures/ARCH26.md) is what surfaced this -- none of the twenty
+    # architectures in docs/architectures/ARCH20.md called `torch.manual_seed` after
     # `transformers` had already pulled in `torch._dynamo`.
     #
     # `torch.compile` is never invoked here, so there is no real eval-frame
@@ -3377,7 +3377,7 @@ def install(module, surface_json: str, overloads_json: str, methods_json: str) -
     # path strings, with no behaviour at all -- but the generic stub makes it an
     # `_Unimplemented`, so every attribute raises. That is why `torch.compile`
     # died on `AOTINDUCTOR_DIR` rather than on anything about compiling
-    # (docs/COMPILE.md §2), and it stands in front of `torch.export` too.
+    # (docs/graph/COMPILE.md §2), and it stands in front of `torch.export` too.
     #
     # Transcribed from upstream rather than invented: these are wire-format
     # paths inside a `.pt2` archive, so a guessed value would produce an archive
@@ -3441,7 +3441,7 @@ def install(module, surface_json: str, overloads_json: str, methods_json: str) -
         def set_eval_frame(callback):
             # Refuse to *install* a hook, and say why. Without this the cell
             # accepts the callback, never installs anything, and `torch.compile`
-            # quietly returns the eager function -- docs/COMPILE.md measured
+            # quietly returns the eager function -- docs/graph/COMPILE.md measured
             # exactly that by stubbing five unrelated symbols. Today's failure
             # is an accident of a missing data module, and closing that module
             # would turn a loud error into a lie.
@@ -3455,8 +3455,8 @@ def install(module, surface_json: str, overloads_json: str, methods_json: str) -
                     "CPython's PEP 523 frame-evaluation hook "
                     "(_PyInterpreterState_SetEvalFrameFunc), which is outside "
                     "the stable ABI this extension is built against "
-                    "(abi3-py313); see docs/COMPILE.md. Use torch.export or "
-                    "the capture API (docs/CAPTURE.md) for a graph."
+                    "(abi3-py313); see docs/graph/COMPILE.md. Use torch.export or "
+                    "the capture API (docs/graph/CAPTURE.md) for a graph."
                 )
             prior = _eval_frame_cell[0]
             _eval_frame_cell[0] = callback
@@ -3524,7 +3524,7 @@ def install(module, surface_json: str, overloads_json: str, methods_json: str) -
         if name.startswith("__"):
             continue
         setattr(varfns, name, _torch_level_function(name, dispatch, overloads))
-    # `torch.div(int, int, rounding_mode=...)` -- docs/ARGFORM.md,
+    # `torch.div(int, int, rounding_mode=...)` -- docs/bindings/ARGFORM.md,
     # `longformer`'s wall. Measured with a `TorchDispatchMode` logger on
     # 2.13.0: `torch.div(7, 2, rounding_mode='trunc')` reaches
     # `aten.div.Tensor_mode` -- upstream wraps a bare Python number into a
@@ -3576,7 +3576,7 @@ def install(module, surface_json: str, overloads_json: str, methods_json: str) -
     varfns.div = div
 
     # `torch.zeros((..., 0-dim int Tensor, ...), dtype=..., device=...)` --
-    # `fastspeech2_conformer`'s wall (docs/TAIL4.md §8.2, docs/BIND4.md).
+    # `fastspeech2_conformer`'s wall (docs/kernels/TAIL4.md §8.2, docs/bindings/BIND4.md).
     # `FeatureProjection`/the length-regulator forward builds `max_len =
     # torch.sum(duration_labels, dim=1).max()`, a 0-dim Tensor, and then
     # writes `torch.zeros((batch, max_len, dim), dtype=..., device=...)`
@@ -3593,14 +3593,14 @@ def install(module, surface_json: str, overloads_json: str, methods_json: str) -
     # above is scoped to `div` alone rather than folded into `_TypeChecker`:
     # that would accept a Tensor in *every* `SymInt[]` position table-wide
     # without a matching measurement for each of them, which is exactly the
-    # silent-divergence trap docs/ARGFORM.md §2 names.
+    # silent-divergence trap docs/bindings/ARGFORM.md §2 names.
     #
     # The refusals were the half this comment used to hand-wave -- a
     # multi-element Tensor was "left to fail on its own `__int__`", and a
     # FLOAT or BOOL Tensor was not considered at all, so `torch.zeros((2,
     # tensor(3.5)))` quietly gave a (2, 3) tensor where upstream raises.
     # `_coerce_symint_size_tensors` now carries upstream's three lines and its
-    # message text; docs/BIND5.md §1 has the measurement.
+    # message text; docs/bindings/BIND5.md §1 has the measurement.
     _table_zeros = varfns.zeros
 
     def zeros(size, *args, **kwargs):
@@ -3614,7 +3614,7 @@ def install(module, surface_json: str, overloads_json: str, methods_json: str) -
         # `_MODE_STACK` check would fire with *itself* as `func`, which is no
         # longer the object `_device_constructors()` finds at `torch.zeros`,
         # and `with torch.device("meta"): torch.zeros(2)` would silently go
-        # back to returning a CPU tensor -- docs/DEVICE_ABS.md §7.2's exact
+        # back to returning a CPU tensor -- docs/devices/DEVICE_ABS.md §7.2's exact
         # failure, caught by `test_meta_road_through_the_vendored_tree` the
         # first time this wrapper was written without the guard.
         if _MODE_STACK:
@@ -3636,7 +3636,7 @@ def install(module, surface_json: str, overloads_json: str, methods_json: str) -
     # `torch.ops.aten.frombuffer.<overload>` -- a work item nobody could ever
     # close, because there is nothing there to reach. Point it at the real
     # implementation instead. It is the entire cost of the safetensors load
-    # path; see `_frombuffer` in lib.rs and docs/CKPT.md.
+    # path; see `_frombuffer` in lib.rs and docs/models/CKPT.md.
     varfns.frombuffer = module._frombuffer
     # `torch.asarray` is the third, and it is `frombuffer`'s sibling in every
     # respect: no `aten::asarray` exists either (`torch.ops.aten.asarray` raises
@@ -3644,7 +3644,7 @@ def install(module, surface_json: str, overloads_json: str, methods_json: str) -
     # work item that could never be closed. It is what safetensors' *default*
     # backend calls -- `frombuffer` serves the `pread` and bytes backends -- so
     # between the two, every safetensors route reaches a real reader. See
-    # `_asarray` in lib.rs and docs/CKPT2.md §4.
+    # `_asarray` in lib.rs and docs/models/CKPT2.md §4.
     varfns.asarray = module._asarray
     # `torch.get_default_dtype` is the fourth. It is not an aten op at all --
     # upstream binds `THPModule_getDefaultDtype` straight onto `_C`
@@ -3740,13 +3740,13 @@ def install(module, surface_json: str, overloads_json: str, methods_json: str) -
     _install_repr_surface(module, varfns, module.TensorBase)
     _install_serialization(module)
 
-    # ---- docs/EXPORT.md §8's hand-off ------------------------------------
+    # ---- docs/graph/EXPORT.md §8's hand-off ------------------------------------
     #
     # **Last, and the position is load-bearing.** These eight install the 32
     # `torch.export` census names over the placeholders that the stub tables
     # and the submodule synthesiser leave behind, so they have to run after
     # every one of those. The first attempt put them beside
-    # `_install_dispatch_keys` -- which is where docs/EXPORT.md §8 proposed
+    # `_install_dispatch_keys` -- which is where docs/graph/EXPORT.md §8 proposed
     # them -- and `_install_dynamo_bool` was silently undone: the name was in
     # `torch._C._dynamo.guards.__dict__` afterwards and its value was the
     # `_Unimplemented` the submodule pass had written over it. Nothing raised;
@@ -3794,7 +3794,7 @@ def install(module, surface_json: str, overloads_json: str, methods_json: str) -
 # What is *not* here is as deliberate as what is. `get_record_offset_no_read`
 # and the mmap path are left refusing, because closing them means reproducing
 # torch's record-alignment arithmetic, and a wrong offset does not raise -- it
-# reads the neighbouring tensor's bytes. docs/CKPT.md §6.
+# reads the neighbouring tensor's bytes. docs/models/CKPT.md §6.
 
 
 class _RecordHolder:
@@ -3963,7 +3963,7 @@ class _ZipWriter:
     unconditionally. An exception from inside the block runs `__exit__`, which
     raises its own, and the second one is what propagates -- so before this
     class existed, *every* failure anywhere on the save path was reported as
-    `PyTorchFileWriter.write_end_of_file`. docs/SAVE.md §1.
+    `PyTorchFileWriter.write_end_of_file`. docs/models/SAVE.md §1.
 
     The three records `_save` does not write are written here, matching where
     upstream's C++ writer writes them:
@@ -4038,7 +4038,7 @@ class _ZipWriter:
             # and the reader trusts the *pickle's* number, so a disagreement
             # here is a record whose payload does not match what will be asked
             # of it -- which reads back as the neighbouring tensor's bytes
-            # rather than as an error (docs/CKPT.md §6).
+            # rather than as an error (docs/models/CKPT.md §6).
             raise RuntimeError(
                 f"torch._C shim: PyTorchFileWriter.write_record({name!r}) was "
                 f"told {size} bytes and given {len(payload)}"
@@ -4060,7 +4060,7 @@ class _ZipWriter:
         # A fixed timestamp, where upstream writes the wall clock. It makes a
         # save byte-reproducible: the same object saved twice gives the same
         # file, which is what lets a federated delta be addressed by its hash
-        # (README, docs/DESIGN.md §10). 1980-01-01 is the zip epoch, the
+        # (README, docs/design/DESIGN.md §10). 1980-01-01 is the zip epoch, the
         # earliest value the format can carry.
         info = zipfile.ZipInfo(full, date_time=(1980, 1, 1, 0, 0, 0))
         info.compress_type = zipfile.ZIP_STORED
@@ -4122,7 +4122,7 @@ class _ZipWriter:
         Refused rather than filled with zeros. The whole point of the context
         manager is to write a checkpoint whose payloads are supplied later by
         something else; a shim that quietly wrote `numbytes` zeros would produce
-        exactly the file docs/CKPT.md §4 spent a section on -- one that loads,
+        exactly the file docs/models/CKPT.md §4 spent a section on -- one that loads,
         matches every key, and is all zeros.
         """
         raise NotImplementedError(
@@ -4130,7 +4130,7 @@ class _ZipWriter:
             f"({name!r}, {numbytes} bytes) -- this is the "
             "torch.serialization.skip_data path, which writes a record header "
             "with no payload for a caller to fill in afterwards. It is refused "
-            "rather than zero-filled (docs/SAVE.md §6)"
+            "rather than zero-filled (docs/models/SAVE.md §6)"
         )
 
     def write_end_of_file(self):
@@ -4239,7 +4239,7 @@ def _install_serialization(module) -> None:
 # neither can be built without the stack.
 #
 # **The stack alone would have been worse than nothing**, and that is the whole
-# reason this file grew a mode dispatch as well. docs/DEVICE_ABS.md §7.2 said
+# reason this file grew a mode dispatch as well. docs/devices/DEVICE_ABS.md §7.2 said
 # it in advance: push a `DeviceContext` and never consult it and
 # `with torch.device("meta"): torch.zeros(2)` returns a *CPU* tensor, silently,
 # with the block appearing to work. A `NotImplementedError` is better than a
@@ -4333,7 +4333,7 @@ def _install_torch_function_modes(module) -> None:
     # than a function -- `surface.json` harvested it from the `.pyi` as
     # `"function"`, so it became a raising stub, and
     # `torch.autograd.profiler.record_function.__exit__` opens with
-    # `with torch._C.DisableTorchFunctionSubclass():` (docs/LOSS.md §6). So it
+    # `with torch._C.DisableTorchFunctionSubclass():` (docs/training/LOSS.md §6). So it
     # sits on the road to `optimizer.zero_grad()` twice over: once for the
     # marker and once for this.
     #
@@ -4385,7 +4385,7 @@ def _fast_symint_list_coerce(value):
 
     The list twin of `_fast_symint_coerce`, and it exists for the reason that
     one does: **the fast path has to reproduce `resolve`'s coercions, not only
-    its predicates.** docs/BIND5.md §7.2 records what happened the last time
+    its predicates.** docs/bindings/BIND5.md §7.2 records what happened the last time
     it did not -- the predicate started admitting a single-element Tensor at a
     scalar `SymInt`, this path handed the raw Tensor down, and the Rust side
     unpacked it anyway *including a `bool` one*, so the divergence came back as
@@ -4432,7 +4432,7 @@ def _compile_fast_path(fn, name, entry, dispatch, is_method):
         # exactly the hazard `_TypeChecker`'s docstring names, and here it had
         # teeth: the Rust side unpacked the Tensor anyway, including a `bool`
         # one, so a divergence from upstream came back as a plausible answer
-        # rather than as an error (docs/BIND5.md §7.2).
+        # rather than as an error (docs/bindings/BIND5.md §7.2).
         "_symint_coerce": _fast_symint_coerce,
         "_symint_list_coerce": _fast_symint_list_coerce,
     }
@@ -4612,7 +4612,7 @@ def _torch_level_function(name: str, dispatch, overloads):
 # `TensorBase` members that do something
 # ---------------------------------------------------------------------------
 #
-# docs/C_SURFACE.md §4 measured a small Llama forward plus greedy `generate`
+# docs/design/C_SURFACE.md §4 measured a small Llama forward plus greedy `generate`
 # and found 50 of `TensorBase`'s 694 members actually used. Everything here
 # serves that list, and nothing here is a second entrance: a method resolves an
 # overload and calls `_C._aten_dispatch`, exactly like `torch.<op>` does.
@@ -4681,7 +4681,7 @@ def _install_tensor_T(tensorbase) -> None:
     this is Python-level surface over the `permute` member `methods.json`
     already carries, not a second kernel.
 
-    `falcon`'s attention module is what asked for this (docs/COMPAT.md,
+    `falcon`'s attention module is what asked for this (docs/models/COMPAT.md,
     transformers 4.x compatibility sweep).
     """
 
@@ -4692,7 +4692,7 @@ def _install_tensor_T(tensorbase) -> None:
 
 
 def _install_tensor_complex_parts(tensorbase, dispatch) -> None:
-    """`Tensor.real` / `Tensor.imag` -- `fnet`'s other wall (docs/COMPLEX3.md
+    """`Tensor.real` / `Tensor.imag` -- `fnet`'s other wall (docs/kernels/COMPLEX3.md
     §6.2), and the reason it is not in `methods.json` alongside everything
     else `_install_tensor_methods` harvests: upstream exposes both as
     **properties** (`torch._C.TensorBase.real`, a `getset_descriptor`), not as
@@ -4704,7 +4704,7 @@ def _install_tensor_complex_parts(tensorbase, dispatch) -> None:
     Both aten keys (`aten.real.default`, `aten.imag.default`) are implemented
     and proven element-wise against upstream in `pytests/test_complex.py`; this
     adds nothing to their arithmetic, only the property that reaches them --
-    checked before writing it, the way docs/BINDINGS.md's `mish` was not.
+    checked before writing it, the way docs/bindings/BINDINGS.md's `mish` was not.
     """
     tensorbase.real = property(lambda self: dispatch("aten.real.default", self))
     tensorbase.imag = property(lambda self: dispatch("aten.imag.default", self))
@@ -4712,7 +4712,7 @@ def _install_tensor_complex_parts(tensorbase, dispatch) -> None:
 
 def _install_tensor_size_list_tensor_forms(module, tensorbase) -> None:
     """`Tensor.new_zeros((..., 0-dim int Tensor, ...))` -- `led` and
-    `longformer`'s shared wall (docs/STRIDED.md §6, docs/BIND5.md §1).
+    `longformer`'s shared wall (docs/kernels/STRIDED.md §6, docs/bindings/BIND5.md §1).
 
     `LongformerSelfAttention._sliding_chunks_query_key_matmul`, borrowed
     verbatim by `modeling_led.py:440` and `modeling_longformer.py:796`, writes
@@ -4725,15 +4725,15 @@ def _install_tensor_size_list_tensor_forms(module, tensorbase) -> None:
     and `chunks_count` there is a **0-dim int64 Tensor**, not a Python int --
     confirmed by instrumenting the real call rather than read off the source
     (`['int', 'Tensor=tensor(2)', 'int', 'int']`). It is the same argument
-    form docs/BIND4.md §3 landed for `torch.zeros`, arriving at a *method*
+    form docs/bindings/BIND4.md §3 landed for `torch.zeros`, arriving at a *method*
     this time, and measured to be upstream's rule for the method too before
     being written: `x.new_zeros((2, tensor(3), 4))` gives `(2, 3, 4)` on real
     torch 2.13.0.
 
     This wraps `new_zeros` ALONE and not the rest of the `new_*` family, for
-    the reason docs/ARGFORM.md §2 gives and docs/BIND4.md §3 followed for
+    the reason docs/bindings/ARGFORM.md §2 gives and docs/bindings/BIND4.md §3 followed for
     `zeros`: upstream accepts the form for `new_ones`, `new_empty` and
-    `new_full` as well (measured, docs/BIND5.md §1), but nothing measured
+    `new_full` as well (measured, docs/bindings/BIND5.md §1), but nothing measured
     calls them that way, and a rule installed table-wide would accept a
     Tensor in every `SymInt[]` position with no matching measurement behind
     each one.
@@ -4742,7 +4742,7 @@ def _install_tensor_size_list_tensor_forms(module, tensorbase) -> None:
     `DeviceContext.__torch_function__` matches its 36 constructors by object
     identity off the `torch` MODULE (`_device_constructors()`,
     `torch/utils/_device.py`), and a bound tensor method is not among them --
-    which is why docs/BIND4.md §3.1's trap does not have a sibling on this
+    which is why docs/bindings/BIND4.md §3.1's trap does not have a sibling on this
     path. The wrapped method's behaviour is otherwise the table-driven one,
     byte for byte: it forwards `*args` and `**kwargs` untouched.
     """
@@ -4810,7 +4810,7 @@ def _install_tensor_conversions(module, tensorbase, dispatch) -> None:
             device = module.device(device)
         # `!=`, not `is not`. This used to be load-bearing for a bad reason --
         # `self.dtype` built a fresh `PyDtype` on every read, so identity was
-        # never true even for the same dtype. That is fixed (docs/BIND.md §9;
+        # never true even for the same dtype. That is fixed (docs/bindings/BIND.md §9;
         # `t.dtype is torch.float32` holds now, and `aten.baddbmm.default`'s
         # decomposition stopped promoting float32 to float64 with it). It
         # stays `!=` anyway, because `device` on the next line has no such
@@ -4838,7 +4838,7 @@ def _install_tensor_conversions(module, tensorbase, dispatch) -> None:
     def to(self, *args, **kwargs):
         """`Tensor.to`, in upstream's own argument shapes.
 
-        This is the clearest case of docs/OVERLOAD.md §9 item 7 -- a Python
+        This is the clearest case of docs/bindings/OVERLOAD.md §9 item 7 -- a Python
         binding whose signatures do not line up with any aten schema. torch's
         parser takes `to(Device device=None, ScalarType dtype=None, ...)`,
         `to(ScalarType dtype, ...)` and `to(Tensor other, ...)`; the aten
@@ -4941,7 +4941,7 @@ def _install_tensor_conversions(module, tensorbase, dispatch) -> None:
     # The name table is `_LEGACY_TENSOR_DTYPES`, the same one
     # `_install_legacy_tensor_types` builds `torch.FloatTensor` and its nine
     # siblings from. Deliberately the same object and not a copy: a second
-    # list of dtype spellings is the failure docs/AUDIT.md found six times.
+    # list of dtype spellings is the failure docs/verification/AUDIT.md found six times.
     # It covers every dtype this build can *hold* -- `uint16`, `complex64` and
     # the rest have no candle storage, so no tensor can carry them and no
     # `x.type()` can be asked about them.
@@ -4999,7 +4999,7 @@ def _install_tensor_conversions(module, tensorbase, dispatch) -> None:
         # `non_blocking` is accepted and ignored for `to`'s reason: there is no
         # async copy engine here. `memory_format` is accepted only for the two
         # formats that ask for what the result already is; the channels-last
-        # pair refuses rather than being dropped (docs/EXPORT5.md §3).
+        # pair refuses rather than being dropped (docs/graph/EXPORT5.md §3).
         _refuse_unrepresentable_memory_format("TensorBase.type", kwargs)
         kwargs.pop("async", None)
         if kwargs:
@@ -5032,7 +5032,7 @@ def _install_tensor_conversions(module, tensorbase, dispatch) -> None:
     setattr(tensorbase, "type", type_)
 
     # `Tensor.expand_as` -- `zoedepth`'s wall once 2-D convolution existed
-    # (docs/KERNELS26.md §7). A *name* gap, not a kernel gap: measured on
+    # (docs/kernels/KERNELS26.md §7). A *name* gap, not a kernel gap: measured on
     # upstream 2.13.0, `aten::expand_as` is `CompositeImplicitAutograd`
     # (`_dispatch_has_kernel_for_dispatch_key` is True) and a
     # `TorchDispatchMode` trace of `x.expand_as(y)` fires exactly one op --
@@ -5093,11 +5093,11 @@ def _install_tensor_conversions(module, tensorbase, dispatch) -> None:
     outer.__qualname__ = "TensorBase.outer"
     setattr(tensorbase, "outer", outer)
 
-    # `Tensor.new_tensor` -- docs/ARCH26.md, `zoedepth`'s wall (through
+    # `Tensor.new_tensor` -- docs/architectures/ARCH26.md, `zoedepth`'s wall (through
     # `Dinov2`'s `_init_weights`, `transformers/initialization.py`'s
     # `trunc_normal_`, `torch/nn/init.py`'s `_no_grad_trunc_normal_`, which
     # reads a scalar bound back with `tensor.new_tensor(a, device="cpu").item()`
-    # -- not one of the twenty in docs/ARCH20.md, none of which triggered
+    # -- not one of the twenty in docs/architectures/ARCH20.md, none of which triggered
     # `trunc_normal_`'s truncated-bounds path during construction).
     #
     # A `TorchDispatchMode` logger on 2.13.0 shows `x.new_tensor(5.0,
@@ -5203,7 +5203,7 @@ def _install_tensor_softmax(tensorbase, dispatch) -> None:
     drift on `dtype=` or on `half_to_float`. `log_softmax` is here for the
     identical reason -- `aten::log_softmax.int` is `CompositeImplicitAutograd`
     and never reaches a kernel, while `aten::_log_softmax` is the dispatched
-    leaf (docs/LOSS.md). Note that `torch._log_softmax`, the *private* free
+    leaf (docs/training/LOSS.md). Note that `torch._log_softmax`, the *private* free
     spelling, is a genuine `overloads.json` entry, because it names the leaf;
     `torch.log_softmax` is bound to this member instead. That asymmetry is
     written out in `overloads.json`'s own `_README`.
@@ -5218,7 +5218,7 @@ def _install_tensor_softmax(tensorbase, dispatch) -> None:
     parser-level key for `Tensor.softmax` is `aten::softmax.int`, which is
     `CompositeImplicitAutograd` and never reaches a kernel, while the key
     upstream's dispatcher actually sees is `aten._softmax.default` (measured
-    with a `TorchDispatchMode` logger on torch 2.13.0, docs/NN_SURFACE.md §6):
+    with a `TorchDispatchMode` logger on torch 2.13.0, docs/bindings/NN_SURFACE.md §6):
 
         x.softmax(dim)                      -> aten._softmax.default(x, dim, False)
         x.softmax(dim, dtype=torch.float64)  -> aten._to_copy.default(x, dtype=float64)
@@ -5278,9 +5278,9 @@ def _install_tensor_where(tensorbase, dispatch) -> None:
     therefore compute `torch.where(x, c, y)`: the *right shape*, the right
     dtype, and the two branches swapped. That failure is invisible to a shape
     check and to any test whose two branches broadcast the same, which is why
-    it is written out here instead. docs/REPEAT.md §1.
+    it is written out here instead. docs/kernels/REPEAT.md §1.
 
-    `docs/BIND5.md` §4.1 recorded this as "`methods.json` simply has no row";
+    `docs/bindings/BIND5.md` §4.1 recorded this as "`methods.json` simply has no row";
     re-measured here rather than trusted, and the row would have been wrong.
     The kernels it named were right -- all five `where` overloads are
     implemented and unchanged by this.
@@ -5390,7 +5390,7 @@ def _install_tensor_chunk(tensorbase, dispatch) -> None:
     setattr(tensorbase, "chunk", chunk)
 
     def flatten(self, start_dim=0, end_dim=-1):
-        """`Tensor.flatten`, `cohere`'s wall (docs/ARCH20.md §5).
+        """`Tensor.flatten`, `cohere`'s wall (docs/architectures/ARCH20.md §5).
 
         `aten::flatten.using_ints` is `CompositeImplicitAutograd` and a
         `TorchDispatchMode` logger on 2.13.0 shows it firing *nothing* of its
@@ -5555,7 +5555,7 @@ def _install_tensor_indexing(module, tensorbase, dispatch) -> None:
             and item.step is None
         )
 
-    # -- sequence indices (docs/ARCH20.md §7, the `falcon` wall) -------------
+    # -- sequence indices (docs/architectures/ARCH20.md §7, the `falcon` wall) -------------
     #
     # `fused_qkv[..., [-2], :]` (`modeling_falcon.py:283`, `_split_heads`) is a
     # *list* in an index tuple, and it used to hit the "index of type list"
@@ -5764,13 +5764,13 @@ def _install_tensor_indexing(module, tensorbase, dispatch) -> None:
         in-place op swapped the wrapper's tensor for a freshly computed one
         instead of writing into the buffer that wrapper pointed at, so the
         upstream sequence ran to completion and changed nothing. That is now
-        `PyTensorBase::write_into` (docs/VIEWS.md §6), and this branch is the
+        `PyTensorBase::write_into` (docs/kernels/VIEWS.md §6), and this branch is the
         caller it was built for.
 
         **Two things still refuse, and neither is a view problem.**
 
           * A slice with `step != 1`. `slice.Tensor` handles it by
-            `index_select`, which *copies* -- measured in docs/VIEWS.md §4,
+            `index_select`, which *copies* -- measured in docs/kernels/VIEWS.md §4,
             `x` and `slice.Tensor(x, 0, 5, 2)` hold independent buffers. So
             the walk would produce something that is not a view of `self`, and
             writing into it would be exactly the silent no-op this branch used
@@ -5789,7 +5789,7 @@ def _install_tensor_indexing(module, tensorbase, dispatch) -> None:
         # A step != 1 slice on the *write* side, lowered to `index_put_`.
         #
         # `aten.slice.Tensor` reaches a step above 1 through `index_select`,
-        # which materialises (docs/VIEWS.md §6.4), so the basic walk below
+        # which materialises (docs/kernels/VIEWS.md §6.4), so the basic walk below
         # would narrow to a tensor that does not share storage with the
         # receiver and the write would be silently lost. The positions the
         # slice names are handed to `index_put_` as an integer index instead,
@@ -5798,7 +5798,7 @@ def _install_tensor_indexing(module, tensorbase, dispatch) -> None:
         # Restricted, on purpose, to **one** stepped slice with every other
         # item a full slice: `index_put_` implements a single index group, and
         # a second one has to be refused rather than approximated. That covers
-        # every call site the 297-architecture sweep found (docs/SETITEM.md
+        # every call site the 297-architecture sweep found (docs/bindings/SETITEM.md
         # §1) -- `pe[:, 0::2] = v` and `freqs_t[..., k::3] = v`.
         #
         # The dtype cast is not incidental. Upstream reaches this through
@@ -5824,7 +5824,7 @@ def _install_tensor_indexing(module, tensorbase, dispatch) -> None:
                     "stepped slice alongside another non-trivial index -- the write "
                     "lowers to aten.index_put_, which implements a single index "
                     "group, and a second group is refused rather than approximated "
-                    "(docs/SETITEM.md §3)"
+                    "(docs/bindings/SETITEM.md §3)"
                 )
             axis = _stepped[0]
             item = index[axis]
@@ -5839,7 +5839,7 @@ def _install_tensor_indexing(module, tensorbase, dispatch) -> None:
                 # Upstream writes nothing here but still checks the broadcast,
                 # and raises with `copy_`'s wording rather than
                 # `index_put_`'s. Not reproduced: an empty stepped write is
-                # not a form any swept architecture uses (docs/SETITEM.md §4).
+                # not a form any swept architecture uses (docs/bindings/SETITEM.md §4).
                 return
             dispatch(
                 "aten.index_put_.default",
@@ -5907,7 +5907,7 @@ def _install_tensor_indexing(module, tensorbase, dispatch) -> None:
                         "the write would land in a tensor that does not share storage "
                         "with the receiver and would be silently lost. Reading "
                         "`x[::2]` is fine; writing to it is what is missing "
-                        "(docs/VIEWS.md §6.4)"
+                        "(docs/kernels/VIEWS.md §6.4)"
                     )
                 view = dispatch(
                     "aten.slice.Tensor", view, dim, item.start, item.stop, step
@@ -5947,7 +5947,7 @@ def _install_tensor_indexing(module, tensorbase, dispatch) -> None:
 # The class name upstream gives the node an op produces, where the naive rule
 # does not get it right.
 #
-# **Measured, not derived.** `docs/BACKWARD4.md` §3.1 ran 48 ops through real
+# **Measured, not derived.** `docs/training/BACKWARD4.md` §3.1 ran 48 ops through real
 # torch 2.13.0 and read `type(y.grad_fn).__name__` off each; the naive rule
 # below -- CamelCase the aten base name and append `Backward0` -- agreed on 41
 # of them. These are the seven that disagreed, and each one disagrees for a
@@ -5983,7 +5983,7 @@ _GRAD_FN_NAMES = {
     #     (both bounds, min only, and the `Tensor.clamp` spelling).
     "aten.matmul.default": "MmBackward0",
     "aten.clamp.default": "ClampBackward1",
-    # docs/SCALAR2.md §4, measured the same way. Both are overload indices the
+    # docs/numerics/SCALAR2.md §4, measured the same way. Both are overload indices the
     # rule cannot derive, and both are reached by an ordinary Python operator:
     #   aten.rsub.Scalar -> RsubBackward1   `2 - x`
     #   aten.pow.Scalar  -> PowBackward2    `2 ** x`
@@ -6016,7 +6016,7 @@ def _grad_fn_name(op: str) -> str:
 class _GradFnNode:
     """What `grad_fn` returns for a non-leaf, and it is deliberately hollow.
 
-    `docs/BACKWARD4.md` §1.3 asked which caller is the first to reach past
+    `docs/training/BACKWARD4.md` §1.3 asked which caller is the first to reach past
     nullness and answered it by counting: on a real `from_pretrained` +
     `.train()` + forward, `grad_fn` is read 546 times and **every one of them is
     a nullness or a truthiness test**. The 547th, and the only one that reaches
@@ -6053,7 +6053,7 @@ class _GradFnNode:
         "next_functions", ())` and every `hasattr` guard in
         `torch/nn/modules/module.py` would take it as "this node happens not to
         have inputs" and carry on, which is the silent-wrong-answer failure
-        `docs/BACKWARD.md` §5.2 is about. So the refusal says what is absent and
+        `docs/training/BACKWARD.md` §5.2 is about. So the refusal says what is absent and
         that it is absent by construction.
 
         Dunders are excluded and still raise `AttributeError`, because that is
@@ -6071,7 +6071,7 @@ class _GradFnNode:
             "next_functions, no saved operands, no apply. "
             "Tensor.backward() does not read this and works anyway: it walks "
             "the eager tape, which records the same ops from the other side "
-            "(docs/BACKWARD9.md). See docs/BACKWARD4.md §1.3, docs/BACKWARD2.md §2."
+            "(docs/training/BACKWARD9.md). See docs/training/BACKWARD4.md §1.3, docs/training/BACKWARD2.md §2."
         )
 
 
@@ -6081,7 +6081,7 @@ def _grad_fn(self):
     Built on read rather than at the door. The door stores one string
     (`tensor.rs`'s `from_op`); allocating a Python object per op instead would
     have put an allocation on the hot path for a value that a real
-    `.train()` forward reads **zero** times (docs/BACKWARD4.md §1.1).
+    `.train()` forward reads **zero** times (docs/training/BACKWARD4.md §1.1).
     """
     op = self._shim_from_op
     if op is None:
@@ -6105,7 +6105,7 @@ def _install_autograd_shape(tensorbase) -> None:
 
       * `requires_grad` stores and reports what was set. Nothing reads it --
         but only a floating-point or complex tensor may carry it, which is
-        upstream's rule and was missing here until docs/BACKWARD2.md §1.4
+        upstream's rule and was missing here until docs/training/BACKWARD2.md §1.4
         measured it. `TensorBase.set_requires_grad` in `tensor.rs` is where it
         is stated; `_refuse_non_floating_requires_grad` below is the same rule
         under `requires_grad_`'s own upstream wording.
@@ -6125,17 +6125,17 @@ def _install_autograd_shape(tensorbase) -> None:
                 raise ValueError("can't optimize a non-leaf Tensor")
 
         -- so with `True` here, `torch.optim.SGD([x * 2])` is **accepted** and
-        upstream raises. Measured both ways, docs/BACKWARD3.md §1.1, along with
+        upstream raises. Measured both ways, docs/training/BACKWARD3.md §1.1, along with
         the two other guards that key on the same predicate
         (`requires_grad_` and `setattr` on a non-leaf, which upstream refuses
         with "you can only change requires_grad flags of leaf variables").
 
         It is nevertheless the honest report *given* the rest of this group: no
-        op propagates `requires_grad` (docs/BACKWARD2.md §1, W4), so a tensor an
+        op propagates `requires_grad` (docs/training/BACKWARD2.md §1, W4), so a tensor an
         op made here really does behave as a constant -- no gradient reaches it,
         nothing accumulates into it, and `backward()` refuses. `is_leaf` cannot
         be made to say otherwise without `grad_fn` becoming a node; there is no
-        version of it that is a smaller change, which is docs/BACKWARD3.md §3
+        version of it that is a smaller change, which is docs/training/BACKWARD3.md §3
         and the reason W4/W6/W7 did not land as a group.
 
         Note also that `retains_grad` is *unimplemented* and is unreachable
@@ -6145,7 +6145,7 @@ def _install_autograd_shape(tensorbase) -> None:
       * `backward()` stays a raising stub, so code that actually depends on
         the flag meaning something fails by name rather than silently getting
         zeros. That refusal is the *whole* of the boundary now: since
-        docs/BACKWARD2.md §4.1 the factory keyword carries the flag instead of
+        docs/training/BACKWARD2.md §4.1 the factory keyword carries the flag instead of
         refusing it, because `requires_grad_` had always carried it and the two
         spellings disagreeing protected nobody.
 
@@ -6153,7 +6153,7 @@ def _install_autograd_shape(tensorbase) -> None:
     storage with the original, so `p.data.normal_()` writes through to `p`;
     returning `self` gives that same write-through with the same object, and
     differs in that our `.data` still reports the original `requires_grad`.
-    Recorded in docs/TENSORBASE.md rather than hidden.
+    Recorded in docs/bindings/TENSORBASE.md rather than hidden.
     """
 
     def _make_subclass(cls, data, require_grad=False, dispatch_strides=False,
@@ -6207,9 +6207,9 @@ def _install_autograd_shape(tensorbase) -> None:
         # Upstream refuses this on a non-leaf before it looks at the dtype, with
         # a longer message than the attribute setter's -- both were transcribed
         # from 2.13.0 by running the failing case, and the difference between
-        # them is upstream's, not this shim's. docs/BACKWARD3.md §1.1 listed
+        # them is upstream's, not this shim's. docs/training/BACKWARD3.md §1.1 listed
         # this as a live divergence that `is_leaf` being hardcoded made
-        # unreachable; docs/BACKWARD4.md §4.1 is it closed.
+        # unreachable; docs/training/BACKWARD4.md §4.1 is it closed.
         if self._shim_from_op is not None:
             raise RuntimeError(
                 "you can only change requires_grad flags of leaf variables. If "
@@ -6222,7 +6222,7 @@ def _install_autograd_shape(tensorbase) -> None:
         # `complex64` tensor anyway, which is upstream's message being loose
         # rather than upstream's behaviour differing. The behaviour is the same
         # rule `TensorBase.set_requires_grad` enforces; only the text differs,
-        # and the text is what a caller greps for. docs/BACKWARD2.md §4.2.
+        # and the text is what a caller greps for. docs/training/BACKWARD2.md §4.2.
         _refuse_non_floating_requires_grad(
             self, bool(mode),
             "only Tensors of floating point dtype can require gradients",
@@ -6236,21 +6236,21 @@ def _install_autograd_shape(tensorbase) -> None:
     setattr(tensorbase, "grad_fn", property(_grad_fn))
 
     def _set_grad(self, value):
-        """`p.grad = ...`, which is a real slot now. docs/BACKWARD.md.
+        """`p.grad = ...`, which is a real slot now. docs/training/BACKWARD.md.
 
         The docstring above says `grad` is always `None`, "which is the truth
-        -- no gradient was ever accumulated", and docs/AUTOGRAD.md §7 argued
+        -- no gradient was ever accumulated", and docs/training/AUTOGRAD.md §7 argued
         explicitly for keeping it that way *while nothing writes to it*. The
         tape writes to it, so that antecedent is gone: what would be dishonest
         now is a `torch.optim` step that silently skipped every parameter
         because the slot it reads cannot be filled.
 
-        **Something fills it implicitly now** (docs/BACKWARD9.md):
+        **Something fills it implicitly now** (docs/training/BACKWARD9.md):
         `Tensor.backward()` reaches `_ImperativeEngine.run_backward`, which
         accumulates into this slot the way upstream's `AccumulateGrad` does --
         a dense copy on the first backward and an in-place `+=` after.
         `CaptureTrace.backward()` still *returns* gradients for the caller to
-        assign, the shape `torch.optim.sgd.sgd` already had (docs/LOSS.md §6.4),
+        assign, the shape `torch.optim.sgd.sgd` already had (docs/training/LOSS.md §6.4),
         and the two coexist because the setter does not care who writes.
         `None` is accepted because it is what `zero_grad(set_to_none=True)`,
         the default, writes.
@@ -6268,7 +6268,7 @@ def _install_autograd_shape(tensorbase) -> None:
     # costs -- `test_the_backward_seed_is_absent_and_nothing_guesses_a_one`
     # pins the consequence so it cannot go stale in prose.
     # Derived, not asserted. Upstream does not store `is_leaf` -- it *is*
-    # `grad_fn is None`, which docs/BACKWARD3.md §3 is entirely about, and
+    # `grad_fn is None`, which docs/training/BACKWARD3.md §3 is entirely about, and
     # writing it as anything else here would re-create the divergence this
     # round exists to close.
     setattr(tensorbase, "is_leaf", property(lambda self: self._shim_from_op is None))
@@ -6277,7 +6277,7 @@ def _install_autograd_shape(tensorbase) -> None:
         "retains_grad",
         property(lambda self: bool(self._shim_retains_grad)),
     )
-    # The getter is `self` (docs/TENSORBASE.md records why it is not a detached
+    # The getter is `self` (docs/bindings/TENSORBASE.md records why it is not a detached
     # view). The *setter* is what `nn.Module._apply` needs -- see
     # `_shim_set_data` in tensor.rs for what it costs and what it agrees with.
     def _set_data(self, value):
@@ -6296,18 +6296,18 @@ def _install_autograd_shape(tensorbase) -> None:
         true here. `retains_grad` starts reporting `True`, which is what
         `torch/optim/optimizer.py:1153` reads -- and reading it is only
         *possible* now that `is_leaf` stopped short-circuiting the `or`
-        (docs/BACKWARD3.md §1.2). What does not happen is the other half:
+        (docs/training/BACKWARD3.md §1.2). What does not happen is the other half:
         **no gradient is populated into a non-leaf's `.grad`.** That is no
         longer because `Tensor.backward()` refuses -- it answers since
-        docs/BACKWARD9.md, and fills every *leaf*'s `.grad` -- but because the
+        docs/training/BACKWARD9.md, and fills every *leaf*'s `.grad` -- but because the
         engine accumulates onto the tape's constants, and a non-leaf is a node
         result rather than a constant. The tape holds its value; nothing
-        surfaces it. docs/BACKWARD9.md §6 names it as unbuilt.
+        surfaces it. docs/training/BACKWARD9.md §6 names it as unbuilt.
 
         On a leaf it is a no-op with no flag set, which is upstream's behaviour
         too -- upstream returns early for a tensor that is already an
         accumulating leaf, and `x.retain_grad(); x.retains_grad` is `False`
-        there as well (measured on 2.13.0, docs/BACKWARD4.md §3.3).
+        there as well (measured on 2.13.0, docs/training/BACKWARD4.md §3.3).
         """
         if not self.requires_grad:
             raise RuntimeError(
@@ -6325,7 +6325,7 @@ def _install_autograd_shape(tensorbase) -> None:
 def _install_grad_mode(module, varfns) -> None:
     """The grad-mode flags `torch.no_grad()` turns on and off.
 
-    docs/FROM_CONFIG.md §2.2 measured `_set_grad_enabled` at **84 calls** during
+    docs/models/FROM_CONFIG.md §2.2 measured `_set_grad_enabled` at **84 calls** during
     `AutoModelForCausalLM.from_config` -- the single most-called name in the
     whole trace, because every `@torch.no_grad()`-decorated initialiser flips it
     twice. So this is not an edge case that can be left refusing.
@@ -6360,7 +6360,7 @@ def _install_grad_mode(module, varfns) -> None:
         # `torch.export` on a predicate that has an obvious answer.
         #
         # It lives HERE, in the same dict as `grad`, rather than as a constant,
-        # because docs/EXPORT.md §2.2 is about exactly the other choice: a
+        # because docs/graph/EXPORT.md §2.2 is about exactly the other choice: a
         # constant `False` would make `with torch.inference_mode():` a block
         # that enters, reports itself absent, and changes nothing. The setter
         # below is what `_InferenceMode.__enter__` writes through, so the guard
@@ -6437,7 +6437,7 @@ def _install_thread_local_store(module) -> None:
     implemented is the flag and not what the flag would govern.
 
     **The reason to implement it is that it was standing in front of the wall
-    that matters.** docs/BACKWARD2.md §1.2 measured what a user got before:
+    that matters.** docs/training/BACKWARD2.md §1.2 measured what a user got before:
 
         >>> torch.ones(2,2).requires_grad_(True).sum().backward()
         NotImplementedError: not implemented in torch._C shim: torch._C._stash_obj_in_tls
@@ -6446,7 +6446,7 @@ def _install_thread_local_store(module) -> None:
     autograd. Worse, stubbing only that one does not reveal the engine either:
     `_engine_run_backward`'s `finally:` calls `_remove_obj_from_tls`, which then
     raises **while the engine's own refusal is unwinding** and replaces it.
-    docs/BACKWARD.md §14.1 met the same masking shape inside `torch.save` and
+    docs/training/BACKWARD.md §14.1 met the same masking shape inside `torch.save` and
     called a refusal a `finally:` overwrites "a refusal nobody can size".
 
     `threading.local()` rather than a module dict, deliberately. A dict would
@@ -6492,12 +6492,12 @@ def _install_thread_local_store(module) -> None:
 
 
 def _install_engine(module) -> None:
-    """`_ImperativeEngine.run_backward` -- the wall, **opened**. docs/BACKWARD9.md.
+    """`_ImperativeEngine.run_backward` -- the wall, **opened**. docs/training/BACKWARD9.md.
 
     This is where both `Tensor.backward()` and `torch.autograd.grad()` land
-    (docs/BACKWARD2.md §1.3 measured that it is one wall and not two), and for
-    eleven rounds it refused by name. `docs/BACKWARD7.md` §6 listed what stood
-    between the refusal and an engine; `docs/BACKWARD8.md` closed the two that
+    (docs/training/BACKWARD2.md §1.3 measured that it is one wall and not two), and for
+    eleven rounds it refused by name. `docs/training/BACKWARD7.md` §6 listed what stood
+    between the refusal and an engine; `docs/training/BACKWARD8.md` closed the two that
     were defects; this closes the rest that a training loop needs.
 
     **It is a translation, not a second engine.** Everything below turns
@@ -6538,7 +6538,7 @@ def _install_engine(module) -> None:
 
         Accumulation is not differentiable and must not be recorded: an
         `add_` into `p.grad` under grad mode would be a write the *next*
-        tape could see. It is also the write docs/BACKWARD8.md §2.3's guard is
+        tape could see. It is also the write docs/training/BACKWARD8.md §2.3's guard is
         about, so doing it off the tape is what keeps the two independent --
         `forgive_own_write` forgives an op its own write, and this is not one.
         """
@@ -6562,7 +6562,7 @@ def _install_engine(module) -> None:
 
         So `p.grad.zero_()`, `p.grad.add_(...)` and every `foreach` optimizer
         would fail on the second step of a loop whose loss ends in `.sum()`.
-        Measured, not reasoned about (docs/BACKWARD9.md §2).
+        Measured, not reasoned about (docs/training/BACKWARD9.md §2).
 
         `contiguous()` materialises when the layout is not dense and returns
         the same storage when it already is, so the `data_ptr` test is what
@@ -6585,7 +6585,7 @@ def _install_engine(module) -> None:
         back one gradient tensor per constant, and for some programs two
         constants get *the same object*: `z = x + y; z.sum().backward()`
         returns the seed itself for both, `grads[0] is grads[1]`, measured
-        (docs/BACKWARD9.md §2). Storing it directly would make `x.grad` and
+        (docs/training/BACKWARD9.md §2). Storing it directly would make `x.grad` and
         `y.grad` one tensor, and the very next step's `x.grad.add_(...)` would
         double `y.grad` silently -- a wrong number, not an error.
         `test_two_leaves_of_one_add_do_not_share_one_gradient_tensor` is that
@@ -6622,7 +6622,7 @@ def _install_engine(module) -> None:
                 "an empty graph rather than fail. Double backward, "
                 "torch.autograd.grad(..., create_graph=True) and any "
                 "gradient-penalty term need it; first-order training does not. "
-                "docs/BACKWARD9.md §6"
+                "docs/training/BACKWARD9.md §6"
             )
         tensors = tuple(tensors)
         if len(tensors) != 1:
@@ -6632,14 +6632,14 @@ def _install_engine(module) -> None:
                 "-- the eager tape has one output, and differentiating several "
                 "roots at once means seeding each and summing into one traversal. "
                 "Call backward() once per root, or sum them into a scalar first. "
-                "docs/BACKWARD9.md §6"
+                "docs/training/BACKWARD9.md §6"
             )
         root = tensors[0]
         if not isinstance(root, module.TensorBase):
             raise NotImplementedError(
                 "not implemented in torch._C shim: backward from a GradientEdge -- "
                 "the eager tape is addressed by tensor identity and has no name for "
-                "an edge. docs/BACKWARD9.md §6"
+                "an edge. docs/training/BACKWARD9.md §6"
             )
         seed = grad_tensors[0] if grad_tensors else None
         # `wrt=None`: ask the tape for every leaf that requires grad and select
@@ -6702,7 +6702,7 @@ def _install_engine(module) -> None:
 # `float128`, `uint16`/`uint32`/`uint64` and the datetime kinds have no candle
 # storage behind them; they refuse by *name* in `_array_like_data` below rather
 # than being mapped to something close, because a silent widening of `uint32`
-# to `int64` is the shape of wrongness docs/GOLDEN.md exists to stop.
+# to `int64` is the shape of wrongness docs/verification/GOLDEN.md exists to stop.
 _NUMPY_DTYPE_TO_TORCH = {
     "bool": "bool",
     "uint8": "uint8",
@@ -6735,7 +6735,7 @@ def _array_like_data(module, data):
 
     `.tolist()` is the bridge, and it is a **copy**, which is the recorded
     divergence: upstream aliases the array's buffer when no cast is needed
-    (docs/DEMAND1.md §4, docs/CTOR.md §3.3), and this shim's tensors do not wrap
+    (docs/architectures/DEMAND1.md §4, docs/bindings/CTOR.md §3.3), and this shim's tensors do not wrap
     foreign buffers, so there is no aliasing answer to give.
 
     Returning the numpy dtype alongside the values is what keeps
@@ -6853,7 +6853,7 @@ def _tensor_factory(module, dispatch):
 
 
 # The legacy per-dtype tensor classes -- `torch.IntTensor` and its nine
-# siblings. `vits` is what needs them (docs/KERNELS26.md §24):
+# siblings. `vits` is what needs them (docs/kernels/KERNELS26.md §24):
 # `modeling_vits.py:349` builds `torch.IntTensor([self.hidden_size])` and then
 # subscripts it, and until now they were `_ShimMeta` placeholders, so the model
 # stopped on `'IntTensor' object is not subscriptable` -- a TypeError from a
@@ -6869,7 +6869,7 @@ def _tensor_factory(module, dispatch):
 # `torch.IntTensor`.
 #
 # All three of the legacy constructor's forms, and the ambiguity is the whole
-# reason this is worth writing carefully (docs/KERNELS26.md §12.1 ground 3):
+# reason this is worth writing carefully (docs/kernels/KERNELS26.md §12.1 ground 3):
 #
 #     IntTensor(2, 3)      a SIZE -> a (2, 3) tensor of int32
 #     IntTensor([2, 3])    DATA   -> a (2,) tensor holding 2 and 3
@@ -6945,7 +6945,7 @@ def _install_legacy_tensor_types(module, dispatch) -> None:
             # data. Measured upstream: `FloatTensor(torch.Size([2, 3]))` is a
             # `(2, 3)` float32 tensor and `LongTensor(torch.Size([2, 3]))` a
             # `(2, 3)` int64 one, i.e. the same size rule `torch.Tensor` has
-            # (docs/CTOR.md §2.1). Before this check they answered a `(2,)`
+            # (docs/bindings/CTOR.md §2.1). Before this check they answered a `(2,)`
             # tensor holding 2 and 3 -- the exact confusion the comment above
             # this function warns about, one type further out than it looked.
             if len(args) == 1 and isinstance(args[0], module.Size):
@@ -6976,7 +6976,7 @@ def _install_legacy_tensor_types(module, dispatch) -> None:
             # wording and the `()` -> `(0,)` rule). It builds at the default
             # float, so the cast is what makes it this class's dtype -- and
             # the values are zeros where upstream's are uninitialised, which
-            # is docs/KERNELS26.md §12.2's recorded property of the size form
+            # is docs/kernels/KERNELS26.md §12.2's recorded property of the size form
             # and not a new one.
             return dispatch("aten._to_copy.default",
                             _sized_tensor(module, base, args, kwargs.get("device")),
@@ -7008,12 +7008,12 @@ def _install_legacy_tensor_types(module, dispatch) -> None:
 
 
 def _make_tensor_class_new(module, dispatch):
-    """`torch.Tensor.__new__` -- docs/DEMAND.md §0.1 rank 1, and it is not
+    """`torch.Tensor.__new__` -- docs/architectures/DEMAND.md §0.1 rank 1, and it is not
     structural.
 
     DEMAND.md called this gap structural on the ground that the refusal lives in
     PyO3's `#[new] fn py_new` and the only class that could carry a Python-level
-    override, `torch.Tensor`, is in the vendored tree. Measured (docs/CTOR.md
+    override, `torch.Tensor`, is in the vendored tree. Measured (docs/bindings/CTOR.md
     §1), `torch.Tensor` is `class Tensor(torch._C.TensorBase)` at
     `torch/_tensor.py:102`; its MRO is `(Tensor, TensorBase, object)`; it
     defines **neither** `__new__` nor `__init__`, inheriting the first from
@@ -7049,7 +7049,7 @@ def _make_tensor_class_new(module, dispatch):
     `nn.Linear(2, 2)` still has two parameters.
 
     The dispatch order below is upstream's parser, and each branch is a rule
-    that a plausible implementation gets wrong -- see docs/CTOR.md §2:
+    that a plausible implementation gets wrong -- see docs/bindings/CTOR.md §2:
 
         Tensor(existing)        re-wrap; keeps the SOURCE dtype, not the default
         Tensor(torch.Size(...)) a SIZE -- and `torch.Size` is a `tuple` subclass,
@@ -7181,7 +7181,7 @@ def _make_tensor_class_new(module, dispatch):
         "re-wrap form Tensor(existing), the size forms Tensor(), Tensor(2, 3) "
         "and Tensor(torch.Size(...)), and the data forms Tensor(sequence) and "
         "Tensor(ndarray) -- the last two at the default dtype, as upstream "
-        "does. See docs/CTOR.md."
+        "does. See docs/bindings/CTOR.md."
     )
     return staticmethod(__new__)
 
@@ -7390,7 +7390,7 @@ _DISCOVERED_RETURNS = {
     # `torch/xpu/__init__.py:278`, reached from `torch.xpu.is_available()`,
     # reached from `transformers/masking_utils.py:39` -- at *import* of
     # `transformers.generation.utils`, which is the lazy import
-    # docs/IMPORT_TORCH.md §11 item 3 recorded `from_config` as dying in.
+    # docs/models/IMPORT_TORCH.md §11 item 3 recorded `from_config` as dying in.
     #
     # This one is a real answer, not a stand-in: upstream returns the number of
     # XPU devices, and a build with no XPU support has none. The name has to
@@ -7424,7 +7424,7 @@ _DISCOVERED_RETURNS = {
     # makes it the very next wall after `import torch` on the road to
     # `from_config`. Upstream increments an internal usage counter and returns
     # nothing; there is no counter here and nothing reads the result. This is
-    # the cleanest member of docs/C_SURFACE.md §7's second tier -- a name whose
+    # the cleanest member of docs/design/C_SURFACE.md §7's second tier -- a name whose
     # existence is the whole requirement.
     "_log_api_usage_once": None,
     # `torch/nn/modules/module.py`, the same shape: upstream records that a
@@ -7447,7 +7447,7 @@ _DISCOVERED_RETURNS = {
     # that warn only while TorchScript tracing. Upstream returns the active
     # `TracingState` or `None`; there is no tracer here, so `None` is the true
     # answer -- and it has to be *callable and answering*, not merely present,
-    # because `len(tensor)` is on the path. (docs/C_SURFACE.md §1-3 noticed
+    # because `len(tensor)` is on the path. (docs/design/C_SURFACE.md §1-3 noticed
     # this name being looked up during `import torch`; it is called later.)
     "_get_tracing_state": None,
     "_has_torch_function": False,
@@ -7455,14 +7455,14 @@ _DISCOVERED_RETURNS = {
     "_has_torch_function_variadic": False,
     # The *dispatch*-mode stack, which `torch/utils/_python_dispatch.py`
     # consults. **Its `_len_torch_dispatch_stack: 0` row used to be here and is
-    # gone** -- docs/EXPORT.md §8 item 3. The comment that stood here said
+    # gone** -- docs/graph/EXPORT.md §8 item 3. The comment that stood here said
     # "nothing pushes onto it here, so it is empty and disabled", which was true
     # when it was written and stopped being true the moment `torch.export`
     # arrived: `FakeTensorMode` and `ProxyTorchDispatchMode` both push.
     # `_install_mode_stack` below installs the real stack, and leaving the row
     # would have let a constant `0` win over it depending on install order --
     # making `with FakeTensorMode():` a block that entered, reported itself
-    # absent, and changed nothing (docs/EXPORT.md §2.2).
+    # absent, and changed nothing (docs/graph/EXPORT.md §2.2).
     #
     # Its torch-*function* sibling used to be beside it as another pair of
     # constants (`_len_torch_function_stack: 0`,
@@ -7470,7 +7470,7 @@ _DISCOVERED_RETURNS = {
     # `_install_torch_function_modes` below -- because `with torch.device(...)`
     # is a torch-function mode and nothing else, and a stack that always
     # answered zero would have made `with torch.device("meta"):` a block that
-    # succeeded and changed nothing. docs/META.md §8.
+    # succeeded and changed nothing. docs/devices/META.md §8.
     "_is_torch_function_all_disabled": False,
 }
 
@@ -7574,8 +7574,8 @@ _DISCOVERED_TYPE_RETURNS = {
 def _install_fx_node_base(module) -> None:
     """`torch._C._NodeBase`, `_NodeIter`, `_fx_map_arg`, `_fx_map_aggregate`.
 
-    docs/EXPORT.md §6 **item 2**, and only item 2. Item 1 -- the dispatcher
-    entrance -- landed in `aten.rs` first (docs/DISPATCH3.md), which is the
+    docs/graph/EXPORT.md §6 **item 2**, and only item 2. Item 1 -- the dispatcher
+    entrance -- landed in `aten.rs` first (docs/design/DISPATCH3.md), which is the
     precondition §6 states in the negative: with modes not consulted, filling
     this in would let `export` run, install a proxy mode, see nothing fire and
     return an `ExportedProgram` with no operators in it. Modes fire now, so
@@ -7584,11 +7584,11 @@ def _install_fx_node_base(module) -> None:
     What was here before: a synthesised type carrying `_erased`, `_next` and
     `_prev` and four raising stubs, so `torch.fx.Graph()` died on its own
     sentinel root node (`graph.py:1369`, `Node(self, "", "root", "", (), {})`)
-    -- four lines, no export involved (docs/EXPORT.md §4.1).
+    -- four lines, no export involved (docs/graph/EXPORT.md §4.1).
 
     Every rule below was measured against real torch 2.13.0 in a separate
     process rather than read off `torch/csrc/fx/node.cpp`, which this tree
-    does not carry; docs/BIND5.md §2 has the transcripts.
+    does not carry; docs/bindings/BIND5.md §2 has the transcripts.
 
     **The sort key is the part that a plausible implementation gets wrong.**
     Nodes carry a `_sort_key` tuple that must order them the same way the
@@ -7633,7 +7633,7 @@ def _install_fx_node_base(module) -> None:
     # (`torch/fx/node.py:885` calls `hasattr(self, name)`), and a getter that
     # raises `NotImplementedError` rather than `AttributeError` makes
     # `hasattr` propagate instead of answering `False`. So the wall was not
-    # only the four stubs docs/EXPORT.md §4.1 counted -- the three members it
+    # only the four stubs docs/graph/EXPORT.md §4.1 counted -- the three members it
     # listed as "present and real" were raising too, which is why they are
     # deleted rather than left alone here.
     for _stub in (
@@ -7801,7 +7801,7 @@ def _install_fx_node_base(module) -> None:
 def _install_dispatch_suppression(module) -> None:
     """The counter behind `no_dispatch()`, read by the dispatcher door itself.
 
-    docs/EXPORT.md §2.4 wrote this function's specification as a prediction:
+    docs/graph/EXPORT.md §2.4 wrote this function's specification as a prediction:
 
         "Entering a counter is a correct implementation **only because this shim
         never consults the mode stack in the first place** ... When
@@ -7817,7 +7817,7 @@ def _install_dispatch_suppression(module) -> None:
     **into** the `FakeTensorMode` that called it.  It died in
     `_find_common_device` -- a factory has no tensor arguments to take a device
     from -- several frames from the guard that should have prevented the
-    re-entry.  docs/EXPORT4.md §5.
+    re-entry.  docs/graph/EXPORT4.md §5.
 
     So the state lives here, where both halves can reach it: the guard writes it
     and `aten.rs`'s `any_dispatch_mode_active` reads it.  Keeping it in the
@@ -7897,7 +7897,7 @@ def _install_dispatcher_kernel_predicates(module) -> None:
     consult, and the two available lies are both bad -- `False` would say "no
     such kernel exists" about upstream's dispatcher, and `True` would promise a
     CUDA kernel that does not exist.  So it refuses, naming the key, rather than
-    guessing.  docs/EXPORT4.md §5.
+    guessing.  docs/graph/EXPORT4.md §5.
     """
     answerable = ("Meta", "CPU")
     builtin = ("aten::", "prims::", "prim::")
@@ -7912,7 +7912,7 @@ def _install_dispatcher_kernel_predicates(module) -> None:
                 f"{' and '.join(answerable)} only, because those are the keys "
                 "its single dispatcher door serves. It keeps no kernel registry "
                 "for other keys, so both available answers would be a claim it "
-                "cannot support. docs/EXPORT4.md §5"
+                "cannot support. docs/graph/EXPORT4.md §5"
             )
         return str(name).startswith(builtin)
 
@@ -7933,7 +7933,7 @@ def _install_arg_parser_predicates(module) -> None:
 
     `fake_tensor.py:2648` asks this on **every** dispatch that reaches a fake
     tensor, so with it left as a synthesised `_Unimplemented` the whole of
-    `torch.export` stopped here.  It is the third wall docs/EXPORT4.md measured
+    `torch.export` stopped here.  It is the third wall docs/graph/EXPORT4.md measured
     and the cheapest of the three, because it is pure data.
 
     Upstream's is a `static std::unordered_set<std::string>` in
@@ -8093,7 +8093,7 @@ def _install_dispatch_keys(module) -> None:
     module._dispatch_has_kernel_for_any_dispatch_key = lambda *a, **k: False
     # "Which ops are registered under this key?" Answered from
     # `native_functions.yaml` for the four alias keys it declares, and refused
-    # by name for backend keys. docs/DECOMP.md §3 -- this is what
+    # by name for backend keys. docs/graph/DECOMP.md §3 -- this is what
     # `core_aten_decompositions()` stopped at.
     module._dispatch_get_registrations_for_dispatch_key = _dispatch_registrations
 
@@ -8216,7 +8216,7 @@ def _install_library(module, schemas) -> None:
 # ---------------------------------------------------------------------------
 #
 # The submodule loop above gives `_nn` all 70 names the stubs declare, every
-# one of them a raising stub. docs/NN_SURFACE.md measured which of them a
+# one of them a raising stub. docs/bindings/NN_SURFACE.md measured which of them a
 # 2-layer Llama forward plus greedy `generate` calls, on upstream torch 2.13.0,
 # by wrapping each builtin rather than by reading the tree:
 #
@@ -8249,7 +8249,7 @@ def _install_nn(module, dispatch) -> None:
         return dispatch("aten.t.default", weight)
 
     # `aten::linear`, transcribed from what upstream *does*, measured branch by
-    # branch against torch 2.13.0 (docs/NN_SURFACE.md §4):
+    # branch against torch 2.13.0 (docs/bindings/NN_SURFACE.md §4):
     #
     #     2-D  + bias      t, addmm
     #     N-D  + bias      view, t, addmm, view          (contiguous input)
@@ -8313,7 +8313,7 @@ def _install_nn(module, dispatch) -> None:
         return dispatch("aten.gelu.default", input, approximate=approximate)
 
     # Upstream's `scaled_dot_product_attention` is a *backend selection*, and
-    # the selection was measured rather than assumed (docs/NN_SURFACE.md §5).
+    # the selection was measured rather than assumed (docs/bindings/NN_SURFACE.md §5).
     # On CPU, 4-D float inputs with `dropout_p == 0` go to
     # `aten._scaled_dot_product_flash_attention_for_cpu` -- for float32,
     # float64, float16 and bfloat16 alike, with or without a mask, with or
@@ -8328,9 +8328,9 @@ def _install_nn(module, dispatch) -> None:
     #
     # **The reason given here used to be "`aten._safe_softmax.default` has no
     # kernel", and that stopped being true.** It has been in `IMPLEMENTED` and
-    # golden-compared since docs/SDPA.md; so have `mul.Scalar`, `expand`,
+    # golden-compared since docs/kernels/SDPA.md; so have `mul.Scalar`, `expand`,
     # `view` and `bmm`. Re-checked against the built artefact rather than
-    # against this comment (docs/TRIL.md §2): every kernel the math backend
+    # against this comment (docs/kernels/TRIL.md §2): every kernel the math backend
     # needs for the 3-D and non-4-D cases is present, and what is missing is
     # the *composite* -- nobody has transcribed upstream's math-backend op
     # sequence, its scale handling or its mask expansion. That is a real
@@ -8368,7 +8368,7 @@ def _install_nn(module, dispatch) -> None:
         off the fused kernel. `_scaled_dot_product_flash_attention_for_cpu`
         does not implement dropout, so upstream falls back here -- which means
         `gpt2`, `bert` and `gpt_bigcode` run ONE op in `.eval()` and twenty in
-        `.train()` (docs/TRAIN.md §3). Until this was written, attention
+        `.train()` (docs/training/TRAIN.md §3). Until this was written, attention
         dropout was the wall behind `nn.Dropout` for all three.
 
         The sequence is upstream's, measured with a `TorchDispatchMode` logger
@@ -8460,14 +8460,14 @@ def _install_nn(module, dispatch) -> None:
             )
         if attn_mask is not None and attn_mask.dtype == module.bool:
             # `convert_boolean_attn_mask`, and it is now built rather than
-            # refused -- `falcon` is what asked (docs/ARCH20.md §7), which
+            # refused -- `falcon` is what asked (docs/architectures/ARCH20.md §7), which
             # passes a bool mask straight into SDPA.
             #
             # **The refusal that used to be here had gone stale, and that is
             # the interesting part.** Its own text named the two kernels it was
             # waiting on -- `aten.scalar_tensor.default` and
             # `aten.where.self` -- and both have been in `IMPLEMENTED`, and
-            # golden-compared, since docs/ARCH.md. Nothing re-read the refusal
+            # golden-compared, since docs/architectures/ARCH.md. Nothing re-read the refusal
             # when they landed, so an architecture stayed blocked on a wall
             # that had already been removed. A refusal that names its
             # dependencies is only better than one that does not if somebody
@@ -8505,7 +8505,7 @@ def _install_nn(module, dispatch) -> None:
         #        heads in "
         #
         # The second one really does end mid-sentence upstream; it is
-        # reproduced verbatim rather than tidied, for the reason docs/CKPT2.md
+        # reproduced verbatim rather than tidied, for the reason docs/models/CKPT2.md
         # §4 gives about `view.dtype`'s messages -- a message that differs
         # from upstream's only in wording is useless exactly where it is
         # needed.
@@ -8530,7 +8530,7 @@ def _install_nn(module, dispatch) -> None:
         # -- upstream's own kernel does, with "Currently do not support dropout
         # > 0" -- so a non-zero `dropout_p` is not a slower road to the same
         # answer, it is a *different* backend with a different op sequence
-        # (docs/TRAIN.md §4). Measured on 2.13.0: `dropout_p=0.0` fires exactly
+        # (docs/training/TRAIN.md §4). Measured on 2.13.0: `dropout_p=0.0` fires exactly
         # one op and `dropout_p=0.1` fires twenty.
         if dropout_p != 0.0:
             return _sdpa_math(
@@ -8550,7 +8550,7 @@ def _install_nn(module, dispatch) -> None:
 
 
     def adaptive_avg_pool2d(input, output_size):
-        """`torch._C._nn.adaptive_avg_pool2d` -- docs/FIXES.md §3.
+        """`torch._C._nn.adaptive_avg_pool2d` -- docs/kernels/FIXES.md §3.
 
         Measured: `F.adaptive_avg_pool2d`'s Python wrapper
         (`torch/nn/functional.py`) calls `_list_with_default(output_size,
@@ -8564,7 +8564,7 @@ def _install_nn(module, dispatch) -> None:
         which is a step the raw aten op's schema (`SymInt[2] output_size`,
         no default expansion) does not have.
 
-        docs/FIXES.md §3 tried the expansion at the aten level instead and
+        docs/kernels/FIXES.md §3 tried the expansion at the aten level instead and
         `tools/golden/compare.py`, which calls the raw aten op directly,
         caught it as a SILENT DIVERGENCE: upstream's raw aten op refuses a
         bare int and this shim's would not have. So the expansion belongs
@@ -8589,14 +8589,14 @@ def _install_nn(module, dispatch) -> None:
 
     def avg_pool2d(input, kernel_size, stride=None, padding=0, ceil_mode=False,
                    count_include_pad=True, divisor_override=None):
-        """`torch._C._nn.avg_pool2d` -- `efficientnet`'s wall (docs/TAIL3.md
-        §7, docs/BIND2.md item 1).
+        """`torch._C._nn.avg_pool2d` -- `efficientnet`'s wall (docs/kernels/TAIL3.md
+        §7, docs/bindings/BIND2.md item 1).
 
         `torch/nn/modules/pooling.py:779` (`nn.AvgPool2d.forward`) calls
         `F.avg_pool2d`, which binds straight to this name with the leaf
         schema's own seven arguments -- unlike `upsample_bilinear2d`/
         `upsample_bicubic2d` a few lines up, there is no separate `.vec`
-        overload here to pick between (docs/BINDINGS.md's `upsample_nearest2d`
+        overload here to pick between (docs/bindings/BINDINGS.md's `upsample_nearest2d`
         warning: measure the signature against upstream, not against a
         neighbour). Measured: `torch._C._nn.avg_pool2d.__doc__` on 2.13.0
         gives exactly `avg_pool2d(input, kernel_size, stride=None, padding=0,
@@ -8604,9 +8604,9 @@ def _install_nn(module, dispatch) -> None:
         which is `aten::avg_pool2d`'s own seven parameters in order.
 
         `aten.avg_pool2d.default` has been implemented and golden-compared
-        since `sew_d` (docs/TAIL3.md §7) -- confirmed again here in
+        since `sew_d` (docs/kernels/TAIL3.md §7) -- confirmed again here in
         `_aten_implemented()` before writing this binding, the check
-        docs/BINDINGS.md's `mish` miss says to make. It already treats a
+        docs/bindings/BINDINGS.md's `mish` miss says to make. It already treats a
         `None`/empty `stride` as "the kernel size" itself (measured with a
         `TorchDispatchMode` logger: `F.avg_pool2d(x, 2)` fires
         `aten.avg_pool2d.default(x, [2, 2])` with no third argument at all),
@@ -8626,7 +8626,7 @@ def _install_nn(module, dispatch) -> None:
     def pad(input, pad, mode="constant", value=None):
         """`torch._C._nn.pad`, which `F.pad` calls after its own dispatch.
 
-        `bert` is the caller (docs/ARCH20.md §2), through
+        `bert` is the caller (docs/architectures/ARCH20.md §2), through
         `modeling_utils.py:2701 _adjust_bias` -- so this runs while the model
         is being *built*, not during a forward.
 
@@ -8639,7 +8639,7 @@ def _install_nn(module, dispatch) -> None:
         .default` with `n = len(pad) // 2` -- not derived from the input's
         rank, because upstream itself refuses combinations that do not line
         up with the rank *inside* the kernel, and deriving `n` from the rank
-        here would accept combinations upstream rejects (docs/PAD.md §5).
+        here would accept combinations upstream rejects (docs/kernels/PAD.md §5).
         `circular` is a genuinely different kernel, a `new_empty`/`slice`/
         `copy_` composite built out of `cat` rather than one of these leaves,
         and is refused by name rather than approximated with one of the
@@ -8683,7 +8683,7 @@ def _install_nn(module, dispatch) -> None:
             raise NotImplementedError(
                 f"not implemented in torch._C shim: torch._C._nn.pad(mode={mode!r}) "
                 f"-- reflect and replicate are implemented; circular is a "
-                f"new_empty/slice/copy_ composite upstream (docs/PAD.md §3)"
+                f"new_empty/slice/copy_ composite upstream (docs/kernels/PAD.md §3)"
             )
         return dispatch(
             "aten.constant_pad_nd.default",
@@ -8696,8 +8696,8 @@ def _install_nn(module, dispatch) -> None:
         """`torch._C._nn.softplus`, which `F.softplus` binds directly to.
 
         `mamba`'s discretisation runs `F.softplus(dt)` on every step
-        (docs/ARCH20.md §4). The kernel -- `aten.softplus.default` -- has been
-        here and golden-compared since docs/OPS4.md; only the name was
+        (docs/architectures/ARCH20.md §4). The kernel -- `aten.softplus.default` -- has been
+        here and golden-compared since docs/kernels/OPS4.md; only the name was
         missing, which is the same shape of gap as `torch.stack`,
         `torch.exp` and `torch.conv1d` in this round.
 
@@ -8834,7 +8834,7 @@ def _install_nn(module, dispatch) -> None:
     def upsample_nearest2d(
         input, output_size, scale_factors=None, scales_w=_LEAF_SENTINEL,
     ):
-        """`torch._C._nn.upsample_nearest2d` -- `vilt`'s wall (docs/TAIL1.md §4).
+        """`torch._C._nn.upsample_nearest2d` -- `vilt`'s wall (docs/kernels/TAIL1.md §4).
 
         `torch/nn/functional.py:5188` (`F.interpolate`, `mode="nearest"`) calls
         this with **three** arguments -- `(input, output_size, scale_factors)`,
@@ -8916,8 +8916,8 @@ def _install_nn(module, dispatch) -> None:
         return [int(value), int(value)]
 
     def im2col(input, kernel_size, dilation, padding, stride):
-        """`torch._C._nn.im2col` -- **`llama4`'s vision tower** (docs/VOICE3.md,
-        docs/COMPLEX2.md §8), and `F.unfold` *is* this binding.
+        """`torch._C._nn.im2col` -- **`llama4`'s vision tower** (docs/architectures/VOICE3.md,
+        docs/kernels/COMPLEX2.md §8), and `F.unfold` *is* this binding.
 
         `torch/nn/functional.py`'s `unfold` ends in
 
@@ -8943,7 +8943,7 @@ def _install_nn(module, dispatch) -> None:
         )
 
     def col2im(input, output_size, kernel_size, dilation, padding, stride):
-        """`torch._C._nn.col2im` -- **`f5-tts`'s wall** (docs/VOICE.md rank 15),
+        """`torch._C._nn.col2im` -- **`f5-tts`'s wall** (docs/architectures/VOICE.md rank 15),
         and `F.fold` *is* this binding, `im2col`'s shape one argument longer.
 
         `torch/nn/functional.py`'s `fold` forwards
@@ -8965,7 +8965,7 @@ def _install_nn(module, dispatch) -> None:
 
     def upsample_nearest1d(input, output_size, scale_factors=None):
         """`torch._C._nn.upsample_nearest1d` -- `bigvgan`/`voice`
-        (docs/VOICE.md rank 14), reached as `F.interpolate(x, ..., mode=
+        (docs/architectures/VOICE.md rank 14), reached as `F.interpolate(x, ..., mode=
         "nearest")` on a **3-D** input.
 
         `torch/nn/functional.py`'s `interpolate` calls
@@ -9027,12 +9027,12 @@ def _install_nn(module, dispatch) -> None:
 
     def upsample_linear1d(input, output_size, align_corners, scale_factors=None):
         """`torch._C._nn.upsample_linear1d` -- `sam_vision_model` /
-        `sam_hq_vision_model`'s wall (docs/ARCH200.md §2, docs/RNN.md §3).
+        `sam_hq_vision_model`'s wall (docs/architectures/ARCH200.md §2, docs/kernels/RNN.md §3).
         `F.interpolate(x_3d, mode="linear")` calls this and only this; the
         kernel (`aten.upsample_linear1d.default`) has been implemented,
-        golden-compared and bit-compared against upstream since docs/RNN.md,
+        golden-compared and bit-compared against upstream since docs/kernels/RNN.md,
         which is what this binding was checked against before being written
-        (docs/BINDINGS.md's `mish` is what happens when that check is
+        (docs/bindings/BINDINGS.md's `mish` is what happens when that check is
         skipped).
 
         `torch/nn/functional.py`'s `interpolate` calls this with exactly
@@ -9044,7 +9044,7 @@ def _install_nn(module, dispatch) -> None:
         align_corners, float? scales=None)`.
 
         **The discriminator is the fourth argument's TYPE, not the arity**,
-        docs/BIND3.md §3.1's exact trap for `upsample_nearest1d` one line
+        docs/bindings/BIND3.md §3.1's exact trap for `upsample_nearest1d` one line
         above this in `torch._C._nn`: both schemas take four arguments here
         (`.vec`'s `output_size` may be `None`; the leaf's may not), so a
         sequence fourth argument is `.vec`'s `scale_factors` and a float is
@@ -9118,7 +9118,7 @@ def _install_nn(module, dispatch) -> None:
         (`hasattr` is False for both on 2.13.0), so no `overloads.json` or
         `methods.json` entry is wanted -- same reasoning as `silu`/`gelu`.
 
-        docs/ARCH100.md: blocks seven ASR encoders (`parakeet` x3, `lasr` x2,
+        docs/architectures/ARCH100.md: blocks seven ASR encoders (`parakeet` x3, `lasr` x2,
         `cohere_asr`, `parakeet_tdt`), all of which gate the trailing channel
         axis after a conv or linear -- which is why the default below is
         `dim=-1` and not `dim=0`: measured against upstream 2.13.0, a bare
@@ -9135,10 +9135,10 @@ def _install_nn(module, dispatch) -> None:
         """
         return dispatch("aten.glu.default", input, dim)
 
-    # -- the cross-entropy composites (docs/LOSS.md) ---------------------
+    # -- the cross-entropy composites (docs/training/LOSS.md) ---------------------
     #
     # Three names, all `CompositeImplicitAutograd`, and **none of them appears
-    # in a dispatch trace** -- which is why docs/AUTOGRAD.md §5.3's op scan
+    # in a dispatch trace** -- which is why docs/training/AUTOGRAD.md §5.3's op scan
     # named two missing kernels and the path needed six more names. A
     # `TorchDispatchMode` sits below the composite layer, so it records the
     # leaves a call lands on and never the names a caller uses to get there.
@@ -9159,7 +9159,7 @@ def _install_nn(module, dispatch) -> None:
         The pair's *second* element, `total_weight`, is dropped here exactly as
         upstream drops it. It is not dead: `nll_loss_backward` takes it as an
         argument, which is why the kernel returns it and why the golden cases
-        check it (docs/LOSS.md §3.1).
+        check it (docs/training/LOSS.md §3.1).
         """
         return dispatch(
             "aten.nll_loss_forward.default", self, target, weight, reduction, ignore_index
@@ -9204,7 +9204,7 @@ def _install_nn(module, dispatch) -> None:
         `(N, V)` shape `ForCausalLMLoss` flattens to, the log-softmax is over
         the vocabulary, which is dim 1 and also the trailing axis. That matters
         more than it looks: it means a real cross-entropy takes `_log_softmax`'s
-        **last-dim** kernel, the narrowing one (docs/LOSS.md §2.1).
+        **last-dim** kernel, the narrowing one (docs/training/LOSS.md §2.1).
 
         The `dtype` argument to `log_softmax` is `self.scalar_type()`, i.e. a
         no-op cast. It is passed anyway, because that is upstream's call and
@@ -9285,7 +9285,7 @@ def _outer_impl(input, vec2):
     `CompositeImplicitAutograd` and a `TorchDispatchMode` trace of
     `torch.outer(a, b)` fires exactly two ops -- `aten.view.default` and
     `aten.mul.Tensor` -- both of which this shim already implements and already
-    golden-compares. `expand_as`'s shape of fix (docs/KERNELS26.md §6.3).
+    golden-compares. `expand_as`'s shape of fix (docs/kernels/KERNELS26.md §6.3).
 
     Written through `.reshape` and `*` rather than through `dispatch` directly,
     so it inherits the broadcasting and type promotion the `mul` path already
@@ -9310,7 +9310,7 @@ def _install_composites(module, varfns, dispatch) -> None:
 
     `torch/nn/functional.py:1491` is `_VF.dropout(input, p, training)`, so
     every `nn.Dropout` in a model reaches `torch._C._VariableFunctions.dropout`
-    -- 10 times in the measured Llama `generate` (docs/NN_SURFACE.md §3).
+    -- 10 times in the measured Llama `generate` (docs/bindings/NN_SURFACE.md §3).
 
     It is not in `overloads.json` because it is not an overload set in the
     sense that table means. `aten::dropout`'s body short-circuits before the
@@ -9320,7 +9320,7 @@ def _install_composites(module, varfns, dispatch) -> None:
     therefore needs no dropout kernel, and routing this name through the
     overload table would have invented a requirement upstream does not have.
 
-    `train=True` is the training half, and docs/TRAIN.md is where it was
+    `train=True` is the training half, and docs/training/TRAIN.md is where it was
     measured. There is **no `aten.dropout.default` kernel to write**: with a
     `TorchDispatchMode` logger on torch 2.13.0, a training-mode `nn.Dropout`
     forward fires
@@ -9335,7 +9335,7 @@ def _install_composites(module, varfns, dispatch) -> None:
     (`is_fused_kernel_acceptable` wants CUDA/XPU/lazy).
 
     So the body below is `at::native::_dropout_impl` transcribed, and three of
-    its details are measured rather than assumed (docs/TRAIN.md §1):
+    its details are measured rather than assumed (docs/training/TRAIN.md §1):
 
       * the range check runs **before** the short-circuit, so
         `torch.dropout(x, 1.5, False)` raises rather than returning `x`;
@@ -9369,10 +9369,10 @@ def _install_composites(module, varfns, dispatch) -> None:
             #
             # `bernoulli_` and `div_` both write in place, and capture refuses
             # mutation so that a trace stays single-assignment
-            # (docs/CAPTURE.md). So the eager decomposition below cannot be
+            # (docs/graph/CAPTURE.md). So the eager decomposition below cannot be
             # recorded at all, and `.train()` dropout was uncapturable --
-            # `gpt2`, `bert`, `opt` and `gpt_bigcode`, docs/TRAIN.md's own four
-            # (docs/AUTOGRAD.md §6.5 named it as one of two reasons to want
+            # `gpt2`, `bert`, `opt` and `gpt_bigcode`, docs/training/TRAIN.md's own four
+            # (docs/training/AUTOGRAD.md §6.5 named it as one of two reasons to want
             # this op). `aten.native_dropout.default` is upstream's own
             # out-of-place spelling of the same thing, is one node rather than
             # four, and hands back the mask a backward will need.
@@ -9386,7 +9386,7 @@ def _install_composites(module, varfns, dispatch) -> None:
             # upstream either.
             #
             # **It is not bit-identical to the branch below, and it must not be
-            # claimed to be** (docs/LOSS.md §7): the two spellings put the
+            # claimed to be** (docs/training/LOSS.md §7): the two spellings put the
             # scale in different places -- `_dropout_impl` divides the *mask*
             # by `1 - p`, `native_dropout` multiplies the *output* by a
             # `1/(1-p)` narrowed to the tensor's dtype. The masks agree draw
@@ -9466,7 +9466,7 @@ def _install_composites(module, varfns, dispatch) -> None:
                     cudnn_enabled=True):
         """`torch.group_norm` / `F.group_norm` / `nn.GroupNorm`'s forward.
 
-        `sew_d`'s wall (docs/KERNELS26.md §19), and `layer_norm`'s shape
+        `sew_d`'s wall (docs/kernels/KERNELS26.md §19), and `layer_norm`'s shape
         exactly: `aten::group_norm` is `CompositeImplicitAutograd`, so a
         `TorchDispatchMode` logger on torch 2.13.0 sees all three of
         `torch.group_norm(...)`, `F.group_norm(...)` and an `nn.GroupNorm`
@@ -9761,7 +9761,7 @@ def _install_composites(module, varfns, dispatch) -> None:
 
         **The ellipsis (`...`)** stands for the leading axes an operand has
         beyond its explicit labels -- `longt5` (`modeling_longt5.py:662`,
-        docs/TAIL3.md §7, docs/BIND2.md item 2) passes exactly one equation
+        docs/kernels/TAIL3.md §7, docs/bindings/BIND2.md item 2) passes exactly one equation
         form, `'...qhd,...khd->...hqk'`. It is expanded to real, fresh labels
         (drawn from letters that appear nowhere else in the equation) before
         the rest of this function ever sees it -- so the contraction
@@ -9773,7 +9773,7 @@ def _install_composites(module, varfns, dispatch) -> None:
         mismatched ranks against each other, and that broadcasting -- not the
         expansion itself -- is refused by name here as out of scope, because
         `longt5`'s call has no such mismatch and inventing the broadcast rule
-        untested would be exactly `docs/BINDINGS.md`'s `upsample_nearest2d`
+        untested would be exactly `docs/bindings/BINDINGS.md`'s `upsample_nearest2d`
         trap the other direction: matching a *summary* ("ellipsis support")
         rather than the measured call.
 
@@ -9971,7 +9971,7 @@ def _install_composites(module, varfns, dispatch) -> None:
         `CompositeImplicitAutograd` and emits *no* record of its own -- it is
         the four-op expansion above, every one of which this shim already has.
         The tensor-`repeats` overload is a genuine kernel plus `index_select`;
-        **both exist here now** (docs/REPEAT.md), where docs/LAST7.md §5.2 left
+        **both exist here now** (docs/kernels/REPEAT.md), where docs/kernels/LAST7.md §5.2 left
         the first of the two missing and this function refusing by name. The
         refusal it left behind is gone and the two callers it named --
         `fastspeech2_conformer`'s length regulator and the one-argument
@@ -10004,7 +10004,7 @@ def _install_composites(module, varfns, dispatch) -> None:
             # vector and the answer is the index vector. `torch.repeat_interleave
             # (tensor([2, 0, 3]))` is `tensor([0, 0, 2, 2, 2])` upstream; with
             # the kernel present this is now that call and nothing else.
-            # docs/REPEAT.md §2.
+            # docs/kernels/REPEAT.md §2.
             if repeats is not _RI_UNSET or dim is not None or not isinstance(
                 input, tensorbase
             ):
@@ -10026,7 +10026,7 @@ def _install_composites(module, varfns, dispatch) -> None:
             )
         if isinstance(repeats, tensorbase):
             # Upstream's lowering, transcribed from a `TorchDispatchMode`
-            # logger on torch 2.13.0 rather than invented (docs/REPEAT.md §2):
+            # logger on torch 2.13.0 rather than invented (docs/kernels/REPEAT.md §2):
             #
             #   dim=0, repeats (3,)     repeat_interleave.Tensor, index_select
             #   dim=0, repeats (1,)     view [1], expand [n], then the two above
@@ -10107,7 +10107,7 @@ def _install_composites(module, varfns, dispatch) -> None:
     setattr(varfns, "repeat_interleave", repeat_interleave)
 
     # Both of the above are reachable as `TensorBase` members too, and a name
-    # with no case is a name nobody checks (docs/GROUPED_MM.md §6.4): the
+    # with no case is a name nobody checks (docs/kernels/GROUPED_MM.md §6.4): the
     # kernel-level cases passed for weeks while `clamp_`/`chunk`/`__setitem__`
     # raised `NotImplementedError` through the member. `Tensor.square()` and
     # `Tensor.repeat_interleave(...)` bind to the same closures, with `self`
@@ -10132,7 +10132,7 @@ def _install_composites(module, varfns, dispatch) -> None:
     # ...and `torch.softmax`, the same shape of gap as `flatten` above, found
     # by running `torch.softmax(x, dim=1)` rather than by reading a list.
     #
-    # `Tensor.softmax` has worked since docs/NN_SURFACE.md §6 (installed by
+    # `Tensor.softmax` has worked since docs/bindings/NN_SURFACE.md §6 (installed by
     # `_install_tensor_softmax`), and `aten._softmax.default` has been
     # implemented and golden-compared far longer than that -- but the free
     # function refused with "overload resolution has no table entry", pointing
@@ -10172,7 +10172,7 @@ def _install_composites(module, varfns, dispatch) -> None:
     # the same reason: `aten::log_softmax.int` is `CompositeImplicitAutograd`,
     # so an `overloads.json` entry would validate against upstream's schema and
     # still name a key no dispatcher ever sees. Bound to the member so the free
-    # spelling and `Tensor.log_softmax` are one function (docs/LOSS.md).
+    # spelling and `Tensor.log_softmax` are one function (docs/training/LOSS.md).
     #
     # `torch._log_softmax` -- one underscore away -- IS an `overloads.json`
     # entry, because that name is the dispatched leaf.
@@ -10191,9 +10191,9 @@ def _install_composites(module, varfns, dispatch) -> None:
         this is the name a `nn.Conv1d` actually calls.
 
         **The kernel was already here.** `aten.convolution.default` has been
-        implemented and golden-compared since docs/OPS4.md, and
+        implemented and golden-compared since docs/kernels/OPS4.md, and
         `torch.conv1d(...)` still refused -- the third instance in this round
-        of a kernel with no spelling (docs/ARCH20.md §5, §9). `aten::conv1d` is
+        of a kernel with no spelling (docs/architectures/ARCH20.md §5, §9). `aten::conv1d` is
         `CompositeImplicitAutograd`; measured with a `TorchDispatchMode` logger
         on 2.13.0, every form of the call fires exactly one record:
 
@@ -10213,7 +10213,7 @@ def _install_composites(module, varfns, dispatch) -> None:
         only the whole answer when that product is *even* -- when it is odd,
         upstream pads the input asymmetrically (one extra zero on the right)
         with `aten::constant_pad_nd` before convolving symmetrically with
-        `total // 2` (docs/RNN.md §1.2). Measured: `padding="same"` with a
+        `total // 2` (docs/kernels/RNN.md §1.2). Measured: `padding="same"` with a
         3-tap kernel and dilation 1 reaches `convolution(..., [1], ...)`,
         which is the even case. Non-unit stride with `"same"` is upstream's
         own refusal.
@@ -10234,7 +10234,7 @@ def _install_composites(module, varfns, dispatch) -> None:
                 kernel = weight.shape[-1]
                 total = dilation[0] * (kernel - 1)
                 if total % 2 != 0:
-                    # docs/RNN.md §1.2, measured with a `TorchDispatchMode`
+                    # docs/kernels/RNN.md §1.2, measured with a `TorchDispatchMode`
                     # logger on upstream 2.13.0:
                     #   aten.constant_pad_nd.default(x, [0, 1])
                     #   aten.convolution.default(..., padding=[total // 2], ...)
@@ -10271,7 +10271,7 @@ def _install_composites(module, varfns, dispatch) -> None:
     setattr(varfns, "conv1d", conv1d)
 
     def conv2d(input, weight, bias=None, stride=1, padding=0, dilation=1, groups=1):
-        """`torch.conv2d` -- docs/ARCH26.md, `zoedepth`'s wall (`Dinov2`'s
+        """`torch.conv2d` -- docs/architectures/ARCH26.md, `zoedepth`'s wall (`Dinov2`'s
         patch-embedding `nn.Conv2d`, through `F.conv2d`, which
         `torch/nn/functional.py` binds straight to `torch.conv2d` the same way
         it binds `F.conv1d` to `torch.conv1d` above).
@@ -10355,7 +10355,7 @@ def _install_composites(module, varfns, dispatch) -> None:
         groups=1, dilation=1,
     ):
         """`torch.conv_transpose2d` -- `zoedepth`'s wall once `conv2d` and
-        `expand_as` were behind it (docs/KERNELS26.md §7).
+        `expand_as` were behind it (docs/kernels/KERNELS26.md §7).
 
         `ZoeDepthUpsample` is `nn.ConvTranspose2d(channels, channels,
         kernel_size=factor, stride=factor, padding=0)`, reached through
@@ -10414,7 +10414,7 @@ def _install_composites(module, varfns, dispatch) -> None:
         input, weight, bias=None, stride=1, padding=0, output_padding=0,
         groups=1, dilation=1,
     ):
-        """`torch.conv_transpose1d` -- `vits`' last wall (docs/KERNELS26.md §24).
+        """`torch.conv_transpose1d` -- `vits`' last wall (docs/kernels/KERNELS26.md §24).
 
         `modeling_vits.py`'s HiFi-GAN decoder is
         `nn.ConvTranspose1d(channels, channels // 2, kernel, stride=rate,
@@ -10464,7 +10464,7 @@ def _install_composites(module, varfns, dispatch) -> None:
 
     def norm_except_dim(v, pow=2, dim=0):
         """`torch.norm_except_dim` -- the piece of `weight_norm` that a traced
-        sweep cannot see (docs/KERNELS26.md §8.3).
+        sweep cannot see (docs/kernels/KERNELS26.md §8.3).
 
         `aten::norm_except_dim` is `CompositeImplicitAutograd`, and it is called
         from `_WeightNorm.right_inverse`, which `ParametrizationList.__init__`
@@ -10580,7 +10580,7 @@ def _install_composites(module, varfns, dispatch) -> None:
 
     # -- `torch.randn` / `torch.rand` and their `_like`/`normal` siblings ----
     #
-    # docs/RANDOM.md. There is no `aten::randn`/`aten::rand` kernel in
+    # docs/kernels/RANDOM.md. There is no `aten::randn`/`aten::rand` kernel in
     # `aten.rs` -- only `aten.empty.memory_format` and
     # `aten.uniform_.default`/`aten.normal_.default` -- so these cannot be
     # `overloads.json` entries (a schema entry would name a kernel this shim
@@ -10802,7 +10802,7 @@ def _install_composites(module, varfns, dispatch) -> None:
                     momentum, eps, cudnn_enabled):
         """`torch.batch_norm` / `F.batch_norm` / every `nn.BatchNorm*d` forward.
 
-        docs/DEMAND.md's rank 1, and `layer_norm`/`group_norm`'s shape exactly:
+        docs/architectures/DEMAND.md's rank 1, and `layer_norm`/`group_norm`'s shape exactly:
         `aten::batch_norm` is `CompositeImplicitAutograd`, so a
         `TorchDispatchMode` logger on torch 2.13.0 sees `torch.batch_norm(...)`,
         `F.batch_norm(...)` and an `nn.BatchNorm2d` forward all emit
@@ -10820,7 +10820,7 @@ def _install_composites(module, varfns, dispatch) -> None:
         with three channels, a length-2 `weight` and a length-4 `weight` both
         return, and both return bit-identical numbers to the correct length-3
         call -- the short one having read a float past the end of its buffer
-        (docs/DEMAND1.md §1.6). Upstream's *composite* is what refuses, and
+        (docs/architectures/DEMAND1.md §1.6). Upstream's *composite* is what refuses, and
         this is upstream's composite. The order below is measured, and it
         shows: a call with a wrong `weight` **and** a wrong `running_mean`
         reports the `running_mean` one.
@@ -10895,7 +10895,7 @@ def _install_composites(module, varfns, dispatch) -> None:
     setattr(varfns, "batch_norm", batch_norm)
 
     def as_tensor(data, dtype=None, device=None):
-        """`torch.as_tensor` -- docs/DEMAND.md rank 4, a **spelling**, not a kernel.
+        """`torch.as_tensor` -- docs/architectures/DEMAND.md rank 4, a **spelling**, not a kernel.
 
         `whisper`'s `.generate()` is the measured hit
         (`generation_whisper.py:1608`, `_retrieve_init_tokens`), but
@@ -10930,9 +10930,9 @@ def _install_composites(module, varfns, dispatch) -> None:
         through `lift_fresh` like a list does and is **copied**. Every measured
         caller in `transformers` builds a fresh array or list and never touches
         it again, so the difference has no observed consequence; it is still a
-        difference, and docs/DEMAND1.md §4 records it.
+        difference, and docs/architectures/DEMAND1.md §4 records it.
 
-        **A correction to the paragraph above, made in docs/CTOR.md's round.**
+        **A correction to the paragraph above, made in docs/bindings/CTOR.md's round.**
         Until that round the ndarray path here did not copy either -- it
         *raised*, because `_tensor_new_from_data` walks nested sequences of
         Python scalars and refuses an `ndarray` by name. "Copies rather than
@@ -11066,7 +11066,7 @@ def _install_behaviour(module, dispatch, transcribed) -> None:
     # `is_available()`; the getter/setter pair is a plain module-level boolean
     # state cell and has to work whether or not a backend exists, or
     # `F.layer_norm` never gets past reading the flag. Measured wall,
-    # docs/GPT2.md.
+    # docs/models/GPT2.md.
     _cudnn_enabled_cell = [True]  # upstream's own default
 
     def _get_cudnn_enabled():
@@ -11079,7 +11079,7 @@ def _install_behaviour(module, dispatch, transcribed) -> None:
     module._set_cudnn_enabled = _set_cudnn_enabled
 
     # The determinism flags -- the same shape of state cell as `cudnn_enabled`
-    # above, and the wall `bert` stopped on (docs/ARCH20.md §2).
+    # above, and the wall `bert` stopped on (docs/architectures/ARCH20.md §2).
     #
     # `F.pad` reads `torch.are_deterministic_algorithms_enabled()` on **every
     # call**, before it does anything else (`torch/nn/functional.py:5806`), and
@@ -11206,9 +11206,9 @@ def _install_behaviour(module, dispatch, transcribed) -> None:
         tensor_cls = getattr(torch_module, "Tensor", None)
         if tensor_cls is not None:
             module._set_tensor_class(tensor_cls)
-            # docs/DEMAND.md §0.1 rank 1, and the reason this hook is the one
+            # docs/architectures/DEMAND.md §0.1 rank 1, and the reason this hook is the one
             # that closes it: `torch.Tensor` inherits `__new__` from
-            # `TensorBase` and defines none of its own (measured, docs/CTOR.md
+            # `TensorBase` and defines none of its own (measured, docs/bindings/CTOR.md
             # §1), so it can be given one here without editing the vendored
             # file that declares it. The guard is on `__new__` being *inherited*
             # rather than on the class being untouched -- if a future vendored
@@ -11251,7 +11251,7 @@ def _install_behaviour(module, dispatch, transcribed) -> None:
     # `torch/autograd/function.py:622`, the *first* line of `Function.apply` --
     # so every `torch.autograd.Function` subclass on a model's forward reaches
     # it, whether or not a backward is ever wanted. `bloom`'s
-    # `GeLUFunction.apply(x)` is the measured caller (docs/ARCH20.md §6), once
+    # `GeLUFunction.apply(x)` is the measured caller (docs/architectures/ARCH20.md §6), once
     # per MLP per layer.
     #
     # `False` is upstream's answer outside a transform (measured on 2.13.0),
@@ -11266,7 +11266,7 @@ def _install_behaviour(module, dispatch, transcribed) -> None:
     # delegates to on its ordinary branch (`torch/autograd/function.py:625`,
     # `return super().apply(*args, **kwargs)`).
     #
-    # `bloom`'s wall (docs/ARCH20.md §6). Its `BloomGelu` calls
+    # `bloom`'s wall (docs/architectures/ARCH20.md §6). Its `BloomGelu` calls
     # `GeLUFunction.apply(x)` in every MLP, so an inference-only shim reaches
     # `autograd.Function` on a *forward*, not through anything gradient-shaped.
     # `_FunctionBase` is one of the synthesised placeholder types, so it was
@@ -11400,7 +11400,7 @@ def _install_behaviour(module, dispatch, transcribed) -> None:
     def _overload_names(qualname):
         """The overload names of one packet, from every table that knows any.
 
-        **This used to be `["default"]` for every op, and docs/DECOMP.md §3 is
+        **This used to be `["default"]` for every op, and docs/graph/DECOMP.md §3 is
         what that cost.** `torch/_decomp/__init__.py:82` expands a
         packet-level `@register_decomposition(aten.transpose)` by calling
         `packet.op_overloads()`, which walks exactly this list -- so with
@@ -11421,7 +11421,7 @@ def _install_behaviour(module, dispatch, transcribed) -> None:
         3. `transcribed` -- `overloads.json` and `methods.json`.
 
         Falling back to `["default"]` when all three are silent keeps the
-        registry open (docs/SCHEMA.md §12): a name nobody has declared still
+        registry open (docs/bindings/SCHEMA.md §12): a name nobody has declared still
         yields a callable, and `_aten_dispatch` refuses it at call time with
         the op named. What is *not* done is the reverse -- adding `default` to
         a packet whose overloads are known. That is the bug being fixed, and
@@ -11504,7 +11504,7 @@ def _install_behaviour(module, dispatch, transcribed) -> None:
            records every predicate it is asked.
 
         Before this there was only 1 and 4, so every one of the 117 implemented
-        aten ops took route 4 -- and docs/DISTRIBUTED.md §8.1 is what that cost.
+        aten ops took route 4 -- and docs/distributed/DISTRIBUTED.md §8.1 is what that cost.
         """
         # `""` is upstream's spelling of "the default overload" and is what
         # `_Schema.parse` puts in `overload_name`; `"default"` is what
@@ -11620,7 +11620,7 @@ def _refuse_unrepresentable_memory_format(op, kwargs):
     It was found by `test_export5.py::test_channels_last_is_false_as_a_fact_
     because_the_build_cannot_make_one`, which is a test written to check the
     *premise* of an answer rather than the answer -- the premise being "no
-    tensor in this build can be in that layout" (docs/EXPORT5.md §3). The
+    tensor in this build can be in that layout" (docs/graph/EXPORT5.md §3). The
     premise was false by way of this door, and nothing else in the suite could
     have noticed, because dropping an argument raises nothing.
 
@@ -11641,7 +11641,7 @@ def _refuse_unrepresentable_memory_format(op, kwargs):
         f"a Layout and no memory-format tag, and no kernel here reads one), so "
         f"the request cannot be honoured. It is refused rather than dropped: "
         f"dropping it returned a contiguous tensor while the caller believed it "
-        f"had asked for another layout (bootstrap.py, docs/EXPORT5.md §3)"
+        f"had asked for another layout (bootstrap.py, docs/graph/EXPORT5.md §3)"
     )
 
 
@@ -11650,7 +11650,7 @@ def _install_backend_flag_toggles(module) -> None:
 
     `torch.export` enters several of these context managers before it traces
     anything, so each was a raising stub that stopped export outright
-    (docs/EXPORT5.md §4).  They are *not* new capabilities: every one of them
+    (docs/graph/EXPORT5.md §4).  They are *not* new capabilities: every one of them
     reports on a backend `_BUILD_FLAGS` above already answers `False` for, and
     the point of implementing them is that a flag pair is the one shape where
     a stub and a lie are easy to confuse.
@@ -11674,8 +11674,8 @@ def _install_backend_flag_toggles(module) -> None:
     every other value by name.**  That asymmetry is the load-bearing part.  A
     setter that quietly accepted `True` would let
     `torch.backends.mkldnn.flags(_enabled=True)` return having changed nothing,
-    which is `docs/COMPILE.md` §5's silent-fallback shape and exactly what
-    `_len_torch_dispatch_stack`'s constant `0` did (docs/EXPORT.md §2.2): a
+    which is `docs/graph/COMPILE.md` §5's silent-fallback shape and exactly what
+    `_len_torch_dispatch_stack`'s constant `0` did (docs/graph/EXPORT.md §2.2): a
     block that entered, reported itself absent, and changed nothing.  Refusing
     means a caller that really wants MKLDNN is told it is not here.
 
@@ -11700,7 +11700,7 @@ def _install_backend_flag_toggles(module) -> None:
                 f"_BUILD_FLAGS table above both answer that it is absent, so "
                 f"the {kind} cannot be turned on. Refused rather than accepted "
                 f"and ignored, which would let torch.backends flags() return "
-                f"having changed nothing (bootstrap.py, docs/EXPORT5.md §4)"
+                f"having changed nothing (bootstrap.py, docs/graph/EXPORT5.md §4)"
             )
 
         return getter, setter
@@ -11731,7 +11731,7 @@ def _install_backend_flag_toggles(module) -> None:
             "torch._C._set_onednn_allow_tf32(True): there is no oneDNN in this "
             "build, so there is no tf32 path to allow. The getter answers None "
             "-- not applicable -- which is upstream's own answer on a build "
-            "without oneDNN (bootstrap.py, docs/EXPORT5.md §4)"
+            "without oneDNN (bootstrap.py, docs/graph/EXPORT5.md §4)"
         )
 
     module._get_onednn_allow_tf32 = _get_onednn_allow_tf32
@@ -11751,7 +11751,7 @@ def _install_backend_flag_toggles(module) -> None:
             f"cuDNN in this build, so there is no depthwise kernel to select. "
             f"Only 'auto' -- the value the getter reports, so that "
             f"torch.backends' save/restore round trip does not raise -- is "
-            f"accepted (bootstrap.py, docs/EXPORT5.md §4)"
+            f"accepted (bootstrap.py, docs/graph/EXPORT5.md §4)"
         )
 
     module._get_cudnn_depthwise_kernel = _get_cudnn_depthwise_kernel
@@ -11777,7 +11777,7 @@ def _install_backend_flag_toggles(module) -> None:
             f"path to select -- so only 'none' can be honoured. Refused rather "
             f"than accepted and ignored, which would silently promise a "
             f"precision change that never happens (bootstrap.py, "
-            f"docs/EXPORT5.md §4)"
+            f"docs/graph/EXPORT5.md §4)"
         )
 
     module._get_fp32_precision_getter = _get_fp32_precision_getter
@@ -11824,7 +11824,7 @@ def _install_dispatch_key_set(module) -> None:
     Only the two devices this shim has are answered, and **every other device
     refuses by name** rather than being given a plausible key set -- the same
     reasoning as `_dispatch_has_computed_kernel_for_dispatch_key`
-    (docs/EXPORT4.md §6.3): a wrong key set here is a silently wrong cache
+    (docs/graph/EXPORT4.md §6.3): a wrong key set here is a silently wrong cache
     entry, and this shim has no kernels behind those devices to describe.
     """
 
@@ -11839,7 +11839,7 @@ def _install_dispatch_key_set(module) -> None:
             f"keys of a cpu or meta tensor and this one is on {device!r}. The "
             f"answer is used to decide whether two tensors dispatch alike, so a "
             f"guess here would be a silently wrong fake-tensor cache entry "
-            f"rather than an error (bootstrap.py, docs/EXPORT5.md §4)"
+            f"rather than an error (bootstrap.py, docs/graph/EXPORT5.md §4)"
         )
 
     module._dispatch_key_set = _dispatch_key_set
@@ -11856,7 +11856,7 @@ def _install_functionality_to_backend_keys(module) -> None:
 
     **It is computed from `_install_dispatch_keys`' own enum rather than
     transcribed**, which is the same choice `_should_allow_numbers_as_tensors`
-    made in docs/EXPORT4.md §6.2 and for the same reason: a transcribed table
+    made in docs/graph/EXPORT4.md §6.2 and for the same reason: a transcribed table
     goes stale silently, and this one is a pure function of a list that already
     exists three thousand lines above.  The backend order is upstream's, read
     off the enum's own numeric order rather than re-listed here.
@@ -11871,11 +11871,11 @@ def _install_functionality_to_backend_keys(module) -> None:
     with `DispatchKey.PreDispatch` -- which is a plain key, not a functionality
     one -- and uses the result to uncache per-dispatch-key handlers. The empty
     list makes that a cache invalidation that invalidates nothing, which is the
-    "entered and changed nothing" shape docs/EXPORT.md §2.2 is about, on the
+    "entered and changed nothing" shape docs/graph/EXPORT.md §2.2 is about, on the
     export path. It was found by
     `test_export5.py::test_functionality_to_backend_keys_matches_upstream_key_for_key`,
     which exists because nullifying this whole function went **uncaught**
-    (docs/EXPORT5.md §11).
+    (docs/graph/EXPORT5.md §11).
     """
     DispatchKey = module.DispatchKey
 
@@ -11911,13 +11911,13 @@ def _install_functionality_to_backend_keys(module) -> None:
 
 
 # ---------------------------------------------------------------------------
-# The `torch.export` census names -- docs/EXPORT.md §8's hand-off, paid.
+# The `torch.export` census names -- docs/graph/EXPORT.md §8's hand-off, paid.
 # ---------------------------------------------------------------------------
 #
 # These 32 `torch._C` names lived in
 # `torchnative/src/main/torchnative/export/upstream.py`, which installed them
-# by monkey-patching `torch._C` *after* `import torch`. docs/EXPORT.md §8 said
-# that was the wrong home and gave the patch; docs/EXPORT4.md §10 listed paying
+# by monkey-patching `torch._C` *after* `import torch`. docs/graph/EXPORT.md §8 said
+# that was the wrong home and gave the patch; docs/graph/EXPORT4.md §10 listed paying
 # it as the next mechanical task. This is it.
 #
 # **The reason it had to move is not tidiness.** Patching after `import torch`
@@ -11935,12 +11935,12 @@ def _install_functionality_to_backend_keys(module) -> None:
 # `rust/torch_c/pytests/export_sweep.py` run against the shim stopped at census
 # name #0 (`torch._C._unset_dispatch_mode`) on all 25 architectures, because
 # the sweep's subprocess never called `upstream.install()`. Every export
-# measurement in docs/EXPORT.md and docs/EXPORT4.md was taken under that
-# monkey-patch, and docs/EXPORT4.md §1.1 said so. After this, the names are
+# measurement in docs/graph/EXPORT.md and docs/graph/EXPORT4.md was taken under that
+# monkey-patch, and docs/graph/EXPORT4.md §1.1 said so. After this, the names are
 # simply there.
 #
 # The functions keep their `(C, put)` signature and are copied **verbatim**
-# rather than rewritten to take `module` alone. docs/EXPORT.md §8 proposed the
+# rather than rewritten to take `module` alone. docs/graph/EXPORT.md §8 proposed the
 # rewrite, and the verbatim copy is preferred here for one reason: this is a
 # move of nine hundred lines of working, tested behaviour, and a move that
 # changes no line cannot change behaviour. `_put` below is the four-line
@@ -11948,8 +11948,8 @@ def _install_functionality_to_backend_keys(module) -> None:
 # reviewable change and should not ride along inside a bisect boundary that is
 # supposed to mean "the same code, in its final home".
 #
-# `set_eval_frame` is not touched -- docs/EXPORT.md §8 item 4, and
-# docs/COMPILE.md §5.1 is why its refusal must outlive any symbol-filling on
+# `set_eval_frame` is not touched -- docs/graph/EXPORT.md §8 item 4, and
+# docs/graph/COMPILE.md §5.1 is why its refusal must outlive any symbol-filling on
 # this path. Nothing below goes near it.
 
 
@@ -11963,7 +11963,7 @@ def _put(owner, name, value, qual=None, only_if_stub=False):
 
     `only_if_stub` survives because one caller needs it --
     `_functorch.is_functorch_wrapped_tensor` is already implemented elsewhere in
-    this file and must not be displaced (docs/EXPORT.md §2.2, row 29).
+    this file and must not be displaced (docs/graph/EXPORT.md §2.2, row 29).
     """
     if only_if_stub and not _is_stub(getattr(owner, name, None)):
         return
@@ -12177,13 +12177,13 @@ def _install_mode_stack(C, put) -> None:
 
     `_len_torch_dispatch_stack` **used to be** the constant `0` in this file's
     `_DISCOVERED_RETURNS` table, with the comment "nothing pushes onto it here".
-    That row was deleted when this function moved here (docs/EXPORT.md §8 item
+    That row was deleted when this function moved here (docs/graph/EXPORT.md §8 item
     3); the sentence below is why.  Under `torch.export` something does push: `FakeTensorMode` and
     `ProxyTorchDispatchMode` both push, and `torch/utils/_python_dispatch.py`
     reads the length back to decide whether a mode is active.  A stack that
     always answered zero would make `with FakeTensorMode():` a block that
     entered and changed nothing -- the same shape of silent no-op
-    `docs/COMPILE.md` §5 refuses for `torch.compile`.
+    `docs/graph/COMPILE.md` §5 refuses for `torch.compile`.
 
     Upstream splits the stack in two: *infra* modes (FAKE, PROXY, FUNCTIONAL)
     live in slots keyed by `_TorchDispatchModeKey` and are not part of the
@@ -12266,7 +12266,7 @@ def _install_mode_stack(C, put) -> None:
 def _is_definitely_a_view(t) -> bool:
     """A *sound positive* view detector, built from the storage model this shim has.
 
-    Measured against upstream on the same three tensors (`docs/EXPORT.md` §3.2):
+    Measured against upstream on the same three tensors (`docs/graph/EXPORT.md` §3.2):
     `storage_offset`, `stride`, `numel` and `untyped_storage().nbytes()` agree
     exactly between this shim and upstream for `x`, `x[1:, 1:]` and `x.t()`.
     So three signals each *prove* a view:
@@ -12286,7 +12286,7 @@ def _is_definitely_a_view(t) -> bool:
     returns `False` for that case, and that is the one wrong answer in the pair.
 
     Making it right is a Rust change -- a base slot on `PyTensorBase` -- and it
-    is outside this document's territory.  `docs/EXPORT.md` §4.2 records it as
+    is outside this document's territory.  `docs/graph/EXPORT.md` §4.2 records it as
     the gap rather than papering it.
     """
     try:
@@ -12323,7 +12323,7 @@ def _install_tensor_predicates(C, put) -> None:
 
     `_is_view` and `_base` are the pair that is **not** a constant, and they are
     the one place on this path where the shim has to say something it cannot
-    fully know.  Views here are real -- `docs/VIEWS.md` §6 made in-place ops
+    fully know.  Views here are real -- `docs/kernels/VIEWS.md` §6 made in-place ops
     write through a layout into shared storage -- so `False` is not free.  The
     arrangement:
 
@@ -12336,7 +12336,7 @@ def _install_tensor_predicates(C, put) -> None:
 
     So a module exported with a sliced input fails loudly at the tensor that
     caused it, rather than producing a graph whose inputs quietly lost their
-    aliasing.  `docs/COMPILE.md` §5 refuses the same shape of silence for
+    aliasing.  `docs/graph/COMPILE.md` §5 refuses the same shape of silence for
     `torch.compile`.
     """
     TensorBase = C.TensorBase
@@ -12382,7 +12382,7 @@ def _install_tensor_predicates(C, put) -> None:
     # the tensor is already in and has nothing to do.  `_set_conj(t, True)`
     # asks for a state this shim cannot represent, and accepting it would leave
     # `is_conj` answering `False` immediately afterwards: a setter whose effect
-    # is invisible to its own getter.  That is the shape docs/EXPORT.md §2.2
+    # is invisible to its own getter.  That is the shape docs/graph/EXPORT.md §2.2
     # names, so it raises instead.
     #
     # Note this is reachable in practice and not a hypothetical: it is exactly
@@ -12395,10 +12395,10 @@ def _install_tensor_predicates(C, put) -> None:
             raise NotImplementedError(
                 f"torch._C._set_{bit}(tensor, True): this shim has no {bit} bit "
                 f"-- TensorBase.is_{bit} answers False as a fact, not as a stub "
-                f"(docs/EXPORT.md §2.3), because candle carries no such flag and "
+                f"(docs/graph/EXPORT.md §2.3), because candle carries no such flag and "
                 f"PyTensorBase has nowhere to put one. Accepting this would make "
                 f"the setter invisible to its own getter, so it is refused "
-                f"(torchnative/export/upstream.py, docs/EXPORT5.md §5)"
+                f"(torchnative/export/upstream.py, docs/graph/EXPORT5.md §5)"
             )
         return setter
 
@@ -12501,14 +12501,14 @@ def _install_profiler(C, put) -> None:
 def _install_dynamo_bool(C, put) -> None:
     """`set_is_in_mode_without_ignore_compile_internals`.
 
-    `docs/COMPILE.md` §1.2 identified this as a two-line bool setter at
+    `docs/graph/COMPILE.md` §1.2 identified this as a two-line bool setter at
     `dynamo/guards.cpp:134` that touches none of the frame-hook machinery.  It
     is on the export path because `torch/_dynamo/utils.py` toggles it around
     mode entry; nothing in this shim reads it back, so it is a cell.
 
     It lives under `torch._C._dynamo.guards`, which is *not* a reason to think
     this opens `torch.compile`.  `set_eval_frame`'s refusal is untouched and
-    stays untouched -- see `docs/COMPILE.md` §5.1 for why that refusal must
+    stays untouched -- see `docs/graph/COMPILE.md` §5.1 for why that refusal must
     outlive any symbol-filling on this path.
     """
     # **`C._dynamo.guards` is not the module this name has to land on**, and
@@ -12567,7 +12567,7 @@ def _install_inference_mode(C, put) -> None:
     What it does here is track a flag and nothing else.  Upstream's
     `InferenceMode` switches a dispatch-key bit that makes new tensors skip
     autograd bookkeeping and become invalid outside the block; this shim has no
-    autograd bookkeeping to skip (`docs/AUTOGRAD.md`) and no version counter to
+    autograd bookkeeping to skip (`docs/training/AUTOGRAD.md`) and no version counter to
     invalidate, so entering and leaving is the entire behaviour.  It is
     recorded rather than discarded so `_is_inference_mode_enabled()` can answer
     from the same place instead of guessing.
@@ -12602,7 +12602,7 @@ def _install_inference_mode(C, put) -> None:
     # `fake_tensor.py:1801` calls it on every cached dispatch.  Writing through
     # to it -- rather than keeping a second flag on `_TLS` -- is what stops the
     # guard and the predicate from answering differently, which is
-    # docs/EXPORT.md §2.2's failure with the operands swapped.
+    # docs/graph/EXPORT.md §2.2's failure with the operands swapped.
     #
     # The `_TLS` fallback is not dead code: it is what runs against a bootstrap
     # that predates the setter, and it keeps this module importable there.
@@ -12659,7 +12659,7 @@ def _install_raii_guards(C, put) -> None:
     """Give the guard family a real `__enter__`/`__exit__`.
 
     Read the honesty limit here carefully, because it is the one that matters
-    on this path and `docs/EXPORT.md` §4.1 is about it.  `_DisableTorchDispatch`
+    on this path and `docs/graph/EXPORT.md` §4.1 is about it.  `_DisableTorchDispatch`
     is the guard `torch/_subclasses/fake_tensor.py:502` uses to build a meta
     tensor *without re-entering the fake mode*.  Entering and leaving a counter
     is a correct implementation **only because this shim never consults the mode
@@ -12667,7 +12667,7 @@ def _install_raii_guards(C, put) -> None:
     (`aten.rs`, the capture hook) and never asks a Python mode to handle one.
     There is therefore nothing for `no_dispatch()` to suppress.
 
-    That is not a happy accident, it is the wall: see `docs/EXPORT.md` §4.  When
+    That is not a happy accident, it is the wall: see `docs/graph/EXPORT.md` §4.  When
     `_aten_dispatch` learns to consult the stack, this guard stops being a
     counter and starts being load-bearing, and the counter is here so that
     change is a body to fill rather than a hole to find.
@@ -12692,7 +12692,7 @@ def _install_raii_guards(C, put) -> None:
                 #
                 # `_PreserveDispatchKeyGuard`'s one-line description in
                 # `_RAII_GUARDS` above is "saves and restores the whole TLS key
-                # state", and until docs/EXPORT5.md it saved and restored
+                # state", and until docs/graph/EXPORT5.md it saved and restored
                 # nothing.  That is not a cosmetic gap, because upstream
                 # *delegates* a restore to it:
                 # `fake_tensor.py::in_kernel_invocation_manager` sets
@@ -12703,7 +12703,7 @@ def _install_raii_guards(C, put) -> None:
                 # *next* entry died on that function's own
                 # `assert meta_in_tls == prev_in_kernel` -- `AssertionError:
                 # True, False`, several frames from anything that mentions a
-                # guard.  Same shape as docs/EXPORT4.md §5: no name was missing,
+                # guard.  Same shape as docs/graph/EXPORT4.md §5: no name was missing,
                 # no stub was raising, and every existing test passed.
                 #
                 # The snapshot is by reference because `DispatchKeySet` is
@@ -12724,7 +12724,7 @@ def _install_raii_guards(C, put) -> None:
                 # below is the one that actually suppresses, and it lives in
                 # `torch._C` because `aten.rs` reads it there.  See
                 # `bootstrap.py::_install_dispatch_suppression` and
-                # docs/EXPORT4.md §5.
+                # docs/graph/EXPORT4.md §5.
                 #
                 # The others stay counters on purpose: `_DisableFuncTorch` and
                 # friends name subsystems this shim does not have, and making
@@ -12760,11 +12760,11 @@ def _install_raii_guards(C, put) -> None:
 def _install_autocast(module) -> None:
     """`torch._C.is_autocast_enabled` and the switch beside it.
 
-    docs/E2E_REAL.md. `transformers/utils/generic.py:250` opens
+    docs/models/E2E_REAL.md. `transformers/utils/generic.py:250` opens
     `maybe_autocast` with `if torch.is_autocast_enabled(device_type) or
     enabled:`, and `modeling_llama.py:121` wraps the rotary embedding in it --
     so this name is the first thing a real `LlamaForCausalLM` forward pass
-    asks for, and docs/DISTRIBUTED.md §7 named it as the wall that round
+    asks for, and docs/distributed/DISTRIBUTED.md §7 named it as the wall that round
     stopped at.
 
     **The read is not a constant; the write is a refusal, and that is the
@@ -12877,7 +12877,7 @@ def _install_autocast(module) -> None:
     # backend" rather than "is the device physically present" -- confirmed by
     # running the check on this machine (no CUDA) and getting `True`.
     #
-    # docs/COMPAT.md has the full argument for why this is `True` rather than
+    # docs/models/COMPAT.md has the full argument for why this is `True` rather than
     # `False` for `"cpu"`. In short: a `False` here does not make
     # `torch.autocast(..., enabled=False)` a no-op the way a caller might
     # expect -- `autocast.__init__` (`torch/amp/autocast_mode.py`) calls this
@@ -12967,7 +12967,7 @@ def _install_autocast(module) -> None:
 def _install_device(module, varfns, tensorbase) -> None:
     """The device layer -- the `_C` names that make `.to(device)` mean something.
 
-    docs/DEVICE_ABS.md is the measurement this was built from; §2 is the table
+    docs/devices/DEVICE_ABS.md is the measurement this was built from; §2 is the table
     of what `torch.device` could and could not do before it. The short version
     is that the *label* worked and everything that consumed a label did not:
     `nn.Module.to("cpu")`, `Module.cpu()`, `Module.float()` and every
@@ -13071,7 +13071,7 @@ def _install_device(module, varfns, tensorbase) -> None:
     # module can be moved or cast by goes through here, so with it refusing,
     # `.to()`, `.cpu()`, `.float()`, `.half()` and `.double()` were all dead.
     #
-    # It is *not* an overload-table entry, for docs/OVERLOAD.md §9 item 7's
+    # It is *not* an overload-table entry, for docs/bindings/OVERLOAD.md §9 item 7's
     # reason -- there is no `aten::_parse_to`; it is a hand-written argument
     # parser in `python_nn_functions.cpp` with no schema at all. The vendored
     # tree carries its own reimplementation at
@@ -13166,7 +13166,7 @@ def _install_device(module, varfns, tensorbase) -> None:
     # `Generator` this shim can make is a CPU generator, and there is no second
     # value for an instance attribute to hold. It becomes wrong again the day a
     # second backend lands -- at which point the generator has to carry its own
-    # device, the same way a tensor will (docs/DEVICE_ABS.md §3.2).
+    # device, the same way a tensor will (docs/devices/DEVICE_ABS.md §3.2).
     #
     # It has to be a property rather than a plain attribute because
     # `_make_property` put one there and the callers reach for the descriptor.
@@ -13177,8 +13177,8 @@ def _install_device(module, varfns, tensorbase) -> None:
 def _install_repr_surface(module, varfns, tensorbase) -> None:
     """What `torch/_tensor_str.py` asks that is neither a kernel nor a device.
 
-    docs/E2E_REAL.md is the measurement. `print(tensor)` was the one thing
-    docs/WHEEL.md §5 recorded the built wheel could not do, and walking the
+    docs/models/E2E_REAL.md is the measurement. `print(tensor)` was the one thing
+    docs/platform/WHEEL.md §5 recorded the built wheel could not do, and walking the
     refusals one at a time produced a list of eleven names -- six kernels
     (`aten.rs`), three device predicates and five representation predicates
     (`tensor.rs`), and the three below, which need something Rust cannot
@@ -13279,7 +13279,7 @@ def _install_repr_surface(module, varfns, tensorbase) -> None:
     def unwrap_if_dead(tensor):
         """`torch/autograd/function.py:632`, on the ordinary `apply` path.
 
-        `bloom` is the measured caller (docs/ARCH20.md §6): its `GeLUFunction`
+        `bloom` is the measured caller (docs/architectures/ARCH20.md §6): its `GeLUFunction`
         is a `torch.autograd.Function`, so every MLP in every layer runs
         `Function.apply`, and `apply` maps this over its arguments before it
         calls `forward`.
@@ -13317,7 +13317,7 @@ def _install_repr_surface(module, varfns, tensorbase) -> None:
 
     # -- `vmap`: a broadcast batching level for scalar index closures -------
     #
-    # `docs/VMAP.md` is the round that built this; read §2 before widening it.
+    # `docs/kernels/VMAP.md` is the round that built this; read §2 before widening it.
     #
     # The demand is `transformers/masking_utils.py:348`, reached by four
     # architectures (`nemotron3_5_asr`, `nemotron_asr_streaming`,
@@ -13338,7 +13338,7 @@ def _install_repr_surface(module, varfns, tensorbase) -> None:
     # *default* path, so this is not a novel claim -- and §3 of VMAP.md measures
     # both paths against upstream torch and finds them bit-identical.
     #
-    # Three things keep this from being the "no-op counter" `docs/COMPLEX.md` §7
+    # Three things keep this from being the "no-op counter" `docs/kernels/COMPLEX.md` §7
     # warned about, which would have produced a wrong attention mask rather than
     # an error:
     #
@@ -13403,7 +13403,7 @@ def _install_repr_surface(module, varfns, tensorbase) -> None:
         return NotImplementedError(
             "not implemented in torch._C shim: " + what + ". This build's "
             "`vmap` is a broadcast batching level for scalar index closures "
-            "only (docs/VMAP.md); a general vmap needs a batching rule per "
+            "only (docs/kernels/VMAP.md); a general vmap needs a batching rule per "
             "operator, which does not exist here. Refusing rather than "
             "returning a plausible wrong answer."
         )
@@ -13774,11 +13774,11 @@ def _install_repr_surface(module, varfns, tensorbase) -> None:
 def _install_distributed_c10d(module, spec) -> None:
     """`torch._C._distributed_c10d`, at world_size 1.
 
-    docs/DISTRIBUTED.md. This subsystem was **off**: `_c10d_init` was one of the
+    docs/distributed/DISTRIBUTED.md. This subsystem was **off**: `_c10d_init` was one of the
     names in the "Deliberate omissions" set at the top of this file, because
     `torch/distributed/__init__.py:28` is `hasattr(torch._C, "_c10d_init")` and
     absence is the switch upstream provides. Turning it on is not a one-line
-    change, and docs/SURFACE_HONESTY.md §2.4 is the measurement that says why:
+    change, and docs/design/SURFACE_HONESTY.md §2.4 is the measurement that says why:
     an instrument that answered *every* attribute still could not finish
     `import torch`, because `distributed_c10d.py:547` walks
     `ReduceOp.RedOpType.__members__` and `distributed_c10d.py:321` reads
@@ -13800,7 +13800,7 @@ def _install_distributed_c10d(module, spec) -> None:
         and saying so is accurate.
       * `TCPStore` **refuses by name**. There is no peer at the other end of
         that socket, and a store that silently behaved like a local dict while
-        claiming to be a rendezvous point is exactly the failure docs/CKPT.md
+        claiming to be a rendezvous point is exactly the failure docs/models/CKPT.md
         recorded -- it looks like it worked.
       * `ProcessGroupGloo`/`Nccl`/`Ucc`/`Xccl`/`Mpi` are **absent**, not stubbed.
         `distributed_c10d.py:204-242` imports each in its own
@@ -14275,14 +14275,14 @@ def _install_distributed_c10d(module, spec) -> None:
           win: there is no code path on which that buffer changes without the
           caller asking for it. A test of this cannot pass by luck, which is
           the whole reason the design is this way round -- see
-          `docs/ASYNCWORK.md` §3.
+          `docs/distributed/ASYNCWORK.md` §3.
         * `is_completed()` is a synchronisation point too. It reports whether
           the exchange has finished, and if it has it publishes *before*
           returning True. So a caller who polls to True may then read the
           buffer and find the answer there, which is upstream gloo's contract;
           and a caller who polls to False still holds their own bytes.
 
-        `docs/ASYNCWORK.md` §5 records the one place this is deliberately
+        `docs/distributed/ASYNCWORK.md` §5 records the one place this is deliberately
         stricter than gloo: gloo's buffer becomes valid when the work does,
         whether or not anybody asked. Here it becomes valid when somebody asks.
         """
@@ -14708,7 +14708,7 @@ def _install_distributed_c10d(module, spec) -> None:
     #                   to move into them, so these are the ones that do work.
     #   send/recv       **refused by name.** There is no second rank, so there
     #                   is no correct behaviour to fall back on. A silent no-op
-    #                   here would be the `filled` guard from docs/CKPT.md
+    #                   here would be the `filled` guard from docs/models/CKPT.md
     #                   again: the caller would read an unwritten buffer and
     #                   never learn why.
     #
@@ -14718,7 +14718,7 @@ def _install_distributed_c10d(module, spec) -> None:
     # Rendezvous waits for every peer to arrive; the data sockets carry one
     # collective's payload over loopback. They are different waits, so they are
     # different numbers. The data timeout is kept at the 30 s
-    # docs/FEDERATED3.md §4 measured the dropout against; the rendezvous one is
+    # docs/distributed/FEDERATED3.md §4 measured the dropout against; the rendezvous one is
     # generous on purpose, because it is waiting for N interpreters to import
     # torch on a loaded machine and not for bytes that are already in flight.
     _PG_RENDEZVOUS_TIMEOUT = 300.0
@@ -14730,7 +14730,7 @@ def _install_distributed_c10d(module, spec) -> None:
         Named `Local` rather than after a transport because there was none when
         it was written: the peer set was `{self}`. It now spans
         `world_size >= 1` over loopback TCP, and the name is kept because what
-        it is local to is the machine -- docs/TRANSPORT.md, docs/FEDERATED4.md.
+        it is local to is the machine -- docs/distributed/TRANSPORT.md, docs/distributed/FEDERATED4.md.
 
         **The topology is a star, and rank 0 is the hub.** Every other rank
         connects to it and talks to nobody else. A ring would halve the wire
@@ -14825,7 +14825,7 @@ def _install_distributed_c10d(module, spec) -> None:
 
         # -- the wire ------------------------------------------------------
         #
-        # Length-prefixed JSON, unchanged from docs/TRANSPORT.md §2. What
+        # Length-prefixed JSON, unchanged from docs/distributed/TRANSPORT.md §2. What
         # changed is who talks to whom.
         @staticmethod
         def _recv_exact(sock, n):
@@ -14944,7 +14944,7 @@ def _install_distributed_c10d(module, spec) -> None:
             The hub reads from **every** leaf before it writes to any of them,
             which is what makes this deadlock-free at any size: `sendall`
             returns when the kernel took the bytes, not when the peer read
-            them (docs/FEDERATED.md's `_WIRE_*` note), so a leaf blocked
+            them (docs/distributed/FEDERATED.md's `_WIRE_*` note), so a leaf blocked
             mid-send is only ever waiting for a hub that is already draining.
 
             `fold(payloads, ranks)` runs **on the hub only**, over the ranks
@@ -14988,7 +14988,7 @@ def _install_distributed_c10d(module, spec) -> None:
                     # told the answer. The ranks it was folded with have
                     # already been sent a result that counts it, so there is no
                     # verdict this can report that every survivor also holds.
-                    # Refused rather than patched over -- docs/FEDERATED4.md.
+                    # Refused rather than patched over -- docs/distributed/FEDERATED4.md.
                     raise RuntimeError(
                         "connection closed: rank(s) %s contributed to this "
                         "collective and then went away before the result "
@@ -15073,7 +15073,7 @@ def _install_distributed_c10d(module, spec) -> None:
                 f"ProcessGroupLocal.{what} with ReduceOp.{name} at "
                 f"world_size {self._size}",
                 "the bitwise reductions are not implemented. SUM, PRODUCT, "
-                "MIN, MAX and AVG are (docs/COLLECT2.md); BAND, BOR and BXOR "
+                "MIN, MAX and AVG are (docs/distributed/COLLECT2.md); BAND, BOR and BXOR "
                 "are defined only on integral dtypes -- upstream gloo raises "
                 "`Cannot use ReduceOp.BAND with non-integral dtype` -- and the "
                 "float tables this layer's federated callers reduce are "
@@ -15094,7 +15094,7 @@ def _install_distributed_c10d(module, spec) -> None:
             the world size when nobody is missing. Under `tolerate=True` that
             is the survivor count rather than the world -- the same verdict the
             hub reports in the envelope, so every survivor divides by the same
-            number. `docs/FEDERATED4.md` §6 is the argument for why that has to
+            number. `docs/distributed/FEDERATED4.md` §6 is the argument for why that has to
             be one process's decision.
             """
             name = getattr(kind, "name", "SUM") if kind is not None else "SUM"
@@ -15231,7 +15231,7 @@ def _install_distributed_c10d(module, spec) -> None:
             with 5.0 and rank 2 with 3.0 where the total was 6.0. Those are not
             errors, they are the absence of a promise. This leaves the non-root
             buffers *untouched*, which is inside the same absence, and
-            `docs/COLLECT2.md` says so rather than letting a caller discover
+            `docs/distributed/COLLECT2.md` says so rather than letting a caller discover
             which of the two it got.
             """
             self._check_reduce_op(opts, "reduce")
@@ -15310,7 +15310,7 @@ def _install_distributed_c10d(module, spec) -> None:
             This is what makes `federated.agree` exact above two ranks. A
             sum-and-compare (`total == value * world`) is an equality test only
             at two; at three it accepts `(h-1, h, h+1)`, so the check that two
-            ranks disagreed would pass on three that did -- docs/FEDERATED4.md.
+            ranks disagreed would pass on three that did -- docs/distributed/FEDERATED4.md.
             """
             import torch
             for outputs, source in zip(output_tensors, input_tensors):
@@ -15440,7 +15440,7 @@ def _install_distributed_c10d(module, spec) -> None:
             **This was silently wrong above one rank**: it copied `sources[0]`
             unconditionally, so rank 0 got the right chunk by coincidence and
             every other rank got its own untouched buffer -- no refusal, no
-            error, a plausible tensor. `docs/COLLECT2.md` §1 measured it. It is
+            error, a plausible tensor. `docs/distributed/COLLECT2.md` §1 measured it. It is
             the shape of defect this layer exists to refuse, and it survived
             because `world_size >= 3` was described as refusing here when in
             fact nothing checked the size at all.
@@ -15510,7 +15510,7 @@ def _install_distributed_c10d(module, spec) -> None:
             chunk, unreduced, and said nothing. Measured against upstream gloo
             on this host with the same inputs: gloo returned
             `[30,33] [36,39] [42,45]`, this returned `[0,1] [10,11] [20,21]`
-            (`docs/COLLECT2.md` §1).
+            (`docs/distributed/COLLECT2.md` §1).
 
             Every rank sends all `size` of its chunks; the hub folds each chunk
             index across the ranks and sends the whole folded list back, and
@@ -15582,14 +15582,14 @@ def _install_distributed_c10d(module, spec) -> None:
             # The copy below is the identity that one rank makes true, and
             # nothing more. Above one rank it was returning each rank's own
             # input with no reduction and no refusal -- the same silent defect
-            # `reduce_scatter` had (docs/COLLECT2.md §1). Refused by name here
+            # `reduce_scatter` had (docs/distributed/COLLECT2.md §1). Refused by name here
             # rather than built: coalescing is a batching of the single form,
             # and there is no caller for it in this tree yet.
             if self._size != 1:
                 refuse("ProcessGroupLocal.reduce_scatter_single_coalesced at world_size %d" % self._size,
                        "only the uncoalesced `reduce_scatter` and "
                        "`reduce_scatter_tensor` are implemented above one rank "
-                       "(docs/COLLECT2.md)")
+                       "(docs/distributed/COLLECT2.md)")
             self._check_reduce_op(opts, "reduce_scatter_single_coalesced")
             for output, source in zip(outputs, inputs):
                 output.copy_(source)
@@ -15599,14 +15599,14 @@ def _install_distributed_c10d(module, spec) -> None:
             # The copy below is the identity that one rank makes true, and
             # nothing more. Above one rank it was returning each rank's own
             # input with no reduction and no refusal -- the same silent defect
-            # `reduce_scatter` had (docs/COLLECT2.md §1). Refused by name here
+            # `reduce_scatter` had (docs/distributed/COLLECT2.md §1). Refused by name here
             # rather than built: coalescing is a batching of the single form,
             # and there is no caller for it in this tree yet.
             if self._size != 1:
                 refuse("ProcessGroupLocal.reduce_scatter_tensor_coalesced at world_size %d" % self._size,
                        "only the uncoalesced `reduce_scatter` and "
                        "`reduce_scatter_tensor` are implemented above one rank "
-                       "(docs/COLLECT2.md)")
+                       "(docs/distributed/COLLECT2.md)")
             self._check_reduce_op(opts, "reduce_scatter_tensor_coalesced")
             for output, source in zip(outputs, inputs):
                 output.copy_(source)
@@ -15619,7 +15619,7 @@ def _install_distributed_c10d(module, spec) -> None:
             the output beside it, so every rank got its own data back
             unchanged: at three ranks it returned `[[0],[1],[2]]` where upstream
             gloo returns `[[0],[10],[20]]`. Nothing checked the world size and
-            nothing refused (`docs/COLLECT2.md` §1).
+            nothing refused (`docs/distributed/COLLECT2.md` §1).
 
             The hub gathers the full `size x size` matrix and sends all of it to
             everybody; each rank reads its own column. Every rank therefore
@@ -15682,7 +15682,7 @@ def _install_distributed_c10d(module, spec) -> None:
                         "all-to-all needs every rank to know every other "
                         "rank's split vector before it can place its own "
                         "chunk, which is an exchange this backend does not do. "
-                        "Equal splits are implemented (docs/COLLECT2.md)",
+                        "Equal splits are implemented (docs/distributed/COLLECT2.md)",
                     )
             flat_in = input.reshape(-1)
             total = flat_in.shape[0]
@@ -15721,7 +15721,7 @@ def _install_distributed_c10d(module, spec) -> None:
             At one rank it is genuinely satisfied on arrival. Above one it is
             one trip through the star: nobody leaves until the hub has heard
             from everybody, which is what a barrier is. Returning `Work()`
-            here would be the `filled` guard from docs/CKPT.md again -- a
+            here would be the `filled` guard from docs/models/CKPT.md again -- a
             caller that used a barrier to order two collectives would be
             told it happened.
             """
@@ -15743,7 +15743,7 @@ def _install_distributed_c10d(module, spec) -> None:
             refuse("ProcessGroupLocal.send",
                    f"there is no route from rank {self._rank} to rank "
                    f"{dst_rank}. The topology is a star through rank 0 "
-                   "(docs/FEDERATED4.md), so a message between two leaves "
+                   "(docs/distributed/FEDERATED4.md), so a message between two leaves "
                    "would have to be relayed by the hub, and a relay that "
                    "the hub can read is not the primitive secure aggregation "
                    "needs. Refused rather than faked")
@@ -15783,7 +15783,7 @@ def _install_distributed_c10d(module, spec) -> None:
     # `barrier` has none. `allreduce_partial` and `allgather_partial` are
     # deliberately absent: they return `(Work, missing_ranks)`, and the
     # survivor verdict is not a thing a caller can be handed later, so they
-    # stay synchronous (docs/ASYNCWORK.md §7).
+    # stay synchronous (docs/distributed/ASYNCWORK.md §7).
     _ASYNC_COLLECTIVES = {
         "allreduce": 0,
         "reduce": 0,
@@ -15829,7 +15829,7 @@ def _install_distributed_c10d(module, spec) -> None:
                 # own**, because the other one silently covered it, so the
                 # suite could see the property and neither of its two
                 # implementations. One choke point is one thing a test can
-                # delete -- docs/ASYNCWORK.md §8.
+                # delete -- docs/distributed/ASYNCWORK.md §8.
                 return body(self, *args, **kwargs)
             if out_index is None:
                 dest = staged = None
@@ -16171,7 +16171,7 @@ def _install_default_generator(module) -> None:
 
     Three methods are real and the rest keep refusing. `get_state`/`set_state`
     are the notable absence: upstream's is a 5056-byte legacy blob whose layout
-    is the MT19937 struct itself (docs/RNG.md §1.1), and exchanging that blob
+    is the MT19937 struct itself (docs/numerics/RNG.md §1.1), and exchanging that blob
     with real torch is a separate piece of work from reproducing the stream.
     Left refusing by name rather than given a format of our own, because a
     round-trippable-but-incompatible blob is the kind of thing that looks like

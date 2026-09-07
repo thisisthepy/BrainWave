@@ -4,20 +4,20 @@
 //! aten operator this implements. Upstream's quantisation surface
 //! (`torch.quantize_per_tensor`, `aten::_int_mm`, `aten::_weight_int8pack_mm`,
 //! `aten::_dyn_quant_matmul_4bit`) names per-tensor-affine `int8` and KleidiAI
-//! 4-bit packs, and docs/DTYPE.md §6.1 measured what the non-KleidiAI half of
+//! 4-bit packs, and docs/numerics/DTYPE.md §6.1 measured what the non-KleidiAI half of
 //! that actually is: the pack casts every `uint8` nibble to `float32` and
 //! concatenates, so it *grows* the weight. Wearing those names over a GGML
 //! k-quant would be claiming a contract this does not honour. So the entrances
 //! carry a leading underscore and no aten name, exactly as `_tensor_from_flat`
-//! does, and docs/QUANT2.md §7 records what it would take to earn the names.
+//! does, and docs/graph/QUANT2.md §7 records what it would take to earn the names.
 //!
 //! **What this buys and what it does not.** It replaces a leaf -- one
 //! `nn.Linear` at a time, from Python, at run time. It does not fuse, does not
 //! see a graph, and cannot reach anything a module boundary hides. That
-//! ceiling is structural and is the reason docs/DECOMP.md's path is not made
+//! ceiling is structural and is the reason docs/graph/DECOMP.md's path is not made
 //! redundant by this one.
 //!
-//! The verification axis is docs/QUANT2.md §2 and it is not a tolerance: the
+//! The verification axis is docs/graph/QUANT2.md §2 and it is not a tolerance: the
 //! Q8_0 and Q4_0 quantisers are reimplemented from the format in
 //! `pytests/ggml_ref.py` and the blob compared **byte for byte**, and the
 //! dequantiser is reimplemented for those two plus Q4K and the reconstruction
@@ -120,7 +120,7 @@ fn _quantized_formats() -> Vec<&'static str> {
 /// operand and no `GgmlType::VecDotType` names them as a weight, so a weight
 /// quantised to either reaches `QMatMul` and fails inside candle with a
 /// message about block types. Refusing at the door names the reason instead.
-/// docs/QUANT2.md §6.
+/// docs/graph/QUANT2.md §6.
 #[pyfunction]
 #[pyo3(name = "_quantize")]
 fn quantize(py: Python<'_>, tensor: PyTensorBase, format: &str) -> PyResult<Py<PyAny>> {
@@ -137,7 +137,7 @@ fn quantize(py: Python<'_>, tensor: PyTensorBase, format: &str) -> PyResult<Py<P
     // Checked here rather than left to candle's `check_shape`, which raises a
     // `RuntimeError` phrased as an internal invariant. This is the wall a
     // caller actually hits -- SmolLM2-135M is 576 wide and no 256-element
-    // k-quant can hold a 576-column weight (docs/QUANT2.md §5.2) -- so it
+    // k-quant can hold a 576-column weight (docs/graph/QUANT2.md §5.2) -- so it
     // refuses by name, at the door, saying which multiple it wanted. The
     // module replacement in `torchnative/quant` groups its skips by this
     // message, so the phrasing is what makes a new wall visible as a new line
@@ -209,7 +209,7 @@ fn quantized_nbytes(tensor: PyTensorBase) -> PyResult<usize> {
 /// `pytests/ggml_ref.py` compare candle's quantiser against an independent
 /// reimplementation *byte for byte* rather than through a tolerance on the
 /// reconstruction, which is the difference between checking the format and
-/// checking that two lossy things are near each other. docs/QUANT2.md §2.1.
+/// checking that two lossy things are near each other. docs/graph/QUANT2.md §2.1.
 #[pyfunction]
 #[pyo3(name = "_quantized_blob")]
 fn quantized_blob<'py>(py: Python<'py>, tensor: PyTensorBase) -> PyResult<Bound<'py, PyBytes>> {
@@ -273,7 +273,7 @@ fn quantized_from_blob(
 ///
 /// The activation must be `float32`. `QMatMul::forward` accepts `f32` and
 /// `f16` only and this shim's reduced-precision path is `bfloat16`
-/// (docs/DTYPE.md §6.2), so widening would have to happen somewhere; doing it
+/// (docs/numerics/DTYPE.md §6.2), so widening would have to happen somewhere; doing it
 /// silently here would hide a cost from whoever is measuring. Refused by name
 /// until there is a measurement to put next to it.
 #[pyfunction]
@@ -293,7 +293,7 @@ fn quantized_linear(
         return Err(not_implemented(format!(
             "{OP}: the activation must be float32, got torch.{}. candle's QMatMul \
              takes f32 or f16 only, and widening here would spend time the caller \
-             cannot see. docs/DTYPE.md §6.2.",
+             cannot see. docs/numerics/DTYPE.md §6.2.",
             input.tag().name()
         )));
     }

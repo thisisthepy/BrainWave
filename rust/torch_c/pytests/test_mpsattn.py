@@ -1,24 +1,24 @@
 """An eager attention block on `mps`, and the four walls that were in its way.
 
-docs/RELEASE_0_0_13a0.md §5 says:
+docs/platform/RELEASE_0_0_13a0.md §5 says:
 
     No transformer forwards on `mps`. `aten._softmax.default` is in the set of
     ops refused there, and every attention block passes through it.
 
 **Both halves of that sentence were re-measured rather than trusted, and each
-turned out to be half right** (docs/MPSATTN.md §1):
+turned out to be half right** (docs/devices/MPSATTN.md §1):
 
   * "no transformer forwards on `mps`" was already false when it was written --
-    docs/MPSFWD.md ran SmolLM2-135M there, and §5 was not updated.
+    docs/devices/MPSFWD.md ran SmolLM2-135M there, and §5 was not updated.
   * "every attention block passes through `_softmax`" is false for the SDPA
-    path, which is what SmolLM2 takes and what docs/MPSFWD.md concluded from.
+    path, which is what SmolLM2 takes and what docs/devices/MPSFWD.md concluded from.
     It is **true** for an *eager* attention block: a BERT built with
     `attn_implementation="eager"` reaches `aten._softmax.default` twice a
     layer, and that is exactly where it stopped.
 
 So the gap named by §5 was real, and it was reachable only by a model
-docs/MPSFWD.md did not run. This file holds the closure down from both sides,
-the split docs/MPS.md established:
+docs/devices/MPSFWD.md did not run. This file holds the closure down from both sides,
+the split docs/devices/MPS.md established:
 
   * **the source**, so a machine with no Metal device still fails if a readback
     comes back into one of these kernels -- the runners that cannot exercise
@@ -53,7 +53,7 @@ def _mps_or_skip(what):
     """A live `mps` device, or None having said why not.
 
     Deliberately not imported from `test_shim` or `test_mpsfwd`, for the reason
-    docs/VULKAN3.md §6.1 paid for: the skip line is the thing this file
+    docs/devices/VULKAN3.md §6.1 paid for: the skip line is the thing this file
     promises to keep truthful, so it names the file that skipped.
     """
     try:
@@ -95,9 +95,9 @@ def test_the_softmax_ops_left_the_refusal_list_by_being_rewritten():
     and the failure being guarded here is somebody putting a `read_flat` back
     into `softmax_default` and taking the op off the list to match.
 
-    **This is also the runtime assertion behind docs/MPSATTN.md §5's claim that
+    **This is also the runtime assertion behind docs/devices/MPSATTN.md §5's claim that
     `_softmax` computed on the GPU.** candle's Metal backend has no silent CPU
-    fallback (docs/MPS.md §1.1): every op it cannot do bails. So an `mps`
+    fallback (docs/devices/MPS.md §1.1): every op it cannot do bails. So an `mps`
     tensor's arithmetic can only have happened on the host if a kernel *here*
     read it back, and that is what this asserts is absent -- from the source,
     against the list the loaded artefact is gating on.
@@ -116,7 +116,7 @@ def test_the_softmax_ops_left_the_refusal_list_by_being_rewritten():
         assert op not in refused, (
             f"{op} is refused on mps again -- if its kernel went back to "
             "reading the tensor to the host that is the right call, but "
-            "docs/MPSATTN.md §2 says it does not"
+            "docs/devices/MPSATTN.md §2 says it does not"
         )
         body = bodies.get(ops[op], "")
         assert not _MPS_READBACK_MARKERS.search(body), (
@@ -130,7 +130,7 @@ def test_the_shared_softmax_reduction_is_candle_ops_and_not_a_scalar_loop():
     """`softmax_on_device` is the one body both ops share, so it is named here.
 
     The per-op scan above follows helper calls **one level, by name**
-    (docs/VOICE3.md records what that nearly cost for `var`/`std`), and
+    (docs/architectures/VOICE3.md records what that nearly cost for `var`/`std`), and
     `softmax_on_device` is exactly one level below both kernels. A `to_vec1`
     added *inside it* would be invisible to the per-op derivation: the kernels'
     own bodies would still be clean, both ops would stay off the list, and the
@@ -165,7 +165,7 @@ def test_the_refusal_list_shrank_and_grew_no_exemption():
     """Two off the list, and nothing moved into the excused column instead.
 
     `MPS_READBACK_BUT_ALLOWED` is the one place an op can hold a readback and
-    still dispatch on `mps`; docs/MPS.md §3.3 argues for its two entries one at
+    still dispatch on `mps`; docs/devices/MPS.md §3.3 argues for its two entries one at
     a time. Nothing this round belongs there. Without this check, "rewritten
     onto the device" and "quietly excused" look identical from outside.
 
@@ -178,7 +178,7 @@ def test_the_refusal_list_shrank_and_grew_no_exemption():
     assert set(_C._shim_mps_readback_but_allowed()) == {
         "aten._local_scalar_dense.default",
         "aten.uniform_.default",
-    }, "the excused list changed -- docs/MPS.md §3.3 argues for exactly two"
+    }, "the excused list changed -- docs/devices/MPS.md §3.3 argues for exactly two"
     for op in MOVED_ONTO_THE_DEVICE:
         assert op not in refused
 
@@ -191,7 +191,7 @@ def test_the_metal_matmul_refusal_is_recognised_as_a_striding_refusal():
     (`MatMulUnexpectedStriding`). Metal answers `MetalKernelError::
     MatMulNonContiguous`, which arrives as `Error::Metal`, so the retry never
     ran there -- and `query @ key.transpose(2, 3)` inside an eager attention
-    block has a permuted left operand (docs/MPSATTN.md §3).
+    block has a permuted left operand (docs/devices/MPSATTN.md §3).
     """
     parsed = _aten_rs_functions()
     if parsed is None:
@@ -214,7 +214,7 @@ def test_softmax_on_mps_agrees_with_the_same_call_on_cpu():
     """The op §5 named, run on the device it said refused it.
 
     Compared with a **tolerance and not equality**, and the boundary is the one
-    docs/MPSFWD.md §5 measured: `matmul` and `mul` are bit-identical between the
+    docs/devices/MPSFWD.md §5 measured: `matmul` and `mul` are bit-identical between the
     backends, but `exp` and float reductions are not -- Metal's transcendental
     kernels differ from the host libm in the last bit and a reduction's
     summation order differs. A softmax is an `exp` and two reductions, so
@@ -253,7 +253,7 @@ def test_softmax_on_mps_agrees_with_the_same_call_on_cpu():
 def test_safe_softmax_on_mps_answers_zero_for_an_all_minus_infinity_row():
     """`_safe_softmax`'s only divergence from `_softmax`, on the device.
 
-    docs/MPS.md's aten docs record the measurement: plain `_softmax` answers
+    docs/devices/MPS.md's aten docs record the measurement: plain `_softmax` answers
     `nan` for a row that is entirely `-inf` (because `-inf - (-inf)` is NaN)
     and `_safe_softmax` answers `0`. That branch used to be an `if` inside a
     scalar loop; on the device it is a `where_cond`, and this is the test that
@@ -281,7 +281,7 @@ def test_softmax_of_a_scalar_and_of_an_empty_tensor_still_answer():
 
     Written because **nullifying the guard for these did not fail this file** --
     it failed the golden corpus, nine cases across every float dtype, and
-    nothing here noticed (docs/MPSATTN.md §5). Golden is in the gate, so the
+    nothing here noticed (docs/devices/MPSATTN.md §5). Golden is in the gate, so the
     regression was caught; but a reader of this file would have concluded the
     edge was covered here, and it was not.
 
@@ -333,7 +333,7 @@ def test_a_permuted_matmul_on_mps_no_longer_refuses_its_own_layout():
     got = _flat(got_t.cpu())
     assert len(got) == len(want) == 1 * 4 * 8 * 8
     # `matmul` is bit-identical between the backends at this shape
-    # (docs/MPSFWD.md §5 measured 331,776/331,776), so this is equality.
+    # (docs/devices/MPSFWD.md §5 measured 331,776/331,776), so this is equality.
     assert got == want
 
 
@@ -358,7 +358,7 @@ def test_a_float_literal_and_a_scalar_where_reach_the_device_at_all():
     # The mask is a bool literal rather than `literal > 0`: `gt.Scalar` widens
     # to `f64` to compare exactly (`compare_common`) and Metal has no `f64`, so
     # it is refused on `mps` for a reason that has nothing to do with this test
-    # and is not on an attention block's path (docs/MPSATTN.md §6).
+    # and is not on an attention block's path (docs/devices/MPSATTN.md §6).
     mask = _C._tensor_new_from_data([[True, False], [False, True]],
                                     _C.bool, device)
     picked = _C._aten_dispatch("aten.where.ScalarOther", mask, literal, -1.0)
@@ -381,7 +381,7 @@ _BERT_CFG = dict(vocab_size=64, hidden_size=32, num_hidden_layers=2,
                  max_position_embeddings=32)
 _BERT_IDS = [[1, 2, 3, 4, 5, 6, 7, 8]]
 # Supplied rather than left to default: `BertEmbeddings` otherwise builds them
-# with `torch.gather`, which is still refused on `mps` (docs/MPSATTN.md §6).
+# with `torch.gather`, which is still refused on `mps` (docs/devices/MPSATTN.md §6).
 # That op is in the *embeddings*, not the attention block.
 _BERT_TT = [[0] * 8]
 
@@ -449,19 +449,19 @@ def _flatten_nested(v):
 
 
 def test_a_bert_encoder_forwards_on_mps_and_agrees_with_upstream():
-    """The claim docs/RELEASE_0_0_13a0.md §5 said could not be made.
+    """The claim docs/platform/RELEASE_0_0_13a0.md §5 said could not be made.
 
     A shrunk BERT with `attn_implementation="eager"` -- so its attention block
     really does go through `aten._softmax.default`, twice a layer -- forwards
     on `mps` and is compared **three ways**: against the same shim model on
     `cpu`, against upstream's `float32`, and against upstream's `float64`.
 
-    **The tolerance is derived, not chosen**, by docs/AGREE.md's rule: upstream
+    **The tolerance is derived, not chosen**, by docs/numerics/AGREE.md's rule: upstream
     is run again in `float64` and both `float32` answers are scored against it,
     and a difference is not a defect if it is within **4x upstream's own
     distance from the float64 truth** for the same output. Anything tighter
     would have to call upstream wrong. Measured on this model
-    (docs/MPSATTN.md §4): upstream's own float32 error is 4.32e-07, the shim on
+    (docs/devices/MPSATTN.md §4): upstream's own float32 error is 4.32e-07, the shim on
     `mps` is 5.26e-07 from the same truth -- 1.22x, not 4x -- and `mps` differs
     from the shim's own `cpu` answer by at most 2.384e-07, which is exactly one
     float32 ulp at that magnitude.
@@ -514,7 +514,7 @@ def test_a_bert_encoder_forwards_on_mps_and_agrees_with_upstream():
         "rather than a constant")
     assert worst_mps <= 4 * worst_upstream, (
         f"mps is {worst_mps:.3e} from the float64 truth against upstream's own "
-        f"{worst_upstream:.3e}; docs/AGREE.md's rule allows 4x")
+        f"{worst_upstream:.3e}; docs/numerics/AGREE.md's rule allows 4x")
     assert worst_cpu <= 4 * worst_upstream, (worst_cpu, worst_upstream)
     # `mps` against the shim's own `cpu`, which is the backend comparison and
     # is tighter than the upstream one: one float32 ulp at this magnitude.

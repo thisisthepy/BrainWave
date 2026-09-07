@@ -31,7 +31,7 @@ use crate::err::{candle_err, not_implemented};
 /// `candle_core::Tensor` owns storage, and `Tensor::zeros` allocates. So a
 /// meta tensor cannot be a candle tensor wearing a label; allocating and
 /// calling it `meta` would invert the one property meta exists for.
-/// docs/META.md §3.
+/// docs/devices/META.md §3.
 ///
 /// The cost of the enum is paid once, at `tensor()`: it returns a `PyResult`
 /// instead of a `&Tensor`, so **no kernel can read storage off a meta tensor
@@ -46,7 +46,7 @@ pub enum Repr {
     /// Stride is deliberately absent. `TensorBase` has no `.stride()` in this
     /// shim (dense tensors do not report one either), so modelling strides here
     /// would give meta a surface the dense side does not have. Recorded in
-    /// docs/META.md §6 as a narrowing, since upstream's meta *does* carry
+    /// docs/devices/META.md §6 as a narrowing, since upstream's meta *does* carry
     /// stride (`torch.zeros(2,3,device="meta").t().stride()` is `(1, 3)`).
     ///
     /// The device label is not stored either, and that is measured rather than
@@ -55,7 +55,7 @@ pub enum Repr {
     /// as `meta:0` and bare `meta`. So there is exactly one meta device and the
     /// label is a constant. If a device kind ever arrives where the index
     /// *survives*, this is the field that has to appear, and
-    /// docs/DEVICE_ABS.md §3.2 is the argument for it.
+    /// docs/devices/DEVICE_ABS.md §3.2 is the argument for it.
     ///
     /// `storage_id` is the identity of the storage this meta tensor would
     /// have. It is **not** an address: upstream's meta storage answers
@@ -66,7 +66,7 @@ pub enum Repr {
     /// process-wide counter at construction and **propagated by the one meta
     /// kernel that is a view** (`aten.view.default`), so `x` and `x.view(-1)`
     /// answer with one storage here as they do upstream, and two separately
-    /// constructed meta tensors do not. docs/EXPORT5.md §2.
+    /// constructed meta tensors do not. docs/graph/EXPORT5.md §2.
     Meta { shape: Vec<usize>, storage_id: usize },
     /// A GGML block-quantised weight.
     ///
@@ -75,8 +75,8 @@ pub enum Repr {
     /// separate type system (`candle_core::quantized`) with its own element
     /// enumeration (`GgmlDType`), its own storage, and its own matmul
     /// (`QMatMul`); it is not convertible to `&Tensor` without dequantising,
-    /// which allocates and throws away the whole point. docs/QUANT.md §5.1 and
-    /// docs/DTYPE.md §6.3.
+    /// which allocates and throws away the whole point. docs/graph/QUANT.md §5.1 and
+    /// docs/numerics/DTYPE.md §6.3.
     ///
     /// So `tensor()` refuses on this arm exactly as it refuses on `Meta`, and
     /// for the same structural reason: **no kernel can read dense storage off
@@ -98,7 +98,7 @@ pub enum Repr {
     /// enum of `Cpu | Cuda | Metal` with nowhere to put a Vulkan handle, so a
     /// Vulkan tensor cannot be a `candle::Tensor` wearing a label any more than
     /// a GGML weight can. It has to live outside candle, and this is where.
-    /// docs/VULKAN2.md §5.1 sized it; docs/VULKAN3.md is what came of that.
+    /// docs/devices/VULKAN2.md §5.1 sized it; docs/devices/VULKAN3.md is what came of that.
     ///
     /// And it inherits `Quantized`'s safety property, which is the whole point
     /// of putting it here rather than anywhere else: `tensor()` refuses on this
@@ -115,13 +115,13 @@ pub enum Repr {
     /// **The fifth arm exists for the same structural reason as the third and
     /// the fourth: candle cannot hold the thing.** `candle_core::DType`
     /// enumerates fourteen real dtypes and no complex one, in 0.11.0 and on
-    /// `main` alike, and -- unlike `torch.int8` (docs/INT8.md) -- it cannot get
+    /// `main` alike, and -- unlike `torch.int8` (docs/numerics/INT8.md) -- it cannot get
     /// one by adding an arm. `WithDType` is bounded on `std::cmp::PartialOrd`
     /// and `cpu::kernels::VecOps` requires `min`/`max`; the complex numbers
     /// are not ordered, so a complex `DType` means *removing* a bound from
     /// candle's core numeric trait and re-bounding every comparison,
     /// reduction, sort, clamp and argmax generic over it, across three
-    /// backends, carried against upstream forever. docs/COMPLEX.md §2.2 sized
+    /// backends, carried against upstream forever. docs/kernels/COMPLEX.md §2.2 sized
     /// that and refused it; no `[patch]` is offered and none should be added.
     ///
     /// **A pair, not interleaving.** Upstream's own representation interleaves
@@ -145,7 +145,7 @@ pub enum Repr {
     /// `PyResult` whose only content is a refusal. Dropping the imaginary part
     /// and returning plausible numbers is therefore not a discipline anyone
     /// has to keep; it is unrepresentable, which is the standard
-    /// docs/VULKAN2.md set. Ops opt in one at a time, by name, in
+    /// docs/devices/VULKAN2.md set. Ops opt in one at a time, by name, in
     /// `complex_ops` below.
     Complex { re: Tensor, im: Tensor },
 }
@@ -166,15 +166,15 @@ pub struct PyTensorBase {
     /// and the alternative was stopping there. `backward()` stays a raising
     /// stub so that code which really depends on the flag meaning something
     /// fails by name rather than silently getting nothing. Recorded as a
-    /// papered-over item in docs/TENSORBASE.md, not as an implementation.
+    /// papered-over item in docs/bindings/TENSORBASE.md, not as an implementation.
     ///
     /// Inert is not the same as unconstrained, and that distinction was missed
-    /// for as long as this comment has existed. `docs/BACKWARD2.md` §1.4
+    /// for as long as this comment has existed. `docs/training/BACKWARD2.md` §1.4
     /// measured the one place where this shim was *more* permissive than
     /// upstream rather than less: an integer tensor could be told to require
     /// gradients here and cannot upstream. `set_requires_grad` states that rule
     /// now, at the site upstream states it -- `tape.rs`'s `wrt_set` had been
-    /// carrying it alone, one layer down, where docs/BACKWARD.md §4.1 records
+    /// carrying it alone, one layer down, where docs/training/BACKWARD.md §4.1 records
     /// having to add it after the reverse walk asked for the derivative of a
     /// token id.
     requires_grad: bool,
@@ -187,16 +187,16 @@ pub struct PyTensorBase {
     /// `OrderedDict()` that `_rebuild_tensor_v2`'s own comment insists on
     /// ("we must give an EMPTY OrderedDict(), if you pass a None you'll run
     /// afoul #12219"). Refusing the assignment stopped `torch.load`; accepting
-    /// it stores something nothing reads. Recorded in docs/CKPT.md §6 as
+    /// it stores something nothing reads. Recorded in docs/models/CKPT.md §6 as
     /// papered over, not implemented.
     backward_hooks: Option<Py<PyAny>>,
     /// The accumulated gradient, and **no longer inert**.
     ///
-    /// `docs/AUTOGRAD.md` §7 argued for leaving this a read-only `None`, and
+    /// `docs/training/AUTOGRAD.md` §7 argued for leaving this a read-only `None`, and
     /// the argument was right at the time and is quoted here rather than
     /// paraphrased: *"making `.grad` writable while nothing writes to it would
     /// move the shim from 'honestly reports no gradient' to 'has a slot that is
-    /// always empty'"*. `docs/BACKWARD.md` is what changed the antecedent --
+    /// always empty'"*. `docs/training/BACKWARD.md` is what changed the antecedent --
     /// the tape writes here, so the slot is no longer always empty, and every
     /// `torch.optim` step in this shim reads it.
     ///
@@ -210,7 +210,7 @@ pub struct PyTensorBase {
     /// `Some(op)` means "this tensor was produced by `op`, under grad mode,
     /// from an operand that required a gradient" -- which is exactly upstream's
     /// condition for `grad_fn is not None`, and therefore for `is_leaf` being
-    /// `False`. `None` means leaf. docs/BACKWARD4.md §2 is why the two cannot
+    /// `False`. `None` means leaf. docs/training/BACKWARD4.md §2 is why the two cannot
     /// be separated: upstream does not store `is_leaf`, it *is*
     /// `grad_fn is None`, so a truthful `is_leaf` and a truthful `grad_fn`
     /// nullness are one field and not two.
@@ -221,20 +221,20 @@ pub struct PyTensorBase {
     /// only faithful attribute is its class name, because
     /// `torch/_tensor_str.py:646` reads `type(grad_fn).__name__` and is the
     /// only caller on an exercised path that reaches past nullness
-    /// (docs/BACKWARD4.md §1.3). `Tensor.backward()` still refuses at
+    /// (docs/training/BACKWARD4.md §1.3). `Tensor.backward()` still refuses at
     /// `_ImperativeEngine.run_backward`; **this field is a description of what
     /// happened, not a promise that it can be undone.**
     from_op: Option<Box<str>>,
     /// `t.retain_grad()` was called. Unreachable before this round, because
     /// upstream's `param.is_leaf or param.retains_grad` short-circuited on an
-    /// `is_leaf` that was always `True` -- docs/BACKWARD3.md §1.2.
+    /// `is_leaf` that was always `True` -- docs/training/BACKWARD3.md §1.2.
     retains_grad: bool,
     /// **The `as_strided` write barrier's keep-alive handle.** `None` for every
     /// tensor that is not an `as_strided` result.
     ///
     /// `Some(barrier)` means this tensor was produced by
     /// `aten.as_strided.default`, which in this shim is a **gather** and not
-    /// the two-way view upstream returns (docs/STRIDED.md). While it is held,
+    /// the two-way view upstream returns (docs/kernels/STRIDED.md). While it is held,
     /// `storage.rs`'s registry bars in-place writes to this tensor's storage
     /// *and* to the base's, so the divergence a gather would otherwise have --
     /// a write lost in either direction, silently -- is a named refusal
@@ -243,7 +243,7 @@ pub struct PyTensorBase {
     /// The field's only job is to own the `Arc`: dropping the last handle is
     /// what unregisters both keys, and holding it is what keeps their
     /// addresses reserved so that neither can be reused while it is still
-    /// meaningful. docs/TAIL4.md §1.2 rejected an address-keyed poison set
+    /// meaningful. docs/kernels/TAIL4.md §1.2 rejected an address-keyed poison set
     /// precisely because it had no such handle.
     strided: Option<std::sync::Arc<crate::storage::StridedBarrier>>,
     /// `torch._C._set_throw_on_mutable_data_ptr(t)` -- the per-tensor bit that
@@ -254,7 +254,7 @@ pub struct PyTensorBase {
     /// worse than refusing, and upstream would rather the caller fail at the
     /// `data_ptr()` than at whatever it did with the number.
     ///
-    /// docs/EXPORT.md §3.2 called this "Rust" and it was right about the
+    /// docs/graph/EXPORT.md §3.2 called this "Rust" and it was right about the
     /// reason: a Python side-table keyed by identity is a *different*
     /// guarantee. A `FakeTensor` is not reliably weak-referenceable, and the
     /// bit has to survive `Tensor._make_subclass`, which builds a new Python
@@ -365,7 +365,7 @@ pub fn no_host_storage() -> PyErr {
         "torch._C shim: this tensor is on the vulkan device; its storage is a \
          VkBuffer, not something a CPU kernel can read. Only the ops taught the \
          vulkan device by name compute on one (torch._C._vulkan_ops()); bring it \
-         back with .cpu() for anything else. docs/VULKAN3.md",
+         back with .cpu() for anything else. docs/devices/VULKAN3.md",
     )
 }
 
@@ -379,11 +379,11 @@ pub fn no_host_storage() -> PyErr {
 /// and is only caught by an element-wise comparison nobody runs. So `tensor()`
 /// refuses here, and the message says which half would have been lost rather
 /// than "no storage", because the reader's next question is whether their gap
-/// is the dtype or the operator. docs/COMPLEX2.md §2.
+/// is the dtype or the operator. docs/kernels/COMPLEX2.md §2.
 pub fn no_real_storage(tag: TorchDType) -> PyErr {
     pyo3::exceptions::PyNotImplementedError::new_err(format!(
         "torch._C shim: this is a {} tensor, held as a pair of real tensors \
-         (torch._C shim has no complex candle dtype -- docs/COMPLEX.md §2). \
+         (torch._C shim has no complex candle dtype -- docs/kernels/COMPLEX.md §2). \
          Handing a kernel its real part alone would drop the imaginary part \
          and return plausible numbers, so there is no dense storage to read. \
          Only the ops taught the complex representation by name compute on \
@@ -448,7 +448,7 @@ impl PyTensorBase {
     /// That is a real widening over the dense side: `torch.empty(2,
     /// dtype=torch.complex64, device="meta")` is representable here while its
     /// CPU counterpart is not, which is also true upstream on a build without a
-    /// kernel for a dtype. docs/META.md §6.
+    /// kernel for a dtype. docs/devices/META.md §6.
     pub fn meta(shape: Vec<usize>, tag: TorchDType) -> Self {
         Self::meta_with_storage_id(shape, tag, next_meta_storage_id())
     }
@@ -484,13 +484,13 @@ impl PyTensorBase {
     /// and a single scale for the whole tensor -- none of which a GGML k-quant
     /// has (Q4K carries eight 6-bit sub-scales and two `f16` super-scales per
     /// 256 elements). It would also be a tag with no meaning for Q4K, there
-    /// being no 4-bit torch dtype that is storable here (docs/QUANT.md §2.1).
+    /// being no 4-bit torch dtype that is storable here (docs/graph/QUANT.md §2.1).
     ///
     /// So `.dtype` answers what comes out of `_dequantize`/`_quantized_linear`
     /// and `.is_quantized` answers that it is quantised; the *format* is a
     /// separate question with a separate answer, `_quantized_format()`. This
     /// is a narrowing against upstream and is recorded as one in
-    /// docs/QUANT2.md §4.
+    /// docs/graph/QUANT2.md §4.
     pub fn quantized(inner: Arc<QTensor>, tag: TorchDType) -> Self {
         Self {
             inner: Repr::Quantized(inner),
@@ -568,7 +568,7 @@ impl PyTensorBase {
         let tag = TorchDType::complex_for_component(re.dtype()).ok_or_else(|| {
             not_implemented(format!(
                 "torch._C shim: no complex dtype over {} -- complex tensors \
-                 here are pairs of half, float or double (docs/COMPLEX.md §3)",
+                 here are pairs of half, float or double (docs/kernels/COMPLEX.md §3)",
                 re.dtype().as_str()
             ))
         })?;
@@ -781,7 +781,7 @@ impl PyTensorBase {
     ///
     /// Upstream this is `unsafeGetTensorImpl()->has_storage()`, and the one
     /// thing it is false for on CPU is a meta tensor -- which is exactly the
-    /// distinction `Repr` was made for (docs/META.md §3). A quantised tensor
+    /// distinction `Repr` was made for (docs/devices/META.md §3). A quantised tensor
     /// owns blocks and answers `true`, as upstream's quantised tensors do;
     /// what it cannot do is hand those blocks over as a flat storage, and that
     /// refusal belongs to `storage_snapshot`, one question later.
@@ -800,7 +800,7 @@ impl PyTensorBase {
     /// numbers to index into the bytes it was handed. Handing over a
     /// materialised view instead would produce a file whose stride and offset
     /// were lies about its own payload -- readable, silently wrong, which is
-    /// the failure shape docs/CKPT.md §4 and §5 are both about.
+    /// the failure shape docs/models/CKPT.md §4 and §5 are both about.
     ///
     /// The second return value is the address of candle's `Storage` inside its
     /// `Arc<RwLock<_>>`. Two tensors that share a buffer -- `x` and `x.t()`,
@@ -914,16 +914,16 @@ impl PyTensorBase {
     ///     write into, since the point is to leave it.
     ///   * `tensor.data = other` -- upstream swaps the `TensorImpl`, so a view
     ///     taken before the assignment does not follow it there either
-    ///     (docs/DEVICE_ABS.md §4).
+    ///     (docs/devices/DEVICE_ABS.md §4).
     ///
     /// Anything that means "the receiver's values change but the receiver
-    /// stays the same tensor" must not come here. docs/VIEWS.md §6.
+    /// stays the same tensor" must not come here. docs/kernels/VIEWS.md §6.
     /// Mark this tensor as an `as_strided` result and bar its storage, and the
     /// base's, from in-place writes for as long as it lives.
     ///
     /// Called from exactly one place, `aten.rs::as_strided_default`, and taking
     /// the `Arc` rather than building it here keeps `storage.rs` the only file
-    /// that knows how the registry is keyed. docs/STRIDED.md §2.
+    /// that knows how the registry is keyed. docs/kernels/STRIDED.md §2.
     pub fn bar_writes_as_strided_view(
         &mut self,
         barrier: std::sync::Arc<crate::storage::StridedBarrier>,
@@ -940,7 +940,7 @@ impl PyTensorBase {
     /// into the buffer this wrapper already points at, through this wrapper's
     /// layout.
     ///
-    /// The difference from `replace_with` is the whole of docs/VIEWS.md §6.
+    /// The difference from `replace_with` is the whole of docs/kernels/VIEWS.md §6.
     /// `select.int` and `slice.Tensor` (step 1) return tensors that share
     /// storage with their input -- candle's `narrow`/`squeeze` clone the
     /// storage `Arc` and rebuild only the `Layout` -- so a write that lands in
@@ -1038,7 +1038,7 @@ impl PyTensorBase {
                 self.device_label().__str__()
             )));
         }
-        // **The `as_strided` write barrier.** docs/STRIDED.md §2.
+        // **The `as_strided` write barrier.** docs/kernels/STRIDED.md §2.
         //
         // This is the single write door -- `aten.rs::write_back` is the only
         // caller of this function and this function is the only thing in the
@@ -1054,8 +1054,8 @@ impl PyTensorBase {
         // the base's values. §4 records the narrowing and the one case it does
         // not reach.
         //
-        // Nullifying this block is what docs/STRIDED.md 5 measured, and it is
-        // the demonstration docs/COMPLEX2.md set as the standard for calling a
+        // Nullifying this block is what docs/kernels/STRIDED.md 5 measured, and it is
+        // the demonstration docs/kernels/COMPLEX2.md set as the standard for calling a
         // guard real: with `if false &&` in front of the call and nothing else
         // changed, `x.as_strided((2,3),(3,1)).fill_(7.)` returns a filled view
         // and leaves `x` at `[0., 1., 2., ...]` where upstream leaves it all
@@ -1075,7 +1075,7 @@ impl PyTensorBase {
                  them in neither. Refusing rather than answering, because \
                  the alternative is the right shape and dtype with the wrong \
                  values. Drop the as_strided result to lift this, or \
-                 .clone() before writing. docs/STRIDED.md"
+                 .clone() before writing. docs/kernels/STRIDED.md"
             )));
         }
 
@@ -1169,7 +1169,7 @@ fn flat_storage(op: &str, source: &Tensor) -> PyResult<CpuStorage> {
         DType::F16 => pour!(F16, half::f16),
         DType::F32 => pour!(F32, f32),
         DType::F64 => pour!(F64, f64),
-        // `float8_e4m3fn` joined the list in docs/FLOAT8C.md §3. `to_vec1`
+        // `float8_e4m3fn` joined the list in docs/numerics/FLOAT8C.md §3. `to_vec1`
         // reads the storage slice directly -- it never widens, so it does not
         // touch candle's non-terminating `F8E4M3 -> f64` arm (§1), which is why
         // this arm is a two-line addition rather than a conversion.
@@ -1190,7 +1190,7 @@ fn flat_storage(op: &str, source: &Tensor) -> PyResult<CpuStorage> {
 /// is the only public surface in the crate that does. `slice_set` is the other
 /// public write path and it cannot serve here: it requires both sides
 /// contiguous and it *refuses a pair that shares storage*, which is precisely
-/// `x[0:2] = x[1:3]`. docs/VIEWS.md §6.2 records what was rejected and why.
+/// `x[0:2] = x[1:3]`. docs/kernels/VIEWS.md §6.2 records what was rejected and why.
 struct WriteThrough {
     /// Row-major, already read out of the source. Same length and dtype as the
     /// destination view's element count and dtype -- `write_into` checked.
@@ -1591,7 +1591,7 @@ impl PyTensorBase {
     /// ```
     ///
     /// The second form is upstream's legacy `torch.Tensor(2, 3)` constructor,
-    /// which this refused by name until docs/KERNELS26.md §4. **The decision
+    /// which this refused by name until docs/kernels/KERNELS26.md §4. **The decision
     /// recorded there is that reproducing it is right**, on three grounds, and
     /// the grounds matter more than the conclusion:
     ///
@@ -1724,7 +1724,7 @@ impl PyTensorBase {
     /// tensor, which `==` hides -- and upstream's own `get_higher_dtype` opens
     /// with `if a is b: return a` as its guard against the `ordered_datatypes`
     /// table, so two float32 operands fell through it and promoted to float64
-    /// (docs/DECOMP.md §7.2, which had the symptom but not the cause).
+    /// (docs/graph/DECOMP.md §7.2, which had the symptom but not the cause).
     #[getter]
     fn dtype(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         crate::dtype::interned(py, self.tag)
@@ -1758,7 +1758,7 @@ impl PyTensorBase {
     /// accepting a different dtype would leave the backward pass accumulating
     /// in the old one while the attribute claimed otherwise -- a setter
     /// invisible to its own effect, which is the shape `_set_conj` refuses for
-    /// the same reason (docs/EXPORT5.md §5).
+    /// the same reason (docs/graph/EXPORT5.md §5).
     ///
     /// Assigning the tensor's own dtype is a no-op and is allowed, so that
     /// save/restore round trips do not raise.
@@ -1774,7 +1774,7 @@ impl PyTensorBase {
              set. Upstream honours this attribute in its backward pass; here \
              nothing would, so accepting it would leave the attribute claiming a \
              precision the backward pass does not use (tensor.rs, \
-             docs/EXPORT5.md §5)",
+             docs/graph/EXPORT5.md §5)",
             self.tag.name()
         )))
     }
@@ -1793,7 +1793,7 @@ impl PyTensorBase {
     /// It is here because `Module.load_state_dict` reads it on every single
     /// parameter -- `torch/nn/modules/module.py:2449`, `if param.is_meta:`,
     /// before the shape check and before the copy. It was the only wall left on
-    /// that path once the weights themselves could be read (docs/CKPT.md).
+    /// that path once the weights themselves could be read (docs/models/CKPT.md).
     /// A stub property raising by name stopped `load_state_dict` outright,
     /// which is the right behaviour for a hole and the wrong answer for a
     /// question the shim can answer.
@@ -1802,7 +1802,7 @@ impl PyTensorBase {
     /// `fake_tensor.py:1293`'s `extract_tensor_metadata` reads it on every
     /// tensor it hashes, so `torch.export` reaches it once per cached dispatch.
     ///
-    /// It is `False` for the same reason `is_conj` is (docs/EXPORT.md §2.3):
+    /// It is `False` for the same reason `is_conj` is (docs/graph/EXPORT.md §2.3):
     /// there is nothing here that could make it `True`. A symbolic size is a
     /// `SymInt` living in a `TensorImpl`'s sizes-and-strides field; this shim's
     /// shapes are `Vec<usize>` on the dense side and `Repr::Meta`'s `shape` on
@@ -1886,12 +1886,12 @@ impl PyTensorBase {
     /// Writing it as a match means an arm cannot be added to `Repr` without
     /// the compiler asking what these six answer for it -- where a bare
     /// `false` would inherit silently, which is exactly the shape of the
-    /// `is_mutable` accident in docs/DISTRIBUTED.md §8.1.
+    /// `is_mutable` accident in docs/distributed/DISTRIBUTED.md §8.1.
     ///
     /// **That is no longer a hypothetical: `Repr::Quantized` landed and the
     /// compiler asked.** Five of the six answered `false` again; `is_quantized`
     /// did not, and so this family is now a live predicate with a constructor
-    /// behind it rather than a set of constants (docs/QUANT2.md §4).
+    /// behind it rather than a set of constants (docs/graph/QUANT2.md §4).
     ///
     /// The other half of the argument is in `pytests/test_shim.py`
     /// (`test_the_alternative_representations_have_no_constructors`): each of
@@ -2168,7 +2168,7 @@ impl PyTensorBase {
     /// way to lend it as a `StorageBase`.
     ///
     /// Copying is safe *here* in a way it is not on the load side, and the
-    /// asymmetry is worth naming since docs/CKPT.md §4 spent a section on the
+    /// asymmetry is worth naming since docs/models/CKPT.md §4 spent a section on the
     /// other direction. Saving reads and never writes, so a snapshot taken
     /// while the tensor is alive has exactly the bytes the tensor has. What a
     /// copy cannot carry by itself is *identity* -- and identity is load
@@ -2180,17 +2180,17 @@ impl PyTensorBase {
     ///
     /// **A meta or quantised tensor refuses**, from `tensor()` and from
     /// `storage_snapshot` respectively: a meta tensor has no bytes at all
-    /// (docs/META.md §3, and `torch/_tensor.py:337` takes a different branch
+    /// (docs/devices/META.md §3, and `torch/_tensor.py:337` takes a different branch
     /// for it before reaching here), and a quantised one has blocks that are
     /// not a flat storage in any dtype torch could name in a record.
     fn untyped_storage(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        // **A meta tensor answers with a handle, and that is docs/EXPORT.md
+        // **A meta tensor answers with a handle, and that is docs/graph/EXPORT.md
         // §3.3 closed.**
         //
         // The refusal it used to give -- `Cannot copy out of meta tensor; no
         // data!`, out of `tensor()` -- was right about the bytes and wrong
         // about the question, the same mismatch `stride()` had one line
-        // earlier (docs/EXPORT4.md §6.5). `meta_utils.py:2071` is not asking
+        // earlier (docs/graph/EXPORT4.md §6.5). `meta_utils.py:2071` is not asking
         // for bytes; it is asking for something to key an aliasing memo on,
         // and it never reads through what it gets. So the answerable part of
         // the question is a size and an identity, and both are available: the
@@ -2200,7 +2200,7 @@ impl PyTensorBase {
         // What it is NOT is a zero-length CPU storage wearing a meta label.
         // `storage::meta` leaves `filled` false, so `set_` still refuses it,
         // and every byte door on it refuses by name rather than answering over
-        // an empty buffer. docs/EXPORT5.md §2 is the table of which of
+        // an empty buffer. docs/graph/EXPORT5.md §2 is the table of which of
         // upstream's expectations that meets and which it refuses.
         if let Some(storage_id) = self.meta_storage_id() {
             let nbytes = self.numel() * self.tag.itemsize();
@@ -2217,11 +2217,11 @@ impl PyTensorBase {
     /// feeds it back to `set_`, which walks it (`gather_strided`), so a
     /// constant zero here would save `x[1]` as if it started at the front of
     /// its buffer -- shape and dtype right, values from the wrong row, no
-    /// exception anywhere. docs/CKPT.md §5 measured that exact failure coming
+    /// exception anywhere. docs/models/CKPT.md §5 measured that exact failure coming
     /// the other way.
     ///
     /// A meta tensor refuses rather than answering `0`: `Repr::Meta` carries no
-    /// layout at all (docs/META.md §6 records the narrowing), so `0` would be
+    /// layout at all (docs/devices/META.md §6 records the narrowing), so `0` would be
     /// a guess that happens to be right for contiguous meta tensors and wrong
     /// for the transposed ones upstream's meta does model.
     fn storage_offset(&self) -> PyResult<usize> {
@@ -2237,7 +2237,7 @@ impl PyTensorBase {
 
     /// `tensor.stride()` / `tensor.stride(dim)`, in elements.
     ///
-    /// candle's `Layout` has carried a real stride since docs/VIEWS.md §6 made
+    /// candle's `Layout` has carried a real stride since docs/kernels/VIEWS.md §6 made
     /// narrowing alias, so this reports what the tensor actually is rather than
     /// what a contiguous tensor of its shape would be. It is the fourth of the
     /// four numbers a `torch.save` record is made of, and the same reasoning as
@@ -2256,7 +2256,7 @@ impl PyTensorBase {
         // **A meta tensor answers its contiguous stride, and that is derived,
         // not guessed.**
         //
-        // `Repr::Meta` stores a shape and no stride (docs/META.md §6 records
+        // `Repr::Meta` stores a shape and no stride (docs/devices/META.md §6 records
         // the narrowing), so the obvious reading is that `stride()` cannot be
         // answered and must refuse -- which is what it did, via `tensor()?`,
         // and the refusal was `Cannot copy out of meta tensor; no data!`. That
@@ -2399,7 +2399,7 @@ impl PyTensorBase {
     /// ---
     ///
     /// **`aten.set_.source_Tensor` and the no-argument form now work too**
-    /// (docs/KERNELS26.md §5), and unlike the storage form above they *do*
+    /// (docs/kernels/KERNELS26.md §5), and unlike the storage form above they *do*
     /// alias, which is upstream's behaviour rather than a divergence.
     ///
     /// ```text
@@ -2515,7 +2515,7 @@ impl PyTensorBase {
                  out of the storage instead of aliasing it, so a tensor built \
                  from an empty storage would be silently zero. The caller must \
                  deliver the bytes before set_, not after (see storage.rs and \
-                 docs/CKPT.md §4)."
+                 docs/models/CKPT.md §4)."
             )));
         }
 
@@ -2567,8 +2567,8 @@ impl PyTensorBase {
     /// rather than the storage being rewritten, so a view taken *before* the
     /// assignment does not follow it. Upstream's `.data =` swaps the TensorImpl
     /// too, so pre-existing views do not follow there either -- for this
-    /// spelling the two agree, and docs/OPS4.md §8's open aliasing question is
-    /// about writes through views, which this is not. docs/DEVICE_ABS.md §4.
+    /// spelling the two agree, and docs/kernels/OPS4.md §8's open aliasing question is
+    /// about writes through views, which this is not. docs/devices/DEVICE_ABS.md §4.
     ///
     /// `requires_grad` is deliberately left alone: upstream's `.data =` does
     /// not touch it, and `_apply` relies on that to keep a `Parameter` a
@@ -2625,7 +2625,7 @@ impl PyTensorBase {
     /// | `channels_last` / `channels_last_3d` | `True` only for a tensor actually in that layout | **`False`, as a fact** |
     ///
     /// The last row is a fact rather than a stand-in, in the same sense as
-    /// `is_mkldnn` (docs/EXPORT.md §2.3): **there is no channels-last
+    /// `is_mkldnn` (docs/graph/EXPORT.md §2.3): **there is no channels-last
     /// representation in this build at all.** candle carries a `Layout` and no
     /// memory-format tag, no kernel here accepts `memory_format=channels_last`,
     /// and `grep channels_last rust/torch_c/src/*.rs` finds only upsample
@@ -2696,7 +2696,7 @@ impl PyTensorBase {
     /// non-leaf half is `from_op`, which the door sets. The disjunction is
     /// upstream's invariant `grad_fn is not None => requires_grad` written as
     /// code: a tensor cannot report a `grad_fn` and deny requiring a gradient.
-    /// docs/BACKWARD4.md §2.
+    /// docs/training/BACKWARD4.md §2.
     #[getter]
     fn requires_grad(&self) -> bool {
         self.requires_grad || self.from_op.is_some()
@@ -2707,7 +2707,7 @@ impl PyTensorBase {
     /// The flag is inert (no graph is built from it), but "inert" says nothing
     /// about which tensors may carry it, and upstream restricts that: only
     /// floating-point and complex tensors may require gradients, because only
-    /// those have a derivative to accumulate. `docs/BACKWARD2.md` §1.4 measured
+    /// those have a derivative to accumulate. `docs/training/BACKWARD2.md` §1.4 measured
     /// this shim accepting `torch.ones(2, dtype=torch.int64).requires_grad_(True)`
     /// where upstream raises -- the single place in the whole autograd chain
     /// where this shim was the permissive one.
@@ -2725,7 +2725,7 @@ impl PyTensorBase {
     #[setter]
     fn set_requires_grad(&mut self, value: bool) -> PyResult<()> {
         // Upstream's own refusal, transcribed from 2.13.0 by running the
-        // failing case, and it is the divergence docs/BACKWARD3.md §1.1 listed
+        // failing case, and it is the divergence docs/training/BACKWARD3.md §1.1 listed
         // and could not close: the flag on a non-leaf is not a flag, it is a
         // consequence of the graph, so changing it is meaningless rather than
         // merely unsupported. Unreachable until `from_op` existed.
@@ -2748,7 +2748,7 @@ impl PyTensorBase {
     /// `bootstrap.py` turns it into `grad_fn` and `is_leaf`; it is exposed as a
     /// string rather than as those two properties because the naming table that
     /// makes `type(grad_fn).__name__` agree with upstream is measured data
-    /// (docs/BACKWARD4.md §3.1) and belongs beside the measurement, in Python,
+    /// (docs/training/BACKWARD4.md §3.1) and belongs beside the measurement, in Python,
     /// where the test that checks it against real torch can read it.
     #[getter]
     pub(crate) fn _shim_from_op(&self) -> Option<&str> {
@@ -2813,7 +2813,7 @@ fn flat_objects(py: Python<'_>, tensor: &Tensor, tag: TorchDType) -> PyResult<Ve
             .collect::<PyResult<Vec<_>>>();
     }
     if dtype.is_float() {
-        // `float8_e4m3fn` refused here until docs/FLOAT8C.md §1: candle's
+        // `float8_e4m3fn` refused here until docs/numerics/FLOAT8C.md §1: candle's
         // `F8E4M3 -> F64` conversion recurses into itself, so this read hung.
         // `widen_f64` routes it `F8E4M3 -> F32 -> F64`, which is exact for
         // every one of the dtype's 256 bit patterns, so the refusal is gone
@@ -2871,26 +2871,26 @@ fn nest(py: Python<'_>, flat: &[Py<PyAny>], dims: &[usize]) -> PyResult<Py<PyAny
 //
 // a data-dependent compare-and-select with a loop-carried dependency on `val`,
 // one element at a time. `ReduceSum` next to it in the same file gets a
-// vectorised path; this one does not. docs/SEQLEN.md §4.3 measured the
+// vectorised path; this one does not. docs/numerics/SEQLEN.md §4.3 measured the
 // consequence: at `[1, 9, 512, 512]` `float32`, candle's max over the last
 // dimension takes 5.69 ms against upstream's 0.099 ms `amax` -- 57x -- and it
 // was 24.3% of a `float32` prefill's main thread.
 //
-// So this is the second of the three routes docs/SEQLEN.md §5 left open. There
+// So this is the second of the three routes docs/numerics/SEQLEN.md §5 left open. There
 // is **no** public candle API that returns a maximum without the index (route
 // one), and forking candle (route three) is not needed: `CustomOp1` +
 // `Tensor::apply_op1_no_bwd` are `pub`, they hand a kernel the storage *and*
 // the layout, and they are the same mechanism `WriteThrough` above already
-// uses for in-place writes (docs/VIEWS.md §6.2). No `unsafe`, no fork.
+// uses for in-place writes (docs/kernels/VIEWS.md §6.2). No `unsafe`, no fork.
 //
 // **The reduction is not the same function candle computes**, and the one place
 // it differs is NaN. candle's predicate is `|x, y| x < y` -- "replace the
 // accumulator when it is smaller than the candidate" -- and every comparison
 // against a NaN is false, so a NaN that is not the *first* element is silently
 // skipped. `max([3, nan, 1])` comes back `3.0` there, where upstream answers
-// `nan` (docs/E2E_REAL.md; `aten.max.default` already works around it with a
+// `nan` (docs/models/E2E_REAL.md; `aten.max.default` already works around it with a
 // separate `x != x` pass, and `max.other` had the same fault in its second
-// operand, docs/SPELLINGS.md). This kernel propagates, which is upstream's rule
+// operand, docs/bindings/SPELLINGS.md). This kernel propagates, which is upstream's rule
 // and also IEEE-754 `maximum`.
 // ---------------------------------------------------------------------------
 
@@ -2970,7 +2970,7 @@ max_scalar_int!(i64);
 /// unobservable.
 ///
 /// Sixteen and not eight or thirty-two: measured, at the real score shape, 0.26
-/// / 0.28 / 0.31 ms for 8 / 16 / 32 lanes on the shape below. docs/SEQLEN.md §7.3.
+/// / 0.28 / 0.31 ms for 8 / 16 / 32 lanes on the shape below. docs/numerics/SEQLEN.md §7.3.
 const AMAX_LANES: usize = 16;
 
 /// The maximum of one contiguous row, NaN-propagating.
@@ -2987,7 +2987,7 @@ const AMAX_LANES: usize = 16;
 /// are one byte against the value's four, so the two accumulators have
 /// different vector widths and LLVM pays to reconcile them on every iteration
 /// -- 0.83 ms with `bool`, 0.28 with `u32`, same arithmetic. All five variants
-/// and their timings are in docs/SEQLEN.md §7.3.
+/// and their timings are in docs/numerics/SEQLEN.md §7.3.
 ///
 /// The one-comparison spelling `!(v <= acc)` is not merely slower, it is
 /// **wrong**: once `acc` is a NaN every subsequent `v <= NaN` is false, so the
@@ -3000,7 +3000,7 @@ const AMAX_LANES: usize = 16;
 /// `amax([-0., 0.])` is `-0.` and `amax([0., -0.])` is `0.`), keeps the *first*
 /// of two equal elements, and splitting a row across lanes can change which
 /// equal element is first. That distinguishes `-0.0` from `+0.0` and nothing
-/// else, because those two compare equal. docs/SEQLEN.md §7.2 works through why
+/// else, because those two compare equal. docs/numerics/SEQLEN.md §7.2 works through why
 /// it cannot reach SDPA's output.
 #[inline(always)]
 fn amax_row<T: MaxScalar>(row: &[T]) -> T {
@@ -3197,7 +3197,7 @@ impl candle_core::CustomOp1 for AMax {
 /// The maximum along `dim`, keeping the reduced dimension as `1`.
 ///
 /// Drop-in for `Tensor::max_keepdim(dim)` apart from the NaN rule above, and
-/// the reason to prefer it is docs/SEQLEN.md §7.
+/// the reason to prefer it is docs/numerics/SEQLEN.md §7.
 pub(crate) fn amax_keepdim(source: &Tensor, dim: usize) -> candle_core::Result<Tensor> {
     // Free when it already is one -- candle's `contiguous` clones the handle
     // rather than the buffer in that case, which is every call SDPA makes.
@@ -3217,7 +3217,7 @@ pub(crate) fn amax_keepdim(source: &Tensor, dim: usize) -> candle_core::Result<T
 //                                               narrowing pass to `acc`
 //     scores.broadcast_add(&mask)               another pass, read + write
 //
-// Measured inside the op at S=1024 (docs/SEQLEN.md §8.2): 1.450 + 2.100 +
+// Measured inside the op at S=1024 (docs/numerics/SEQLEN.md §8.2): 1.450 + 2.100 +
 // 2.133 = 5.68 ms of a 21.2 ms call, thirty times a forward. The mask is the
 // same mask on all thirty of those calls and on every forward after it.
 //
@@ -3305,7 +3305,7 @@ fn scale_and_mask_rows<T: ScoreScalar>(
 }
 
 /// The `CustomOp1` that carries `scale_and_mask_rows` across the storage
-/// boundary, the same mechanism `AMax` above uses and docs/VIEWS.md §6.2
+/// boundary, the same mechanism `AMax` above uses and docs/kernels/VIEWS.md §6.2
 /// describes.
 struct ScaleCausal {
     scale: f64,
@@ -3375,7 +3375,7 @@ impl candle_core::CustomOp1 for ScaleCausal {
 ///
 /// Bit-for-bit the two-op spelling it replaces, element by element -- there is
 /// no reassociation to argue about because nothing is reduced here.
-/// docs/SEQLEN.md §8.3 has the argument and §8.4 the test that would catch it
+/// docs/numerics/SEQLEN.md §8.3 has the argument and §8.4 the test that would catch it
 /// being wrong.
 pub(crate) fn scale_and_causal_mask(source: &Tensor, scale: f64) -> candle_core::Result<Tensor> {
     let source = source.contiguous()?;
@@ -3385,7 +3385,7 @@ pub(crate) fn scale_and_causal_mask(source: &Tensor, scale: f64) -> candle_core:
 // ---------------------------------------------------------------------------
 // The transposed copy, blocked.
 //
-// docs/SEQLEN.md §8.12 named this as the one clean kernel win left in SDPA:
+// docs/numerics/SEQLEN.md §8.12 named this as the one clean kernel win left in SDPA:
 // `k.transpose(2, 3).contiguous()` moves 2.4 MB at ~3.7 GB/s, against
 // upstream's 0.134 ms for the same bytes -- 1.15 ms of a 13.64 ms per-call
 // gap at `S=1024`, which is 8% of the SDPA gap and 7% of the model gap.
@@ -3570,7 +3570,7 @@ pub(crate) fn transposed_contiguous(t: &Tensor) -> candle_core::Result<Tensor> {
 /// A module-level function upstream too, not a tensor member. It is the first
 /// wall on the `torch.save` path -- `torch/_tensor.py:328`, inside
 /// `_reduce_ex_internal`, before anything else about the tensor is looked at
-/// (docs/SAVE.md §1.1) -- and `torch/_tensor.py:158` asks it again on the
+/// (docs/models/SAVE.md §1.1) -- and `torch/_tensor.py:158` asks it again on the
 /// deepcopy path.
 ///
 /// The argument is anything, because upstream's takes anything: it is asked
@@ -3596,7 +3596,7 @@ pub fn has_storage(value: &Bound<'_, PyAny>) -> PyResult<bool> {
 
 
 // ---------------------------------------------------------------------------
-// W5: `grad_fn` as a nullness. docs/BACKWARD4.md.
+// W5: `grad_fn` as a nullness. docs/training/BACKWARD4.md.
 // ---------------------------------------------------------------------------
 
 /// Grad mode, mirrored out of `bootstrap.py`'s `_install_grad_mode` dict.
@@ -3607,7 +3607,7 @@ pub fn has_storage(value: &Bound<'_, PyAny>) -> PyResult<bool> {
 /// `PyDict_GetItem` plus a `PyObject_IsTrue` per op is a cost paid by every
 /// caller including the ones that never differentiate anything. A relaxed load
 /// of an `AtomicBool` is the same shape as `capture::is_active`, which
-/// docs/CAPTURE.md §7 already measured at the same door.
+/// docs/graph/CAPTURE.md §7 already measured at the same door.
 ///
 /// `Ordering::Relaxed` for the same reason capture uses it: there is nothing
 /// else for this flag to be ordered *against*. A thread that flips it and then
@@ -3707,7 +3707,7 @@ pub fn grad_enabled_flag() -> bool {
 /// parameter.
 ///
 /// Every entry was checked against upstream rather than reasoned about
-/// (docs/BACKWARD4.md §3.2): `torch.ops.aten.<op>(param, ...)` on torch 2.13.0
+/// (docs/training/BACKWARD4.md §3.2): `torch.ops.aten.<op>(param, ...)` on torch 2.13.0
 /// reports `grad_fn is None` for all of them.
 ///
 ///   * `detach` is the definition of the boundary -- it is how a caller *asks*
@@ -3770,7 +3770,7 @@ fn collect_tensors<'py>(value: &Bound<'py, PyAny>, out: &mut Vec<Bound<'py, PyAn
 ///
 /// Deliberately allocation-free. It is on the hot path of every dispatch in the
 /// process, including the ones with no autograd anywhere near them, and
-/// `docs/BACKWARD3.md` §4's last row is the reason: a SmolLM2-135M forward at
+/// `docs/training/BACKWARD3.md` §4's last row is the reason: a SmolLM2-135M forward at
 /// `S=8` is 1862 dispatches, and a `Vec` per dispatch to answer `false` 1862
 /// times would be a cost paid by callers who never intend to differentiate.
 fn any_operand_requires_grad(
@@ -3827,8 +3827,8 @@ fn any_operand_requires_grad(
 /// that already exists -- which is `optimizer.step()`'s `add_` turning every
 /// parameter in the model into a non-leaf. Upstream can afford to mark it
 /// because upstream has version counters and a leaf-mutation refusal
-/// (docs/BACKWARD2.md §1.5, W10); here the honest answer is to leave leafness
-/// alone, and `docs/BACKWARD4.md` §4.2 records the divergence that follows:
+/// (docs/training/BACKWARD2.md §1.5, W10); here the honest answer is to leave leafness
+/// alone, and `docs/training/BACKWARD4.md` §4.2 records the divergence that follows:
 /// an activation mutated in place stays a leaf here and does not upstream.
 ///
 /// Errors are not propagated: a marking failure must not turn a working
@@ -3836,7 +3836,7 @@ fn any_operand_requires_grad(
 /// caller is holding it mutably) simply stays a leaf, which is the answer the
 /// shim gave before this round for every tensor.
 /// Returns **whether an output was marked** -- i.e. whether upstream would
-/// have built a graph node for this call. `docs/BACKWARD7.md` §2: the eager
+/// have built a graph node for this call. `docs/training/BACKWARD7.md` §2: the eager
 /// recorder is gated on this `bool` and not on a test of its own, so that a
 /// dispatch which differentiates nothing pays one value already in a register
 /// rather than a second walk of the argument tuple. It is also the *definition*
@@ -3906,7 +3906,7 @@ pub fn mark_from_op(
 // `complex_ops` -- the ops taught `Repr::Complex` by name
 // ---------------------------------------------------------------------------
 //
-// docs/COMPLEX2.md. This module is the counterpart of `quant.rs` and
+// docs/kernels/COMPLEX2.md. This module is the counterpart of `quant.rs` and
 // `vulkan::dispatch`: the arm refuses everywhere by default (`tensor()`), and
 // capability arrives here, one operator at a time, each one having to say what
 // it does with *both* halves.
@@ -3930,12 +3930,12 @@ pub mod complex_ops {
     ///
     /// A pair-of-tensors representation cannot alias an interleaved buffer,
     /// and choosing the pair was the decision that bought the correct `.shape`
-    /// (docs/COMPLEX.md §3.2). So this is a **narrowing**, it is stated here
+    /// (docs/kernels/COMPLEX.md §3.2). So this is a **narrowing**, it is stated here
     /// rather than left to be discovered, it is asserted as a narrowing in
     /// `pytests/test_complex.py::test_view_as_complex_copies_where_upstream_aliases`,
     /// and it is safe for the models measured only because all three of
     /// `llama4`'s call sites feed a freshly computed expression that is never
-    /// written to again. docs/COMPLEX2.md §6.
+    /// written to again. docs/kernels/COMPLEX2.md §6.
     pub fn view_as_complex(py: Python<'_>, input: &PyTensorBase) -> PyResult<Py<PyAny>> {
         const OP: &str = "aten.view_as_complex.default";
         // Upstream's own message, verbatim, for the dtype it cannot take.
@@ -4171,7 +4171,7 @@ pub mod complex_ops {
     /// before anything else can look at the tensor.
     ///
     /// A copy of both halves, which is what this shim's dense `detach`/`alias`
-    /// already do -- they copy rather than alias (docs/OPS4.md §8) -- so the
+    /// already do -- they copy rather than alias (docs/kernels/OPS4.md §8) -- so the
     /// complex arm is not losing an aliasing property the real one had. The
     /// autograd flags are dropped exactly as `detach` drops them.
     pub fn passthrough(py: Python<'_>, input: &PyTensorBase) -> PyResult<Py<PyAny>> {
@@ -4252,7 +4252,7 @@ pub mod complex_ops {
     /// the same one-line "do it to both halves" would work for each. Every op
     /// added to this module is surface that has to be compared against
     /// upstream, and no measured caller reaches them on a complex tensor; they
-    /// refuse at `tensor()` until one does. docs/COMPLEX2.md §5.
+    /// refuse at `tensor()` until one does. docs/kernels/COMPLEX2.md §5.
     pub fn unsqueeze(py: Python<'_>, input: &PyTensorBase, dim: i64) -> PyResult<Py<PyAny>> {
         const OP: &str = "aten.unsqueeze.default";
         let (re, im) = input.complex_parts(OP)?;
@@ -4516,7 +4516,7 @@ mod amax_tests {
     }
 
     /// NaN propagates from **any** position, which is the half of the rule
-    /// candle gets wrong (docs/E2E_REAL.md: `max([3, nan, 1])` is `3.0` there)
+    /// candle gets wrong (docs/models/E2E_REAL.md: `max([3, nan, 1])` is `3.0` there)
     /// and the half a one-comparison `!(v <= acc)` would get wrong is the
     /// other one -- a NaN early in a long row surviving to the end.
     #[test]

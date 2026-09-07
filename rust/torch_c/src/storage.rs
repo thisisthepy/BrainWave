@@ -15,7 +15,7 @@
 //! no way to express that aliasing, so here a storage is a byte buffer that
 //! `TensorBase.set_` **copies out of**.
 //!
-//! That difference is not cosmetic, and docs/CKPT.md §4 has the measurement:
+//! That difference is not cosmetic, and docs/models/CKPT.md §4 has the measurement:
 //! `torch.load`'s two container formats fill the storage at different moments
 //! relative to `set_`.
 //!
@@ -87,7 +87,7 @@ pub struct PyStorageBase {
     ///
     /// `TensorBase.untyped_storage()` cannot lend candle's buffer out as a
     /// `StorageBase` -- candle owns it -- so it copies (`snapshot` below, and
-    /// docs/SAVE.md §3). A copy alone would lose the one thing `torch.save`
+    /// docs/models/SAVE.md §3). A copy alone would lose the one thing `torch.save`
     /// reads a storage's address *for*: `torch/serialization.py:1235` keys the
     /// record table on `storage._cdata`, so two tensors that are views of one
     /// buffer must answer with one value or the file loses that they were
@@ -108,7 +108,7 @@ pub struct PyStorageBase {
     /// `filled` is false and stays false. It exists because
     /// `torch/_subclasses/meta_utils.py:2071` asks a meta tensor for its
     /// storage in order to key an aliasing memo, and a size-and-identity
-    /// handle is exactly what that question wants -- see docs/EXPORT5.md §2 for
+    /// handle is exactly what that question wants -- see docs/graph/EXPORT5.md §2 for
     /// which of upstream's expectations it meets and which it refuses by name.
     device: String,
 }
@@ -148,7 +148,7 @@ impl PyStorageBase {
              here carries a size ({} bytes) and an identity and no bytes at all, \
              which is what meta_utils.py's aliasing memo asks of it; it is not a \
              buffer of zeros standing in for one. Refused rather than answered \
-             (docs/EXPORT5.md §2, storage.rs)",
+             (docs/graph/EXPORT5.md §2, storage.rs)",
             self.len
         ))
     }
@@ -166,7 +166,7 @@ impl PyStorageBase {
                  buffer and cannot lend it out -- so a write here would be \
                  invisible to the tensor it came from. Refused rather than \
                  accepted silently: write to the tensor instead \
-                 (docs/SAVE.md §3, storage.rs)"
+                 (docs/models/SAVE.md §3, storage.rs)"
             ))
         } else {
             not_implemented(format!(
@@ -230,7 +230,7 @@ pub fn snapshot(py: Python<'_>, bytes: Vec<u8>, origin: usize) -> PyResult<Py<Py
 /// The storage handle of a meta tensor: a size and an identity, and no bytes.
 ///
 /// `TensorBase.untyped_storage()`'s meta half, and the answer to
-/// `docs/EXPORT.md` §3.3. `nbytes` is what the tensor's elements *would*
+/// `docs/graph/EXPORT.md` §3.3. `nbytes` is what the tensor's elements *would*
 /// occupy, `storage_id` is `Repr::Meta`'s token (see `tensor.rs`), and `buf`
 /// stays empty -- there is nothing to put in it.
 ///
@@ -512,7 +512,7 @@ impl PyStorageBase {
     /// **The three write doors, all refusing, and this is what makes
     /// `untyped_storage()` honest.**
     ///
-    /// docs/BACKWARD.md §14.3 sized `untyped_storage()` and stopped, on the
+    /// docs/training/BACKWARD.md §14.3 sized `untyped_storage()` and stopped, on the
     /// grounds that a storage which is a copy would let a caller write through
     /// it and have the write land nowhere -- *"a lie on the public surface to
     /// satisfy the one caller that cannot detect it"*. That objection is right
@@ -553,7 +553,7 @@ impl PyStorageBase {
         // is a divergence rather than a gap: `len` here is derived from the
         // meta tensor's shape and dtype at the moment the handle was made, so
         // a resize would leave the storage and the tensor disagreeing about a
-        // number the tensor is the authority on. docs/EXPORT5.md §2 lists it
+        // number the tensor is the authority on. docs/graph/EXPORT5.md §2 lists it
         // among the expectations this handle refuses by name.
         if self.is_meta() {
             return Err(not_implemented(format!(
@@ -561,7 +561,7 @@ impl PyStorageBase {
                  tensor. Upstream resizes one; this handle's size ({} bytes) is \
                  derived from the meta tensor's shape and dtype and is not \
                  independently settable, so resizing would leave the storage and \
-                 the tensor disagreeing (docs/EXPORT5.md §2)",
+                 the tensor disagreeing (docs/graph/EXPORT5.md §2)",
                 self.len
             )));
         }
@@ -669,7 +669,7 @@ impl PyStorageBase {
     ///
     /// `torch.save(obj, f, _use_new_zipfile_serialization=False)` reaches
     /// `_legacy_save`, which writes each storage with this. It is refused for
-    /// the same reason the legacy *reader* is (docs/CKPT.md §4): that format
+    /// the same reason the legacy *reader* is (docs/models/CKPT.md §4): that format
     /// puts `_rebuild_tensor`'s `set_` *before* the bytes arrive, and this
     /// shim's `set_` copies rather than aliases, so a checkpoint written in it
     /// would have to be read back through a path that produces zeros. Writing a
@@ -693,7 +693,7 @@ impl PyStorageBase {
              the legacy format fills a storage *after* _rebuild_tensor has \
              called set_, and this shim's set_ copies instead of aliasing, so \
              anything written in that format reads back as zeros here \
-             (docs/CKPT.md §4, docs/SAVE.md §6). Save with the default zip \
+             (docs/models/CKPT.md §4, docs/models/SAVE.md §6). Save with the default zip \
              container, which this build both writes and reads",
         ))
     }
@@ -737,7 +737,7 @@ impl PyStorageBase {
         Err(not_implemented(
             "torch._C shim: UntypedStorage does not pickle on its own. \
              torch.save does not need it to -- it writes storages as zip \
-             records through persistent_id (docs/SAVE.md) -- so this is \
+             records through persistent_id (docs/models/SAVE.md) -- so this is \
              reached only by pickling a storage directly",
         ))
     }
@@ -789,7 +789,7 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
 }
 
 // ---------------------------------------------------------------------------
-// The `as_strided` write barrier. docs/STRIDED.md.
+// The `as_strided` write barrier. docs/kernels/STRIDED.md.
 // ---------------------------------------------------------------------------
 //
 // `aten.as_strided` promises a **two-way view**: writes through the result are
@@ -798,7 +798,7 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
 // public and `Tensor::from_storage` is public, but the struct that joins them
 // (`Tensor_ { storage: Arc<RwLock<Storage>>, layout }`) has no public field, so
 // the nine internal sites that build a shallow view cannot be reached from
-// here. docs/TAIL3.md §6 and `tools/golden/reach_allow.json` recorded that; it
+// here. docs/kernels/TAIL3.md §6 and `tools/golden/reach_allow.json` recorded that; it
 // is re-verified in `test_strided.py`.
 //
 // So the result is a **gather**, and a gather is silently wrong for a writer in
@@ -812,7 +812,7 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
 // **Why an address is a sound key here and is not one in general.** An address
 // is reused after the allocation it named is freed, so a permanent poison set
 // keyed on one starts refusing writes to unrelated later tensors -- which is
-// exactly why docs/TAIL4.md §1.2 rejected this structure. What removes that
+// exactly why docs/kernels/TAIL4.md §1.2 rejected this structure. What removes that
 // objection is the keep-alive below: a `StridedBarrier` holds a clone of both
 // candle tensors, so neither storage can be freed while its key is registered,
 // so neither key can be reused while it means something. The barrier is
@@ -825,7 +825,7 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
 // aliasing it. This is the same lifetime, reached a different way.
 //
 // What this does not close is written down rather than hidden, in
-// docs/STRIDED.md §4: an alias of the *result* that outlives the result.
+// docs/kernels/STRIDED.md §4: an alias of the *result* that outlives the result.
 
 /// `storage address -> how many live barriers name it`.
 ///

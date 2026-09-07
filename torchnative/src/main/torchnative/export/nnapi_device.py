@@ -1,9 +1,9 @@
 """Execute a serialised NNAPI blob on a real NNAPI runtime, over `adb`.
 
-docs/NPU2.md is the round this belongs to. `nnapi.py` ends at
+docs/graph/NPU2.md is the round this belongs to. `nnapi.py` ends at
 `parse_model`: it decodes the blob back through the layout upstream's
 serialiser wrote, which proves the *layout* and says nothing about arithmetic.
-docs/NPU.md was explicit that this is where the claim stopped -- "structurally
+docs/graph/NPU.md was explicit that this is where the claim stopped -- "structurally
 validated", because no NNAPI runtime exists on a Mac.
 
 This module closes that. It ships the blob, the weight buffers and the input
@@ -24,7 +24,7 @@ Three things it deliberately does not do:
 * **It does not choose the driver silently.** `devices()` lists what the
   runtime offers and the runner is told which one to compile for, because
   "NNAPI executed it" and "the CPU reference driver executed it" are different
-  claims (docs/NPU2.md §3).
+  claims (docs/graph/NPU2.md §3).
 
 Every entry point refuses by name when there is no device, no `adb`, or no NDK
 to build the runner with, so a caller can tell "not executed here" from
@@ -55,7 +55,7 @@ class NnapiDeviceRefused(RuntimeError):
     """No device, no toolchain, or the device would not run the blob."""
 
 
-#: The only directory this module writes to. docs/VULKAN3.md §4's precedent:
+#: The only directory this module writes to. docs/devices/VULKAN3.md §4's precedent:
 #: the emulators are shared, so use what is already there and leave nothing
 #: behind outside a directory the project owns by name.
 DEVICE_DIR = "/data/local/tmp/bw_device"
@@ -159,7 +159,7 @@ def devices(binary: str | None = None, workdir: str | None = None) -> list[dict]
     Read from `ANeuralNetworks_getDeviceCount` on the device rather than
     assumed. On an emulator this is typically a software reference driver and
     the sample drivers that ship with the image -- which is still execution,
-    and docs/NPU2.md says which one answered rather than leaving it as "an
+    and docs/graph/NPU2.md says which one answered rather than leaving it as "an
     NPU".
     """
     import tempfile
@@ -304,7 +304,7 @@ def run_on_device(model, inputs, *, device_name=None, workdir=None) -> dict:
         out_remote = f"{DEVICE_DIR}/npu2_outputs.bin"
         pushed = [out_remote]
         # The device is shared, so the cleanup is in a `finally`: a driver that
-        # refuses (see `nnapi-sample_quant`, docs/NPU2.md §3.6) raises out of
+        # refuses (see `nnapi-sample_quant`, docs/graph/NPU2.md §3.6) raises out of
         # the middle of this, and leaving the blob and a 5 MB binary behind
         # would make a refusal cost the next user disk.
         try:

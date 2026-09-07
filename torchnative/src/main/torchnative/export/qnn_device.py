@@ -17,11 +17,11 @@ Android's own properties and mapped through **ExecuTorch's** chipset table
 (`torchnative.export.qnn.resolve_soc`), and the HTP libraries are located by
 looking for the files.
 
-Nothing here executes a model. docs/QNN.md §6.4 says why: this round could not
+Nothing here executes a model. docs/devices/QNN.md §6.4 says why: this round could not
 lower a QNN artefact -- the host cannot -- so there is nothing to execute, and
 a module that ran *something* and reported success would be reporting on the
 CPU path. What this module does is answer the two questions the device
-procedure in docs/QNN.md §5 starts with, from the device rather than from a
+procedure in docs/devices/QNN.md §5 starts with, from the device rather than from a
 guess: **which SoC is this** and **is the HTP reachable**.
 """
 

@@ -1,13 +1,13 @@
 """`torch.export` — it works, and here is exactly how far that goes.
 
-`docs/EXPORT4.md` §3 listed four claims and answered "not reached" to three of
+`docs/graph/EXPORT4.md` §3 listed four claims and answered "not reached" to three of
 them.  This round answers all four **yes on four hand-written modules** and
 **no on every one of the ten real architectures upstream can export**.  Both
-halves are the result; `docs/EXPORT5.md` is the measurement.
+halves are the result; `docs/graph/EXPORT5.md` is the measurement.
 
 What these tests are shaped against
 -----------------------------------
-`docs/EXPORT.md` §4.2 predicted, in prose, an `ExportedProgram` that "would
+`docs/graph/EXPORT.md` §4.2 predicted, in prose, an `ExportedProgram` that "would
 print, would serialise" and contain **no operators**.  Halfway through this
 round that is precisely what `torch.export.export()` returned, for a nameable
 reason (§6 of the doc: the proxy mode lives on a pre-dispatch stack this shim's
@@ -19,17 +19,17 @@ door never read).  It did not look wrong.  So:
   most likely to lose;
 * the three verdicts `exported` / `replayed` / `agreed` are three separate
   tests, never collapsed, and the agreement tolerance is **derived from
-  upstream's own float32-vs-float64 error** (`docs/AGREE.md`'s method) rather
+  upstream's own float32-vs-float64 error** (`docs/numerics/AGREE.md`'s method) rather
   than chosen;
 * the meta storage handle is tested for what it **refuses** as much as for what
   it answers, because a handle that answered plausibly to everything would have
   satisfied `meta_utils.py` and lied to everyone else.
 
-Every probe asserts `is_shim` before it asserts anything else — `docs/EXPORT4.md`
+Every probe asserts `is_shim` before it asserts anything else — `docs/graph/EXPORT4.md`
 §1 lost hours to a worktree whose vendored tree had no `torch/__init__.py`, so
 every measurement silently came from upstream torch 2.13.0.
 
-`DOCWATCH` markers in `docs/EXPORT5.md` use `ge`, never `eq` on a shared global
+`DOCWATCH` markers in `docs/graph/EXPORT5.md` use `ge`, never `eq` on a shared global
 count.
 """
 
@@ -63,7 +63,7 @@ from torch import nn
 out = {}
 out["is_shim"] = hasattr(torch._C, "_aten_implemented")
 # NOTE: no `torchnative.export.upstream.install()` anywhere in this probe.
-# That is the point of docs/EXPORT5.md §7 -- before the hand-off, every export
+# That is the point of docs/graph/EXPORT5.md §7 -- before the hand-off, every export
 # measurement in this repository was taken under a runtime monkey-patch, and
 # without it export stopped at census name #0.
 
@@ -125,7 +125,7 @@ for name, module, inputs64 in CASES:
         rec["n_call_function"] = len(rec["ops"])
         rec["n_placeholder"] = len([n for n in ep.graph.nodes if n.op == "placeholder"])
         # A lifted constant holding a fake tensor is how an empty graph
-        # disguises itself -- docs/EXPORT5.md §6.
+        # disguises itself -- docs/graph/EXPORT5.md §6.
         rec["constants"] = sorted(getattr(ep, "constants", {}) or {})
         played = attempt(lambda: ep.module()(*inputs32))
         if played["status"] != "ok":
@@ -138,7 +138,7 @@ for name, module, inputs64 in CASES:
 out["cases"] = cases
 
 if out["is_shim"]:
-    # ---- the meta storage handle, docs/EXPORT5.md §2 -----------------------
+    # ---- the meta storage handle, docs/graph/EXPORT5.md §2 -----------------------
     t = torch.empty((3, 4), dtype=torch.float32, device="meta")
     s = attempt(lambda: t.untyped_storage())
     if s["status"] == "ok":
@@ -195,7 +195,7 @@ if out["is_shim"]:
     out["is_contiguous_positional"] = attempt(
         lambda: torch.ones(3).is_contiguous(torch.contiguous_format))
     # Can this build make a channels-last tensor at all? The `False` above is a
-    # fact only while it cannot. docs/EXPORT5.md §3.
+    # fact only while it cannot. docs/graph/EXPORT5.md §3.
     out["channels_last_constructible"] = attempt(
         lambda: torch.ones(2, 3, 4, 5).to(memory_format=torch.channels_last))
 
@@ -225,7 +225,7 @@ if out["is_shim"]:
             torch.ones(3, device="meta")),
     }
 
-    # ---- the guard that had stopped restoring, docs/EXPORT5.md §5 ----------
+    # ---- the guard that had stopped restoring, docs/graph/EXPORT5.md §5 ----------
     seq = []
     torch._C._set_meta_in_tls_dispatch_include(False)
     seq.append(torch._C._meta_in_tls_dispatch_include())
@@ -248,7 +248,7 @@ if out["is_shim"]:
     torch._C._set_meta_in_tls_dispatch_include(False)
     out["preserve_guard_nested"] = nested
 
-    # ---- the hand-off, docs/EXPORT5.md §7 ----------------------------------
+    # ---- the hand-off, docs/graph/EXPORT5.md §7 ----------------------------------
     from torchnative.export import upstream
     report = upstream.install()
     out["handoff"] = {
@@ -323,14 +323,14 @@ def _upstream(_cache={}):
 # ---------------------------------------------------------------------------
 
 def _rel(x, y):
-    """`max|x-y| / max|y|` -- the scale-relative error docs/AGREE.md uses."""
+    """`max|x-y| / max|y|` -- the scale-relative error docs/numerics/AGREE.md uses."""
     num = max(abs(p - q) for p, q in zip(x, y))
     den = max(abs(q) for q in y) or 1.0
     return num / den
 
 
 def _derived_tolerance(up):
-    """`docs/AGREE.md`'s method, re-run here rather than transcribed.
+    """`docs/numerics/AGREE.md`'s method, re-run here rather than transcribed.
 
     For each case, upstream's **own** float32 answer is scored against its own
     float64 answer.  The tolerance is the p90 of that distribution, floored at
@@ -339,7 +339,7 @@ def _derived_tolerance(up):
     The floor is doing the work on this population and that is worth saying
     plainly: these four modules are numerically easy (p90 lands near 0.4 ulp),
     and without a floor the tolerance would be tighter than float32 arithmetic
-    can be relied on to be.  `docs/AGREE.md` puts the floor there for exactly
+    can be relied on to be.  `docs/numerics/AGREE.md` puts the floor there for exactly
     that case — "so that a population which happened to be numerically easy
     could not drive the tolerance below a few ulp".
     """
@@ -353,7 +353,7 @@ def _derived_tolerance(up):
 def test_the_tolerance_is_derived_from_upstreams_own_error_and_not_chosen():
     """The number has to come from a measurement, or the agreement claim is empty.
 
-    This is `docs/AGREE.md`'s rule and `docs/EXPORT4.md` §9's reason for keeping
+    This is `docs/numerics/AGREE.md`'s rule and `docs/graph/EXPORT4.md` §9's reason for keeping
     `agreed` as its own verdict.  Asserted here rather than trusted: the
     tolerance must equal the p90-floored-at-8-ulp of upstream's own
     float32-vs-float64 error, and every one of those errors must be a real
@@ -380,7 +380,7 @@ def test_exported_torch_export_returns_an_exported_program():
     """Verdict 1 of 3, and **the weakest of the three.**
 
     It is separated from the other two because it is the one that can be true
-    while the others are false without looking wrong at all — `docs/EXPORT.md`
+    while the others are false without looking wrong at all — `docs/graph/EXPORT.md`
     §4.2, and this round met that failure in the flesh (§6 of the doc).
     """
     if not _available():
@@ -395,7 +395,7 @@ def test_the_exported_graph_is_not_empty_which_is_the_failure_that_looks_right()
     """Verdict 1.5: an `ExportedProgram` holding no operators is not an export.
 
     **This test exists because that graph was really produced.** Before
-    `docs/EXPORT5.md` §6, `torch.export.export()` on `x.relu()` returned:
+    `docs/graph/EXPORT5.md` §6, `torch.export.export()` on `x.relu()` returned:
 
         graph():
             %c_lifted_tensor_0 : [num_users=1] = placeholder[...]
@@ -418,14 +418,14 @@ def test_the_exported_graph_is_not_empty_which_is_the_failure_that_looks_right()
         assert c.get("exported"), (name, c.get("export_error"))
         assert c["n_call_function"] > 0, (
             f"{name}: torch.export.export() returned an ExportedProgram whose "
-            f"graph holds NO operators. docs/EXPORT.md §4.2 is this exact "
+            f"graph holds NO operators. docs/graph/EXPORT.md §4.2 is this exact "
             f"failure; do not relax this test to 'did it export'."
         )
         assert not c["constants"], (
             f"{name}: the exported program lifted constants {c['constants']}. "
             f"That is how an untraced computation hides -- the answer is "
             f"folded into a constant and the input goes unused "
-            f"(docs/EXPORT5.md §6)."
+            f"(docs/graph/EXPORT5.md §6)."
         )
 
 
@@ -469,7 +469,7 @@ def test_agreed_the_replay_matches_upstream_element_wise_at_a_derived_tolerance(
 def test_the_agreement_is_bit_identical_and_not_merely_inside_the_tolerance():
     """Recorded separately, because the two are different results.
 
-    `docs/EXPORT4.md` §9 makes this point about `export_sweep.py` recording the
+    `docs/graph/EXPORT4.md` §9 makes this point about `export_sweep.py` recording the
     worst deviation rather than a boolean: a boolean cannot tell bit-identical
     from just-inside-tolerance, and that difference is the whole question once
     decompositions are involved.  Here there are no decompositions yet and the
@@ -482,15 +482,15 @@ def test_the_agreement_is_bit_identical_and_not_merely_inside_the_tolerance():
         assert c["replay32"] == up["cases"][name]["eager32"], (
             f"{name}: agreement is no longer bit-identical. That may be fine -- "
             f"check it against the derived tolerance -- but it is a change and "
-            f"docs/EXPORT5.md §8 says it was exact."
+            f"docs/graph/EXPORT5.md §8 says it was exact."
         )
 
 
 def test_the_shim_and_upstream_agree_on_which_operators_the_graph_holds():
     """Same operators, and the **overload** disagreement named rather than hidden.
 
-    `docs/EXPORT.md` §5 found `capture.rs` recording `aten.mul.Scalar` where
-    upstream dispatches `aten.mul.Tensor`; `docs/EXPORT4.md` §5 found the same
+    `docs/graph/EXPORT.md` §5 found `capture.rs` recording `aten.mul.Scalar` where
+    upstream dispatches `aten.mul.Tensor`; `docs/graph/EXPORT4.md` §5 found the same
     difference reaching a `TorchDispatchMode`.  It now reaches the **exported
     graph**, which is the front end that matters most, because Core ATen and
     ExecuTorch's Edge dialect are defined per overload.
@@ -518,7 +518,7 @@ def test_the_shim_and_upstream_agree_on_which_operators_the_graph_holds():
             disagreements[name] = (mine, theirs)
     # The known one, pinned so that closing it is noticed.
     assert "scalar_chain" in disagreements, (
-        "the .Scalar/.Tensor overload disagreement (docs/EXPORT.md §5) no "
+        "the .Scalar/.Tensor overload disagreement (docs/graph/EXPORT.md §5) no "
         "longer appears in the exported graph. If it was closed, say so in a "
         "doc and delete this assertion deliberately."
     )
@@ -531,11 +531,11 @@ def test_the_shim_and_upstream_agree_on_which_operators_the_graph_holds():
 # ---------------------------------------------------------------------------
 
 def test_a_meta_tensor_answers_a_storage_handle_with_a_size_and_no_bytes():
-    """`docs/EXPORT.md` §3.3, closed.
+    """`docs/graph/EXPORT.md` §3.3, closed.
 
     The three numbers that make it a handle rather than a buffer: the size is
     the tensor's real footprint, the device says meta, and `filled` is false and
-    stays false -- which is what keeps `set_`'s guard (docs/CKPT.md §4) able to
+    stays false -- which is what keeps `set_`'s guard (docs/models/CKPT.md §4) able to
     refuse it.
     """
     if not _available():
@@ -661,7 +661,7 @@ def test_channels_last_is_false_as_a_fact_because_the_build_cannot_make_one():
     tensor, and that is only *true* while no tensor in this build can be in that
     layout.  So the test checks the premise: constructing a channels-last tensor
     must fail.  The day it succeeds, this test fails -- and that is the day the
-    `False` above starts lying, which is exactly `docs/EXPORT4.md` §6.5's shape
+    `False` above starts lying, which is exactly `docs/graph/EXPORT4.md` §6.5's shape
     of argument for the meta `stride()`.
     """
     if not _available():
@@ -671,7 +671,7 @@ def test_channels_last_is_false_as_a_fact_because_the_build_cannot_make_one():
     assert made["status"] == "raise", (
         "this build constructed a channels-last tensor, so answering False to "
         "is_contiguous(memory_format=channels_last) is no longer a fact about "
-        "the build -- it is now a wrong answer (docs/EXPORT5.md §3)"
+        "the build -- it is now a wrong answer (docs/graph/EXPORT5.md §3)"
     )
 
 
@@ -682,8 +682,8 @@ def test_channels_last_is_false_as_a_fact_because_the_build_cannot_make_one():
 def test_a_setter_that_cannot_take_effect_refuses_instead_of_accepting():
     """The shape this repository keeps meeting, met four more times.
 
-    `_len_torch_dispatch_stack` answering a constant `0` (docs/EXPORT.md §2.2)
-    and `no_dispatch()` suppressing nothing (docs/EXPORT4.md §5) are both "a
+    `_len_torch_dispatch_stack` answering a constant `0` (docs/graph/EXPORT.md §2.2)
+    and `no_dispatch()` suppressing nothing (docs/graph/EXPORT4.md §5) are both "a
     call that entered, reported itself absent, and changed nothing".  A setter
     whose effect its own getter cannot see is the same failure.
 
@@ -700,7 +700,7 @@ def test_a_setter_that_cannot_take_effect_refuses_instead_of_accepting():
         assert s[refused]["status"] == "raise", (
             f"{refused} was accepted. Its getter cannot report the change, so "
             f"accepting it makes the setter invisible to its own effect "
-            f"(docs/EXPORT5.md §5): {s[refused]}"
+            f"(docs/graph/EXPORT5.md §5): {s[refused]}"
         )
         assert s[refused]["type"] == "NotImplementedError", s[refused]
 
@@ -748,7 +748,7 @@ def test_dispatch_key_set_is_device_only_and_matches_upstreams_spelling():
 def test_functionality_to_backend_keys_matches_upstream_key_for_key():
     """**This test exists because its nullification went uncaught.**
 
-    `docs/EXPORT5.md` §11 records it: replacing the whole body with
+    `docs/graph/EXPORT5.md` §11 records it: replacing the whole body with
     `return []` broke nothing.  Every suite stayed green and
     `torch.export.export()` still worked, because the only caller is
     `torch/utils/_python_dispatch.py::_push_mode`, which uses the result to
@@ -763,7 +763,7 @@ def test_functionality_to_backend_keys_matches_upstream_key_for_key():
     shim so the loop has no body either way — which is precisely why it was
     invisible.  It is a **cache invalidation that quietly invalidates nothing**,
     the same "entered and changed nothing" shape as
-    `_len_torch_dispatch_stack`'s constant `0` (docs/EXPORT.md §2.2), and it
+    `_len_torch_dispatch_stack`'s constant `0` (docs/graph/EXPORT.md §2.2), and it
     would surface as a stale handler rather than as an error.
 
     So the answer is checked against **upstream's**, key for key, rather than
@@ -793,7 +793,7 @@ def test_functionality_to_backend_keys_matches_upstream_key_for_key():
     # entry. That is pre-existing -- `_functionality_to_backend_keys` is derived
     # from the enum and reports exactly what the enum holds -- and it is pinned
     # here rather than smoothed over, because the *difference* is the thing that
-    # must not grow. docs/EXPORT5.md §11.
+    # must not grow. docs/graph/EXPORT5.md §11.
     #
     # A transcribed table would have listed `AutogradMAIA` and answered a key
     # the enum does not have; deriving from the enum and diffing against
@@ -814,7 +814,7 @@ def test_functionality_to_backend_keys_matches_upstream_key_for_key():
     assert len(theirs["Dense"]) == 16, theirs["Dense"]
     assert mine["Dense"], (
         "the functionality keys answered an empty list, which is the "
-        "nullification docs/EXPORT5.md §11 found uncaught"
+        "nullification docs/graph/EXPORT5.md §11 found uncaught"
     )
 
 
@@ -823,7 +823,7 @@ def test_functionality_to_backend_keys_matches_upstream_key_for_key():
 # ---------------------------------------------------------------------------
 
 def test_preserve_dispatch_key_guard_actually_restores_what_it_saved():
-    """The defect, as a test. `docs/EXPORT5.md` §5.
+    """The defect, as a test. `docs/graph/EXPORT5.md` §5.
 
     `_PreserveDispatchKeyGuard`'s one-line description has always read "saves
     and restores the whole TLS key state", and until this round it saved and
@@ -864,12 +864,12 @@ def test_the_guard_restores_to_what_it_saw_rather_than_to_a_constant():
 # ---------------------------------------------------------------------------
 
 def test_the_census_names_are_present_with_no_monkey_patch_at_all():
-    """`docs/EXPORT.md` §8's hand-off, paid -- and this is how it is checked.
+    """`docs/graph/EXPORT.md` §8's hand-off, paid -- and this is how it is checked.
 
     Every measurement in the probe above runs **without** calling
     `torchnative.export.upstream.install()`.  Before this round that was not
     possible: `export_sweep.py` against the shim stopped at census name #0 on
-    all 40 architectures for exactly that reason, and `docs/EXPORT4.md` §1.1
+    all 40 architectures for exactly that reason, and `docs/graph/EXPORT4.md` §1.1
     recorded that every export number in the repository was taken under the
     patch.
 
@@ -890,7 +890,7 @@ def test_the_census_names_are_present_with_no_monkey_patch_at_all():
     )
     assert h["rebound"] == 0, (
         "the rebind pass repointed bindings, which means something was patched "
-        "after `import torch` -- the exact cost docs/EXPORT.md §8 moved this "
+        "after `import torch` -- the exact cost docs/graph/EXPORT.md §8 moved this "
         f"code to remove: {h['rebound']}"
     )
 

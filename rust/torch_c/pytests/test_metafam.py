@@ -1,4 +1,4 @@
-"""docs/METAFAM.md -- closing the FAMILIES docs/VOICE4.md left open.
+"""docs/kernels/METAFAM.md -- closing the FAMILIES docs/architectures/VOICE4.md left open.
 
 VOICE4.md §4 gave `aten.sum.default` and `aten.view.default` meta kernels
 because BigVGAN's `__init__` needed exactly those two overloads, and said so
@@ -8,14 +8,14 @@ closed two MEMBERS, not their families. `sum.dim_IntList`, `mean.dim`,
 reduction family) and `reshape.default`, `t.default`, `transpose.int`,
 `permute.default`, `unsqueeze.default`, `squeeze.dim`, `squeeze.default` and
 `slice.Tensor` (the view/shape family) sat in the same
-`docs/META.md` §7.4 table with no meta kernel, despite every one of them
+`docs/devices/META.md` §7.4 table with no meta kernel, despite every one of them
 already carrying a dense kernel and golden cases (`_aten_implemented()`
 included all of them before this round -- the same finding VOICE4.md made
 about `sum`/`view`, extended to their siblings).
 
 Every kernel here calls the SAME shape/dtype helper its dense sibling already
 factored out (`reduced_dims`, `sum_natural_tag`, `resolve_shape`,
-`normalise_dim`, ...) rather than restating the rule -- docs/META.md §7.1's
+`normalise_dim`, ...) rather than restating the rule -- docs/devices/META.md §7.1's
 argument for why a meta kernel that disagrees with its own dense kernel is
 worse than no meta kernel at all: nothing downstream can tell the difference
 until a value is read, and by then the wrong shape has already propagated.
@@ -248,7 +248,7 @@ def _compare(prefix, min_cases):
 def test_sum_dim_int_list_answers_what_upstream_answers():
     """Shape drops the reduced axes (or keeps them at size 1); dtype is
     `sum_natural_tag` -- the SAME function `aten.sum.default`'s meta kernel
-    already calls, per docs/META.md §7.1."""
+    already calls, per docs/devices/META.md §7.1."""
     _compare("sumdim_", 10)
 
 
@@ -334,7 +334,7 @@ def test_slice_tensor_answers_what_upstream_answers():
 
 # --------------------------------------------------------------------------
 # The manifest claim itself, asserted rather than only written down --
-# docs/VOICE4.md §4.1's move, extended to every op this round adds.
+# docs/architectures/VOICE4.md §4.1's move, extended to every op this round adds.
 # --------------------------------------------------------------------------
 
 _NEW_META_OPS = (

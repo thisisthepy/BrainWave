@@ -1,8 +1,8 @@
 """The `torch.export` census names — **moved, and this is what is left.**
 
-`docs/EXPORT.md` §8 described this module as "a staging area, not the final
-home" and wrote the patch that would move it.  `docs/EXPORT4.md` §10 listed
-paying that debt as the next mechanical task.  `docs/EXPORT5.md` §7 paid it:
+`docs/graph/EXPORT.md` §8 described this module as "a staging area, not the final
+home" and wrote the patch that would move it.  `docs/graph/EXPORT4.md` §10 listed
+paying that debt as the next mechanical task.  `docs/graph/EXPORT5.md` §7 paid it:
 every implementation that used to live here is now in
 `rust/torch_c/src/bootstrap.py`, installed at the end of its `install()`,
 before any `from torch._C import ...` in the vendored tree has run.
@@ -26,8 +26,8 @@ And the measurement that made it urgent rather than tidy: before the move,
 `rust/torch_c/pytests/export_sweep.py` run against the shim stopped at census
 name #0 (`torch._C._unset_dispatch_mode`) on **every** architecture, because
 the sweep's subprocess never called `install()`.  Every export number in
-`docs/EXPORT.md` and `docs/EXPORT4.md` was taken under the patch, and
-`docs/EXPORT4.md` §1.1 said so.  After the move the names are simply there.
+`docs/graph/EXPORT.md` and `docs/graph/EXPORT4.md` was taken under the patch, and
+`docs/graph/EXPORT4.md` §1.1 said so.  After the move the names are simply there.
 """
 
 from __future__ import annotations
@@ -50,8 +50,8 @@ def _bootstrap():
         raise RuntimeError(
             "torchnative.export.upstream: the torch._C shim's bootstrap module is "
             "not loaded, so the census names it now owns cannot be reached. This "
-            "file stopped implementing them in docs/EXPORT5.md §7; import torch "
-            "from the vendored tree first (see docs/EXPORT5.md)"
+            "file stopped implementing them in docs/graph/EXPORT5.md §7; import torch "
+            "from the vendored tree first (see docs/graph/EXPORT5.md)"
         )
     return module
 
@@ -82,7 +82,7 @@ class InstallReport:
 
 #: The `torch._C` names the bootstrap now supplies.  Unchanged from the tuple
 #: this module carried while it installed them, so the census in
-#: `docs/EXPORT.md` §2 and the tests that read it cannot drift apart silently.
+#: `docs/graph/EXPORT.md` §2 and the tests that read it cannot drift apart silently.
 _NAMES = (
     "_unset_dispatch_mode",
     "_set_dispatch_mode",
@@ -165,6 +165,6 @@ def __getattr__(name):
     raise AttributeError(
         f"torchnative.export.upstream has no attribute {name!r}. The "
         f"implementations moved to rust/torch_c/src/bootstrap.py in "
-        f"docs/EXPORT5.md §7; this module forwards to it and the bootstrap does "
+        f"docs/graph/EXPORT5.md §7; this module forwards to it and the bootstrap does "
         f"not have that name either."
     )

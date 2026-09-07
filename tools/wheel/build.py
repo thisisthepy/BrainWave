@@ -30,14 +30,14 @@ What it does beyond `pip wheel .`:
               from `CARGO_TARGET_DIR/<triple>/release/` -- and until 2026-08-29
               nothing looked at their age, so a five-day-old extension shipped
               with an exit code of 0 and passed every check downstream (§
-              `artefact_verdict`, docs/WHEEL.md §11).
+              `artefact_verdict`, docs/platform/WHEEL.md §11).
 
   repack      Two fixes that have no setuptools spelling, applied to the
               finished archive (§ `_repack`):
                 - `torch-<v>.dist-info/` from upstream, so that
                   `importlib.metadata.version("torch")` answers. transformers
                   gates the entire torch integration on that call
-                  (docs/VENDOR.md), so it is load-bearing, not decoration.
+                  (docs/platform/VENDOR.md), so it is load-bearing, not decoration.
                 - the Mach-O install name of `_C.abi3.so`, which cargo sets to
                   the absolute path of the build machine's target directory.
 
@@ -66,7 +66,7 @@ exactly the three that are platform-shaped (§ `TARGETS`):
                   compatibility is not a property of the interpreter build, so
                   the Linux `_sysconfigdata_*.py` has no field for it. The floor
                   comes from the artefact's own `.gnu.version_r`, which is where
-                  auditwheel reads it (§ `LinuxTarget`, docs/LINUX.md §5).
+                  auditwheel reads it (§ `LinuxTarget`, docs/platform/LINUX.md §5).
 
                   `win_amd64` / `win_arm64` are the odd pair: no floor exists to
                   compute, so the tag is a *name*. It is still not written down
@@ -76,13 +76,13 @@ exactly the three that are platform-shaped (§ `TARGETS`):
                   `win_aarch64` is exactly as plausible as `win_arm64` to
                   everybody except pip.
 
-Each non-Apple platform carries two architectures (docs/WHEELMATRIX.md). One of
+Each non-Apple platform carries two architectures (docs/platform/WHEELMATRIX.md). One of
 the nine targets **refuses**: `--target android-x86_64`, because no
 x86_64-linux-android CPython exists to derive a tag from and none can be
 obtained here -- § `_ANDROID_X86_64_REFUSAL` has the whole reason. It is listed
 rather than omitted so the refusal names what is missing, instead of the target
 looking like one nobody thought about; `--target linux-x86_64` was in that state
-until docs/LINUX.md §9 made cargo-zigbuild work, and is now built and executed.
+until docs/platform/LINUX.md §9 made cargo-zigbuild work, and is now built and executed.
 
 Then check it for real -- building is not the proof:
 
@@ -395,7 +395,7 @@ def _retag(name: str, plat: str) -> str:
 # distribution the extension is built against -- `ANDROID_API_LEVEL` and
 # `IPHONEOS_DEPLOYMENT_TARGET` in its `_sysconfigdata_*.py`. Hardcoding either
 # would mean the tag stays put when the distribution is replaced, which is the
-# same class of lie as the `universal2` tag in §3.3 of docs/WHEEL.md.
+# same class of lie as the `universal2` tag in §3.3 of docs/platform/WHEEL.md.
 
 TARGET_PYTHON_ROOT = Path(os.environ.get(
     "TORCHNATIVE_TARGET_PYTHON", "/Volumes/macMini/caches/target-python"))
@@ -437,7 +437,7 @@ CRATE = REPO / "rust" / "torch_c"
 #
 #   * building here means writing down a second spelling of the cross build.
 #     The device one needs PYO3_CONFIG_FILE (whose contents live in
-#     docs/WHEEL.md §7.1, not in this repository), PYO3_CROSS_LIB_DIR and
+#     docs/platform/WHEEL.md §7.1, not in this repository), PYO3_CROSS_LIB_DIR and
 #     TORCHNATIVE_PYTHON_FRAMEWORK_DIR; the Android one goes through
 #     `scripts/device_android.sh build` and `cargo ndk --platform 21`. A second
 #     spelling can drift from the first, and this repository's whole class of
@@ -762,7 +762,7 @@ class Target:
     # `if platform.system() == "Windows": return`, while `_load_dll_libraries()`
     # globs `torch/lib/*.dll` and LoadLibrary's every hit -- so an empty stub
     # there would be loaded for nothing, and a failure to load it would be
-    # raised rather than swallowed. See docs/WINDOWS.md §4.3.
+    # raised rather than swallowed. See docs/platform/WINDOWS.md §4.3.
     global_deps_name: str | None = "libtorch_global_deps.so"
 
     # Where the extension sits in the archive, which is not the same question as
@@ -784,7 +784,7 @@ class Target:
     #: says the build has not happened yet and names the command that would do
     #: it. A refusal says no such command exists on this machine, and running
     #: the hint cannot help -- a different sentence, and the one
-    #: `--target linux-x86_64` needed before docs/LINUX.md §9 made
+    #: `--target linux-x86_64` needed before docs/platform/LINUX.md §9 made
     #: cargo-zigbuild work.
     #:
     #: Checked in `main` *before* the artefact, so a refusing target answers
@@ -928,7 +928,7 @@ class IOSTarget(Target):
         self.sdk = sdk
         self.platform_id = platform_id
         self.rebuild_hint = (
-            "re-run the cross build for this target -- docs/WHEEL.md §7.1 has "
+            "re-run the cross build for this target -- docs/platform/WHEEL.md §7.1 has "
             f"the exact command (cargo build --release --target {rust_target}, "
             "with PYO3_CONFIG_FILE and PYO3_CROSS_LIB_DIR"
             + (", TORCHNATIVE_PYTHON_FRAMEWORK_DIR"
@@ -997,7 +997,7 @@ class IOSTarget(Target):
             _fail(
                 f"{self.artefact} does not link Python.framework "
                 f"(LC_LOAD_DYLIB: {info.get('dylibs')}). See "
-                "docs/RUST_CROSSBUILD.md §0.5, and check "
+                "docs/platform/RUST_CROSSBUILD.md §0.5, and check "
                 "TORCHNATIVE_PYTHON_FRAMEWORK_DIR"
             )
 
@@ -1029,7 +1029,7 @@ class LinuxTarget(Target):
     would let a wheel linking, say, `libopenblas.so` claim a tag whose entire
     promise is that it does not.
 
-    The artefact is buildable on this machine as of docs/LINUX.md §9, with
+    The artefact is buildable on this machine as of docs/platform/LINUX.md §9, with
     cargo-zigbuild; before that it was not, and this class still refuses by name
     when the file is missing rather than dropping out of `--target`'s choices.
     """
@@ -1081,7 +1081,7 @@ class LinuxTarget(Target):
             key, rust_target,
             # No `prefix/` subdirectory: this distribution is
             # python-build-standalone's `install_only` layout, like the iOS ones
-            # and unlike the Android one. docs/LINUX.md §3 compares the four.
+            # and unlike the Android one. docs/platform/LINUX.md §3 compares the four.
             TARGET_PYTHON_ROOT / rust_target, "lib_C.so",
         )
         #: The architecture as three different vocabularies spell it, which all
@@ -1098,7 +1098,7 @@ class LinuxTarget(Target):
             f"PYO3_CROSS_LIB_DIR=<target-python>/lib cargo zigbuild --release "
             f"--target {rust_target}.{self.GLIBC_TARGET[0]}."
             f"{self.GLIBC_TARGET[1]}, from rust/torch_c "
-            "(docs/LINUX.md §9.2 has the whole environment; §9.1 installs "
+            "(docs/platform/LINUX.md §9.2 has the whole environment; §9.1 installs "
             "cargo-zigbuild and ziglang, which it needs)"
         )
 
@@ -1142,7 +1142,7 @@ class LinuxTarget(Target):
                 "  question having no answer, and the two must not be confused.\n"
                 "  An ELF gets version requirements from the libc it was linked\n"
                 "  against; an image linked with `-shared` against no libc at all\n"
-                "  links cleanly and lands here (docs/LINUX.md §2.6).\n"
+                "  links cleanly and lands here (docs/platform/LINUX.md §2.6).\n"
                 f"  Fix: {self.rebuild_hint}"
             )
 
@@ -1217,13 +1217,13 @@ class LinuxTarget(Target):
         return tag
 
     #: The glibc `cc()` compiles the global-deps stub against, and the number
-    #: docs/LINUX.md §9.2 passes to `cargo zigbuild --target
+    #: docs/platform/LINUX.md §9.2 passes to `cargo zigbuild --target
     #: x86_64-unknown-linux-gnu.<here>` for the Rust artefact. Kept in one place
     #: so the two members of the wheel are named the same version, but it does
     #: **not** set the tag: the tag is read off the artefact (see the class
     #: docstring), and lowering this constant would not lower the tag. The stub
     #: is empty, so it references no glibc symbol at all and records no version
-    #: requirement whatever this says -- measured in docs/LINUX.md §9.3. That is
+    #: requirement whatever this says -- measured in docs/platform/LINUX.md §9.3. That is
     #: why there is no cross-check between the two here: it could not fail.
     GLIBC_TARGET = (2, 17)
 
@@ -1258,7 +1258,7 @@ class LinuxTarget(Target):
         Both halves in one command, because that is what `global_deps_stub`
         runs. This machine can do the two halves separately -- Apple clang emits
         ELF x86-64 objects and rustup's `rust-lld` links them, measured in
-        docs/LINUX.md §2.7 -- and still cannot do them in one: driving lld
+        docs/platform/LINUX.md §2.7 -- and still cannot do them in one: driving lld
         through `clang --ld-path=` dies on `Library not loaded:
         @rpath/libLLVM.dylib`, because SIP strips `DYLD_LIBRARY_PATH` when
         `/usr/bin/clang` execs. So the separate-halves result is a fact about
@@ -1291,9 +1291,9 @@ class LinuxTarget(Target):
             "have to be built\n"
             "  by the host cc, which puts a Mach-O inside a Linux wheel and "
             "makes `import torch`\n"
-            "  fail on Linux only (docs/VENDOR.md wall 1).\n"
+            "  fail on Linux only (docs/platform/VENDOR.md wall 1).\n"
             "  Fix: `pip install ziglang` into any interpreter on PATH "
-            "(docs/LINUX.md §9.1),\n"
+            "(docs/platform/LINUX.md §9.1),\n"
             "  or point CC_x86_64_unknown_linux_gnu at a cross gcc such as "
             "x86_64-linux-gnu-gcc."
         )
@@ -1504,7 +1504,7 @@ class WindowsTarget(Target):
     *does* make decidable: the image is a PE32+ DLL of this target's machine,
     and -- in `verify_windows.py` -- every symbol it imports is attributed to a
     named DLL by the import table. That second one has no Linux counterpart
-    (docs/LINUX.md §6.1) and is as strong as the iOS device check.
+    (docs/platform/LINUX.md §6.1) and is as strong as the iOS device check.
 
     Two structural differences from every other target, both forced by upstream
     torch rather than chosen here:
@@ -1562,7 +1562,7 @@ class WindowsTarget(Target):
             "PYO3_CROSS_LIB_DIR=<target-python>/libs "
             "PYO3_CROSS_PYTHON_VERSION=3.13 "
             f"cargo xwin build --release --target {rust_target}, from "
-            "rust/torch_c (docs/WINDOWS.md §3 has the whole environment, "
+            "rust/torch_c (docs/platform/WINDOWS.md §3 has the whole environment, "
             "including the four MSVC tool shims §3.2 installs, which "
             "cargo-xwin needs and this machine does not otherwise have)"
         )
@@ -1599,7 +1599,7 @@ class WindowsTarget(Target):
                     f"{self.python_root} has no {relative} -- it is not a "
                     f"{self.pe_machine} Windows CPython\n"
                     "  distribution of the shape this target builds against "
-                    "(docs/WINDOWS.md §2)."
+                    "(docs/platform/WINDOWS.md §2)."
                 )
         # And it has to be the *right* architecture's, not merely a Windows
         # one. `_check_distribution` above is satisfied by either of the two
@@ -1691,7 +1691,7 @@ class WindowsTarget(Target):
 
     def cc(self) -> list[str]:            # pragma: no cover - never reached
         _fail("the Windows wheel carries no global-deps library, so no C "
-              "compiler is needed for it (docs/WINDOWS.md §4.3)")
+              "compiler is needed for it (docs/platform/WINDOWS.md §4.3)")
 
     def check_image(self, data: bytes, what: str) -> None:
         info = pe_info(data)
@@ -1714,7 +1714,7 @@ class PyEmscriptenTarget(Target):
     `IOSTarget` reads `IPHONEOS_DEPLOYMENT_TARGET`, `LinuxTarget` reads the
     artefact's own `.gnu.version_r`. **The principle survives here and its usual
     implementation does not**, and the gap between those two sentences is the
-    whole of docs/WASM.md §9.4a:
+    whole of docs/platform/WASM.md §9.4a:
 
         pyodide-lock.json  ->  info.abi_version = "2026_0"     <- the tag
                                info.platform    = "emscripten_5_0_3"
@@ -1737,7 +1737,7 @@ class PyEmscriptenTarget(Target):
     is the same shape of guard for the opposite problem -- here the file exists,
     is readable, and is the wrong source.
 
-    The rest is small, which is the finding of docs/WASM.md §9.3: `abi3` is
+    The rest is small, which is the finding of docs/platform/WASM.md §9.3: `abi3` is
     inert on this target rather than harmful, so `extension_member` and
     `global_deps_name` are both inherited unchanged. `.abi3.so` really is in
     Pyodide's `EXTENSION_SUFFIXES` and `cp313-abi3-pyemscripten_2026_0_wasm32`
@@ -1759,14 +1759,14 @@ class PyEmscriptenTarget(Target):
         "EM_CACHE=/tmp/em-cache-<scratch> "
         "PATH=<emsdk>/upstream/emscripten:$PATH "
         "cargo build --release --target wasm32-unknown-emscripten, from "
-        "rust/torch_c (docs/WASM.md §9.6; never write to the shared emsdk "
+        "rust/torch_c (docs/platform/WASM.md §9.6; never write to the shared emsdk "
         "cache -- set EM_CACHE first)"
     )
 
     def sysconfig(self) -> dict[str, object]:
         """Refuses. The tag is not in there, and the plausible answer is wrong.
 
-        Structural on purpose (docs/WASM.md §9.4a). The file this would read --
+        Structural on purpose (docs/platform/WASM.md §9.4a). The file this would read --
         `_sysconfigdata__emscripten_wasm32-emscripten.py`, inside Pyodide's
         `python_stdlib.zip` -- exists and is readable, and every value in it is
         about CPython's build rather than about Pyodide. Its
@@ -1784,7 +1784,7 @@ class PyEmscriptenTarget(Target):
             "`emscripten_5_0_3_wasm32` -- a real tag,\n"
             "  accepted by packaging, published by nobody. Read\n"
             f"  {PYODIDE_ROOT / 'pyodide-lock.json'} instead; `platform_tag` "
-            "does. docs/WASM.md §9.4a."
+            "does. docs/platform/WASM.md §9.4a."
         )
 
     def _lock(self) -> dict:
@@ -1794,7 +1794,7 @@ class PyEmscriptenTarget(Target):
             _fail(
                 f"no {lock} -- this is the only machine-readable place "
                 "PYODIDE_ABI_VERSION exists\n"
-                "  (docs/WASM.md §9.4a), so without it the tag cannot be "
+                "  (docs/platform/WASM.md §9.4a), so without it the tag cannot be "
                 "derived at all. Set\n"
                 "  TORCHNATIVE_PYODIDE to a Pyodide distribution."
             )
@@ -1812,7 +1812,7 @@ class PyEmscriptenTarget(Target):
         tag = _normalise(f"pyemscripten_{info['abi_version']}_{info['arch']}")
         # No `_confirm_with_packaging`: there is no `pyemscripten_platforms`
         # generator to ask. `packaging` on the *target* does yield this tag
-        # (docs/WASM.md §9.3 read it off the real interpreter), but that path
+        # (docs/platform/WASM.md §9.3 read it off the real interpreter), but that path
         # reads Pyodide's own patched `sys.implementation`, which does not exist
         # on this machine. Said out loud rather than skipped silently, the same
         # way `_confirm_with_packaging` reports a `packaging` too old to know a
@@ -1828,7 +1828,7 @@ class PyEmscriptenTarget(Target):
     def cc(self) -> list[str]:
         """`emcc`, with the two flags that are the whole difference from Android.
 
-        `-fwasm-exceptions` because docs/WASM.md §7.4a found it mandatory for
+        `-fwasm-exceptions` because docs/platform/WASM.md §7.4a found it mandatory for
         *every* module in the process once any module uses it, side modules
         included. `-sSIDE_MODULE=2` because `ctypes.CDLL` on Emscripten is
         `dlopen`, and `dlopen` cannot take a main-module link -- which is the
@@ -1841,7 +1841,7 @@ class PyEmscriptenTarget(Target):
                 "  Add <emsdk>/upstream/emscripten to PATH, and set EM_CACHE to "
                 "a scratch\n"
                 "  directory first: the shared emsdk cache must not be written "
-                "to (docs/WASM.md §9.6)."
+                "to (docs/platform/WASM.md §9.6)."
             )
         if not os.environ.get("EM_CACHE"):
             _fail(
@@ -1849,7 +1849,7 @@ class PyEmscriptenTarget(Target):
                 "cache on first use,\n"
                 "  and the emsdk on this machine is shared and must not be "
                 "modified. Set\n"
-                "  EM_CACHE to a scratch directory (docs/WASM.md §9.6)."
+                "  EM_CACHE to a scratch directory (docs/platform/WASM.md §9.6)."
             )
         return [emcc, "-shared", "-fPIC", "-fwasm-exceptions",
                 "-sSIDE_MODULE=2"]
@@ -1867,7 +1867,7 @@ class PyEmscriptenTarget(Target):
                 "its own memory\n"
                 "  instead of importing one, and Emscripten's dlopen cannot "
                 "load it. Build it\n"
-                "  with -sSIDE_MODULE (docs/WASM.md §9.2)."
+                "  with -sSIDE_MODULE (docs/platform/WASM.md §9.2)."
             )
 
 
@@ -1912,14 +1912,14 @@ def _confirm_with_packaging(tag: str, family: str, **kwargs) -> None:
 #: `target-python/x86_64-linux-android/` does not exist.
 #:
 #: It cannot be downloaded. python-build-standalone's 20260825 release -- the
-#: source of the four fetchable distributions in docs/TARGET_PYTHON.md --
+#: source of the four fetchable distributions in docs/platform/TARGET_PYTHON.md --
 #: publishes 871 assets and no Android target among them (checked, not
 #: assumed). CPython publishes no Android binaries either. The only route is a
-#: local cross-build, which is what docs/TARGET_PYTHON.md §5 records for the
+#: local cross-build, which is what docs/platform/TARGET_PYTHON.md §5 records for the
 #: aarch64 one, and §5 also records that that build is the one distribution of
 #: the five whose provenance could not be reconstructed.
 #:
-#: And the wheel could not be checked if it were built. docs/WHEELMATRIX.md
+#: And the wheel could not be checked if it were built. docs/platform/WHEELMATRIX.md
 #: §3.3 has the measurement: this Mac's emulator ships only
 #: `emulator/qemu/darwin-aarch64`, so it runs aarch64 guests and nothing else,
 #: and all four installed system images are `arm64-v8a`. So `verify_android.py`
@@ -1939,7 +1939,7 @@ _ANDROID_X86_64_REFUSAL = (
     "  * It is not downloadable. python-build-standalone 20260825 publishes 871 "
     "assets and no\n"
     "    Android target; CPython publishes no Android binaries at all.\n"
-    "  * A local cross-build is the only route, and docs/TARGET_PYTHON.md §5 "
+    "  * A local cross-build is the only route, and docs/platform/TARGET_PYTHON.md §5 "
     "records what that\n"
     "    bought last time: the aarch64 Android distribution is the one of five "
     "whose source\n"
@@ -1950,7 +1950,7 @@ _ANDROID_X86_64_REFUSAL = (
     "    verify_android.py -- the only script here that *runs* a cross wheel -- "
     "has no x86-64\n"
     "    Android to run it on, and no Apple Silicon host has one "
-    "(docs/WHEELMATRIX.md §3.3).\n"
+    "(docs/platform/WHEELMATRIX.md §3.3).\n"
     "  Refused by name rather than dropped from the registry, so this reads as "
     "a target that\n"
     "  was thought about -- the reason `--target linux-x86_64` was listed while "
@@ -2128,7 +2128,7 @@ def _repack(wheel: Path, extra: dict[str, bytes], dist_info: str,
 # A translation unit with one symbol, so that `nm` on the result says what it is
 # instead of showing an empty library and leaving the next reader to guess.
 _GLOBAL_DEPS_C = """
-/* Generated by tools/wheel/build.py. See docs/WHEEL.md. */
+/* Generated by tools/wheel/build.py. See docs/platform/WHEEL.md. */
 const char torchnative_global_deps_note[] =
     "torchnative: this build has no global native dependencies; "
     "torch/__init__.py:_load_global_deps only needs this file to dlopen.";
@@ -2138,7 +2138,7 @@ const char torchnative_global_deps_note[] =
 def global_deps_stub(target: "Target | None" = None) -> dict[str, bytes]:
     """An empty `torch/lib/libtorch_global_deps` so `import torch` needs no env.
 
-    Wall 1 in docs/VENDOR.md: `torch/__init__.py:_load_global_deps()` does an
+    Wall 1 in docs/platform/VENDOR.md: `torch/__init__.py:_load_global_deps()` does an
     unconditional `ctypes.CDLL(torch/lib/libtorch_global_deps.<ext>,
     RTLD_GLOBAL)`, and `vendor_torch.sh` drops `torch/lib/` entirely. Every
     invocation in this repository routes around it with
@@ -2181,7 +2181,7 @@ def global_deps_stub(target: "Target | None" = None) -> dict[str, bytes]:
               "returns immediately on\n"
               "      Windows, and _load_dll_libraries() would LoadLibrary an "
               "empty one for nothing\n"
-              "      (docs/WINDOWS.md §4.3)")
+              "      (docs/platform/WINDOWS.md §4.3)")
         return {}
 
     if target is None:
@@ -2193,7 +2193,7 @@ def global_deps_stub(target: "Target | None" = None) -> dict[str, bytes]:
                 "no C compiler (set CC) -- cannot build the empty "
                 f"torch/lib/{name}, without which the installed "
                 "wheel cannot `import torch` unless the user sets "
-                "TORCH_USE_RTLD_GLOBAL=1 (docs/VENDOR.md wall 1)"
+                "TORCH_USE_RTLD_GLOBAL=1 (docs/platform/VENDOR.md wall 1)"
             )
         argv = [cc, "-shared", "-fPIC"]
         # Match the deployment target the wheel will be *tagged* with. Without
@@ -2201,7 +2201,7 @@ def global_deps_stub(target: "Target | None" = None) -> dict[str, bytes]:
         # have -- measured at `macos 26.0+` inside a wheel tagged
         # `macosx_11_0_arm64` -- and dyld enforces that field, so the file the
         # tag promises would be unloadable on every macOS the tag claims. Same
-        # class of mistake as the `universal2` tag in docs/WHEEL.md §3.3: the
+        # class of mistake as the `universal2` tag in docs/platform/WHEEL.md §3.3: the
         # archive contents and the tag disagreeing, in the direction that only
         # shows up on somebody else's machine.
         if sys.platform == "darwin":
@@ -2341,7 +2341,7 @@ def verify(wheel: Path, expected: set[str], target: "Target | None",
                 + ("    ...\n" if len(unexpected) > 20 else "")
                 + "  a wheel that gained content nobody asked for is exactly "
                 "as unverified as\n  one that is missing content -- see the "
-                ".DS_Store incident in docs/WHEEL.md"
+                ".DS_Store incident in docs/platform/WHEEL.md"
             )
 
         if target is None:
@@ -2371,7 +2371,7 @@ def verify(wheel: Path, expected: set[str], target: "Target | None",
                 if n.startswith("torch/lib/libtorch_global_deps"))
             if strays:
                 _fail(f"{wheel.name} carries {strays}, but this target loads no "
-                      "global-deps library at all (docs/WINDOWS.md §4.3)")
+                      "global-deps library at all (docs/platform/WINDOWS.md §4.3)")
         else:
             deps = f"torch/lib/{target.global_deps_name}"
             if deps not in names:
@@ -2498,7 +2498,7 @@ def _minimal_elf(machine: int = 0x3E, etype: int = 3,
 
     Hand-built rather than compiled, because the point of the cases that use it
     is what happens when an image carries *no* version requirements, and this
-    machine cannot produce such a file through the normal route (docs/LINUX.md
+    machine cannot produce such a file through the normal route (docs/platform/LINUX.md
     §2.7 builds one, but only with tools that a self-test may not assume).
     """
     ehdr = bytearray(64)
@@ -2540,7 +2540,7 @@ def self_test_linux() -> int:
     `lib_C.so` and asserts that the glibc version handed to `cargo zigbuild`
     comes back out of the derivation, which is an input to another tool compared
     against an output of this one. It only exists because the artefact became
-    buildable (docs/LINUX.md §9.2); before that it is skipped, loudly.
+    buildable (docs/platform/LINUX.md §9.2); before that it is skipped, loudly.
     """
     target = TARGETS["linux-x86_64"]
     root = target.python_root
@@ -2679,7 +2679,7 @@ def self_test_linux() -> int:
         f"got: {said[:200]!r}",
     ))
 
-    # 4. The docs/LINUX.md §2.6 trap. An ELF with no version requirements is the
+    # 4. The docs/platform/LINUX.md §2.6 trap. An ELF with no version requirements is the
     #    check having no answer, and must not read as a low floor -- that is the
     #    same fold-two-outcomes-into-one mistake `artefact_verdict` exists to
     #    avoid, in the direction that silently passes.
@@ -2738,7 +2738,7 @@ def self_test_linux() -> int:
     #    given to a different tool against the *output* of the derivation. It
     #    fails if zig ignored the requested version, if a dependency pulled in a
     #    newer glibc symbol, or if GLIBC_TARGET drifted from the command in
-    #    docs/LINUX.md §9.2.
+    #    docs/platform/LINUX.md §9.2.
     ours = target.artefact
     if not ours.exists():
         print("  ! case 7 skipped -- no cross-built lib_C.so "
@@ -3033,7 +3033,7 @@ def self_test_pyemscripten() -> int:
     """`PyEmscriptenTarget`'s one structural claim, exercised rather than
     asserted in a comment.
 
-    docs/WASM.md §9.4a: this is the only target whose tag is not derivable from
+    docs/platform/WASM.md §9.4a: this is the only target whose tag is not derivable from
     a CPython, and the failure mode is that someone copies `AndroidTarget`,
     calls `self.sysconfig()`, gets `emscripten_5_0_3_wasm32` -- a tag
     `packaging` accepts and nothing on PyPI uses -- and ships it. A comment

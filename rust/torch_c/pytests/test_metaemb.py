@@ -1,6 +1,6 @@
-"""docs/METAEMB.md -- the meta kernels real models actually stop on.
+"""docs/kernels/METAEMB.md -- the meta kernels real models actually stop on.
 
-docs/METAFAM.md §2.2 MEASURED that the top wall for a `forward` under
+docs/kernels/METAFAM.md §2.2 MEASURED that the top wall for a `forward` under
 `torch.device("meta")` was `aten.embedding.default`, for five of seven
 architectures, and left it undone because it belonged to a different family.
 This file is the tests for closing it -- and for the multi-output ops
@@ -314,7 +314,7 @@ def _run(side):
 # Cases where upstream's OWN meta kernel disagrees with upstream's OWN cpu
 # kernel, so "agree with upstream" has two answers and the diff cannot be
 # strict. This shim has one door and follows its dense kernel, which follows
-# cpu -- docs/META.md §7.3's standing rule, applied here to nine more
+# cpu -- docs/devices/META.md §7.3's standing rule, applied here to nine more
 # instances of it. Every one is checked separately BY NAME below, in
 # `test_the_nine_upstream_self_disagreements_are_followed_to_the_dense_side`,
 # so that "excluded" never means "unchecked".
@@ -348,14 +348,14 @@ _KNOWN_SHIM_WIDE_REFUSAL = {
 # tensor, so `check_devices_agree` finds no meta device to route on and the
 # call lands in the DENSE kernel -- which answers `RuntimeError` where
 # upstream answers `ValueError`. A real (pre-existing, dense) divergence,
-# recorded in docs/METAEMB.md §3.4, and not a meta one. The meta arm's own
+# recorded in docs/kernels/METAEMB.md §3.4, and not a meta one. The meta arm's own
 # `ValueError` for an empty list is unreachable and says so here rather than
 # being quietly deleted: it would become reachable the day a meta device can
 # be named without a tensor.
 _UNREACHABLE_FROM_META = {"cat_empty_list_refuses", "repeat_interleave_refuses"}
 
 # Stride only. This shim's meta tensors report CONTIGUOUS strides computed
-# from the shape (docs/META.md §12 -- meta carries no stride field of its
+# from the shape (docs/devices/META.md §12 -- meta carries no stride field of its
 # own), which is right everywhere upstream's result is contiguous and differs
 # on degenerate extents, where upstream reports a stride this shim has no
 # field to remember. Named rather than dropped: the shape and dtype of these
@@ -369,7 +369,7 @@ _STRIDE_DIVERGENCE = {
     # parent, on every chunk), and its SDPA `logsumexp` is laid out
     # transposed (`(32, 1, 4)` for a `(2, 4, 8)` shape). This shim's meta
     # tensors carry no stride field at all and report contiguous strides
-    # computed from the shape -- docs/META.md §12's standing gap, whose first
+    # computed from the shape -- docs/devices/META.md §12's standing gap, whose first
     # instance was `expand`. These are its second and third, and the first
     # where the divergence is not confined to an empty tensor.
     "split_dim1", "split_neg_dim",
@@ -430,7 +430,7 @@ def test_gather_answers_the_index_shape_with_the_inputs_dtype():
     index VALUE against `self`'s extent, and a meta tensor holds no values.
     Upstream's meta kernel omits the same check. That is the one thing a
     caller loses by running `gather` on meta, and it is stated in
-    docs/METAEMB.md §4 rather than papered over.
+    docs/kernels/METAEMB.md §4 rather than papered over.
     """
     assert _compare("gather_", 15) >= 15
 
@@ -609,7 +609,7 @@ def test_the_three_data_dependent_ops_refuse_by_name_with_the_reason():
     assert "aten.masked_select.default" in got, got
     assert "will not have a meta kernel" in got, got
     assert "VALUES" in got, got
-    assert "docs/METAEMB.md" in got, got
+    assert "docs/kernels/METAEMB.md" in got, got
 
 
 def test_index_tensor_answers_integer_indices_and_refuses_a_bool_mask():
@@ -633,7 +633,7 @@ def test_the_thirteen_upstream_self_disagreements_are_followed_to_the_dense_side
     """"Excluded from the diff" must never mean "unchecked".
 
     Each key below is a call where upstream's own meta kernel and its own cpu
-    kernel answer differently -- the docs/META.md §7.3 shape of divergence.
+    kernel answer differently -- the docs/devices/META.md §7.3 shape of divergence.
     This shim follows the dense/cpu side in every one, and this test asserts
     the CHOSEN answer literally, so the exclusion list cannot quietly grow to
     cover a real disagreement.

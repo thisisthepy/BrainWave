@@ -6,7 +6,7 @@
 
 **Why replacement and not a dtype.** `torch.int8` tensors cannot be built on
 this stack at all -- candle-core 0.11's `DType` has no `I8`, so the storage
-does not exist (docs/QUANT.md §2.1) -- and candle's quantisation is not a
+does not exist (docs/graph/QUANT.md §2.1) -- and candle's quantisation is not a
 `DType` either: `QTensor`/`GgmlDType` is a separate type system that
 `Tensor`/`DType` never sees (§5.1). Teaching `aten.mm` a new element type
 would therefore reach none of candle's fast kernels. Swapping the leaf reaches
@@ -21,7 +21,7 @@ patched. Instances are exchanged.
 **The ceiling that comes with it.** A replaced leaf is all this covers. There
 is no fusion, no view of the surrounding graph, and nothing inside a module
 boundary is reachable -- an attention block handed over whole needs a graph,
-which is docs/DECOMP.md's path and not this one. The two are not exclusive.
+which is docs/graph/DECOMP.md's path and not this one. The two are not exclusive.
 
 **What this module does not do.** It does not quantise activations (the
 activation stays `float32`, and candle quantises it per call inside `vec_dot`),
@@ -91,7 +91,7 @@ class QuantizedLinear(torch.nn.Module):
 
     So a quantised model here is a runtime object, not a serialisable one.
     Writing one out means writing GGUF, which is `_C._quantized_blob()` plus a
-    container this repository does not have (docs/QUANT2.md §7).
+    container this repository does not have (docs/graph/QUANT2.md §7).
 
     **The bias stays dense `float32`.** It is `out_features` numbers against a
     weight of `in_features * out_features`, so quantising it would buy a
@@ -118,7 +118,7 @@ class QuantizedLinear(torch.nn.Module):
         The raise is the point. A silent skip on a shape the format cannot hold
         would report a quantised model that is mostly dense -- and the shape in
         question is not exotic: SmolLM2-135M is 576 wide, which no 256-element
-        k-quant can hold (docs/QUANT2.md §5.2).
+        k-quant can hold (docs/graph/QUANT2.md §5.2).
         """
         weight = mod.weight
         out_features, in_features = weight.shape
@@ -217,7 +217,7 @@ class _Report:
             # and nothing else in the model shrank -- SmolLM2's embedding is
             # 113 MB that stays dense, so a reader who takes this ratio for the
             # model's is off by nearly two (3.76x here against 2.10x all-in,
-            # docs/QUANT2.md §8). A true number that reads as a bigger claim
+            # docs/graph/QUANT2.md §8). A true number that reads as a bigger claim
             # than it supports is the failure this repository keeps paying for.
             f"replaced weight bytes {self.dense_bytes} -> {self.quantized_bytes} "
             f"({self.ratio:.2f}x); unreplaced parameters are unchanged"
@@ -243,7 +243,7 @@ def quantize_(model, format="q8_0", predicate=None):
     small model (49152 x 576 in SmolLM2-135M, 63% of the parameters) and also
     the one whose error lands directly on the logits with no further layer to
     attenuate it. Both facts are real and pull opposite ways, so the choice is
-    left to `predicate` rather than made here silently -- docs/QUANT2.md §5.3
+    left to `predicate` rather than made here silently -- docs/graph/QUANT2.md §5.3
     has the measurement of what skipping it costs and buys.
     """
     report = _Report(format)
@@ -336,7 +336,7 @@ def storage_bytes(model):
     tensor stays alive inside the embedding, and the quantised head is an
     additional copy -- so on SmolLM2-135M, `format="q8_0"` over everything
     lands at 2.10x while the same format *skipping* `lm_head` lands at 2.38x
-    (docs/QUANT2.md §5.4). It is still worth doing for speed, because the
+    (docs/graph/QUANT2.md §5.4). It is still worth doing for speed, because the
     dense `lm_head` is where the time is; it is a trade and not a free win.
     """
     dense = 0

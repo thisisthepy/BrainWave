@@ -1,6 +1,6 @@
 //! torch's CPU random number generator, ported rather than approximated.
 //!
-//! docs/RNG.md settled the question this file answers. candle's CPU backend
+//! docs/numerics/RNG.md settled the question this file answers. candle's CPU backend
 //! *refuses* to be seeded -- `set_seed` and `get_current_seed` are both
 //! `bail!` -- so "use candle's RNG but line the seeds up" was never an option,
 //! and `rand_distr`'s Ziggurat normal consumes a data-dependent number of
@@ -23,7 +23,7 @@
 //! tensor has 16 or more contiguous elements, and when the size is not a
 //! multiple of 16 the kernel *redraws the last 16 elements over the top of
 //! values it already wrote*. Same seed, `n=15` and `n=16` share not one value.
-//! docs/RNG.md §1.3 measured all of that; this file transcribes it.
+//! docs/numerics/RNG.md §1.3 measured all of that; this file transcribes it.
 //!
 //! Everything here is deliberately arithmetic-for-arithmetic with the C++,
 //! down to `2.0f * c10::pi<double>` being evaluated in double and only then
@@ -43,7 +43,7 @@ const LMASK: u32 = 0x7fff_ffff;
 /// `at::mt19937_engine`.
 ///
 /// The field names are upstream's because the legacy `get_state()` blob is
-/// literally this struct (docs/RNG.md §1.1), so keeping them aligned is what
+/// literally this struct (docs/numerics/RNG.md §1.1), so keeping them aligned is what
 /// makes that format implementable later without re-deriving anything.
 pub struct Mt19937 {
     seed: u64,
@@ -79,7 +79,7 @@ impl Mt19937 {
         }
         // `left_ = 1`, not `MERSENNE_STATE_N`. Combined with the pre-decrement
         // in `next_u32`, this makes a twist run *before the first draw* --
-        // docs/RNG.md §1.1 records getting this backwards first, which
+        // docs/numerics/RNG.md §1.1 records getting this backwards first, which
         // produces a plausible-looking stream that matches numpy and not
         // torch.
         self.left = 1;
@@ -149,7 +149,7 @@ pub struct CpuGenerator {
     /// Unused today and kept anyway: it is the float half of upstream's pair
     /// cache. Nothing in the CPU kernels reaches it, because `normal_kernel`'s
     /// scalar path instantiates `normal_distribution<double>` regardless of
-    /// the tensor's dtype (docs/RNG.md §1.3) -- but that is a fact about the
+    /// the tensor's dtype (docs/numerics/RNG.md §1.3) -- but that is a fact about the
     /// *kernel*, not about the generator, and a future op that asks for a
     /// float normal would need this slot to stay in step with upstream.
     #[allow(dead_code)]
@@ -234,7 +234,7 @@ pub fn default_generator() -> MutexGuard<'static, CpuGenerator> {
 
 /// `transformation::uniform_real<float>`.
 ///
-/// The mask is on the *low* bits. docs/RNG.md §1.2 measured the obvious
+/// The mask is on the *low* bits. docs/numerics/RNG.md §1.2 measured the obvious
 /// alternative (`val >> 8`) against real torch and it disagreed on every seed.
 ///
 /// The affine step is `mul_add`, not `*` then `+`. Upstream's source says
@@ -291,7 +291,7 @@ pub fn uniform_fill_f64(gen: &mut CpuGenerator, size: usize, from: f64, to: f64)
 /// what upstream actually runs on the hosts this shim is built for. On a
 /// machine where the vector specialisation *is* live the last bits could
 /// differ, since `sincos256_ps`/`log256_ps` are not libm -- recorded as
-/// unmeasured in docs/RNG.md §6.
+/// unmeasured in docs/numerics/RNG.md §6.
 ///
 /// Two transcription traps here, both invisible in the output until they are
 /// wrong by a few ulp:
@@ -406,7 +406,7 @@ pub fn normal_fill_reduced(gen: &mut CpuGenerator, size: usize, mean: f32, std: 
 /// `normal_kernel`'s scalar branch instantiates this with `T = double` for
 /// *every* dtype, so a `float16` tensor of 5 elements consumes 64-bit uniforms
 /// and rounds at the very end. Assuming the accumulate type followed the
-/// tensor dtype was the first thing docs/RNG.md §1.3 got wrong, and it
+/// tensor dtype was the first thing docs/numerics/RNG.md §1.3 got wrong, and it
 /// disagreed with torch on all eighteen combinations it tried.
 #[inline]
 fn normal_sample_f64(gen: &mut CpuGenerator, mean: f64, stdv: f64) -> f64 {
@@ -454,7 +454,7 @@ pub fn normal_serial(gen: &mut CpuGenerator, size: usize, mean: f64, stdv: f64) 
 /// does not enter into it.** Transcribing the first arm instead gives a
 /// generator that agrees with upstream below 2^28 and above 2^32 and consumes
 /// the stream at the wrong rate for everything between -- so the values are
-/// wrong *and* every later draw is displaced. docs/RANDINT.md §1.1 pins the
+/// wrong *and* every later draw is displaced. docs/kernels/RANDINT.md §1.1 pins the
 /// boundary by measurement (width 2^28-1 -> six words for six elements, width
 /// 2^28 -> twelve) rather than by reading either arm.
 const RANDINT_WIDE_THRESHOLD: u64 = 1 << 28;
@@ -500,7 +500,7 @@ pub fn randint_from_to_fill(
 /// `randperm_cpu` -- Fisher-Yates over `[0, n)`, in the order upstream walks it.
 ///
 /// It draws from the same engine `randint` does, one 32-bit word per swap and
-/// `n - 1` of them, which is why docs/RANDINT.md §4 concludes `randperm` falls
+/// `n - 1` of them, which is why docs/kernels/RANDINT.md §4 concludes `randperm` falls
 /// out of this work rather than being its own algorithm. There is no
 /// large-`n` alternative path: n = 0, 1, 2, 6, 17, 20, 100, 1000, 29999,
 /// 30000, 30001 and 50000 were all reproduced by exactly this loop.
@@ -521,7 +521,7 @@ pub fn randperm_fill(gen: &mut CpuGenerator, n: usize) -> Vec<i64> {
 /// number. That path decides which of two different refusals upstream gives
 /// for `randint(10**9, 10**9 + 7, dtype=torch.float16)`, and an integer-only
 /// transcription of the rounding gets the other one -- measured, and it is
-/// the only disagreement the 2399-case sweep behind docs/RANDINT.md §5 found
+/// the only disagreement the 2399-case sweep behind docs/kernels/RANDINT.md §5 found
 /// once the values matched.
 #[derive(Clone, Copy)]
 pub struct FloatFormat {
@@ -647,9 +647,9 @@ fn exponential_sample_f64(gen: &mut CpuGenerator, lambda: f64) -> f64 {
 ///
 /// This exists for `aten.multinomial.default`, whose fast path is
 /// `empty_like(self).exponential_(1)` followed by an argmax of `self / q`
-/// (docs/SAMPLING.md §2). `aten.exponential_` itself is deliberately not
+/// (docs/models/SAMPLING.md §2). `aten.exponential_` itself is deliberately not
 /// implemented: nothing measured calls it directly, and advertising an op this
-/// shim has never been asked for is the direction docs/TORCH_C.md §1 refuses.
+/// shim has never been asked for is the direction docs/design/TORCH_C.md §1 refuses.
 pub fn exponential_serial(gen: &mut CpuGenerator, size: usize, lambda: f64) -> Vec<f64> {
     (0..size)
         .map(|_| exponential_sample_f64(gen, lambda))

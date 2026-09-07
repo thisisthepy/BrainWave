@@ -16,7 +16,7 @@ What "installed" means here, precisely, because it is not `pip install`:
   * the archive is unpacked onto the device's CPython **site-packages**, at
     `<root>/lib/python3.13/site-packages`, which is where an installer would put
     it. Not onto a `PYTHONPATH` directory -- every earlier Android measurement
-    in this repository (docs/DEVICE.md) used `PYTHONPATH=$ROOT/site`, and a
+    in this repository (docs/devices/DEVICE.md) used `PYTHONPATH=$ROOT/site`, and a
     `PYTHONPATH` entry is exactly the thing that can shadow a broken install.
   * `.data/purelib/` is relocated into site-packages, as an installer does with
     that PEP 427 directory. That is how upstream's `torch-<v>.dist-info` gets to
@@ -34,10 +34,10 @@ What "installed" means here, precisely, because it is not `pip install`:
 
 Two things are measured that the host wheel cannot measure:
 
-  1. **without `TORCH_USE_RTLD_GLOBAL=1`.** docs/DEVICE.md records that variable
+  1. **without `TORCH_USE_RTLD_GLOBAL=1`.** docs/devices/DEVICE.md records that variable
      as *required* on Android -- but that was measured against a staged tree
      with no `torch/lib/libtorch_global_deps.so` in it. The wheel ships one, and
-     shipping it is the entire argument of docs/WHEEL.md §3.2. Either the
+     shipping it is the entire argument of docs/platform/WHEEL.md §3.2. Either the
      ordinary branch works now or the file is decoration.
   2. **with and without the `_multiprocessing` stub.** The Android CPython
      distribution builds neither `_multiprocessing` nor `_posixshmem`, and
@@ -380,7 +380,7 @@ def main() -> None:
                 f"sys.platform is {plain['platform']!r} -- this did not run on "
                 "an Android interpreter")
 
-    # Not a failure, but the thing docs/DEVICE.md §4 will have to be corrected
+    # Not a failure, but the thing docs/devices/DEVICE.md §4 will have to be corrected
     # for, so it has to be reported either way rather than inferred.
     bare = results["bare"]
     print("  _multiprocessing stub  "

@@ -18,7 +18,7 @@ library is supposed to provide it? The three formats answer it very differently.
                     load order, so in general the image does not say. Only
                     *versioned* symbols do -- `.gnu.version_r` is grouped by
                     library -- which covers glibc and not CPython, because
-                    CPython versions none of its exports (docs/LINUX.md §6.1).
+                    CPython versions none of its exports (docs/platform/LINUX.md §6.1).
     PE (Windows)    the import table **is** the answer. An import is not a name
                     to be searched for: it is an entry under an
                     IMAGE_IMPORT_DESCRIPTOR that names a DLL. There is no
@@ -60,7 +60,7 @@ Specifically:
   * **`import torch` is not run.** No `LoadLibrary`, no DLL search path, no
     `os.add_dll_directory`. `_load_dll_libraries()` does several things at
     import time that only a Windows machine can exercise -- see
-    docs/WINDOWS.md §4.3.
+    docs/platform/WINDOWS.md §4.3.
 """
 
 from __future__ import annotations
@@ -130,7 +130,7 @@ def select_arch(wheel: Path) -> str:
     return tag
 
 #: The one binary member of the Windows wheel. There is no global-deps library:
-#: `_load_global_deps()` returns immediately on Windows (docs/WINDOWS.md §4.3).
+#: `_load_global_deps()` returns immediately on Windows (docs/platform/WINDOWS.md §4.3).
 MEMBERS = ("torch/_C.pyd",)
 
 #: DLLs the target distribution ships, so their exports can actually be read.
@@ -273,7 +273,7 @@ def check_wheel(wheel: Path) -> int:
                   "to be torch/_C.pyd, which is the only suffix in "
                   "dynload_win.c's table that an abi3 build can use")
 
-    print("ladder (docs/WINDOWS.md §5):")
+    print("ladder (docs/platform/WINDOWS.md §5):")
     print(f"  built              yes -- the archive holds a PE32+ {ARCH} DLL")
     print("  tagged             yes -- see tools/wheel/build.py WindowsTarget")
     print("  symbols resolve    CPython and the MSVC runtime yes, per DLL;")
@@ -351,7 +351,7 @@ def self_test() -> int:
     # 2. The claim that makes this stronger than the ELF check: for OUR
     #    artefact, the CPython imports are attributed to python3.dll by the
     #    file, not merely found in it. On Linux the equivalent 118 symbols name
-    #    no library at all (docs/LINUX.md §6.4), and that is the difference.
+    #    no library at all (docs/platform/LINUX.md §6.4), and that is the difference.
     ours = None
     for candidate in sorted(REPO.glob("dist/*win_amd64.whl")):
         with zipfile.ZipFile(candidate) as zf:

@@ -1,4 +1,4 @@
-"""`aten.glu.default` -- the ASR encoders' shared wall (docs/GLU.md).
+"""`aten.glu.default` -- the ASR encoders' shared wall (docs/kernels/GLU.md).
 
 `torch._C._nn.glu` is what `F.glu` binds to upstream, and ARCH100.md's sweep
 found it blocking seven architectures (`parakeet` x3, `lasr` x2,
@@ -6,7 +6,7 @@ found it blocking seven architectures (`parakeet` x3, `lasr` x2,
 `aten.glu.default`, directly through `_C._aten_dispatch` -- the same door
 `test_shim.py` uses -- rather than through `torch._C._nn.glu`, which is a
 Python-level composite installed by `bootstrap.py::_install_nn` and out of
-scope for this file (see docs/GLU.md for the remaining wiring step).
+scope for this file (see docs/kernels/GLU.md for the remaining wiring step).
 
 The formula (`a * sigmoid(b)` after splitting in half) is not the risk here;
 two edge cases are, both measured against upstream 2.13.0 rather than
@@ -49,7 +49,7 @@ def test_glu_is_advertised_and_dispatchable():
 
 
 def test_glu_default_dim_is_minus_one_not_zero():
-    """The trap `docs/GLU.md` calls out: a `dim=0` default would split the
+    """The trap `docs/kernels/GLU.md` calls out: a `dim=0` default would split the
     batch axis instead of the channel axis, which is silently wrong for
     every one of the seven blocked ASR encoders (they all gate the
     trailing axis)."""

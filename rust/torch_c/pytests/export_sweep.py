@@ -10,7 +10,7 @@ it is a strictly harder one:
     it holds REPLAY to the same numbers as the eager module it was traced from?
 
 Those are three separate verdicts and this script keeps them separate, because
-docs/EXPORT4.md §3 is about a failure mode where they get merged:
+docs/graph/EXPORT4.md §3 is about a failure mode where they get merged:
 
     exported   -- `torch.export.export()` returned an `ExportedProgram`
     replayed   -- `ep.module()(*inputs)` ran without raising
@@ -18,7 +18,7 @@ docs/EXPORT4.md §3 is about a failure mode where they get merged:
 
 A graph that BUILDS and a graph that COMPUTES are different claims. An
 `ExportedProgram` that prints, serialises, and contains no operators would pass
-"exported" and fail "agreed", and docs/EXPORT.md §4.2 is the argument that such a
+"exported" and fail "agreed", and docs/graph/EXPORT.md §4.2 is the argument that such a
 graph would not look wrong. So `exported` alone is never reported as a success
 here: the headline number is `agreed`.
 

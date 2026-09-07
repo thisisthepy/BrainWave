@@ -1,6 +1,6 @@
-"""Tests for the argument-form gaps docs/ARGFORM.md closes.
+"""Tests for the argument-form gaps docs/bindings/ARGFORM.md closes.
 
-docs/ARCH100.md swept 297 architectures and found six blocked not by a
+docs/architectures/ARCH100.md swept 297 architectures and found six blocked not by a
 missing operator but by an argument *form* of an op that already exists:
 
     torch.ones(dtype=bool)                                     gpt_neo
@@ -18,7 +18,7 @@ Every alias here was checked against real torch 2.13.0 *before* being added
 (CLAUDE.md's own warning: upstream accepts a numpy spelling on some ops and
 refuses it on others, so accepting it everywhere would be a shim more
 permissive than the thing it replaces). What each measurement found and what
-was done about it is in docs/ARGFORM.md; this file is the proof the code
+was done about it is in docs/bindings/ARGFORM.md; this file is the proof the code
 actually does what that document claims.
 
 Two of the six are NOT touched here, and are not bugs in this file:
@@ -26,7 +26,7 @@ Two of the six are NOT touched here, and are not bugs in this file:
   * the "asymmetric" conv padding was `aten.rs`'s candle backend refusing a
     per-axis-differing value by name -- out of that round's territory
     (`aten.rs`) and a backend limit, not an argument-form gap. **That refusal
-    is gone**: docs/LAST7.md §4 spends the difference as explicit zero padding
+    is gone**: docs/kernels/LAST7.md §4 spends the difference as explicit zero padding
     on the input and convolves with the common remainder, so the pin here is
     now `test_per_axis_conv_padding_now_computes_and_agrees_with_upstream`,
     which diffs values, plus
@@ -35,10 +35,10 @@ Two of the six are NOT touched here, and are not bugs in this file:
   * the `torch.embedding` case reproduces upstream's OWN refusal (measured:
     `TypeError: embedding(): argument 'indices' ... must be Tensor, not
     NoneType`) -- not an argument-form gap at all, so there is nothing to
-    close here; see docs/ARGFORM.md's note on it.
+    close here; see docs/bindings/ARGFORM.md's note on it.
 
 Also covers the `torch._C._nn.glu` binding wired up in the same round --
-docs/ARCH100.md's `_nn.glu` blocker, seven ASR encoders. The kernel
+docs/architectures/ARCH100.md's `_nn.glu` blocker, seven ASR encoders. The kernel
 (`aten.glu.default`) lands on a different branch and is not in this
 worktree, so the numeric behaviour cannot be asserted here; only that the
 binding exists, is advertised, and reaches the dispatcher under the right
@@ -112,7 +112,7 @@ def test_mean_keepdims_alias_matches_keepdim():
 
 
 def test_axis_alias_is_not_installed_for_an_op_that_was_not_measured():
-    # docs/ARGFORM.md's whole point: `axis=` is accepted on some ops and
+    # docs/bindings/ARGFORM.md's whole point: `axis=` is accepted on some ops and
     # refused on others upstream, so it must not be installed as a blanket
     # rule. `sum` was not one of the six architectures and was not measured
     # here, so it must still refuse -- proving the alias table is scoped to
@@ -125,7 +125,7 @@ def test_axis_alias_is_not_installed_for_an_op_that_was_not_measured():
     else:
         raise AssertionError(
             "Tensor.sum(axis=...) resolved -- the numpy-alias table has "
-            "leaked into an op docs/ARGFORM.md never measured"
+            "leaked into an op docs/bindings/ARGFORM.md never measured"
         )
 
 
@@ -179,7 +179,7 @@ def test_div_scalar_wrapping_does_not_disturb_the_tensor_tensor_path():
 
 
 def test_adaptive_avg_pool2d_bare_int_normalises_to_a_pair():
-    # docs/FIXES.md §3: the raw aten op refuses a bare int (matching
+    # docs/kernels/FIXES.md §3: the raw aten op refuses a bare int (matching
     # upstream's raw aten op, measured) but upstream's `torch._C._nn.
     # adaptive_avg_pool2d` -- a *different* binding, and the one `F.
     # adaptive_avg_pool2d` actually calls -- accepts one and expands it to a
@@ -198,7 +198,7 @@ def test_adaptive_avg_pool2d_bare_int_normalises_to_a_pair():
     else:
         raise AssertionError(
             "the raw aten op accepted a bare int -- this is the exact "
-            "SILENT DIVERGENCE docs/FIXES.md §3 measured and reverted; the "
+            "SILENT DIVERGENCE docs/kernels/FIXES.md §3 measured and reverted; the "
             "expansion belongs in the _nn binding, not the aten op"
         )
 
@@ -218,15 +218,15 @@ def test_per_axis_conv_padding_now_computes_and_agrees_with_upstream():
     """nystromformer's wall, inverted.
 
     **This test was `test_asymmetric_conv_padding_is_a_backend_limit_not_an_
-    argument_form` and asserted the refusal.** docs/ARGFORM.md §1 measured that
+    argument_form` and asserted the refusal.** docs/bindings/ARGFORM.md §1 measured that
     `padding=[0, 5]` is not asymmetric padding at all -- it is two axes each
     padded symmetrically by a different amount, which upstream computes fine --
     and classified this shim's refusal as a genuine candle limitation rather
     than an argument-form gap. That classification was right about candle and
     wrong about the conclusion: `conv2d`'s padding really is one scalar, but the
     difference between the axes can be spent as explicit zero padding on the
-    input, exactly as docs/RNN.md §2 spent the odd half of `padding='same'`.
-    docs/LAST7.md §4 lands that lowering, so the assertion above became an
+    input, exactly as docs/kernels/RNN.md §2 spent the odd half of `padding='same'`.
+    docs/kernels/LAST7.md §4 lands that lowering, so the assertion above became an
     assertion that a working op is missing.
 
     Inverted into the stronger form: the values, against a reference measured on
@@ -261,12 +261,12 @@ def test_per_axis_conv_padding_now_computes_and_agrees_with_upstream():
 
 
 def test_a_per_axis_differing_stride_is_still_refused_by_name():
-    """The half of docs/ARGFORM.md §1's finding that did NOT close.
+    """The half of docs/bindings/ARGFORM.md §1's finding that did NOT close.
 
     Padding has a lowering because zeros can be added to the input; a stride has
     none -- there is nothing to add that makes an unequal stride equal. So the
     refusal stays, and it stays *named*, which is what keeps the two halves
-    distinguishable. docs/LAST7.md §4.
+    distinguishable. docs/kernels/LAST7.md §4.
     """
     inp = _C._tensor_from_flat([0.0] * 98, [1, 2, 7, 7])
     wgt = _C._tensor_from_flat([0.0] * 36, [2, 2, 3, 3])
@@ -280,7 +280,7 @@ def test_a_per_axis_differing_stride_is_still_refused_by_name():
     else:
         raise AssertionError(
             "a per-axis-differing stride resolved -- if the backend grew this, "
-            "update docs/LAST7.md §4 and invert this test too"
+            "update docs/kernels/LAST7.md §4 and invert this test too"
         )
 
 
@@ -299,7 +299,7 @@ def test_glu_is_advertised_and_reaches_the_kernel_key_with_the_right_default_dim
     Inverted rather than deleted, and asserting the stronger thing: the values,
     against upstream's own definition. `glu(x, dim)` splits `x` in half along
     `dim` and returns `a * sigmoid(b)`, so a binding that reached the right key
-    with the wrong `dim` -- the trap docs/GLU.md measured, since the default is
+    with the wrong `dim` -- the trap docs/kernels/GLU.md measured, since the default is
     `-1` and not `0` -- gives different numbers here rather than passing.
     """
     import math

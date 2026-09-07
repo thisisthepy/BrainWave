@@ -1,6 +1,6 @@
 """The QNN ahead-of-time lowering, as a script a CI job runs and a suite imports.
 
-`docs/QNN.md` §1.3 measured why the lowering cannot run on this project's
+`docs/devices/QNN.md` §1.3 measured why the lowering cannot run on this project's
 machine: the `executorch` macOS-arm64 wheel has no
 `executorch/backends/qualcomm/python/`, all 112 op builders import
 `PyQnnManagerAdaptor` at module scope, the QNN SDK's host libraries exist only
@@ -17,7 +17,7 @@ is this repository's existing answer to that and this file follows it.
 `rust/torch_c/pytests/test_qnnci.py` is what exercises the decisions below,
 on a machine that has no executorch and never will.
 
-**The decision this file exists to make.** `docs/QNN.md` §6.2: QNN's dangerous
+**The decision this file exists to make.** `docs/devices/QNN.md` §6.2: QNN's dangerous
 fallback is at *compile* time, not run time. `QnnPartitioner` silently declines
 whatever it cannot handle, those nodes stay in the program as portable CPU
 kernels, and the resulting `.pte` loads, runs and returns the right answer. So
@@ -34,19 +34,19 @@ Two classes of failure, kept apart, because they call for different handling:
 
 * **coverage** -- the file *is* a genuine QNN program, and the partitioner
   claimed too little of it. `delegated_fraction` is the number, §5 step 6
-  asserts `> 0.9`, and `docs/QNN.md` §11 says plainly that its value for a real
+  asserts `> 0.9`, and `docs/devices/QNN.md` §11 says plainly that its value for a real
   `LlamaMLP` under `QnnPartitioner` is **UNKNOWN and may be poor** -- citing
-  `docs/REFOLD.md` §1.1, where this project assumed op-table coverage and was
+  `docs/graph/REFOLD.md` §1.1, where this project assumed op-table coverage and was
   wrong three times. So this fails the job loudly, and the artefact is still
   uploaded, because a genuine QNN program with poor coverage is *the finding*
   and throwing it away would destroy the evidence for it.
 
 **The threshold is a constant, not an input.** It would be trivial to expose
 `--min-delegated-fraction` on the workflow and let a maintainer dial it down
-until the run went green. That is the specific thing `docs/QNN.md` §11 warns
+until the run went green. That is the specific thing `docs/devices/QNN.md` §11 warns
 against and the reason it is `MIN_DELEGATED_FRACTION` below, cited to the line
 of the doc that chose it. If the real number is 0.34, the job goes red and the
-right response is to write 0.34 into `docs/QNN.md` §11 as a measurement --
+right response is to write 0.34 into `docs/devices/QNN.md` §11 as a measurement --
 not to edit this constant so the red goes away.
 """
 
@@ -56,12 +56,12 @@ import os
 import sys
 
 
-# docs/QNN.md §5 step 6: `assert report["delegated_fraction"] > 0.9, report`.
+# docs/devices/QNN.md §5 step 6: `assert report["delegated_fraction"] > 0.9, report`.
 # Copied from the procedure rather than chosen here, and deliberately strict
 # (`>`, not `>=`) for the same reason.
 MIN_DELEGATED_FRACTION = 0.9
 
-# docs/QNN.md §4.3 / `torchnative.export.qnn.QNN_BACKEND_ID`. Restated rather
+# docs/devices/QNN.md §4.3 / `torchnative.export.qnn.QNN_BACKEND_ID`. Restated rather
 # than imported so that this module's decisions can be tested on a host where
 # `torchnative.export.qnn` cannot be imported at all -- and
 # `test_qnnci.py::test_the_backend_id_here_matches_the_one_the_module_uses`
@@ -70,7 +70,7 @@ QNN_BACKEND_ID = "QnnBackend"
 
 # The device that will run this. `CLAUDE.md` §7: Galaxy Tab S9 Ultra,
 # `ro.soc.model = SM8550`, Snapdragon 8 Gen 2, HTP v73, arm64-v8a.
-# `docs/QNN.md` §5.1 read those off the physical device rather than assuming
+# `docs/devices/QNN.md` §5.1 read those off the physical device rather than assuming
 # them. The doc's *example* says SM8650, which is a different HTP generation
 # (v75) and would produce an artefact this device refuses at backend init --
 # so the default here is the measured value and the workflow takes it as an
@@ -86,7 +86,7 @@ class Verdict:
 
     `integrity` gates the upload. `coverage` does not -- it fails the job while
     letting the artefact through, because a genuine QNN program that the
-    partitioner barely claimed is exactly the measurement `docs/QNN.md` §11
+    partitioner barely claimed is exactly the measurement `docs/devices/QNN.md` §11
     says is missing, and deleting it would be deleting the answer.
     """
 
@@ -115,7 +115,7 @@ class Verdict:
 
 
 def verify_facts(facts, soc_model, min_fraction=MIN_DELEGATED_FRACTION):
-    """`docs/QNN.md` §5 step 7 plus step 6's assertion, as a pure function.
+    """`docs/devices/QNN.md` §5 step 7 plus step 6's assertion, as a pure function.
 
     `facts` is what `collect_facts` reads off a real artefact; taking it as a
     plain dict rather than reaching for `torchnative.export.qnn` here is what
@@ -140,7 +140,7 @@ def verify_facts(facts, soc_model, min_fraction=MIN_DELEGATED_FRACTION):
             f"read_artefact(...).is_qnn is False. The delegates in this "
             f"program are {backend_ids or '()'}. This is not a QNN artefact: "
             f"either the lowering silently produced a portable-kernel program, "
-            f"or it fell through to a different partitioner. docs/QNN.md §6.2 "
+            f"or it fell through to a different partitioner. docs/devices/QNN.md §6.2 "
             f"row 1 -- it would still load, still run, and still return the "
             f"right answer on the CPU."
         )
@@ -149,7 +149,7 @@ def verify_facts(facts, soc_model, min_fraction=MIN_DELEGATED_FRACTION):
     # property computed by `torchnative.export.qnn`, and this reads the ids
     # the artefact actually carries. If the two ever disagree, that
     # disagreement is itself the finding -- so both are checked rather than
-    # trusting the derived one. (docs/QNN.md §4.3 on why there is no second
+    # trusting the derived one. (docs/devices/QNN.md §4.3 on why there is no second
     # parser here: both of these come from upstream's own deserialiser.)
     if QNN_BACKEND_ID not in backend_ids:
         integrity.append(
@@ -188,7 +188,7 @@ def verify_facts(facts, soc_model, min_fraction=MIN_DELEGATED_FRACTION):
             f"the delegation report describes an empty graph "
             f"(total_nodes={total!r}). Nothing was exported, so nothing was "
             f"partitioned, and `delegated_fraction` below is not a "
-            f"partitioner result. docs/QNN.md §6.1(a)."
+            f"partitioner result. docs/devices/QNN.md §6.1(a)."
         )
     elif fraction is None:
         integrity.append(
@@ -197,20 +197,20 @@ def verify_facts(facts, soc_model, min_fraction=MIN_DELEGATED_FRACTION):
         )
     # (4b) §5 step 6: `assert report["delegated_fraction"] > 0.9, report`.
     #
-    # docs/QNN.md §11: this number is UNKNOWN for a real `LlamaMLP` under
+    # docs/devices/QNN.md §11: this number is UNKNOWN for a real `LlamaMLP` under
     # `QnnPartitioner` and **may be poor**. Do not tune it to make the run
-    # green -- §11 cites docs/REFOLD.md §1.1, three occasions of assuming
+    # green -- §11 cites docs/graph/REFOLD.md §1.1, three occasions of assuming
     # coverage and being wrong. If this fires, the number is the deliverable.
     elif not fraction > min_fraction:
         coverage.append(
             f"delegated_fraction is {fraction:.4f} "
             f"({delegation.get('delegated_nodes')} of {total} nodes in "
             f"{delegation.get('subgraphs')} subgraph(s)), which does not clear "
-            f"the {min_fraction} that docs/QNN.md §5 step 6 asserts. The "
+            f"the {min_fraction} that docs/devices/QNN.md §5 step 6 asserts. The "
             f"artefact IS a QNN program -- the integrity checks passed -- so "
             f"the {delegation.get('non_delegated_nodes')} node(s) "
             f"`QnnPartitioner` declined stay in it as portable CPU kernels and "
-            f"will run on the application processor. docs/QNN.md §11 says this "
+            f"will run on the application processor. docs/devices/QNN.md §11 says this "
             f"value was unknown and might be poor. It is now known. Record it "
             f"in §11 as a measurement; do NOT lower MIN_DELEGATED_FRACTION."
         )
@@ -219,7 +219,7 @@ def verify_facts(facts, soc_model, min_fraction=MIN_DELEGATED_FRACTION):
 
 
 def collect_facts(qnn, path, soc_model, report):
-    """Read `docs/QNN.md` §5 step 7's four answers off a real `.pte`.
+    """Read `docs/devices/QNN.md` §5 step 7's four answers off a real `.pte`.
 
     `qnn` is passed in rather than imported so this stays callable with a
     double in the local suite. Every read goes through
@@ -253,7 +253,7 @@ def collect_facts(qnn, path, soc_model, report):
 def render_summary(verdict, soc_model):
     """Markdown for `$GITHUB_STEP_SUMMARY`.
 
-    `docs/QNN.md` §11 item 1 asks for `delegated_fraction` to be *reported*,
+    `docs/devices/QNN.md` §11 item 1 asks for `delegated_fraction` to be *reported*,
     not merely asserted on, so it is printed on every path -- including the
     paths where the job is about to go red, which are the ones where somebody
     will actually want the number.
@@ -285,7 +285,7 @@ def render_summary(verdict, soc_model):
     if isinstance(fraction, (int, float)):
         lines.append(
             f"`delegated_fraction` is **{fraction:.4f}** against a threshold of "
-            f"{MIN_DELEGATED_FRACTION} (docs/QNN.md §5 step 6). §11 recorded "
+            f"{MIN_DELEGATED_FRACTION} (docs/devices/QNN.md §5 step 6). §11 recorded "
             f"this value as UNKNOWN for a real `LlamaMLP` under "
             f"`QnnPartitioner`; this run is the measurement."
         )
@@ -295,7 +295,7 @@ def render_summary(verdict, soc_model):
         lines.append(
             "**Lowering succeeded and the artefact is a QNN program built for "
             "this silicon.** This proves NOTHING about HTP execution -- see "
-            "the workflow header and docs/QNN.md §6.4."
+            "the workflow header and docs/devices/QNN.md §6.4."
         )
     else:
         if verdict.integrity:
@@ -354,11 +354,11 @@ def build_parser():
     parser.add_argument("--facts-json", default="delegation_report.json")
     parser.add_argument(
         "--seq-len", type=int, default=5,
-        help="example-input sequence length; docs/QNN.md §5 step 6 uses 5",
+        help="example-input sequence length; docs/devices/QNN.md §5 step 6 uses 5",
     )
     # Deliberately NOT a --min-delegated-fraction. See the module docstring:
     # an adjustable threshold is a threshold that gets adjusted until it
-    # passes, and docs/QNN.md §11 is specifically about that failure.
+    # passes, and docs/devices/QNN.md §11 is specifically about that failure.
     return parser
 
 
@@ -390,7 +390,7 @@ def _resolve_submodule(model, path):
 def main(argv=None):
     args = build_parser().parse_args(argv)
 
-    # `torchnative.export.qnn` is a thin driver (docs/QNN.md §2): the exporter
+    # `torchnative.export.qnn` is a thin driver (docs/devices/QNN.md §2): the exporter
     # and the partitioner are UPSTREAM's. So this process must be running
     # upstream torch, NOT this project's shim -- which is the opposite of the
     # `assert hasattr(torch._C, "_aten_implemented")` that CLAUDE.md §3 asks
@@ -403,8 +403,8 @@ def main(argv=None):
         raise SystemExit(
             "torchnative qnn-ci: this interpreter has the torchnative shim "
             "installed. The QNN lowering is upstream torch + upstream "
-            "executorch (docs/QNN.md §2); running it under the shim would "
-            "measure this project's torch.export, which docs/EXPORT5.md §0 "
+            "executorch (docs/devices/QNN.md §2); running it under the shim would "
+            "measure this project's torch.export, which docs/graph/EXPORT5.md §0 "
             "measures at 0 of 40 architectures. Refusing."
         )
 
@@ -414,7 +414,7 @@ def main(argv=None):
     # The wall, named, before anything else happens. On a host where the QNN
     # AOT half is missing this is the entire output of the job, and it names
     # the module rather than surfacing as an ImportError from inside a
-    # partitioner pass. docs/QNN.md §1.3 is the measurement it encodes.
+    # partitioner pass. docs/devices/QNN.md §1.3 is the measurement it encodes.
     # `probe()` rather than calling `executorch_version()` / `qnn_sdk_version()`
     # directly: those two raise `QnnRefused` when executorch is absent, and on
     # the host this job is most likely to fail on, executorch being absent is
@@ -431,11 +431,11 @@ def main(argv=None):
         raise SystemExit(
             f"torchnative qnn-ci: the QNN ahead-of-time half is not available "
             f"on this runner -- {refusal}\n\n"
-            f"This job exists because docs/QNN.md §1.3 measured that it is "
+            f"This job exists because docs/devices/QNN.md §1.3 measured that it is "
             f"unavailable on this project's own machine and a Linux x86-64 "
             f"host is what it needs. If this fires HERE, then a hosted "
             f"ubuntu runner is not sufficient either, and that is a finding "
-            f"for docs/QNNCI.md -- not something to work around."
+            f"for docs/devices/QNNCI.md -- not something to work around."
         )
 
     if args.soc_model not in qnn.soc_targets():
@@ -452,7 +452,7 @@ def main(argv=None):
     example = torch.randn(1, args.seq_len, model.config.hidden_size)
     print(f"lowering {args.submodule}: {type(submodule).__name__}")
 
-    # fp16=True: docs/QNN.md §7/§7.2. `kHtpQuantized` is QNN's *default* and
+    # fp16=True: docs/devices/QNN.md §7/§7.2. `kHtpQuantized` is QNN's *default* and
     # needs a calibrated quantizer, which §11 names as a different round.
     path, report = qnn.lower(
         submodule, (example,), args.soc_model, args.out, fp16=True

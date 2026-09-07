@@ -1,11 +1,11 @@
 """The collectives of `ProcessGroupLocal` above one rank, against upstream gloo.
 
-`docs/RELEASE_0_0_13a0.md` §5 said this layer was "`allreduce(op=SUM)` only,
+`docs/platform/RELEASE_0_0_13a0.md` §5 said this layer was "`allreduce(op=SUM)` only,
 over loopback on one machine. Other collectives, other reduce ops, secure
 aggregation and differential privacy refuse by name."
 
 **Two thirds of that sentence was wrong, in opposite directions**, and
-`docs/COLLECT2.md` §1 is the measurement. `all_gather`, `all_gather_into_tensor`
+`docs/distributed/COLLECT2.md` §1 is the measurement. `all_gather`, `all_gather_into_tensor`
 and `barrier` already worked at three ranks. `reduce_scatter`, `scatter`,
 `all_to_all` and `all_to_all_single` did not refuse *at all* -- they returned
 each rank's own input, unreduced and untransposed, with no error. A sentence
@@ -15,7 +15,7 @@ two, because a caller who believes it will never look.
 Everything here is compared against **upstream's own `torch.distributed` over
 gloo**, in three real process groups at each world size: the shim, upstream in
 float32, and upstream in float64. The float64 run is not decoration -- it is
-where the tolerance comes from. `docs/AGREE.md` §2's method is that a threshold
+where the tolerance comes from. `docs/numerics/AGREE.md` §2's method is that a threshold
 picked by eye is not a result, so each collective's is read off *upstream's own*
 float32-vs-float64 error on that same collective with those same inputs,
 floored at 8 float32 ulp. For the collectives that never combine two numbers
@@ -54,10 +54,10 @@ from test_shim import _CKPT_VENDOR_DIR
 C2_WORLDS = (3, 4)
 
 #: One float32 ulp at 1.0. The floor under every derived tolerance, in the
-#: units `docs/AGREE.md` §2 states its own in.
+#: units `docs/numerics/AGREE.md` §2 states its own in.
 C2_F32_ULP = 2.0 ** -23
 
-#: `docs/AGREE.md` floors its tolerance at 8 ulp. Same floor, same reason: a
+#: `docs/numerics/AGREE.md` floors its tolerance at 8 ulp. Same floor, same reason: a
 #: sweep whose inputs happened to be numerically easy must not be able to drive
 #: the threshold below the width of the type it is measuring.
 C2_ULP_FLOOR = 8
@@ -318,7 +318,7 @@ def c2_run(torch, dist, rank, world, DT, shim):
 
     # -- the ordering contract, for PRODUCT --------------------------------
     #
-    # `docs/FEDERATED4.md` §2 pinned the ascending-rank fold for SUM with
+    # `docs/distributed/FEDERATED4.md` §2 pinned the ascending-rank fold for SUM with
     # `1.0 + 1e8 - 1e8`. The same contract binds PRODUCT and the probe for it
     # is sharper: in rank order the product is finite, in *any* order that
     # multiplies the two large terms first it overflows float32 to infinity.
@@ -344,7 +344,7 @@ def c2_run(torch, dist, rank, world, DT, shim):
     # ranks come out of `init_process_group` within milliseconds of each
     # other) and far below the harness timeout. The later ranks are measured
     # and reported but not asserted on, because for them the answer really is
-    # unspecified -- see `docs/ASYNCWORK.md` §6.
+    # unspecified -- see `docs/distributed/ASYNCWORK.md` §6.
     def async_probe():
         t = ft(c2_values(rank, 3, "async"))
         source = t.tolist()
@@ -538,7 +538,7 @@ def _c2_flat(value):
 
 
 def c2_derived_tolerance(up32, up64):
-    """`docs/AGREE.md` §2's method, applied to one collective's own output.
+    """`docs/numerics/AGREE.md` §2's method, applied to one collective's own output.
 
     The threshold is **upstream's own** float32-vs-float64 relative error on
     this collective with these inputs, floored at 8 float32 ulp. Its defence is
@@ -617,7 +617,7 @@ def c2_exc(report, key):
 # The value-producing collectives, and whether every rank's answer is
 # specified. `reduce` and `gather` name a root and leave every other rank's
 # buffer undefined -- measured on gloo at three ranks, where the non-roots came
-# back holding partial sums (docs/COLLECT2.md §4). The probes return `None`
+# back holding partial sums (docs/distributed/COLLECT2.md §4). The probes return `None`
 # off-root so that "undefined" is represented rather than asserted about.
 C2_VALUE_PROBES = (
     "allreduce_SUM", "allreduce_MIN", "allreduce_MAX", "allreduce_PRODUCT",
@@ -659,7 +659,7 @@ def test_every_collective_matches_upstream_gloo_at_world_three_and_four():
 
 
 def test_the_tolerance_is_derived_from_upstream_and_is_not_a_free_parameter():
-    """`docs/AGREE.md` §2's rule, restated where it can fail.
+    """`docs/numerics/AGREE.md` §2's rule, restated where it can fail.
 
     Two things are pinned. The floor is 8 float32 ulp and not a rounder number
     someone liked; and the collectives that combine no numbers really do have a
@@ -723,7 +723,7 @@ def test_all_five_reduce_ops_agree_with_upstream_and_the_bitwise_three_refuse():
                                   c2_ok(up32[rank], key),
                                   c2_ok(up64[rank], key))
             # Every rank ends holding the same bytes -- one fold on the hub,
-            # one result sent back (docs/FEDERATED4.md §2).
+            # one result sent back (docs/distributed/FEDERATED4.md §2).
             answers = [c2_ok(shim[rank], key) for rank in range(world)]
             assert all(a == answers[0] for a in answers), (key, world, answers)
 
@@ -734,7 +734,7 @@ def test_all_five_reduce_ops_agree_with_upstream_and_the_bitwise_three_refuse():
                 assert "ProcessGroupLocal.allreduce" in msg, msg
                 assert "ReduceOp.%s" % opname in msg, msg
                 assert "world_size %d" % world in msg, msg
-                assert "docs/COLLECT2.md" in msg, msg
+                assert "docs/distributed/COLLECT2.md" in msg, msg
 
         for rank in range(world):
             msg = c2_exc(shim[rank], "allreduce_PREMUL_SUM")
@@ -849,7 +849,7 @@ def test_reduce_leaves_the_non_root_buffers_exactly_as_it_found_them():
     shape of every other defect in this file.
 
     This backend leaves them **untouched**, which is inside the same freedom,
-    and asserts it here so that the sentence in `docs/COLLECT2.md` §4 is a
+    and asserts it here so that the sentence in `docs/distributed/COLLECT2.md` §4 is a
     tested claim rather than a description. It is also the only sabotage in the
     nullification sweep that the first draft of this file did not catch:
     copying the result onto every rank changed real behaviour that nothing was
@@ -875,7 +875,7 @@ def test_reduce_leaves_the_non_root_buffers_exactly_as_it_found_them():
             assert ours["after"] == ours["input"], (
                 "reduce at world %d left rank %d holding %r where its input "
                 "was %r. Only the root's buffer is specified, and this backend "
-                "documents that it writes nowhere else (docs/COLLECT2.md §4)."
+                "documents that it writes nowhere else (docs/distributed/COLLECT2.md §4)."
                 % (world, rank, ours["after"], ours["input"]))
             theirs = c2_ok(up32[rank], "reduce_untouched")
             if theirs["after"] != theirs["input"]:
@@ -916,11 +916,11 @@ def test_all_to_all_single_refuses_uneven_splits_by_name():
             assert "NotImplementedError" in msg, msg
             assert "all_to_all_single" in msg, msg
             assert "split" in msg, msg
-            assert "docs/COLLECT2.md" in msg, msg
+            assert "docs/distributed/COLLECT2.md" in msg, msg
 
 
 def test_the_product_fold_is_in_ascending_rank_order_and_says_so():
-    """`docs/FEDERATED4.md` §2's contract, for the other non-associative op.
+    """`docs/distributed/FEDERATED4.md` §2's contract, for the other non-associative op.
 
     In rank order `2**-120 * 2**100 * 2**100` is `2**80`, finite. Any order
     that multiplies the two large factors first overflows float32 to infinity.
@@ -974,7 +974,7 @@ def test_barrier_actually_blocks_rather_than_reporting_that_it_did():
             assert entry["elapsed"] >= 0.5, (
                 "world %d rank %d left the barrier after %.3fs while rank %d "
                 "was still sleeping for 1.0s before entering it. A barrier "
-                "nobody waits at is the `filled` guard from docs/CKPT.md."
+                "nobody waits at is the `filled` guard from docs/models/CKPT.md."
                 % (world, rank, entry["elapsed"], world - 1))
 
 
@@ -982,14 +982,14 @@ def test_async_op_is_genuinely_async_on_both_sides_and_neither_publishes_early()
     """The async surface, re-measured after it was built -- and it now agrees.
 
     This test is the **inversion** of the one that stood here while
-    `docs/COLLECT2.md` §7 was true. That one pinned a divergence: upstream
+    `docs/distributed/COLLECT2.md` §7 was true. That one pinned a divergence: upstream
     gloo's handle was incomplete before `wait()` and this backend's was already
     complete, because every collective ran to completion inside the call. That
     is no longer the case, so the claim changed and the test changed with it --
     it was not deleted, and it still asserts **both sides**, so it cannot
     quietly become a test of nothing if either backend moves.
 
-    Four assertions, and what each would catch (docs/ASYNCWORK.md §6):
+    Four assertions, and what each would catch (docs/distributed/ASYNCWORK.md §6):
 
     * upstream is incomplete before `wait()` at rank 0 -- unchanged, and the
       only assertion here that was already passing. It is what makes the
@@ -1031,7 +1031,7 @@ def test_async_op_is_genuinely_async_on_both_sides_and_neither_publishes_early()
                     "this backend reported a completed work before wait() at "
                     "world %d rank 0, with two peers still asleep -- so the "
                     "collective ran inside the call and async_op is a lie "
-                    "again (docs/ASYNCWORK.md)" % (world,))
+                    "again (docs/distributed/ASYNCWORK.md)" % (world,))
 
             assert ours["wait_returned"] is True, ours
             assert theirs["wait_returned"] is True, theirs
@@ -1061,7 +1061,7 @@ def test_point_to_point_still_refuses_by_name_and_was_not_weakened():
     the capability a naive reading would build `send` on top of. It is still
     refused, and for the reason it always was: on a star that message is
     relayed by the hub, and a relay the hub can read is not the primitive
-    secure aggregation needs (docs/FEDERATED4.md §7).
+    secure aggregation needs (docs/distributed/FEDERATED4.md §7).
     """
     for world in C2_WORLDS:
         shim = c2_shim(world)

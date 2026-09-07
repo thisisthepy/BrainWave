@@ -1,9 +1,9 @@
 """`torch.vmap` over the four architectures' mask closures, checked by value.
 
-`docs/VMAP.md` is the round; this file is the part of it that goes red.
+`docs/kernels/VMAP.md` is the round; this file is the part of it that goes red.
 
-`docs/COMPLEX.md` §7 sized `torch._C._functorch._vmap_increment_nesting` as the
-largest single item on `docs/ARCH200.md`'s blocked list -- four architectures,
+`docs/kernels/COMPLEX.md` §7 sized `torch._C._functorch._vmap_increment_nesting` as the
+largest single item on `docs/architectures/ARCH200.md`'s blocked list -- four architectures,
 `nemotron3_5_asr`, `nemotron_asr_streaming`, `nemotron_asr_streaming_encoder`
 and `t5gemma2` -- and said the one thing that must *not* happen is a cheap
 stub, because the value that comes back is used as an attention mask. A wrong
@@ -316,7 +316,7 @@ def _case_names():
 def test_the_vmapped_mask_is_bit_identical_to_upstream():
     """The whole point of the round.
 
-    `docs/COMPLEX.md` §7: "a no-op counter is worse than nothing ... it just
+    `docs/kernels/COMPLEX.md` §7: "a no-op counter is worse than nothing ... it just
     produces a wrong mask and a model that appears to run." So this compares
     the *values*, not the shape and not the dtype alone -- every element of
     every case, against upstream torch in its own process.
@@ -488,7 +488,7 @@ def test_no_level_is_left_on_the_stack_by_a_refusal():
 def test_vmap_landed_without_a_kernel_or_a_repr_arm():
     """The negative half of the claim, and the reason golden did not move.
 
-    `docs/COMPLEX2.md` is the cautionary example: a new `Repr` arm reached 19
+    `docs/kernels/COMPLEX2.md` is the cautionary example: a new `Repr` arm reached 19
     `match` sites and nullifying the central refusal made 6 of 10 sampled ops
     compute silently. A batched dimension looked like the same shape of
     problem and turned out not to be one -- the representation is a plain

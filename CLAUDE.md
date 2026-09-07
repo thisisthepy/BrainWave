@@ -126,7 +126,7 @@ assert hasattr(torch._C, "_aten_implemented")   # shim 인가 upstream 인가
 | **도달함** (reachability) | import 되고 forward 가 끝까지 간다 |
 | **일치함** (agreement) | **upstream 의 숫자를 낸다.** 원소 단위 비교 |
 
-`docs/AGREE.md` 이전의 모든 커버리지 숫자는 **도달함**이었습니다. "돈다"와 "upstream 의 답을
+`docs/numerics/AGREE.md` 이전의 모든 커버리지 숫자는 **도달함**이었습니다. "돈다"와 "upstream 의 답을
 낸다"는 다른 주장이고, **drop-in 이라는 말을 지탱하는 것은 두 번째뿐입니다.**
 
 **허용오차는 고르는 것이 아니라 유도하는 것입니다.** upstream 자신을 float64 로 다시 돌려
@@ -137,7 +137,7 @@ assert hasattr(torch._C, "_aten_implemented")   # shim 인가 upstream 인가
 **가속기에서 "GPU/NPU 에서 돌았다"는 런타임에서 단언해야 합니다.** 답이 맞는 것으로
 추론하면 안 됩니다. CoreML 회차는 `MLComputePlan` 의 op 단위 답을 읽어서야 **자기 모델들이
 CPU 에서 돌고 있었다**는 것을 알아냈습니다 — 결과는 양쪽 다 맞았습니다. Intel·Qualcomm
-스택도 조용히 폴백합니다. `docs/MPSATTN.md` §3.1 은 **소스 스캔 증거를 무력화하는 방법**을
+스택도 조용히 폴백합니다. `docs/devices/MPSATTN.md` §3.1 은 **소스 스캔 증거를 무력화하는 방법**을
 기록해 두었으니, 카운터처럼 소스 서술이 아닌 증거를 쓰십시오.
 
 **측정은 단독으로 돌립니다.** 부하가 걸린 기계의 숫자는 쓸 수 없습니다 — 같은 커밋이
@@ -160,7 +160,7 @@ CPU 에서 돌고 있었다**는 것을 알아냈습니다 — 결과는 양쪽 
 
 작업 시작 전에 사용자가 준 파일을 먼저 찾아 읽으십시오. 없으면 "사양이 어디 있는지"를
 물으십시오. 디렉터리 목록으로 답하지 마십시오 — `export/` 에 `coreml.py` 와 `nnapi.py` 밖에
-없는 것을 보고 "인텔은 미착수"라고 답한 적이 있는데, 인텔은 `docs/QUANT2.md` §3 에 설계
+없는 것을 보고 "인텔은 미착수"라고 답한 적이 있는데, 인텔은 `docs/graph/QUANT2.md` §3 에 설계
 선례로 기록되어 있었습니다.
 
 ### 5.2 사용자가 구조를 말하면 그것이 제약이지 제안이 아니다
@@ -299,7 +299,7 @@ gradient 를 아예 보지 않습니다.**
 ```
 
 `.pte` 나 벤더 블롭은 **모듈 뒤에 숨는 구현 세부**지 사용자가 쥐는 물건이 아닙니다.
-`docs/QUANT2.md` §3 이 `quantize_` 를 이 모듈 교체 모양으로 규정합니다. **뒷단 선택은 "어느
+`docs/graph/QUANT2.md` §3 이 `quantize_` 를 이 모듈 교체 모양으로 규정합니다. **뒷단 선택은 "어느
 것이 벤더 NPU 에 제일 잘 닿나"의 문제일 뿐, API 모양의 문제가 아닙니다.**
 
 NPU 는 op 을 하나씩 받지 않고 **서브그래프를 통째로** 받습니다. 그래서 캡처 층
@@ -314,7 +314,7 @@ variant 라 **`Repr` 팔도, 디스패처 팔도, 우리 커널도 필요 없습
 
 ## 9. 알려진 제약
 
-- **`torch.compile` 은 영구 거부**입니다. abi3 가 PEP 523 을 막습니다 (`docs/COMPILE.md` — 다만
+- **`torch.compile` 은 영구 거부**입니다. abi3 가 PEP 523 을 막습니다 (`docs/graph/COMPILE.md` — 다만
   abi3 가 막는 것은 프레임 훅이지 Dynamo 가 아니라는 정정이 §에 있습니다).
 - **NNAPI 는 Android 15 에서 deprecated** 됐습니다. 후계는 단일 OS API 가 아니라 **벤더별
   LiteRT delegate** 입니다. `nnapi.py` 는 여전히 동작하므로 지우지 마십시오.

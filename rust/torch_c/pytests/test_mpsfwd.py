@@ -1,19 +1,19 @@
 """A transformer forward on `mps`, and the four kernels that were in its way.
 
-docs/RELEASE_0_0_13a0.md §5 lists "no transformer forwards on `mps`" as a gap.
-docs/MPS.md named the shape of it: the ops whose kernels in `aten.rs` read a
+docs/platform/RELEASE_0_0_13a0.md §5 lists "no transformer forwards on `mps`" as a gap.
+docs/devices/MPS.md named the shape of it: the ops whose kernels in `aten.rs` read a
 dispatched tensor back to host memory are refused on `mps` rather than allowed
 to return a correct value the GPU did not compute -- and a transformer's path
 went through some of them.
 
-**Which ones was measured rather than guessed** (docs/MPSFWD.md §2): the gate
+**Which ones was measured rather than guessed** (docs/devices/MPSFWD.md §2): the gate
 was temporarily made to log-and-allow, SmolLM2-135M was run on `mps`, and
 exactly three refusals fired -- `aten.pow.Tensor_Scalar` (RMSNorm's
 `x.pow(2)`), `aten.neg.default` (`rotate_half`, twice a layer) and
 `aten.cumsum.default` (the attention mask). Not `aten._softmax.default`, which
-docs/MPS.md expected to be the one: SmolLM2 goes through
+docs/devices/MPS.md expected to be the one: SmolLM2 goes through
 `F.scaled_dot_product_attention`, whose kernel writes its softmax out from
-candle ops (docs/SEQLEN.md §7.4 recorded that and it still holds).
+candle ops (docs/numerics/SEQLEN.md §7.4 recorded that and it still holds).
 
 All three were rewritten to stay on the device and are off
 `MPS_HOST_READBACK_OPS`. This file holds that down from both sides:
@@ -50,7 +50,7 @@ def _mps_or_skip(what):
 
     Same shape as `test_shim._mps_or_skip` and deliberately not imported from
     it: the skip line is the thing this file promises to keep truthful
-    (docs/VULKAN3.md §6.1 is what a lying skip line cost), so it says which
+    (docs/devices/VULKAN3.md §6.1 is what a lying skip line cost), so it says which
     file skipped.
     """
     try:
@@ -116,7 +116,7 @@ def test_the_ops_that_left_the_refusal_list_no_longer_read_back():
         assert op not in refused, (
             f"{op} is refused on mps again -- if its kernel went back to "
             "reading the tensor to the host that is the right call, but "
-            "docs/MPSFWD.md §3 says it does not"
+            "docs/devices/MPSFWD.md §3 says it does not"
         )
         body = bodies.get(ops[op], "")
         assert not _MPS_READBACK_MARKERS.search(body), (
@@ -132,7 +132,7 @@ def test_the_refusal_list_did_not_grow_a_way_around_itself():
     """The gate is a list of *refusals*; it has no exemptions this round.
 
     `MPS_READBACK_BUT_ALLOWED` is the one place an op can hold a readback and
-    still be dispatched on `mps`, and docs/MPS.md §3.3 argues for its two
+    still be dispatched on `mps`, and docs/devices/MPS.md §3.3 argues for its two
     entries one at a time. Nothing this round belongs there -- the four ops
     above were rewritten instead -- so the check is that it is still exactly
     those two.
@@ -222,7 +222,7 @@ def test_pow_with_a_general_exponent_on_mps_refuses_rather_than_lowering_precisi
     there instead of computing in `f32` and handing back numbers the CPU would
     not have produced.
 
-    That is the same choice docs/MPS.md made at the door, one layer down: a
+    That is the same choice docs/devices/MPS.md made at the door, one layer down: a
     loud failure rather than a quiet difference. Asserted so that a later
     "just use f32 on Metal" is a test change and not a silent one.
     """
@@ -238,7 +238,7 @@ def test_pow_with_a_general_exponent_on_mps_refuses_rather_than_lowering_precisi
     else:
         raise AssertionError(
             "pow with a non-square exponent must not quietly compute in f32 "
-            "on mps -- see docs/MPSFWD.md §3"
+            "on mps -- see docs/devices/MPSFWD.md §3"
         )
 
 
@@ -296,7 +296,7 @@ def test_sdpa_on_mps_agrees_with_cpu():
     `CustomOp1`s with a CPU kernel and no Metal one, so candle answered `no
     metal implementation for torch._C shim: ...` for each in turn -- three
     walls after the refused kernels were cleared. Each has a fallback on Metal
-    that is documented as bit-identical to it on the CPU (docs/MPSFWD.md §4).
+    that is documented as bit-identical to it on the CPU (docs/devices/MPSFWD.md §4).
 
     A tolerance and not equality, and the reason is the matmuls either side of
     the softmax rather than any of the three: a GPU GEMM sums in a different
@@ -326,14 +326,14 @@ def test_sdpa_on_mps_agrees_with_cpu():
 
 
 def test_a_transformer_block_forwards_on_mps_and_agrees_with_cpu():
-    """The gap in docs/RELEASE_0_0_13a0.md §5, at a size that fits in a suite.
+    """The gap in docs/platform/RELEASE_0_0_13a0.md §5, at a size that fits in a suite.
 
     Every op SmolLM2's decoder layer reaches is here in the order it reaches
     them -- RMSNorm (`pow(2)`, `mean`, `rsqrt`, `mul`), the rotary halves
     (`neg`, `cat`), SDPA, and the gated MLP (`silu`, `mul`) -- run twice from
     the same weights, once on the CPU and once on `mps`, and compared.
 
-    It is not a substitute for the real checkpoint: docs/MPSFWD.md §5 has
+    It is not a substitute for the real checkpoint: docs/devices/MPSFWD.md §5 has
     SmolLM2-135M itself, 393,216 logits, agreeing to 5.3e-6 relative. It is
     the part of that which can run without a 135M-parameter download, and it
     fails for the same reasons.

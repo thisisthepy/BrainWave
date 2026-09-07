@@ -20,7 +20,7 @@
  *
  *   CANNOT: that `import torch` works. These are stubs. Nothing here refcounts,
  *         allocates a PyObject, or executes interpreter code. A real answer
- *         needs a Pyodide distribution -- see docs/WASM.md 7.6.
+ *         needs a Pyodide distribution -- see docs/platform/WASM.md 7.6.
  *
  * Build:
  *   emcc pyinit_host.c -fwasm-exceptions -sMAIN_MODULE=1 -sNODERAWFS=1 -o py.js
@@ -55,7 +55,7 @@ int main(int argc, char **argv) {
         printf("dlopen  FAIL: %s\n", dlerror());
         return 1;
     }
-    /* Deliberately NOT "all 54 imports resolved". A negative control (docs/WASM.md
+    /* Deliberately NOT "all 54 imports resolved". A negative control (docs/platform/WASM.md
      * 7.5a) showed that deleting a CPython symbol from this host still gives a
      * successful dlopen: Emscripten substitutes a stub that aborts when called.
      * So a successful load proves the module instantiated, not that every symbol

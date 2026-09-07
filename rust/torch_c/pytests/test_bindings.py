@@ -2,7 +2,7 @@
 
 `tools/golden/compare.py` calls `_C._aten_dispatch(key, ...)` with a key it
 took from its own case table, so it proves the *kernel* and is structurally
-blind to whether anything a user writes arrives there (docs/REACH.md). Three
+blind to whether anything a user writes arrives there (docs/bindings/REACH.md). Three
 kernels in this tree were golden-green and unreachable for exactly that reason
 -- each needed a composite in `bootstrap.py`, and `bootstrap.py` belonged to a
 different round every time. `tools/golden/reach_allow.json` carried two of them
@@ -21,7 +21,7 @@ asserts it, so the suite cannot pass by having run the same library twice --
 which is the failure shape that makes a comparison test meaningless while
 looking perfect.
 
-`mish` is the fourth debt and it is **not** here. docs/BINDINGS.md §5 says why:
+`mish` is the fourth debt and it is **not** here. docs/bindings/BINDINGS.md §5 says why:
 its kernel was written, matched to 1 ULP, and then removed, so there is no
 `aten.mish.default` in `_aten_implemented()` for a binding to reach. A
 `_nn.mish` composite would be a door onto nothing.
@@ -79,7 +79,7 @@ rec("qr_tall_R", lambda: torch.linalg.qr(TALL)[1])
 rec("qr_complete_Q", lambda: torch.linalg.qr(TALL, mode="complete")[0])
 rec("qr_complete_R", lambda: torch.linalg.qr(TALL, mode="complete")[1])
 # The `dlarfg` xnorm==0 branch: get it wrong and this is -I, orthogonal and
-# wrong (docs/TAIL1.md §5).
+# wrong (docs/kernels/TAIL1.md §5).
 rec("qr_eye_R", lambda: torch.linalg.qr(EYE)[1])
 # mode="r" answers a *one-dimensional* empty Q, not (m, 0) -- measured.
 rec("qr_r_mode_Q_shape", lambda: list(torch.linalg.qr(TALL, mode="r")[0].shape))
@@ -231,7 +231,7 @@ def test_linalg_qr_answers_upstreams_sign_convention_on_the_identity():
     """`dlarfg`'s `xnorm == 0` short circuit. Without it `qr(eye(3))` is `-I`
     -- orthogonal, satisfying `Q @ R == A`, and not upstream's answer. This is
     asserted against a literal as well as against upstream because it is the
-    single most likely wrong answer here (docs/TAIL1.md §5)."""
+    single most likely wrong answer here (docs/kernels/TAIL1.md §5)."""
     if not _available():
         return
     shim, _ = _fixtures()
@@ -386,8 +386,8 @@ def test_nn_init_orthogonal_gets_past_linalg_qr_and_stops_at_the_next_wall():
 
 
 def test_mish_has_neither_a_kernel_nor_a_binding():
-    """docs/BINDINGS.md §5. `mish` was the fourth debt on this round's list and
-    it could not be paid: its kernel was removed (docs/VOICE.md §4.4), so a
+    """docs/bindings/BINDINGS.md §5. `mish` was the fourth debt on this round's list and
+    it could not be paid: its kernel was removed (docs/architectures/VOICE.md §4.4), so a
     `_nn.mish` composite would dispatch to an op that is not there. This
     asserts the *pair* -- kernel absent and binding absent -- so that landing
     either one alone turns it red and whoever does it has to land the other."""

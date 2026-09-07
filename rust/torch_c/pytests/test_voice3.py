@@ -1,4 +1,4 @@
-"""docs/VOICE3.md -- the seven walls, each proven against upstream in its own
+"""docs/architectures/VOICE3.md -- the seven walls, each proven against upstream in its own
 process, on inputs where a *plausible wrong implementation* differs.
 
 `tools/golden/cases.py` compares each of these ops against upstream
@@ -860,7 +860,7 @@ def test_upsample_nearest1d_refuses_what_upstream_refuses_including_bool():
 
 
 def test_this_round_landed_fifteen_registrations_over_eight_kernels():
-    """docs/ARCH100.md measured missing *names* outnumbering missing *kernels*
+    """docs/architectures/ARCH100.md measured missing *names* outnumbering missing *kernels*
     49 to 22 in this tail, so "seven ops" would overstate the work if some
     were table rows. Here it cuts both ways: **eight kernel bodies behind
     fifteen registrations**. `var` and `std` have three overloads each and
@@ -1011,7 +1011,7 @@ def test_var_and_std_clamp_the_divisor_at_zero_so_an_overshoot_is_inf_not_nan():
 
 
 def test_the_three_nn_bindings_now_carry_these_kernels_all_the_way_to_F():
-    """INVERTED (docs/BIND3.md). This test used to assert that `im2col`,
+    """INVERTED (docs/bindings/BIND3.md). This test used to assert that `im2col`,
     `col2im` and `upsample_nearest1d` had kernels and were **not reachable**
     from `F.unfold` / `F.fold` / `F.interpolate`, because `_install_nn` in
     `bootstrap.py` had no entry for them and that file was outside the
@@ -1033,7 +1033,7 @@ def test_the_three_nn_bindings_now_carry_these_kernels_all_the_way_to_F():
                  "un1d_via_F_interpolate"):
         _agree(name)
     # And the kernels themselves are advertised, which is the other half --
-    # a binding onto a missing kernel is docs/BINDINGS.md's `mish`.
+    # a binding onto a missing kernel is docs/bindings/BINDINGS.md's `mish`.
     implemented = set(_C._aten_implemented())
     for op in ("aten.im2col.default", "aten.col2im.default",
                "aten.upsample_nearest1d.default"):

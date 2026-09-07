@@ -31,7 +31,7 @@ use crate::tensor::PyTensorBase;
 /// hands it to Python so the vendored layer and the tests can ask rather than
 /// keep their own copy of the list.
 ///
-/// The `TensorBase` surface (docs/TENSORBASE.md) is interleaved here rather
+/// The `TensorBase` surface (docs/bindings/TENSORBASE.md) is interleaved here rather
 /// than kept in a block of its own. `_aten_implemented()` means exactly one
 /// thing -- "this op has a kernel *and* `tools/golden/cases.py` compares it
 /// against upstream" -- and which Python spelling reaches an op is not part of
@@ -294,7 +294,7 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.where.self",
     "aten.zero_.default",
     "aten.zeros_like.default",
-    // `prims.*` -- docs/PRIMS.md. Sorted after the aten names rather than
+    // `prims.*` -- docs/kernels/PRIMS.md. Sorted after the aten names rather than
     // merged into them: the list is one namespace's work queue followed by
     // another's, and interleaving `prims.cos` between `aten.copy_` and
     // `aten.cos` would hide that these thirteen arrived together.
@@ -334,7 +334,7 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.kaiser_window.default",
     "aten.kaiser_window.periodic",
     "aten.kaiser_window.beta",
-    // docs/TAIL4.md
+    // docs/kernels/TAIL4.md
     "aten.index_copy_.default",
     "aten.index_copy.default",
     "aten.round.default",
@@ -362,19 +362,19 @@ pub const IMPLEMENTED: &[&str] = &[
 /// the conservative direction (it under-reports rather than over-reports).
 /// The fix is one case builder and one line move.
 ///
-/// `aten.mul.Scalar` was the first to get that fix (docs/TAIL.md): a
+/// `aten.mul.Scalar` was the first to get that fix (docs/kernels/TAIL.md): a
 /// re-measurement of `falcon` under `_aten_all_implemented()` found the
 /// kernel already dispatching, so the remaining work was exactly the case
 /// builder the comment above describes, plus this one line move.
 ///
 /// `aten.max.other` was the second, and it is worth recording that the case
-/// builder written for it while it was parked here (docs/SPELLINGS.md §7.3)
+/// builder written for it while it was parked here (docs/bindings/SPELLINGS.md §7.3)
 /// *found a live defect* -- a NaN in the second operand was dropped -- and
 /// held it as a deliberately failing case until the kernel could be fixed.
 /// Promotion and fix landed together; a builder written against a parked op is
 /// not a formality.
 /// `aten.add.Scalar` and `aten.sub.Scalar` were the third and fourth, and
-/// they are the ones that say the parking list is not free. docs/SCALAR.md
+/// they are the ones that say the parking list is not free. docs/numerics/SCALAR.md
 /// §6 recorded that the *narrowing* half of the scalar family had no golden
 /// coverage because of this list -- sabotage F3 was caught by two smoke tests
 /// and **zero** golden cases -- and writing the two builders on promotion
@@ -391,11 +391,11 @@ pub const IMPLEMENTED: &[&str] = &[
 /// that checked membership of `[low, high)` and deliberately not the
 /// sequence -- so between the two of them, nothing in the harness was ever in
 /// a position to notice that both drew from a different generator entirely
-/// (docs/RANDINT.md §8). Promotion came with the fix, and the builder that
+/// (docs/kernels/RANDINT.md §8). Promotion came with the fix, and the builder that
 /// replaced that comparator compares seeded values.
 pub const IMPLEMENTED_AWAITING_GOLDEN: &[&str] = &[
     "aten.any.dims",
-    // The five complex ops (docs/COMPLEX2.md). Parked here rather than
+    // The five complex ops (docs/kernels/COMPLEX2.md). Parked here rather than
     // advertised, and for a *stronger* reason than the rest of this list: the
     // golden harness compares a shim result against an upstream one by reading
     // both as real tensors, and four of these five return or accept a
@@ -409,7 +409,7 @@ pub const IMPLEMENTED_AWAITING_GOLDEN: &[&str] = &[
     // `aten.mul.Tensor` is deliberately NOT here: its dense path is unchanged
     // and stays golden-compared. Only the complex branch is new, and that
     // branch is unreachable without one of the four constructors above it.
-    // The three `_fft_*` ops (docs/FFT.md). Parked for the same reason as the
+    // The three `_fft_*` ops (docs/kernels/FFT.md). Parked for the same reason as the
     // five above: `_fft_r2c` and `_fft_c2c` RETURN a complex tensor and
     // `_fft_c2r` TAKES one, so on at least one side of every comparison there
     // is no dense storage for the golden harness to read. They are proven
@@ -420,7 +420,7 @@ pub const IMPLEMENTED_AWAITING_GOLDEN: &[&str] = &[
     "aten._fft_c2c.default",
     "aten._fft_c2r.default",
     "aten._fft_r2c.default",
-    // docs/COMPLEX3.md. Parked for the same reason as the five below it: it
+    // docs/kernels/COMPLEX3.md. Parked for the same reason as the five below it: it
     // RETURNS a complex tensor, so the golden harness -- which compares by
     // reading both sides as dense tensors -- has nothing to read on this
     // side. Proven element-wise against a live upstream in
@@ -440,7 +440,7 @@ pub const IMPLEMENTED_AWAITING_GOLDEN: &[&str] = &[
     // `resolve_torch_overload` refuses by design when `torch.ops.aten` has
     // no matching entry, so this cannot go through `compare.py`'s normal
     // per-op golden loop -- it is proven against upstream directly in
-    // `pytests/test_indexsel.py` instead (docs/INDEXSEL.md).
+    // `pytests/test_indexsel.py` instead (docs/kernels/INDEXSEL.md).
     "aten.reshape_as.default",
     "aten.zeros.default",
 ];
@@ -466,10 +466,10 @@ pub fn all_implemented() -> Vec<&'static str> {
 // whole of what makes the setter load-bearing rather than decorative.
 
 // ---------------------------------------------------------------------------
-// The torch-dispatch mode stack (docs/DISPATCH3.md)
+// The torch-dispatch mode stack (docs/design/DISPATCH3.md)
 // ---------------------------------------------------------------------------
 //
-// `docs/EXPORT.md` §4.2 measured the gap this closes: a `TorchDispatchMode`
+// `docs/graph/EXPORT.md` §4.2 measured the gap this closes: a `TorchDispatchMode`
 // entered, `_len_torch_dispatch_stack()` reported 1 inside the block, and
 // `__torch_dispatch__` was never called, because the single door did not read
 // the stack. The capture hook in `aten_dispatch` runs *after* the kernel, so
@@ -561,9 +561,9 @@ fn any_dispatch_mode_active(py: Python<'_>) -> bool {
     // into the very `FakeTensorMode` that is trying to build it.
     //
     // Before the door consulted the mode stack at all there was nothing to
-    // suppress and the guard was a bare counter (docs/EXPORT.md §2.4 says so in
+    // suppress and the guard was a bare counter (docs/graph/EXPORT.md §2.4 says so in
     // as many words). Now there is, and this is the read half of that counter.
-    // docs/EXPORT4.md §5.
+    // docs/graph/EXPORT4.md §5.
     if !entered {
         return false;
     }
@@ -621,7 +621,7 @@ struct ActiveMode<'py> {
 ///
 /// **This is the stack `torch.export` actually uses, and nothing in
 /// `torch._C` can see it.** The finding, measured rather than reasoned
-/// (docs/EXPORT5.md §6): `torch/utils/_python_dispatch.py::_push_mode` branches
+/// (docs/graph/EXPORT5.md §6): `torch/utils/_python_dispatch.py::_push_mode` branches
 /// on `mode._dispatch_key`, *not* on `mode._mode_key`, and
 /// `ProxyTorchDispatchMode.__init__` is handed `DispatchKey.PreDispatch` by
 /// export's tracer. So the proxy mode never reaches
@@ -629,7 +629,7 @@ struct ActiveMode<'py> {
 /// `torch._ops._set_mode_pre_dispatch`, which keeps it in an ordinary Python
 /// object in that module.
 ///
-/// The symptom of not reading it is the one `docs/EXPORT.md` §4.2 predicted in
+/// The symptom of not reading it is the one `docs/graph/EXPORT.md` §4.2 predicted in
 /// full: `torch.export.export()` **succeeds**, returns an `ExportedProgram`,
 /// prints, serialises -- and its graph holds a placeholder, an output and
 /// **no operators**, because only `FakeTensorMode` ever saw the ops and the
@@ -731,7 +731,7 @@ fn op_overload<'py>(py: Python<'py>, op: &str) -> PyResult<Bound<'py, PyAny>> {
 /// `type(a).__torch_dispatch__ is not torch.Tensor.__torch_dispatch__` -- so a
 /// plain tensor contributes nothing and the tuple is empty, which is exactly
 /// what upstream produces for `(x * 2 + 1).relu()` (measured side by side in
-/// docs/DISPATCH3.md §2). A `FakeTensor` argument does contribute, which is
+/// docs/design/DISPATCH3.md §2). A `FakeTensor` argument does contribute, which is
 /// the case that makes the tuple worth computing rather than hard-coding.
 ///
 /// Top-level arguments only. Upstream walks into lists; nothing that reaches a
@@ -923,7 +923,7 @@ pub fn aten_dispatch_entry(
     // bound by keyword, so `args` is just `(op,)`) the slice is empty and
     // CPython hands back the interned empty tuple without allocating.
     let rest = args.get_slice(1, args.len());
-    // The mode-stack consult (docs/DISPATCH3.md). When nothing has entered a
+    // The mode-stack consult (docs/design/DISPATCH3.md). When nothing has entered a
     // `TorchDispatchMode` -- which is every golden case, every eager forward
     // and every `loss.backward()` -- this is one module attribute read and a
     // branch that is not taken, and `aten_dispatch` below is reached with the
@@ -938,18 +938,18 @@ pub fn aten_dispatch_entry(
 
 
 // ---------------------------------------------------------------------------
-// `float8_e4m3fn`: refusing exactly what upstream refuses (docs/FLOAT8B.md)
+// `float8_e4m3fn`: refusing exactly what upstream refuses (docs/numerics/FLOAT8B.md)
 // ---------------------------------------------------------------------------
 
 /// The 114 ops upstream 2.13.0 refuses for `float8_e4m3fn`, paired with the
 /// **kernel name upstream puts in the message**, transcribed per op.
 ///
-/// docs/FLOAT8B.md §2: the wording is not unified because the difference carries
+/// docs/numerics/FLOAT8B.md §2: the wording is not unified because the difference carries
 /// information. `add`, `sub` and `rsub` all report `"add_stub"`; `mean` and `sum`
 /// both report `"sum_cpu"`; `relu` reports `"clamp_min_scalar_cpu"` while
 /// `hardtanh` reports `"clamp_scalar_cpu"`. Each pair says which kernel upstream
 /// would have dispatched to, and a house string would erase it. Same reasoning as
-/// docs/PROMOTE.md and docs/BACKWARD2.md, which both transcribed rather than
+/// docs/numerics/PROMOTE.md and docs/training/BACKWARD2.md, which both transcribed rather than
 /// unified.
 ///
 /// Sorted by op: `float8_e4m3fn_kernel` binary-searches it, and a duplicate is
@@ -1086,14 +1086,14 @@ fn float8_e4m3fn_kernel(op: &str) -> Option<&'static str> {
 }
 
 /// The ten ops upstream **computes** for this dtype and this build cannot
-/// (docs/FLOAT8B.md §4.1): candle 0.11.0's `WithDType for f8e4m3::to_f64`
+/// (docs/numerics/FLOAT8B.md §4.1): candle 0.11.0's `WithDType for f8e4m3::to_f64`
 /// recurses into itself and release-mode LLVM turns that into `.L1: jmp .L1`,
 /// so they hang instead of answering.
 ///
 /// They are refused in **this shim's** words, never upstream's. Reporting
 /// `"pow" not implemented for 'Float8_e4m3fn'` for `aten.pow.Scalar` would be a
 /// lie: upstream implements it.
-/// **Empty as of docs/FLOAT8C.md.** All ten ops it held are settled: eight
+/// **Empty as of docs/numerics/FLOAT8C.md.** All ten ops it held are settled: eight
 /// compute here now that `widen_f64` routes around candle's poisoned arm, and
 /// the remaining two (`aten.pow.Scalar`, `aten.pow.Tensor_Scalar`) turned out
 /// to be ops upstream refuses for all but a degenerate exponent, so they moved
@@ -1110,7 +1110,7 @@ fn float8_shim_only_refusal(op: &str) -> bool {
 
 /// `aten.pow.Scalar` and `aten.pow.Tensor_Scalar` for `float8_e4m3fn`, where
 /// upstream's refusal is **value-dependent** rather than op-level -- the same
-/// shape as `aten.matmul.default`'s shape-dependence (docs/FLOAT8B.md §2.1),
+/// shape as `aten.matmul.default`'s shape-dependence (docs/numerics/FLOAT8B.md §2.1),
 /// and the reason neither belongs in `FLOAT8_E4M3FN_REFUSALS`.
 ///
 /// Measured on 2.13.0 over `{0, 1, 2, 3, -1, 0.5, 1.5, True, False}`:
@@ -1147,15 +1147,15 @@ fn float8_pow_refuses(op: &str, args: &Bound<'_, PyTuple>, kwargs: Option<&Bound
 /// Whether the float8 gate applies to this call: at least one tensor operand is
 /// `float8_e4m3fn` and no tensor operand is a *different* floating-point dtype.
 ///
-/// The second half is the whole subtlety (docs/FLOAT8B.md §2.1). Upstream refuses
+/// The second half is the whole subtlety (docs/numerics/FLOAT8B.md §2.1). Upstream refuses
 /// a mixed call like `add(float8, float32)` **before** it looks up a kernel, with
 /// a `RuntimeError` -- `Promotion for Float8 Types is not supported` -- and
 /// answering that with `NotImplementedError` would be a new divergence in
-/// exception *type*, which is the failure docs/PROMOTE.md's last section is about.
+/// exception *type*, which is the failure docs/numerics/PROMOTE.md's last section is about.
 ///
 /// Integer and bool operands do not block the gate: `gather`'s int64 index and
 /// `masked_fill`'s bool mask do not promote, and upstream does report the kernel
-/// message for those calls (measured, docs/FLOAT8B.md §2.1).
+/// message for those calls (measured, docs/numerics/FLOAT8B.md §2.1).
 fn float8_only_floats(args: &Bound<'_, PyTuple>, kwargs: Option<&Bound<'_, PyDict>>) -> bool {
     let mut saw_f8 = false;
     let mut saw_other_float = false;
@@ -1233,7 +1233,7 @@ fn all_operands_are_1d(args: &Bound<'_, PyTuple>, kwargs: Option<&Bound<'_, PyDi
 /// scans anything new.
 ///
 /// At the door rather than in 114 kernels for the reason the device gate is
-/// there: a kernel can forget, and the 27 ops in docs/FLOAT8B.md table B never
+/// there: a kernel can forget, and the 27 ops in docs/numerics/FLOAT8B.md table B never
 /// reach a kernel at all -- they disappear into candle's `F8E4M3 -> f64`
 /// tail-call loop first. Only the door runs before that.
 fn float8_e4m3fn_gate(
@@ -1254,14 +1254,14 @@ fn float8_e4m3fn_gate(
     }
     // `aten.matmul.default` is not on the table: upstream's refusal for it is
     // **shape-dependent**, not op-level -- 2-D x 2-D returns a float8 result, and
-    // only the 1-D x 1-D form falls through to `dot` (docs/FLOAT8B.md §2.1). So
+    // only the 1-D x 1-D form falls through to `dot` (docs/numerics/FLOAT8B.md §2.1). So
     // it is gated on the shape upstream actually refuses, and left alone on the
     // shape upstream answers.
     if op == "aten.matmul.default" && float8_only_floats(args, kwargs) && all_operands_are_1d(args, kwargs) {
         return Err(not_implemented("\"dot\" not implemented for 'Float8_e4m3fn'"));
     }
     // `aten.adaptive_avg_pool1d.default` is value-dependent in the same way,
-    // and docs/FLOAT8B.md table D has it as an op upstream *computes* only
+    // and docs/numerics/FLOAT8B.md table D has it as an op upstream *computes* only
     // because the generic recipe synthesised `output_size=[0]` -- an empty
     // output, where no kernel is ever dispatched. Re-measured over
     // `[0] [1] [2] [4]` and 2-D and 3-D inputs, upstream refuses every
@@ -1293,7 +1293,7 @@ fn float8_e4m3fn_gate(
         return Err(not_implemented(format!(
             "{op}: float8_e4m3fn is not supported by this op in the torch._C shim \
              (candle's F8E4M3 -> f64 conversion does not terminate); upstream \
-             computes this -- docs/FLOAT8B.md §4.1"
+             computes this -- docs/numerics/FLOAT8B.md §4.1"
         )));
     }
     Ok(())
@@ -1301,7 +1301,7 @@ fn float8_e4m3fn_gate(
 
 /// `t.to_dtype(DType::F64)`, with `F8E4M3` widened through `F32` on the way.
 ///
-/// **This is the whole of docs/FLOAT8C.md §1.** candle 0.11.0's
+/// **This is the whole of docs/numerics/FLOAT8C.md §1.** candle 0.11.0's
 /// `WithDType for f8e4m3` generates `fn to_f64(self) -> f64 { (|v: f8e4m3|
 /// v.to_f64())(self) }`, and the by-value trait method is the exact receiver
 /// match, so the inner call resolves to itself; release-mode LLVM turns that
@@ -1317,7 +1317,7 @@ fn float8_e4m3fn_gate(
 /// every one of its 256 bit patterns is exactly representable in `f32`, and
 /// `f32 -> f64` is exact for all of them; the two-step result is bit-identical
 /// to what a non-recursive `to_f64` would return. `tools/golden/compare.py`
-/// already reads float8 results by this same widening (docs/FLOAT8B.md §5.1).
+/// already reads float8 results by this same widening (docs/numerics/FLOAT8B.md §5.1).
 ///
 /// It is a free function rather than a method so that **every** `F64` widening
 /// in this crate can be routed through one place: a `to_dtype(DType::F64)` left
@@ -1344,7 +1344,7 @@ pub fn aten_dispatch(
     // paid for a scan twice at the hottest line in the crate; merged, meta
     // costs the dispatcher a discriminant test on a value the gate already had
     // in hand.
-    // docs/FLOAT8B.md: `float8_e4m3fn` refuses here exactly where upstream
+    // docs/numerics/FLOAT8B.md: `float8_e4m3fn` refuses here exactly where upstream
     // refuses, in upstream's own words. Before the device gate, because the
     // hanging ops in table B never come back from the kernel to be refused.
     float8_e4m3fn_gate(op, args, kwargs)?;
@@ -1355,10 +1355,10 @@ pub fn aten_dispatch(
         // not a reading of ninety kernels. Everything not on the list refuses
         // there, naming itself -- and `PyTensorBase::tensor()` refuses under
         // it anyway, so a kernel reached by some other route still cannot read
-        // a `VkBuffer` as CPU storage. docs/VULKAN3.md.
+        // a `VkBuffer` as CPU storage. docs/devices/VULKAN3.md.
         Some(Where::Vulkan) => crate::vulkan::dispatch(py, op, args, kwargs)?,
         // The mps half, and it is one line here because the whole of it is a
-        // table lookup in `device.rs` (docs/MPS.md). An mps tensor is an
+        // table lookup in `device.rs` (docs/devices/MPS.md). An mps tensor is an
         // ordinary `Repr::Dense`, so unlike Vulkan there is no representation
         // to make the mistake unrepresentable -- but there is also nothing to
         // *find*: candle's Metal backend never falls back to the CPU silently,
@@ -1378,14 +1378,14 @@ pub fn aten_dispatch(
         // It needs it *more*. On Metal the float readback path was already
         // loud, because `read_flat` widens through `f64` and Metal has no
         // `F32 -> F64` -- thirteen of the fourteen silent fallbacks
-        // docs/MPS.md §2 probed were on the integer path. CUDA implements
+        // docs/devices/MPS.md §2 probed were on the integer path. CUDA implements
         // `f64`, so those same kernels succeed quietly there.
         //
         // `note_cuda_dispatch` is after the gate and before the kernel: it
         // counts ops that actually ran on cuda tensors, which is the runtime
-        // half of the evidence `_cuda_counters()` reports (docs/CUDA.md §5).
+        // half of the evidence `_cuda_counters()` reports (docs/devices/CUDA.md §5).
         // Placed here rather than inside the kernels for the reason
-        // docs/MPSATTN.md §3.1 gives -- there is one door, and a kernel cannot
+        // docs/devices/MPSATTN.md §3.1 gives -- there is one door, and a kernel cannot
         // acquire a cuda tensor without coming through it, so this count cannot
         // be dodged by moving code around the way a source scan can.
         Some(Where::Dense(ref device)) if crate::device::is_cuda(device) => {
@@ -1398,7 +1398,7 @@ pub fn aten_dispatch(
         // "device not available in torch._C shim: vulkan" -- so the *only* way
         // onto that device was a constant factory, and every Vulkan kernel
         // that had ever been tested had been tested on constants
-        // (docs/VULKAN4.md §1). `maybe_upload` returns `None` for every call
+        // (docs/devices/VULKAN4.md §1). `maybe_upload` returns `None` for every call
         // that is not a copy to vulkan, so nothing else changes shape here.
         _ => match crate::vulkan::maybe_upload(py, op, args, kwargs)? {
             Some(out) => out,
@@ -1410,15 +1410,15 @@ pub fn aten_dispatch(
     // here rather than in each kernel means a kernel can keep returning the
     // native type and cannot forget.
     let out = crate::tensor::promote(py, out)?;
-    // The graph capture hook (docs/CAPTURE.md). It is here rather than in
+    // The graph capture hook (docs/graph/CAPTURE.md). It is here rather than in
     // `aten_dispatch_inner` for two reasons: the meta path has to be recorded
     // too, and the identity the recorder registers has to be the object
     // *Python will hold*, which is `promote`'s result rather than the kernel's.
     //
     // When capture is off -- which is always, unless something asked for it --
     // this is one relaxed atomic load and a branch that is not taken. That is
-    // the entire cost added to the single door, measured in docs/CAPTURE.md §7.
-    // W5 (docs/BACKWARD4.md). Beside the capture hook rather than inside it,
+    // the entire cost added to the single door, measured in docs/graph/CAPTURE.md §7.
+    // W5 (docs/training/BACKWARD4.md). Beside the capture hook rather than inside it,
     // and for the same three reasons: the meta path has to be answered too, the
     // identity that gets marked has to be the object *Python will hold* --
     // `promote`'s result -- and there is exactly one place where "an op
@@ -1428,7 +1428,7 @@ pub fn aten_dispatch(
     // atomic load, one table scan of twelve strings, and a walk of the argument
     // tuple that stops at the first tensor and finds a `false`.
     let on_graph = crate::tensor::mark_from_op(py, op, args, kwargs, &out);
-    // W8, the eager recorder (docs/BACKWARD7.md). Gated on `mark_from_op`'s
+    // W8, the eager recorder (docs/training/BACKWARD7.md). Gated on `mark_from_op`'s
     // answer rather than on a test of its own: an op belongs on the eager tape
     // exactly when upstream would have given its result a `grad_fn`, and that
     // question has just been answered. A dispatch that differentiates nothing
@@ -1437,7 +1437,7 @@ pub fn aten_dispatch(
     if on_graph && crate::capture::eager_enabled() {
         crate::capture::eager_record(py, op, args, kwargs, &out);
     }
-    // W10a (docs/BACKWARD6.md). Beside `mark_from_op` and **not inside it**:
+    // W10a (docs/training/BACKWARD6.md). Beside `mark_from_op` and **not inside it**:
     // that function returns early when grad mode is off, and the call this
     // exists to see -- `optimizer.step()`'s `add_` -- is made under `no_grad`.
     // On the ordinary path this is `is_mutating`: one `rsplit_once` and a
@@ -1452,7 +1452,7 @@ pub fn aten_dispatch(
 /// Where a dispatched tensor argument lives, comparable without allocating.
 ///
 /// Not `PyDevice`: a label costs a `String` per argument and that was measured
-/// at +78 ns per dispatch (docs/DEVICE_ABS.md §6). Not `candle_core::Device`
+/// at +78 ns per dispatch (docs/devices/DEVICE_ABS.md §6). Not `candle_core::Device`
 /// either, because **a meta tensor has no candle handle** -- that is the whole
 /// content of `Repr::Meta`. So the gate compares this, which is a discriminant
 /// test in both arms, and builds a label only on the path that is about to
@@ -1463,7 +1463,7 @@ enum Where {
     Meta,
     /// No handle at all, like `Meta` -- but for the opposite reason. `Meta` has
     /// no handle because it has no storage; this one has storage that candle's
-    /// `Device` enum has no variant for (docs/VULKAN2.md §5.1). There is one
+    /// `Device` enum has no variant for (docs/devices/VULKAN2.md §5.1). There is one
     /// Vulkan device, so there is nothing to compare and the arm is a unit.
     Vulkan,
 }
@@ -1508,7 +1508,7 @@ impl Where {
 /// all tensors to be on the same device, but found at least two devices, mps:0
 /// and cpu!"*, `torch.mm` says *"Tensor for argument #1 'mat1' is on CPU, but
 /// expected it to be on GPU"*, and `torch.cat([cpu, mps])` **segfaults** the
-/// process on torch 2.13.0 (measured on this host, docs/DEVICE_ABS.md §6). A
+/// process on torch 2.13.0 (measured on this host, docs/devices/DEVICE_ABS.md §6). A
 /// per-kernel check is a check every new kernel has to remember; putting it at
 /// the single door means no kernel can forget it, and this shim has a single
 /// door precisely so that things like this have somewhere to go.
@@ -1520,8 +1520,8 @@ impl Where {
 /// reached it.** Until there was a second device it could not fire at all --
 /// `resolve()` refuses every non-CPU label, so every tensor was on the CPU and
 /// the loop always found one device. That was recorded as an untested branch in
-/// docs/DEVICE_ABS.md §10. `meta` needs no backend, so `cpu + meta` is an input
-/// this build can actually construct, and docs/META.md §5 is the measurement
+/// docs/devices/DEVICE_ABS.md §10. `meta` needs no backend, so `cpu + meta` is an input
+/// this build can actually construct, and docs/devices/META.md §5 is the measurement
 /// that it raises.
 ///
 /// **The comparison is on candle's handles, not on reconstructed labels, and
@@ -1531,7 +1531,7 @@ impl Where {
 /// for `add.Tensor` (346 -> 424 ns) and **+86 ns** for `cat.default`
 /// (392 -> 479 ns) -- +22% on the cheapest op this door has. Comparing `Device`
 /// directly is an enum discriminant test; a label is built only on the failing
-/// path, where an allocation is free next to raising. docs/DEVICE_ABS.md §6 has
+/// path, where an allocation is free next to raising. docs/devices/DEVICE_ABS.md §6 has
 /// the numbers from both versions. `Where` keeps that property while making
 /// room for a tensor with no handle at all.
 ///
@@ -1558,7 +1558,7 @@ fn check_devices_agree(
     // straight past the gate and died inside the kernel on
     // `Cannot copy out of meta tensor; no data!` -- the right refusal by
     // accident, from the wrong place, and it would have been a wrong *answer*
-    // for two backends that could both actually compute. docs/META.md §5.
+    // for two backends that could both actually compute. docs/devices/META.md §5.
     if let Some(kwargs) = kwargs {
         for (_, value) in kwargs.iter() {
             scan_for_device(op, &mut first, &value)?;
@@ -1614,7 +1614,7 @@ fn scan_for_device(
 /// The agreement test reads the representation in place instead of building a
 /// `Where` per argument. Constructing one clones a `candle_core::Device`, and
 /// the version that did so on every argument (rather than only on the first)
-/// showed up in the A/B -- see docs/META.md §9. `Where` is built once, for the
+/// showed up in the A/B -- see docs/devices/META.md §9. `Where` is built once, for the
 /// first tensor, and again only on the path that is about to raise.
 #[inline]
 fn visit_for_device(
@@ -1654,7 +1654,7 @@ fn visit_for_device(
         return Ok(true);
     }
     // `copy_` is the one op upstream lets cross devices, because transferring
-    // *is* its definition (docs/DEVICE_ABS.md §3.4, measured: `cpu.copy_(mps)`
+    // *is* its definition (docs/devices/DEVICE_ABS.md §3.4, measured: `cpu.copy_(mps)`
     // returns a cpu tensor). Checked only here, on the path that was about to
     // raise, so agreeing arguments pay nothing for it.
     if op == "aten.copy_.default" {
@@ -1692,7 +1692,7 @@ fn visit_for_device(
 /// upstream", and the golden harness compares values -- which a meta tensor by
 /// definition has none of. Meta support is a property of ops already on the
 /// list, so op coverage stays 96 and the evidence lives in
-/// `pytests/test_shim.py` instead. docs/META.md §7.
+/// `pytests/test_shim.py` instead. docs/devices/META.md §7.
 fn meta_dispatch(
     py: Python<'_>,
     op: &str,
@@ -1705,7 +1705,7 @@ fn meta_dispatch(
         // Metadata pass-throughs: upstream's kernels for these return a tensor
         // with the same shape and dtype and (for `detach`/`alias`) share
         // storage, which meta has none of. This shim's dense `detach`/`alias`
-        // already copy rather than alias (docs/OPS4.md §8), so meta is not
+        // already copy rather than alias (docs/kernels/OPS4.md §8), so meta is not
         // losing an aliasing property it otherwise had.
         "aten.detach.default" | "aten.alias.default" | "aten.clone.default"
         | "aten.contiguous.default" | "aten.lift_fresh.default"
@@ -1784,11 +1784,11 @@ fn meta_dispatch(
         // -- is brought across by `torch.empty_like(param, device=...)` in
         // `transformers/modeling_utils.py:4763,4771`. Without this the load
         // reads the whole file and then stops one step before the model is
-        // usable, which is exactly where docs/CKPT2.md §3 found it.
+        // usable, which is exactly where docs/models/CKPT2.md §3 found it.
         //
         // Shape, dtype and device rules are the dense kernel's, restated with
         // the same helpers in the same argument order, for the reason
-        // docs/E2E_REAL.md §6.1 gives: a meta kernel that promises a different
+        // docs/models/E2E_REAL.md §6.1 gives: a meta kernel that promises a different
         // dtype than the dense one hands the caller an allocation the dense
         // kernel then refuses to compute into.
         //
@@ -1821,7 +1821,7 @@ fn meta_dispatch(
             }
         }
         // ---------------------------------------------------------------
-        // The elementwise family. docs/META.md §7.1.
+        // The elementwise family. docs/devices/META.md §7.1.
         //
         // Every arm below is the same two-part answer -- a shape rule and a
         // dtype rule -- and **neither part is restated here.** The shape is
@@ -1829,7 +1829,7 @@ fn meta_dispatch(
         // reproduces upstream's wording for a mismatch. The dtype is the
         // dense kernel's own helper, called rather than copied.
         //
-        // That is not tidiness. docs/E2E_REAL.md §6.1: a meta kernel that
+        // That is not tidiness. docs/models/E2E_REAL.md §6.1: a meta kernel that
         // promises a dtype the dense kernel would not produce hands the
         // caller an allocation the dense kernel then refuses to compute into,
         // and the divergence surfaces far from here. Calling the same
@@ -1867,7 +1867,7 @@ fn meta_dispatch(
             meta_result(py, input.dims().to_vec(), TorchDType::Bool)
         }
         // The `Tensor` overloads add the broadcast and keep `same_dtype`.
-        // Upstream promotes here and this shim does not (docs/BIND.md §9);
+        // Upstream promotes here and this shim does not (docs/bindings/BIND.md §9);
         // reproducing the *refusal* is what keeps meta from advertising a
         // comparison the dense kernel declines to run.
         //
@@ -2154,7 +2154,7 @@ fn meta_dispatch(
         // Three shape kernels, and the reason they are the only three.
         //
         // The elementwise block above got `llama` and thirteen others through
-        // construction on meta. Sweeping all twenty (docs/META.md §7.2)
+        // construction on meta. Sweeping all twenty (docs/devices/META.md §7.2)
         // printed a work queue with exactly two entries behind it --
         // `select.int` for five architectures and `tril.default` for one --
         // and re-running it behind those printed one more, `expand.default`
@@ -2204,7 +2204,7 @@ fn meta_dispatch(
         //
         // `gpt_bigcode` is the caller: its causal-mask buffer is
         // `torch.tril(torch.ones((n, n), dtype=torch.bool))` built in
-        // `__init__` (docs/TORCHSCRIPT.md §6), so it runs during
+        // `__init__` (docs/graph/TORCHSCRIPT.md §6), so it runs during
         // construction and lands on meta.
         "aten.tril.default" | "aten.triu.default" => {
             let name = if op == "aten.tril.default" { "tril" } else { "triu" };
@@ -2324,7 +2324,7 @@ fn meta_dispatch(
         // `keepdim` on this overload (`sum.dim_IntList` is the one that has
         // them, and it is not here because nothing has asked for it).
         //
-        // Reached by voicestudio's BigVGAN (docs/VOICE4.md §4): every
+        // Reached by voicestudio's BigVGAN (docs/architectures/VOICE4.md §4): every
         // anti-aliased activation normalises its resampling filter with
         // `taps / taps.sum()` in `__init__`, and `from_pretrained` runs
         // `__init__` under `init_empty_weights` -- so the 218 filters are
@@ -2368,7 +2368,7 @@ fn meta_dispatch(
         // Writing a second shape-and-dtype rule here would have been the easy
         // move and the wrong one: `zeros_like`'s dtype rule would then exist
         // twice, and the two copies would diverge the first time one was
-        // corrected. docs/EXPORT5.md §4.
+        // corrected. docs/graph/EXPORT5.md §4.
         //
         // It is reached because `check_meta` routes a meta input to this table
         // before the dense entry, and both branches of the delegate are live on
@@ -2413,7 +2413,7 @@ fn meta_dispatch(
         // dense kernel would compute is worse than no meta kernel, because
         // nothing downstream can tell the difference until values are read.
         //
-        // Reduction family (docs/META.md §7.4's 축소 column).
+        // Reduction family (docs/devices/META.md §7.4's 축소 column).
         "aten.sum.dim_IntList" => {
             let input = tensor_arg(op, args, kwargs, 0, "self")?;
             let rank = input.dims().len();
@@ -2519,7 +2519,7 @@ fn meta_dispatch(
             meta_result(py, reduced_dims(&extents, &dims, keepdim), input.tag())
         }
         // ---------------------------------------------------------------
-        // View/shape family (docs/META.md §7.4's 뷰·모양 column). Every one
+        // View/shape family (docs/devices/META.md §7.4's 뷰·모양 column). Every one
         // of these is metadata-only even on a dense tensor -- no element
         // moves -- so unlike the reduction family above there is no
         // "compute vs. infer" gap to bridge, only the argument parsing and
@@ -2689,7 +2689,7 @@ fn meta_dispatch(
         }
         // ---------------------------------------------------------------
         // Contraction/indexing family and the multi-output reductions.
-        // docs/METAEMB.md. Two things distinguish this block from the
+        // docs/kernels/METAEMB.md. Two things distinguish this block from the
         // reduction and view blocks above.
         //
         // **The first is that these are what real models actually hit.**
@@ -2963,12 +2963,12 @@ fn meta_dispatch(
             )
         }
         // ---------------------------------------------------------------
-        // The contraction family proper (docs/META.md §7.4's 축약 column),
+        // The contraction family proper (docs/devices/META.md §7.4's 축약 column),
         // reached on the SECOND round of the same measurement: with
         // `embedding` and `gather` closed, `matmul` became the first wall for
         // mistral and qwen2 and `native_layer_norm` for the other five
         // (METAEMB.md §2.3). Re-measuring after each landing rather than
-        // implementing a list is docs/META.md §7.2's own method.
+        // implementing a list is docs/devices/META.md §7.2's own method.
         //
         // Every shape rule here is transcribed from its dense sibling and
         // every REFUSAL is the dense kernel's, including the ones where the
@@ -3166,7 +3166,7 @@ fn meta_dispatch(
             Ok(PyTuple::new(py, triple)?.into_any().unbind())
         }
         // ---------------------------------------------------------------
-        // Combine/split and composite (docs/META.md §7.4's 결합·분할 and
+        // Combine/split and composite (docs/devices/META.md §7.4's 결합·분할 and
         // 합성·활성 columns), reached on the THIRD round of the measurement:
         // with the contraction family closed, the eight architectures'
         // first wall moved to SDPA (x4), `cat` (x2), `split` and
@@ -3409,7 +3409,7 @@ fn meta_dispatch(
             ];
             Ok(PyTuple::new(py, pair)?.into_any().unbind())
         }
-        // The activation family (docs/META.md §7.4's 합성·활성 column), the
+        // The activation family (docs/devices/META.md §7.4's 합성·활성 column), the
         // FOURTH round's wall: `gelu` for five architectures, `silu` for two.
         // Shape-preserving and dtype-preserving, so the only content of these
         // kernels is the refusal -- which is why they are one arm and not
@@ -3545,7 +3545,7 @@ fn meta_dispatch(
                              holds none. This is the same boundary upstream draws -- a bool \
                              mask on a meta tensor reaches torch.nonzero's meta registration, \
                              which refuses for the same reason. The integer-index half of \
-                             this op IS answered. See docs/METAEMB.md §5.",
+                             this op IS answered. See docs/kernels/METAEMB.md §5.",
                             index.tag().name()
                         )))
                     }
@@ -3622,13 +3622,13 @@ fn meta_dispatch(
              function of the input's VALUES, not of the input's shape, and a meta tensor \
              holds no values. This is a refusal, not a gap -- upstream has no meta kernel \
              for these either, for the same reason. Use a dense tensor, or supply the \
-             output size explicitly where the op accepts one. See docs/METAEMB.md §5."
+             output size explicitly where the op accepts one. See docs/kernels/METAEMB.md §5."
         ))),
         other => Err(not_implemented(format!(
             "torch._C shim has no meta kernel for {other}. A meta tensor holds shape and \
              dtype and no storage, so this op would have to infer its output shape without \
              computing -- which is a real kernel (upstream registers one in \
-             torch/_meta_registrations.py), not a fallthrough. See docs/META.md §7 for the \
+             torch/_meta_registrations.py), not a fallthrough. See docs/devices/META.md §7 for the \
              list that is implemented."
         ))),
     }
@@ -3715,7 +3715,7 @@ fn meta_result(py: Python<'_>, shape: Vec<usize>, tag: TorchDType) -> PyResult<P
 /// The last one is the whole point of meta and the reason this is not a
 /// fallthrough: a shim that quietly produced a zero-filled CPU tensor here
 /// would turn "no weights were loaded" into "the weights are all zero", which
-/// is the failure `docs/CKPT.md`'s `filled` guard exists to prevent one layer
+/// is the failure `docs/models/CKPT.md`'s `filled` guard exists to prevent one layer
 /// down.
 fn meta_to_copy(
     py: Python<'_>,
@@ -3728,7 +3728,7 @@ fn meta_to_copy(
     reject_unsupported(OP, args, kwargs, &[(2, "layout"), (4, "pin_memory")])?;
     reject_memory_format(OP, args, kwargs, 6)?;
     // `device=None` keeps the tensor where it is -- on meta. Same contract as
-    // the dense path (docs/DEVICE_ABS.md §5.2), and here it is observable:
+    // the dense path (docs/devices/DEVICE_ABS.md §5.2), and here it is observable:
     // reading the absent argument as "the CPU" would make every `.float()` on
     // a meta parameter try to leave the meta device.
     let label = device_arg_or_label(args, kwargs, 3, "device", &PyDevice::meta())?;
@@ -3789,7 +3789,7 @@ fn aten_dispatch_inner(
         //
         // `detach` is here because it is the op `llama4` construction reaches
         // first: `nn.Buffer` -> `nn/parameter.py` -> `data.detach()`.
-        // docs/COMPLEX2.md §5.
+        // docs/kernels/COMPLEX2.md §5.
         "aten.detach.default"
         | "aten.alias.default"
         | "aten.clone.default"
@@ -3821,7 +3821,7 @@ fn aten_dispatch_inner(
             // is never an alias of anything (`view_as_complex` calls candle's
             // `copy()`, which allocates unconditionally), so no view exists
             // that could observe the difference between swapping the
-            // representation and writing through it. docs/COMPLEX2.md §6.
+            // representation and writing through it. docs/kernels/COMPLEX2.md §6.
             receiver.borrow_mut().replace_with(replacement);
             Ok(receiver.into_any().unbind())
         }
@@ -3835,7 +3835,7 @@ fn aten_dispatch_inner(
             let other = required("aten.mul.Scalar", args, kwargs, 1, "other")?;
             crate::tensor::complex_ops::mul_scalar(py, &input, other.extract::<f64>()?)
         }
-        // -- docs/COMPLEX3.md: the four walls docs/BIND3.md §6 measured -----
+        // -- docs/kernels/COMPLEX3.md: the four walls docs/bindings/BIND3.md §6 measured -----
         //
         // One contiguous run, guarded exactly as the six above are and for the
         // same reason: each of these keys already has a dense kernel that
@@ -3878,7 +3878,7 @@ fn aten_dispatch_inner(
         "aten.addmm.default" => addmm_default(py, args, kwargs),
         "aten.alias.default" => alias_default(py, args, kwargs),
         "aten.as_strided.default" => as_strided_default(py, args, kwargs),
-        // -- docs/LAST7.md: the sliding-window view -----------------------
+        // -- docs/kernels/LAST7.md: the sliding-window view -----------------------
         "aten.unfold.default" => unfold_default(py, args, kwargs),
         "aten.arange.default" => arange(py, args, kwargs, ArangeForm::End),
         "aten.arange.start" => arange(py, args, kwargs, ArangeForm::Start),
@@ -3920,11 +3920,11 @@ fn aten_dispatch_inner(
         // `sqrt` sits with the `unary_float` family rather than beside
         // `rsqrt`'s own kernel: it is one candle call, and sharing the family
         // is what makes `float16` in / `float16` out true for both without
-        // restating the rule. docs/KERNELS26.md §1.
+        // restating the rule. docs/kernels/KERNELS26.md §1.
         "aten.sqrt.default" => unary_float(py, args, kwargs, "aten.sqrt.default", Unary::Sqrt),
         "aten.rsub.Scalar" => rsub_scalar(py, args, kwargs),
 
-        // -- what upstream's `repr(tensor)` dispatches (docs/E2E_REAL.md) ----
+        // -- what upstream's `repr(tensor)` dispatches (docs/models/E2E_REAL.md) ----
         "aten.abs.default" => abs_default(py, args, kwargs),
         "aten.adaptive_avg_pool1d.default" => adaptive_avg_pool1d_default(py, args, kwargs),
         "aten.greater.Tensor" => compare_tensor(py, args, kwargs, "aten.greater.Tensor", Cmp::Gt),
@@ -3939,12 +3939,12 @@ fn aten_dispatch_inner(
         "aten.masked_select.default" => masked_select_default(py, args, kwargs),
         "aten.unbind.int" => unbind_int(py, args, kwargs),
 
-        // -- attention (docs/OPS8.md) --------------------------------------
+        // -- attention (docs/kernels/OPS8.md) --------------------------------------
         "aten._scaled_dot_product_flash_attention_for_cpu.default" => {
             sdpa_flash_cpu(py, args, kwargs)
         }
 
-        // -- the four docs/GPT2.md measured a 2-layer GPT-2 stopping on -----
+        // -- the four docs/models/GPT2.md measured a 2-layer GPT-2 stopping on -----
         "aten.native_group_norm.default" => native_group_norm_default(py, args, kwargs),
         "aten.upsample_bilinear2d.default" => upsample_bilinear2d_default(py, args, kwargs),
         "aten.upsample_bicubic2d.default" => upsample_bicubic2d_default(py, args, kwargs),
@@ -3953,7 +3953,7 @@ fn aten_dispatch_inner(
         "aten.native_layer_norm.default" => native_layer_norm_default(py, args, kwargs),
         "aten.native_batch_norm.default" => native_batch_norm_default(py, args, kwargs),
 
-        // -- the TensorBase surface (docs/TENSORBASE.md) -------------------
+        // -- the TensorBase surface (docs/bindings/TENSORBASE.md) -------------------
         "aten.add.Scalar" => arith_scalar(py, args, kwargs, "aten.add.Scalar", Arith::Add),
         "aten.sub.Tensor" => arith_tensor(py, args, kwargs, "aten.sub.Tensor", Arith::Sub),
         "aten.sub.Scalar" => arith_scalar(py, args, kwargs, "aten.sub.Scalar", Arith::Sub),
@@ -3965,7 +3965,7 @@ fn aten_dispatch_inner(
         // deliberate: the tag can only be complex if the arm is
         // (`PyTensorBase::complex` is the single entrance), and reading the
         // representation is what makes that true rather than assumed.
-        // docs/COMPLEX2.md §4.
+        // docs/kernels/COMPLEX2.md §4.
         "aten.mul.Tensor" => {
             let lhs = tensor_arg("aten.mul.Tensor", args, kwargs, 0, "self")?;
             let rhs = tensor_arg("aten.mul.Tensor", args, kwargs, 1, "other")?;
@@ -4144,7 +4144,7 @@ fn aten_dispatch_inner(
         "aten.contiguous.default" => contiguous_default(py, args, kwargs),
         "aten.clone.default" => clone_default(py, args, kwargs, "aten.clone.default"),
 
-        // -- `prims.*` (docs/PRIMS.md) -------------------------------------
+        // -- `prims.*` (docs/kernels/PRIMS.md) -------------------------------------
         //
         // Nine of these thirteen are an aten kernel under another name --
         // upstream's own `impl_aten` for `prims.cos` *is* `torch.cos` -- so
@@ -4187,12 +4187,12 @@ fn aten_dispatch_inner(
         "aten.uniform_.default" => uniform_inplace(py, args, kwargs),
         "aten.normal_.default" => normal_inplace(py, args, kwargs),
 
-        // -- what widening past the Llama/GPT-2 family asks for (docs/ARCH.md) --
+        // -- what widening past the Llama/GPT-2 family asks for (docs/architectures/ARCH.md) --
         "aten.gelu.default" => gelu_default(py, args, kwargs),
         "aten.gather.default" => gather_default(py, args, kwargs),
         "aten.hardtanh.default" => hardtanh_default(py, args, kwargs),
 
-        // -- the eight `do_sample=True` stops on (docs/SAMPLING.md) ---------
+        // -- the eight `do_sample=True` stops on (docs/models/SAMPLING.md) ---------
         "aten._softmax.default" => softmax_default(py, args, kwargs),
         "aten.scatter.src" => scatter_src(py, args, kwargs),
         "aten.scatter_reduce.two" => scatter_reduce_two(py, args, kwargs),
@@ -4208,14 +4208,14 @@ fn aten_dispatch_inner(
         "aten.topk.default" => topk_default(py, args, kwargs),
         "aten.multinomial.default" => multinomial_default(py, args, kwargs),
 
-        // -- the cross-entropy forward (docs/LOSS.md) ----------------------
+        // -- the cross-entropy forward (docs/training/LOSS.md) ----------------------
         "aten._log_softmax.default" => log_softmax_default(py, args, kwargs),
         "aten.nll_loss_forward.default" => nll_loss_forward_default(py, args, kwargs),
 
-        // -- the out-of-place dropout capture can record (docs/LOSS.md §7) --
+        // -- the out-of-place dropout capture can record (docs/training/LOSS.md §7) --
         "aten.native_dropout.default" => native_dropout_default(py, args, kwargs),
 
-        // -- falcon / bloom / gpt_bigcode (docs/TAIL.md) --------------------
+        // -- falcon / bloom / gpt_bigcode (docs/kernels/TAIL.md) --------------------
         "aten._safe_softmax.default" => safe_softmax_default(py, args, kwargs),
         "aten.add_.Tensor" => {
             arith_inplace_tensor(py, args, kwargs, "aten.add_.Tensor", Arith::Add)
@@ -4223,10 +4223,10 @@ fn aten_dispatch_inner(
         "aten.baddbmm.default" => baddbmm_default(py, args, kwargs),
         "aten.split_with_sizes.default" => split_with_sizes(py, args, kwargs),
 
-        // -- mamba / mixtral (docs/OPS4.md) ---------------------------------
+        // -- mamba / mixtral (docs/kernels/OPS4.md) ---------------------------------
         "aten.erf.default" => unary_float(py, args, kwargs, "aten.erf.default", Unary::Erf),
         "aten.exp.default" => unary_float(py, args, kwargs, "aten.exp.default", Unary::Exp),
-        // `mamba`'s *construction* wall, not its forward (docs/ARCH20.md §4).
+        // `mamba`'s *construction* wall, not its forward (docs/architectures/ARCH20.md §4).
         "aten.log.default" => unary_float(py, args, kwargs, "aten.log.default", Unary::Log),
         "aten.log2.default" => log2_default(py, args, kwargs),
         "aten.leaky_relu.default" => leaky_relu_default(py, args, kwargs),
@@ -4237,9 +4237,9 @@ fn aten_dispatch_inner(
         "aten.expm1.default" => expm1_default(py, args, kwargs),
         // `bert`'s wall: `F.pad` on a bias while the model is being built.
         "aten.constant_pad_nd.default" => constant_pad_nd(py, args, kwargs),
-        // docs/PAD.md: `torch.stft`'s first wall, and four of the five
-        // speech models docs/VOICE.md ranks. Six schemas, one gather.
-        // docs/PAD.md §8: nn.RMSNorm, docs/VOICE.md rank 16 (f5).
+        // docs/kernels/PAD.md: `torch.stft`'s first wall, and four of the five
+        // speech models docs/architectures/VOICE.md ranks. Six schemas, one gather.
+        // docs/kernels/PAD.md §8: nn.RMSNorm, docs/architectures/VOICE.md rank 16 (f5).
         "aten.rms_norm.default" => rms_norm_default(py, args, kwargs),
         "aten.reflection_pad1d.default" => {
             pad_nd(py, args, kwargs, "aten.reflection_pad1d.default", 1, PadMode::Reflect)
@@ -4259,7 +4259,7 @@ fn aten_dispatch_inner(
         "aten.replication_pad3d.default" => {
             pad_nd(py, args, kwargs, "aten.replication_pad3d.default", 3, PadMode::Replicate)
         }
-        // docs/FFT.md: the third of docs/COMPLEX.md's three walls. The
+        // docs/kernels/FFT.md: the third of docs/kernels/COMPLEX.md's three walls. The
         // transform itself; `aten.stft.*` above it is the framing.
         "aten.stft.default" => stft_kernel(py, args, kwargs, "aten.stft.default", false),
         "aten.stft.center" => stft_kernel(py, args, kwargs, "aten.stft.center", true),
@@ -4275,7 +4275,7 @@ fn aten_dispatch_inner(
         // The last of the six comparisons to get its Tensor overload. `le`,
         // `lt` and `gt` all had both halves and `ge` had only `.Scalar`, so
         // `x >= tensor` resolved through `methods.json` and then refused by
-        // name (docs/GROUPED_MM.md §6.4). Same kernel as its five siblings.
+        // name (docs/kernels/GROUPED_MM.md §6.4). Same kernel as its five siblings.
         "aten.ge.Tensor" => compare_tensor(py, args, kwargs, "aten.ge.Tensor", Cmp::Ge),
         "aten.flip.default" => flip_default(py, args, kwargs),
         "aten.floor_divide.default" => floor_divide_default(py, args, kwargs),
@@ -4289,7 +4289,7 @@ fn aten_dispatch_inner(
         "aten.clamp_min.default" => clamp_min_default(py, args, kwargs),
         "aten.div_.Tensor" => div_inplace_tensor(py, args, kwargs),
         // `noise.div_(1 - p)`, the scale step of upstream's dropout
-        // decomposition (docs/TRAIN.md §1). The out-of-place `div.Scalar` and
+        // decomposition (docs/training/TRAIN.md §1). The out-of-place `div.Scalar` and
         // the in-place `sub_`/`mul_`/`add_` scalar forms were all here already;
         // this one was the hole in the middle of them, and it is the same
         // helper -- `div_.Scalar` differs from `mul_.Scalar` only in
@@ -4305,7 +4305,7 @@ fn aten_dispatch_inner(
         "aten.index_add.default" => index_add_common(py, args, kwargs, "aten.index_add.default", false),
         "aten.index_add_.default" => index_add_common(py, args, kwargs, "aten.index_add_.default", true),
 
-        // -- the rest of the in-place arithmetic family (docs/ARCH20.md §8) --
+        // -- the rest of the in-place arithmetic family (docs/architectures/ARCH20.md §8) --
         //
         // `add_.Tensor` above was the only one of these with a kernel, and
         // none of the five had a *member*, so `x -= y`, `x *= y`, `x.neg_()`
@@ -4362,7 +4362,7 @@ fn aten_dispatch_inner(
 
         "aten.one_hot.default" => one_hot_default(py, args, kwargs),
 
-        // -- docs/INDEXSEL.md: index_select, argsort, where.Scalar, new_full,
+        // -- docs/kernels/INDEXSEL.md: index_select, argsort, where.Scalar, new_full,
         // reshape_as, unflatten, chunk (free-function), diff, multiply,
         // logical_and --------------------------------------------------
         "aten.index_select.default" => index_select_default(py, args, kwargs),
@@ -4379,7 +4379,7 @@ fn aten_dispatch_inner(
         "aten.multiply.Scalar" => arith_scalar(py, args, kwargs, "aten.multiply.Scalar", Arith::Mul),
         "aten.logical_and.default" => logical_and_default(py, args, kwargs),
 
-        // -- docs/RNN.md: one contiguous run, kept together for the merge ---
+        // -- docs/kernels/RNN.md: one contiguous run, kept together for the merge ---
         "aten.upsample_linear1d.default" => upsample_linear1d_default(py, args, kwargs),
         "aten.lstm.input" => lstm_input(py, args, kwargs),
         // The OTHER `aten::lstm` overload, refused by name rather than
@@ -4395,7 +4395,7 @@ fn aten_dispatch_inner(
              rather than a rectangular (seq, batch, feature) tensor. \
              `aten.lstm.input` is implemented.",
         )),
-        // -- docs/TAIL4.md: index_copy_, index_copy, round (four keys),
+        // -- docs/kernels/TAIL4.md: index_copy_, index_copy, round (four keys),
         // logsumexp, t_ ------------------------------------------------
         "aten.index_copy_.default" => {
             index_copy_common(py, args, kwargs, "aten.index_copy_.default", true)
@@ -4446,7 +4446,7 @@ pub fn aten_all_implemented() -> Vec<&'static str> {
 // Three ops, deliberately of three different *kinds* rather than three of the
 // same kind -- a factory, an elementwise binary, and a matmul. Each exercises a
 // different part of the floor, so the pattern is shown to generalise. The
-// reasoning is written out in docs/TORCH_C.md.
+// reasoning is written out in docs/design/TORCH_C.md.
 // ---------------------------------------------------------------------------
 
 /// `aten::full(SymInt[] size, Scalar fill_value, *, ScalarType? dtype=None,
@@ -4472,11 +4472,11 @@ fn full_default(
     // torch infers int64 from an integer fill value and the default float dtype
     // otherwise. A Python `bool` lands in this branch because `bool` subclasses
     // `int`; torch would give it `torch.bool`, which the shim has no dtype for
-    // at all -- recorded in docs/TORCH_C.md rather than papered over.
+    // at all -- recorded in docs/design/TORCH_C.md rather than papered over.
     // `bool` subclasses `int` in Python, so the bool test has to come first.
     // torch gives `torch.full((2,), True)` dtype `torch.bool`; before the
     // dtype tag existed this branch was unreachable and the shim handed back
-    // `int64` (docs/TORCH_C.md §2 recorded it as an open item).
+    // `int64` (docs/design/TORCH_C.md §2 recorded it as an open item).
     let fill_is_bool = fill.is_instance_of::<pyo3::types::PyBool>();
     let fill_is_int = fill.is_instance_of::<pyo3::types::PyInt>();
     let dtype = match optional(args, kwargs, 2, "dtype")? {
@@ -4574,7 +4574,7 @@ fn filled_block(
 /// T5 family (`t5`, `mt5`, `long_t5`, `umt5`, `switch_transformers`,
 /// `t5gemma`). The call is
 /// `torch.full_like(relative_position_if_large, num_buckets - 1)` on an
-/// `int64` tensor with a Python `int` fill (docs/DEMAND.md rank 3).
+/// `int64` tensor with a Python `int` fill (docs/architectures/DEMAND.md rank 3).
 ///
 /// A leaf upstream (`_dispatch_has_kernel_for_dispatch_key(...,
 /// "CompositeImplicitAutograd")` is `False`), and a `TorchDispatchMode` logger
@@ -4660,7 +4660,7 @@ fn full_like_default(
 /// `aten::constant_pad_nd(Tensor self, SymInt[] pad, Scalar value=0) -> Tensor`
 ///
 /// `bert`'s wall, and the only genuinely new *kernel* the twenty-architecture
-/// round needed (docs/ARCH20.md §2). `transformers`'
+/// round needed (docs/architectures/ARCH20.md §2). `transformers`'
 /// `modeling_utils.py:2701 _adjust_bias` pads the output-embedding bias when
 /// the head's vocabulary is wider than the embedding it is tied to, so this
 /// runs during `from_config` -- `bert` never reached its own forward.
@@ -4698,7 +4698,7 @@ fn full_like_default(
 /// The two shape refusals are upstream's messages transcribed, spacing
 /// included -- "Pad length is 6while the input has 2dimensions." really is
 /// missing both spaces upstream, and is reproduced rather than tidied for the
-/// reason docs/CKPT2.md §4 gives: a message that differs from upstream's only
+/// reason docs/models/CKPT2.md §4 gives: a message that differs from upstream's only
 /// in wording is useless exactly where it is needed.
 fn constant_pad_nd(
     py: Python<'_>,
@@ -4797,7 +4797,7 @@ fn constant_pad_nd(
 /// is not here because it is a different kernel entirely
 /// (`constant_pad_nd`, above) and `circular` is not here because upstream
 /// has no aten op for it at all -- traced, it decomposes into
-/// `new_empty`/`slice`/`copy_` above the dispatcher (docs/PAD.md §3).
+/// `new_empty`/`slice`/`copy_` above the dispatcher (docs/kernels/PAD.md §3).
 #[derive(Clone, Copy, PartialEq)]
 enum PadMode {
     Reflect,
@@ -4871,15 +4871,15 @@ fn pad_source_index(mode: PadMode, j: i64, left: i64, w: i64) -> i64 {
 /// ```
 ///
 /// **`torch.stft`'s first wall, and it has nothing to do with complex
-/// numbers.** docs/COMPLEX.md §5 measured that both `return_complex=True` and
+/// numbers.** docs/kernels/COMPLEX.md §5 measured that both `return_complex=True` and
 /// `return_complex=False` raise the identical error before any transform,
 /// because `stft` reflect-pads its input by `n_fft // 2` when `center=True`.
 /// A `TorchDispatchMode` trace of `torch.stft` confirms the order:
 /// `view` -> **`reflection_pad1d`** -> `view` -> `unsqueeze` -> `as_strided`
 /// -> `mul` -> `_fft_r2c` -> `transpose_` -> `squeeze_`. So this op moves that
-/// wall; it does not remove it (docs/PAD.md §4).
+/// wall; it does not remove it (docs/kernels/PAD.md §4).
 ///
-/// docs/VOICE.md §1 ranks `F.pad(mode="reflect")` as blocking four of its five
+/// docs/architectures/VOICE.md §1 ranks `F.pad(mode="reflect")` as blocking four of its five
 /// speech models (bigvgan, f5, parler, vocos) and `mode="replicate"` a fifth
 /// case in bigvgan, which is the other direction this op is demanded from.
 ///
@@ -4892,7 +4892,7 @@ fn pad_source_index(mode: PadMode, j: i64, left: i64, w: i64) -> i64 {
 /// convention `constant_pad_nd` documents -- `padding[0..2]` is the last axis.
 ///
 /// Everything below is upstream's message, transcribed from a run rather than
-/// paraphrased, because docs/CKPT2.md §4's point applies here twice over: a
+/// paraphrased, because docs/models/CKPT2.md §4's point applies here twice over: a
 /// caller that pads too wide gets an error either way, and the only thing that
 /// tells it *which* limit it hit is the wording.
 ///
@@ -4932,7 +4932,7 @@ fn pad_nd(
         // **The two modes word this differently and it is not a typo
         // upstream.** All six were run: `reflection_pad*` appends
         // ", but got: N" and `replication_pad*` stops at the expected count.
-        // Transcribed rather than unified, per docs/CKPT2.md §4.
+        // Transcribed rather than unified, per docs/models/CKPT2.md §4.
         return Err(pyo3::exceptions::PyRuntimeError::new_err(match mode {
             PadMode::Reflect => format!(
                 "padding size is expected to be {}, but got: {}",
@@ -5050,7 +5050,7 @@ fn pad_nd(
 /// `aten::rms_norm(Tensor input, SymInt[] normalized_shape, Tensor? weight=None,
 /// float? eps=None) -> Tensor`
 ///
-/// `nn.RMSNorm`, docs/VOICE.md §1 rank 16 -- `f5`'s forward. Root-mean-square
+/// `nn.RMSNorm`, docs/architectures/VOICE.md §1 rank 16 -- `f5`'s forward. Root-mean-square
 /// normalisation: unlike `layer_norm` it does **not** subtract the mean, so
 /// there is no `centred` step and no bias.
 ///
@@ -5240,7 +5240,7 @@ fn add_tensor(
     };
 
     // Promotes, over the same lattice as every other elementwise binary op --
-    // docs/PROMOTE.md §3, where `add.Tensor`'s 9x9 grid was measured against
+    // docs/numerics/PROMOTE.md §3, where `add.Tensor`'s 9x9 grid was measured against
     // `torch.promote_types` and agreed in every cell.
     let tag = promote_operands(OP, &lhs, &rhs)?;
     // `bool + bool` is a logical or in torch, not an arithmetic sum
@@ -5267,7 +5267,7 @@ fn add_tensor(
     // The whole widen/add/narrow in one pass when the operands allow it. It
     // computes the same function -- `reduced::fused_arith` refuses rather than
     // approximating -- and `alpha != 1` is left to the slow path because
-    // `scale_by_alpha` is a rule of its own (§3.1 of docs/BF16.md) and folding
+    // `scale_by_alpha` is a rule of its own (§3.1 of docs/numerics/BF16.md) and folding
     // it in here would be a second place for that rule to live.
     //
     // Both operands reach the common dtype before either reaches `acc` --
@@ -5309,7 +5309,7 @@ fn add_tensor(
 /// wrong at k = 64), so a real model in `float16` drifts layer by layer.
 ///
 /// That went unnoticed because every GEMM case in `tools/golden/cases.py` was
-/// small enough for `float16` accumulation to be lossless; docs/GPT2.md §7
+/// small enough for `float16` accumulation to be lossless; docs/models/GPT2.md §7
 /// listed "the error at real layer sizes" as unmeasured, and this was in it.
 /// The large-size cases added alongside this function are what found it.
 ///
@@ -5324,7 +5324,7 @@ fn add_tensor(
 /// exactly; standing one in would answer a different question.
 fn gemm_accumulate_in(storage: candle_core::DType) -> candle_core::DType {
     // `float8_e4m3fn` is a gemm-only widening and deliberately not part of
-    // `opmath_in` (docs/FLOAT8C.md §4). candle has no `F8E4M3` matmul at all --
+    // `opmath_in` (docs/numerics/FLOAT8C.md §4). candle has no `F8E4M3` matmul at all --
     // `unsupported dtype F8E4M3 for op matmul` -- while upstream computes
     // `mm`/`addmm`/`bmm`/`matmul` for it and returns a `float8_e4m3fn` result.
     //
@@ -5338,7 +5338,7 @@ fn gemm_accumulate_in(storage: candle_core::DType) -> candle_core::DType {
     //
     // Scoped to gemm rather than to `opmath_in` because `opmath_in` is the
     // elementwise opmath type, and upstream **refuses** float8 for the
-    // elementwise kernels (docs/FLOAT8B.md §2). Widening there would compute
+    // elementwise kernels (docs/numerics/FLOAT8B.md §2). Widening there would compute
     // where upstream declines, which is the divergence direction this dtype's
     // gate exists to prevent.
     if storage == candle_core::DType::F8E4M3 {
@@ -5355,7 +5355,7 @@ fn gemm_accumulate_in(storage: candle_core::DType) -> candle_core::DType {
 /// (`reduced.rs`). That gate reads as conservative, and it is the opposite:
 /// **every weight in a real forward pass arrives here non-contiguous.**
 /// `bootstrap.py::linear` hands the kernel `t(weight)`, a free transpose
-/// *view*, so the fast conversion `docs/DTYPE.md` added never once fired on
+/// *view*, so the fast conversion `docs/numerics/DTYPE.md` added never once fired on
 /// the operand that dominates. It was measured on contiguous tensors, which is
 /// the layout a model never produces.
 ///
@@ -5369,7 +5369,7 @@ fn gemm_accumulate_in(storage: candle_core::DType) -> candle_core::DType {
 ///
 /// Measured at the decoding shape (`[1,576] @ [576,49152]`, `bfloat16`):
 /// **69.60 ms** through the fallback, against 3.10 ms for our own `float32`
-/// and 1.03 ms for upstream. docs/DTYPE_PERF.md §4.
+/// and 1.03 ms for upstream. docs/perf/DTYPE_PERF.md §4.
 ///
 /// **Why this cannot move a value.** Conversion is elementwise, so it commutes
 /// with a transpose: transposing is a relabelling of *which* element sits
@@ -5413,7 +5413,7 @@ fn is_matmul_striding_refusal(e: &candle_core::Error) -> bool {
         // built with `attn_implementation="eager"` stopped inside
         // `eager_attention_forward` on `query @ key.transpose(2, 3)`, whose
         // left operand is a `view`+`permute` and not contiguous
-        // (docs/MPSATTN.md §3). Matched on the message because the variant is
+        // (docs/devices/MPSATTN.md §3). Matched on the message because the variant is
         // in `candle-metal-kernels`, which this crate does not depend on by
         // name; the message is `MetalKernelError`'s own `#[error(...)]` text.
         candle_core::Error::Metal(inner) => {
@@ -5430,7 +5430,7 @@ fn is_matmul_striding_refusal(e: &candle_core::Error) -> bool {
 /// dominant cost of the whole call: `bootstrap.py::linear` hands the kernel
 /// `t(weight)`, a free transpose *view*, and `.contiguous()` on that view is a
 /// strided gather of the entire weight. On SmolLM2-135M's `lm_head` that is
-/// 113 MB re-written per forward pass (docs/QUANT2.md §6, docs/LINEAR.md).
+/// 113 MB re-written per forward pass (docs/graph/QUANT2.md §6, docs/perf/LINEAR.md).
 ///
 /// **candle does not need it.** Both CPU backends read `lhs_l.stride()` and
 /// `rhs_l.stride()` and hand the last two of them to the multiply:
@@ -5484,7 +5484,7 @@ fn gemm_with_layout_fallback(
 /// is the same 113 MB `lm_head` copy `gemm_with_layout_fallback` exists to
 /// remove, just performed one level down. Removing our `.contiguous()` alone
 /// does nothing here: measured 85.8 ms before, 88.3 ms after, against 4.7 ms
-/// upstream (docs/LINEAR.md).
+/// upstream (docs/perf/LINEAR.md).
 ///
 /// `at::native::matmul` does not broadcast this case at all. When the right
 /// operand is 2-D it *folds*: the left operand's leading dimensions collapse
@@ -5529,11 +5529,11 @@ fn batched_matmul(lhs: &Tensor, rhs: &Tensor) -> candle_core::Result<Tensor> {
 
 /// The rank-5 matmul, and **why `.contiguous()` is not the fix for it.**
 ///
-/// `docs/ARCH100.md` recorded `aten.matmul.default:
+/// `docs/architectures/ARCH100.md` recorded `aten.matmul.default:
 /// MatMulUnexpectedStriding { ..., msg: "non-contiguous lhs" }` against five
 /// architectures -- `hiera`, `olmo_hybrid` and `qwen3_next` in the sweep, plus
 /// `qwen3_5*` and `minicpmv4_6` -- and classified it a backend limitation.
-/// `docs/SETITEM.md` proposed a `contiguous()` as the plausible fix. **Both
+/// `docs/bindings/SETITEM.md` proposed a `contiguous()` as the plausible fix. **Both
 /// operands in every one of those refusals are already contiguous**, which is
 /// checkable from the layouts the error itself prints:
 ///
@@ -5668,7 +5668,7 @@ fn fold_batch_axes_matmul(lhs: &Tensor, rhs: &Tensor) -> Option<candle_core::Res
 /// accumulates down a residual stream instead of cancelling. On
 /// SmolLM2-135M's default `bfloat16` path that reached a maximum logit
 /// difference of 11.75 against upstream and changed the generated text; with
-/// the widening it is 0.0 and the tokens match. docs/BF16.md.
+/// the widening it is 0.0 and the tokens match. docs/numerics/BF16.md.
 ///
 /// Widening is not "more accurate than torch" here -- it is what torch does.
 /// `add` on two `bfloat16` values is `float(a) + float(b)` narrowed once
@@ -5847,7 +5847,7 @@ fn bmm_default(
 /// refuses everything else, and it is the only readable implementation in the
 /// vendored tree -- so reading it as the specification is the natural mistake.
 /// The CPU kernel takes f32, bf16 and f16, measured, and f32 is the dtype
-/// Mixtral calls it with. docs/GROUPED_MM.md §1.
+/// Mixtral calls it with. docs/kernels/GROUPED_MM.md §1.
 fn grouped_mm_dtype_ok(tag: TorchDType) -> bool {
     matches!(
         tag,
@@ -5858,7 +5858,7 @@ fn grouped_mm_dtype_ok(tag: TorchDType) -> bool {
 /// Upstream's 16-byte stride rule for a `_grouped_mm` operand.
 ///
 /// Reproduced rather than skipped, and that is a decision rather than an
-/// oversight -- see docs/GROUPED_MM.md §2.2. candle would multiply these
+/// oversight -- see docs/kernels/GROUPED_MM.md §2.2. candle would multiply these
 /// operands happily; upstream's CPU kernel will not, and `transformers` keeps
 /// a whole fallback path (`torch.ops.transformers.grouped_mm_fallback`) for
 /// programs that would hit it. Computing where upstream raises is the
@@ -5891,7 +5891,7 @@ fn grouped_mm_strides_ok(tensor: &Tensor, storage: candle_core::DType) -> bool {
 /// `offs` is a cumulative end index, so group `g` covers `[offs[g-1], offs[g])`
 /// with `offs[-1]` read as `0`. Two measured behaviours make the obvious
 /// `cat`-of-blocks implementation wrong, and this returns the information
-/// needed to get both right (docs/GROUPED_MM.md §2.3):
+/// needed to get both right (docs/kernels/GROUPED_MM.md §2.3):
 ///
 ///  * `offs[-1] < extent` leaves the tail **unwritten**. `transformers` relies
 ///    on that on purpose for its expert-parallel sentinel rows. Unwritten
@@ -5952,13 +5952,13 @@ fn grouped_mm_block(
 ///     Tensor? bias=None, ScalarType? out_dtype=None) -> Tensor`
 ///
 /// The mixture-of-experts GEMM, and the last operator standing between this
-/// shim and Mixtral (docs/OPS4.md §13.3 left it out of scope by name).
+/// shim and Mixtral (docs/kernels/OPS4.md §13.3 left it out of scope by name).
 /// Instead of one `(M,K) x (K,N)` it multiplies a stack of *variable-sized*
 /// groups described by a cumulative offset vector, which is how an MoE layer
 /// routes tokens to experts without materialising a tensor per expert.
 ///
 /// Four layouts, because `self` and `mat2` may each be 2-D or 3-D, and `offs`
-/// partitions a different axis in each (docs/GROUPED_MM.md §2):
+/// partitions a different axis in each (docs/kernels/GROUPED_MM.md §2):
 ///
 /// ```text
 ///   (M,K) x (G,K,N)  offs over the rows of self         -> (M,N)
@@ -6241,7 +6241,7 @@ fn addmm_scale(
 ///     Scalar alpha=1) -> Tensor`
 ///
 /// `beta * self + alpha * (mat1 @ mat2)`, and the reason it exists as its own
-/// op rather than as `mm` + `add` is docs/NN_SURFACE.md §5: `at::native::linear`
+/// op rather than as `mm` + `add` is docs/bindings/NN_SURFACE.md §5: `at::native::linear`
 /// emits `addmm` for every `bias=True` branch, so a shim without it makes
 /// `nn.Linear` take a path upstream would not take. `bootstrap.py` already
 /// reads `_aten_all_implemented()` to decide, so landing this kernel is what
@@ -6266,7 +6266,7 @@ fn addmm_scale(
 ///
 /// The dtype gap this inherits is `mm`'s, not a new one: candle's `matmul` has
 /// no integral kernel, so `int64`/`int32`/`int16`/`uint8`/`bfloat16` refuse
-/// here exactly where `aten.mm.default` already refuses (docs/TORCH_C.md §2),
+/// here exactly where `aten.mm.default` already refuses (docs/design/TORCH_C.md §2),
 /// *except* when `alpha == 0` -- then no matmul happens and the answer comes
 /// out. That asymmetry is deliberate: it is the quick return above, and
 /// refusing it would be inventing a restriction torch does not have.
@@ -6414,7 +6414,7 @@ fn addmm_default(
 ///     Scalar alpha=1) -> Tensor`
 ///
 /// `bmm`'s batching composed with `addmm`'s `beta * self + alpha * (batch1 @
-/// batch2)`, needed to open `bloom` (docs/TAIL.md) -- its attention builds the
+/// batch2)`, needed to open `bloom` (docs/kernels/TAIL.md) -- its attention builds the
 /// scaled QK^T scores with this one op rather than a separate scale-then-add.
 ///
 /// The `beta=0` quick return is `addmm`'s, reused batched and re-measured to
@@ -6422,7 +6422,7 @@ fn addmm_default(
 /// a clean product (no `nan` leaks through the skipped add). `alpha=0` is
 /// **not** the mirror-image quick return, despite the kernel used to claim
 /// so and despite `addmm` itself skipping the multiply on `alpha=0` --
-/// measured against torch 2.13.0 (docs/TAIL.md §2.1):
+/// measured against torch 2.13.0 (docs/kernels/TAIL.md §2.1):
 /// `baddbmm(zeros_self, inf_batch1, batch2, alpha=0)` comes back with `nan`
 /// in it, so upstream still runs the real IEEE multiply and only then scales
 /// by zero (`0 * inf == nan`, not skipped). This kernel now does the same:
@@ -6542,7 +6542,7 @@ fn baddbmm_default(
     // `gemm_accumulate_in`.
     let acc_dtype = gemm_accumulate_in(storage);
     // Unlike `addmm`, `alpha == 0` is NOT a quick return here -- measured
-    // against torch 2.13.0 (docs/TAIL.md §2.1): the multiply still runs and
+    // against torch 2.13.0 (docs/kernels/TAIL.md §2.1): the multiply still runs and
     // its NaNs/Infs still leak through, only the *scale* is skipped. So the
     // product is always computed; `addmm_scale` folds the `alpha == 1` case
     // back down to a plain clone, same as it always did.
@@ -6623,12 +6623,12 @@ fn baddbmm_default(
 ///     upstream's kernel is blocked with an online softmax and the order in
 ///     which it recombines those blocks is observable. The flat formulation
 ///     disagrees with upstream on 3562 of 4096 elements at `float32`
-///     (docs/SDPA.md §3) and on 32% of the attention outputs of a real
+///     (docs/kernels/SDPA.md §3) and on 32% of the attention outputs of a real
 ///     SmolLM2-135M forward -- all inside the golden harness's tolerance.
 ///   * **reference** -- `crate::flash`, which reproduces the blocking and
 ///     brings both of those numbers to 0 for `bfloat16`/`float16`. Not 0 for
-///     `float32`/`float64`, where upstream calls a BLAS: docs/SDPA.md §5 has
-///     that split. It costs **20x** at T=512 (docs/SDPA.md §12), which is why
+///     `float32`/`float64`, where upstream calls a BLAS: docs/kernels/SDPA.md §5 has
+///     that split. It costs **20x** at T=512 (docs/kernels/SDPA.md §12), which is why
 ///     it is not the default in a library whose point is running on a phone.
 ///
 /// The blocking the reference reproduces is upstream's, not a choice: 32 query
@@ -6718,7 +6718,7 @@ fn sdpa_flash_cpu(
     // The fork. One relaxed atomic load per call, against a kernel whose
     // cheapest measured shape is tens of microseconds -- see
     // `crate::flash::reference_enabled` for why the default path cannot feel
-    // it, and docs/SDPA.md §12 for why the exact kernel is not the default.
+    // it, and docs/kernels/SDPA.md §12 for why the exact kernel is not the default.
     let (out, logsumexp) = if crate::flash::reference_enabled() {
         // ------------------------------------------------------------------
         // Reference: `crate::flash`, upstream's blocked kernel reproduced.
@@ -6766,7 +6766,7 @@ fn sdpa_flash_cpu(
         // Which storage dtype the probabilities are narrowed to between the
         // two matrix products. `storage`, not `acc`: the narrowing follows the
         // *input* dtype, which is the whole reason reduced precision has a
-        // separate path upstream. See `crate::flash` and docs/SDPA.md.
+        // separate path upstream. See `crate::flash` and docs/kernels/SDPA.md.
         let narrowing = match storage {
             candle_core::DType::BF16 => crate::flash::Narrowing::BFloat16,
             candle_core::DType::F16 => crate::flash::Narrowing::Float16,
@@ -6796,9 +6796,9 @@ fn sdpa_flash_cpu(
             // `transa='T'` GEMM, which it does support -- works, is 5% faster
             // at S=512, and **changes the answer at S=6**: the prefill digest
             // moved, measured. A different GEMM blocking is a different
-            // summation order. docs/SEQLEN.md §8.5.
+            // summation order. docs/numerics/SEQLEN.md §8.5.
             //
-            // What changed (docs/KERNELS26.md §7) is *how* the copy is made,
+            // What changed (docs/kernels/KERNELS26.md §7) is *how* the copy is made,
             // not whether it is made. candle's `copy_strided_src` walks a
             // transposed layout one element at a time, recomputing a
             // multi-dimensional index per element and reading `head_dim`
@@ -6812,7 +6812,7 @@ fn sdpa_flash_cpu(
             // The only thing that changed is the order in which the same
             // assignments happen. That is the whole difference between this
             // and the rejected change above, and it is why the prefill digests
-            // hold at every length docs/SEQLEN.md §1.3 pins.
+            // hold at every length docs/numerics/SEQLEN.md §1.3 pins.
             .and_then(|kt| contiguous_blocked(&kt))
             .and_then(|kt| q.matmul(&kt))
             .map_err(|e| candle_err(OP, e))?;
@@ -6829,7 +6829,7 @@ fn sdpa_flash_cpu(
         // `tensor.rs::scale_and_causal_mask` is checked bit-for-bit against the
         // two-op spelling it replaces -- including the `+ 0.0` that turns a
         // negative-zero product positive and the `+ -inf` that turns a positive
-        // infinity into a NaN. docs/SEQLEN.md §8.3.
+        // infinity into a NaN. docs/numerics/SEQLEN.md §8.3.
         let mut scores = if is_causal {
             // Upper-left aligned, per the measurement above.
             scale_and_causal_mask_anywhere(&raw, scale).map_err(|e| candle_err(OP, e))?
@@ -6853,7 +6853,7 @@ fn sdpa_flash_cpu(
         // *value* and candle only has the reduction that also computes an
         // argmax, which measured 57x slower than upstream's `amax` at the score
         // shape this very line produces and was 24.3% of a `float32` prefill.
-        // docs/SEQLEN.md §7. The two agree bit for bit on every input this line
+        // docs/numerics/SEQLEN.md §7. The two agree bit for bit on every input this line
         // can produce -- §7.2 has the argument, and it is an argument rather
         // than a tolerance.
         let row_max = amax_keepdim_anywhere(&scores, 3).map_err(|e| candle_err(OP, e))?;
@@ -7049,7 +7049,7 @@ fn arange_length(
 ///     dtype=None, Layout? layout=None, Device? device=None, bool?
 ///     pin_memory=None) -> Tensor`
 ///
-/// docs/DEMAND.md §0.1 rank 4 -- `ConvNextModel.__init__`'s stochastic-depth
+/// docs/architectures/DEMAND.md §0.1 rank 4 -- `ConvNextModel.__init__`'s stochastic-depth
 /// rate schedule, a construction-time wall rather than a forward one. Leaf
 /// upstream (`RangeFactoriesKernel.cpp::linspace_kernel`, fetched and read
 /// rather than guessed, since three of its details are easy to get wrong by
@@ -7260,7 +7260,7 @@ fn zeros_or_ones(
     // `resolve()`: it has no `candle_core::Device` to resolve to. This is the
     // one factory taught the device -- `torch.ones(2, 2, device="vulkan")` and
     // `torch.empty(...)`/`torch.zeros(...)` beside it -- and every other
-    // factory still stops at `resolve()` naming `vulkan`. docs/VULKAN3.md.
+    // factory still stops at `resolve()` naming `vulkan`. docs/devices/VULKAN3.md.
     if label.kind == "vulkan" {
         return crate::vulkan::factory(py, op, size, dtype, if one { 1.0 } else { 0.0 });
     }
@@ -7382,14 +7382,14 @@ fn ones_default(
 ///
 /// This is the constructor behind every fake tensor: `meta_utils.py:2009` builds
 /// the meta tensor for a `FakeTensor` with it, so `torch.export` reaches it
-/// before it reaches anything interesting. docs/EXPORT.md §3.1 named it as the
-/// wall past the census, and docs/EXPORT4.md §4 is what it turned out to be.
+/// before it reaches anything interesting. docs/graph/EXPORT.md §3.1 named it as the
+/// wall past the census, and docs/graph/EXPORT4.md §4 is what it turned out to be.
 ///
 /// **It serves the contiguous case and refuses every other stride by name.**
 /// That split is forced, not chosen, and both halves of it are in the type:
 ///
 /// * `Repr::Meta { shape }` (tensor.rs) stores a shape and no stride. That is a
-///   deliberate narrowing recorded in docs/META.md §6 -- upstream's meta *does*
+///   deliberate narrowing recorded in docs/devices/META.md §6 -- upstream's meta *does*
 ///   carry stride -- and it means a meta tensor here cannot remember a stride it
 ///   was asked for.
 /// * A dense tensor cannot carry an arbitrary caller-supplied stride either.
@@ -7490,10 +7490,10 @@ fn empty_strided_default(
             "{OP}: a non-contiguous stride is not representable in this shim -- \
              asked for size={size:?} stride={stride:?}, and the only stride this \
              shim can build for that size is the contiguous {contiguous:?}. \
-             A meta tensor here stores a shape and no stride (docs/META.md §6), \
+             A meta tensor here stores a shape and no stride (docs/devices/META.md §6), \
              and a dense tensor cannot be given a caller-supplied stride at all, \
              so returning a contiguous tensor would silently answer a different \
-             layout than the one requested. docs/EXPORT4.md §4"
+             layout than the one requested. docs/graph/EXPORT4.md §4"
         )));
     }
 
@@ -7526,7 +7526,7 @@ fn rsqrt_default(
     op: &str,
 ) -> PyResult<Py<PyAny>> {
     // The key is a parameter because `prims.rsqrt` is this exact kernel
-    // under another name (docs/PRIMS.md), and a refusal that named the aten
+    // under another name (docs/kernels/PRIMS.md), and a refusal that named the aten
     // spelling for a call that never mentioned aten would send the reader to
     // the wrong op.
     #[allow(non_snake_case)]
@@ -7558,7 +7558,7 @@ fn rsqrt_default(
 ///
 /// **`tensor` is the *result* category, not necessarily an operand's dtype.**
 /// `pow_tensor_tensor` hands in the promotion of its two operands
-/// (docs/ARCH20.md §6), so a `float32 ** int32` reaches here as `Float32` and
+/// (docs/architectures/ARCH20.md §6), so a `float32 ** int32` reaches here as `Float32` and
 /// the `Bool` arm below only fires when *both* sides are boolean -- which is
 /// exactly where upstream raises `NotImplementedError: "pow" not implemented
 /// for 'Bool'`, measured. The other two overloads still hand in the tensor
@@ -7657,7 +7657,7 @@ fn powi(base: i64, exponent: i64) -> i64 {
 /// -- and every RMSNorm transformers ships -- computes
 /// `hidden_states.pow(2).mean(-1, keepdim=True)`, which for SmolLM2-135M is 61
 /// calls per forward on a contiguous `[1, S, 576]` `float32` tensor.
-/// `docs/SEQLEN.md` §2 measures that one op at **90-173x upstream** and shows
+/// `docs/numerics/SEQLEN.md` §2 measures that one op at **90-173x upstream** and shows
 /// that it accounts for the entire *linear-in-S* term of the model-level gap.
 /// Upstream is fast for exactly this reason: ATen's `pow_tensor_scalar`
 /// special-cases small integral exponents into multiplication.
@@ -7685,7 +7685,7 @@ fn powi(base: i64, exponent: i64) -> i64 {
 ///
 /// **`f16` and `bf16` are deliberately excluded.** For those the `f64`
 /// intermediate is still exact but candle's reduced-precision multiply is not
-/// obviously a single correctly-rounded step, and `docs/DTYPE_PERF.md` owns the
+/// obviously a single correctly-rounded step, and `docs/perf/DTYPE_PERF.md` owns the
 /// `bfloat16` checksum. Leaving them on the old path means that checksum cannot
 /// move as a consequence of this change -- it is not merely expected to hold,
 /// it is untouched.
@@ -7808,7 +7808,7 @@ fn pow_tensor_scalar(
     }
     let shape = base.tensor()?.dims().to_vec();
     // `x ** 2` is the RMSNorm case and it is the whole linear term of the
-    // model-level gap (docs/SEQLEN.md §2). Bit-identical -- see the fast path's
+    // model-level gap (docs/numerics/SEQLEN.md §2). Bit-identical -- see the fast path's
     // doc comment for why that is exactness rather than tolerance.
     if let Some(t) = pow_square_fast_path(OP, base.tensor()?, exponent, tag)? {
         return finish(py, t, tag);
@@ -7831,7 +7831,7 @@ fn pow_tensor_scalar(
     // `side_from_tensor` -> `Vec<f64>` -> `powf` in Rust -> `from_vec`, which
     // is why `aten.pow.Tensor_Scalar` was refused on `mps` -- and RMSNorm's
     // `hidden_states.pow(2)` is the reason a SmolLM2 forward could not start
-    // (docs/MPSFWD.md §3). The two paths below compute the same values the
+    // (docs/devices/MPSFWD.md §3). The two paths below compute the same values the
     // host loop did, in the same dtype and the same order.
     let _ = &shape;
     let source = base.tensor()?;
@@ -7843,7 +7843,7 @@ fn pow_tensor_scalar(
         // `float32` on a device that cannot do it -- Metal has no `f64`, so a
         // non-square exponent raises there rather than computing at a
         // precision the CPU would not have used. Refusing loudly on the
-        // device is the same choice docs/MPS.md made at the door.
+        // device is the same choice docs/devices/MPS.md made at the door.
         let e = if tag == TorchDType::Float32 && !exponent.is_int() {
             exponent.as_f64()
         } else {
@@ -7931,7 +7931,7 @@ fn pow_tensor_tensor(
     let base = tensor_arg(OP, args, kwargs, 0, "self")?;
     let exponent = tensor_arg(OP, args, kwargs, 1, "exponent")?;
     // **Promotes rather than requiring equal dtypes** -- `bloom` is what asked
-    // (docs/ARCH20.md §6): `build_alibi_tensor` computes
+    // (docs/architectures/ARCH20.md §6): `build_alibi_tensor` computes
     // `torch.pow(base, powers)` with a `float32` base and an `int32` exponent,
     // and `same_dtype` refused it by name.
     //
@@ -7946,7 +7946,7 @@ fn pow_tensor_tensor(
     // fast path returns the shared dtype before the rank table is consulted,
     // which is the only reason a same-rank pair like `float16 ** float16` does
     // not escape to `float32` the way `float16 ** bfloat16` correctly does
-    // (docs/BIND.md §9 -- `get_higher_dtype`'s `if a is b` guards exactly the
+    // (docs/bindings/BIND.md §9 -- `get_higher_dtype`'s `if a is b` guards exactly the
     // same table for exactly the same reason).
     let tag = pow_result_tag(OP, promote_operands(OP, &base, &exponent)?, false)?;
 
@@ -7994,7 +7994,7 @@ fn side_from_tensor(op: &str, tensor: &Tensor, tag: TorchDType) -> PyResult<PowS
 
 /// The `Scalar` side of a `pow`, **narrowed into the result dtype first**.
 ///
-/// `pow` is on the other side of the split docs/SCALAR.md draws: where
+/// `pow` is on the other side of the split docs/numerics/SCALAR.md draws: where
 /// `mul_kernel` and `div_*_kernel` read the operand with
 /// `original_scalar_value<opmath_t>`, `pow_tensor_scalar_kernel` converts it to
 /// the dispatched `scalar_t`, so the exponent really is rounded into the
@@ -8033,7 +8033,7 @@ fn side_from_scalar(value: &Scalar, tag: TorchDType) -> PowSide {
 /// (`cache_utils.py:144`), so the *first* decoder step of every model is a cat
 /// of a 1-D empty against a 4-D tensor. Without the rule this shim raised
 /// `IndexError: Dimension out of range` and the forward pass stopped there
-/// (docs/E2E_REAL.md).
+/// (docs/models/E2E_REAL.md).
 ///
 /// The rule is narrow, and measured on 2.13.0 rather than inferred:
 ///
@@ -8107,7 +8107,7 @@ fn cat_default(
 ///
 /// Reached by GPT-J's rotary embedding, which is the only architecture of the
 /// four this op was added for that calls it: `stack([x1, x2], dim=-1)` on a
-/// pair of `(batch, seq, heads, dim/2)` slices, then a flatten. docs/ARCH.md
+/// pair of `(batch, seq, heads, dim/2)` slices, then a flatten. docs/architectures/ARCH.md
 /// counts three more callers (`cohere`, `helium`, `mamba`).
 ///
 /// Three rules were measured rather than inferred, and two of them differ from
@@ -8124,7 +8124,7 @@ fn cat_default(
 ///     `int64` and `stack([int64, float32])` gives `float32`, both measured.
 ///     This shim used to refuse; it now promotes through `promote_list`, the
 ///     same fold `cat_default` uses, `stack`'s own 9x9 grid having been
-///     measured against `torch.promote_types` in docs/PROMOTE.md §3 rather
+///     measured against `torch.promote_types` in docs/numerics/PROMOTE.md §3 rather
 ///     than inherited from `cat`'s.
 ///
 /// Entries are made contiguous first. Upstream accepts a non-contiguous entry
@@ -8193,7 +8193,7 @@ fn stack_default(
 /// A 0-D tensor holding one number. It is how `falcon`, `gptj`, `bloom` and
 /// `mpt` build their attention mask fill value -- all four call
 /// `scalar_tensor(finfo(dtype).min, dtype=..., device=...)` and hand the result
-/// straight to `where.self` (measured, docs/OPS4.md §1).
+/// straight to `where.self` (measured, docs/kernels/OPS4.md §1).
 ///
 /// **The dtype rule is not `full`'s, and inferring it from `full` would be
 /// wrong.** `full` reads the fill value's category (`full([], 3)` is `int64`,
@@ -8378,7 +8378,7 @@ fn embedding_default(
     // before the embedding lookup, and candle's `index_select` accepts only
     // `u8`/`u32`/`i64` -- so this refused with `candle: unsupported dtype F32
     // for op index-select`, a message naming the *weight's* dtype and no part
-    // of the actual problem, which is why docs/ARCH200.md classified it as a
+    // of the actual problem, which is why docs/architectures/ARCH200.md classified it as a
     // backend limitation. Upstream takes `Int` and `Long` alike
     // (`torch.embedding(w, idx.int())` is measured to answer the same values
     // as `torch.embedding(w, idx.long())`), and refuses anything else by name.
@@ -8527,7 +8527,7 @@ fn randint_float_format(tag: TorchDType) -> Option<crate::rng::FloatFormat> {
 ///
 /// The name is `caffe2::TypeMeta`'s C++ spelling, not torch's Python one --
 /// upstream's message is `to - 1 is out of bounds for int`, never `int32`.
-/// Measured dtype by dtype (docs/RANDINT.md §3.3); guessing `int32` here would
+/// Measured dtype by dtype (docs/kernels/RANDINT.md §3.3); guessing `int32` here would
 /// produce a refusal that reads right and does not match.
 ///
 /// `None` means the check cannot fire: every `int64_t` is representable, and
@@ -8603,7 +8603,7 @@ fn randint_narrow(
 /// This used to draw from candle's unseedable generator and say so. It now
 /// draws from the ported one (`crate::rng`), so a seeded `randint` reproduces
 /// upstream bit for bit -- and, just as importantly, leaves the stream where
-/// upstream leaves it. docs/RANDINT.md is the measurement; three things in it
+/// upstream leaves it. docs/kernels/RANDINT.md is the measurement; three things in it
 /// are not guessable from the values alone:
 ///
 ///   * **One draw per element, never a retry.** `uniform_int_from_to` is a
@@ -8697,7 +8697,7 @@ fn randint(
 ///
 /// Here because it is the same machinery, not because the surface wanted
 /// widening: `randperm_cpu` is Fisher-Yates over the *same* MT19937, one
-/// 32-bit `random()` per swap, `n - 1` of them. docs/RANDINT.md §4 reproduced
+/// 32-bit `random()` per swap, `n - 1` of them. docs/kernels/RANDINT.md §4 reproduced
 /// n up to 50000 with that one loop and found no large-`n` alternative path,
 /// which is what made adding it cheaper than refusing it by name.
 ///
@@ -8793,7 +8793,7 @@ fn randperm(
 // ---------------------------------------------------------------------------
 // The `TensorBase` surface
 //
-// docs/C_SURFACE.md §4 measured a small Llama forward plus greedy `generate`
+// docs/design/C_SURFACE.md §4 measured a small Llama forward plus greedy `generate`
 // and found 50 of `TensorBase`'s 694 members actually used. These are the
 // kernels behind that list. They are reached from `methods.json` through the
 // same resolver `torch.<op>` uses and through the same single `_aten_dispatch`
@@ -8817,7 +8817,7 @@ fn randperm(
 //     callers that made these two measured.
 //   * **A Python scalar does not widen a tensor of the same category.** That
 //     is torch's "wrapped number" rule, measured for `pow` in
-//     docs/OVERLOAD.md §6.3 and re-measured here for the arithmetic ops:
+//     docs/bindings/OVERLOAD.md §6.3 and re-measured here for the arithmetic ops:
 //     `float_t * 2 -> float32`, `int64_t * 2 -> int64`, `int64_t * 2.0 ->
 //     float32`. True division is the exception and always floats.
 // ---------------------------------------------------------------------------
@@ -8855,7 +8855,7 @@ fn arith_tag(
     scalar_is_float: Option<bool>,
 ) -> PyResult<TorchDType> {
     // **`torch.bool` does four different things here and the refusal used to
-    // say it did one.** The whole matrix was re-measured on 2.13.0 (docs/TAIL.md
+    // say it did one.** The whole matrix was re-measured on 2.13.0 (docs/kernels/TAIL.md
     // §2.2 found the first row of it; the rest came out of the same probe):
     //
     // ```text
@@ -8868,9 +8868,9 @@ fn arith_tag(
     //
     // The message this used to carry -- "torch.bool operands are logical, not
     // arithmetic, in torch (BOOL.md §2.2)" -- is true of exactly two of those
-    // twelve cells. `docs/BOOL.md` §2.2's table measured `x + x` for two bool
+    // twelve cells. `docs/numerics/BOOL.md` §2.2's table measured `x + x` for two bool
     // *tensors*, and a later round generalised that finding into a blanket
-    // refusal for every overload, message included. docs/AUDIT.md reported it
+    // refusal for every overload, message included. docs/verification/AUDIT.md reported it
     // as a live defect: for `.Scalar` upstream reads True/False as 1/0 and
     // promotes exactly like any other integral tensor, which is arithmetic and
     // not logical; and for `-` upstream refuses too, so calling it "logical"
@@ -8896,7 +8896,7 @@ fn arith_tag(
     //
     // It is here because `torch.isfinite` needs it: upstream's own body is
     // `(self == self) * (self.abs() != inf)`, a multiply of two bool tensors,
-    // and that is on the `print(tensor)` path (docs/E2E_REAL.md).
+    // and that is on the `print(tensor)` path (docs/models/E2E_REAL.md).
     //
     // `scalar_is_float.is_none()` is exactly "this is the Tensor overload".
     if tensor == TorchDType::Bool && !(kind == Arith::Mul && scalar_is_float.is_none()) {
@@ -8921,7 +8921,7 @@ fn arith_tag(
             (Arith::Add | Arith::Mul, false, _) => "torch.bool `+` between two tensors is \
                  a logical OR returning bool (measured: [T,F] + [T,T] is [True, True]); \
                  candle would give 2, which is still truthy and so silently wrong \
-                 downstream (docs/BOOL.md §6.3). Not implemented in torch._C shim",
+                 downstream (docs/numerics/BOOL.md §6.3). Not implemented in torch._C shim",
             // Everything else: upstream COMPUTES, arithmetically, and the
             // promotion is what is missing here.
             _ => "upstream reads a torch.bool operand as 1/0 here and computes \
@@ -9051,12 +9051,12 @@ fn promote_types(lhs: TorchDType, rhs: TorchDType) -> Option<TorchDType> {
 /// **Three ops call this: `mul.Tensor`, `bitwise_and.Tensor` and
 /// `pow.Tensor_Tensor`.** Everything else -- `add`, `sub`, `div`,
 /// `bitwise_or` -- still goes through `same_dtype` and still refuses. That
-/// split is the "no unmeasured implementation" rule (docs/E2E_REAL.md §1.2)
+/// split is the "no unmeasured implementation" rule (docs/models/E2E_REAL.md §1.2)
 /// rather than an oversight: these are the ops a real forward was measured
 /// stopping on, and they were found one at a time, by running it.
 ///
 /// `pow.Tensor_Tensor` is the third and it came from `bloom`
-/// (docs/ARCH20.md §6), whose `build_alibi_tensor` raises a `float32` base to
+/// (docs/architectures/ARCH20.md §6), whose `build_alibi_tensor` raises a `float32` base to
 /// an `int32` power. Its cells were re-measured against
 /// `pow.Tensor_Tensor`'s own result dtype rather than assumed from `mul`'s:
 /// the two agree everywhere except `bool ** bool`, which `pow_result_tag`
@@ -9107,7 +9107,7 @@ fn promote_types(lhs: TorchDType, rhs: TorchDType) -> Option<TorchDType> {
 /// supported, attempted to promote Float8_e4m3fn and Float`. That is a
 /// different exception type and a different sentence from the
 /// "dtype promotion not implemented" this shim raises for pairs it simply has
-/// no rule for, and the two must not be merged -- docs/PROMOTE.md's last
+/// no rule for, and the two must not be merged -- docs/numerics/PROMOTE.md's last
 /// section exists because a refusal once carried the right words under the
 /// wrong type, and `except NotImplementedError` did not catch it.
 fn float8_promotion_refusal(a: TorchDType, b: TorchDType) -> Option<PyErr> {
@@ -9203,8 +9203,8 @@ fn arith_tensor(
     let lhs = tensor_arg(op, args, kwargs, 0, "self")?;
     let rhs = tensor_arg(op, args, kwargs, 1, "other")?;
     // **All four promote.** They did not always: `mul` was widened for
-    // docs/OPS4.md and `div` for `sam3_video`, one measured caller at a time,
-    // while `add` and `sub` kept `same_dtype`'s refusal. docs/PROMOTE.md §3
+    // docs/kernels/OPS4.md and `div` for `sam3_video`, one measured caller at a time,
+    // while `add` and `sub` kept `same_dtype`'s refusal. docs/numerics/PROMOTE.md §3
     // closed the split by measuring the whole 9x9 grid for all four against
     // `torch.promote_types` -- they agree in every cell, so there is one rule
     // here and no reason for two of the four to decline it.
@@ -9272,7 +9272,7 @@ fn arith_tensor(
 ///
 ///   * the divisor is the **original** scalar widened to `float`, not the
 ///     scalar narrowed to the tensor's dtype. `add`/`mul` do narrow it (that
-///     is docs/GENERATE.md §3.2's `x + 0.3` adding `0.30078125`); `div` does
+///     is docs/models/GENERATE.md §3.2's `x + 0.3` adding `0.30078125`); `div` does
 ///     not, because `original_scalar_value` reads the `Scalar` rather than the
 ///     promoted operand.
 ///   * the division is turned into a **reciprocal and a multiply**, once, for
@@ -9281,7 +9281,7 @@ fn arith_tensor(
 /// Measured on 2.13.0, `float16` ones divided by `0.3`: upstream answers
 /// `3.333984375`, which is `f16(1.0f / 0.3f)`. Narrowing first gives
 /// `1 / f16(0.3) = 3.33203125`, one representable step below -- and that is
-/// what this shim answered until docs/TRAIN.md §4. **`bfloat16` cannot see the
+/// what this shim answered until docs/training/TRAIN.md §4. **`bfloat16` cannot see the
 /// difference**: both roads round to `3.328125`, which is why the existing
 /// `div.Scalar` kernel passed every bfloat16 case it had and was wrong.
 ///
@@ -9303,10 +9303,10 @@ fn div_scalar_reduced_float(
 
 /// `crate::tensor::amax_keepdim`, except on Metal.
 ///
-/// The third `cpu_fwd`-only `CustomOp1` on SDPA's path (docs/MPSFWD.md §2).
+/// The third `cpu_fwd`-only `CustomOp1` on SDPA's path (docs/devices/MPSFWD.md §2).
 /// `amax` exists because candle's `max_keepdim` also computes an argmax and
 /// measured 57x slower than upstream's `amax` at this shape -- 24.3% of a
-/// `float32` prefill (docs/SEQLEN.md §7). That is a *speed* argument, and the
+/// `float32` prefill (docs/numerics/SEQLEN.md §7). That is a *speed* argument, and the
 /// two are documented to agree **bit for bit on every input this line can
 /// produce** (§7.2, an argument rather than a tolerance), so falling back to
 /// the reduction candle does have on Metal changes nothing but the time.
@@ -9322,7 +9322,7 @@ fn amax_keepdim_anywhere(t: &Tensor, dim: usize) -> candle_core::Result<Tensor> 
 /// Same shape of problem as `contiguous_blocked` above: the fused pass is a
 /// `CustomOp1` with only a `cpu_fwd`, so an `mps` score matrix gets
 /// `no metal implementation for torch._C shim: scale + causal mask`. That was
-/// the second thing a SmolLM2 forward hit inside SDPA (docs/MPSFWD.md §2).
+/// the second thing a SmolLM2 forward hit inside SDPA (docs/devices/MPSFWD.md §2).
 ///
 /// The fallback is **the two-op spelling the fused pass was measured against**,
 /// not an approximation of it: `affine(scale, 0.0)` and then a `broadcast_add`
@@ -9333,7 +9333,7 @@ fn amax_keepdim_anywhere(t: &Tensor, dim: usize) -> candle_core::Result<Tensor> 
 ///
 /// The fused pass exists because the two-op form was three passes over
 /// `[batch, head, S, S]` plus a rebuilt mask, measured at 5.68 ms of a 21.2 ms
-/// call (docs/SEQLEN.md §8.3). That cost is a CPU measurement and it is the
+/// call (docs/numerics/SEQLEN.md §8.3). That cost is a CPU measurement and it is the
 /// price paid here for the op existing at all on the device.
 fn scale_and_causal_mask_anywhere(raw: &Tensor, scale: f64) -> candle_core::Result<Tensor> {
     if !crate::device::is_metal(raw.device()) {
@@ -9369,7 +9369,7 @@ fn scale_and_causal_mask_anywhere(raw: &Tensor, scale: f64) -> candle_core::Resu
 /// else, so candle answers `no metal implementation for torch._C shim:
 /// transposed copy` for an `mps` tensor -- which is where a SmolLM2 forward
 /// stopped once the refused kernels were off its path, inside SDPA's
-/// `k.transpose(2, 3)` (docs/MPSFWD.md §2).
+/// `k.transpose(2, 3)` (docs/devices/MPSFWD.md §2).
 ///
 /// Falling back to candle's own `contiguous` there is safe for the reason
 /// `transposed_contiguous` gives for its *other* fallback: the blocked copy is
@@ -9391,7 +9391,7 @@ fn contiguous_blocked(t: &Tensor) -> candle_core::Result<Tensor> {
 /// scalar operand the obvious way dies at the first one with
 /// `candle: unsupported const-set f64` -- which is where a SmolLM2 forward on
 /// `mps` stopped, in `mul.Scalar` inside the rotary embedding
-/// (docs/MPSFWD.md §2).
+/// (docs/devices/MPSFWD.md §2).
 ///
 /// `steps` are the dtype conversions applied **on the host**, in order, before
 /// the move; the call sites pass exactly the ones they used to apply after the
@@ -9441,7 +9441,7 @@ fn arith_scalar(
     //
     // **Where the scalar gets rounded is a property of the kernel, not of the
     // `.Scalar` family**, and the two halves disagree. Both measured on 2.13.0
-    // over 420 values per dtype; docs/SCALAR.md has the table.
+    // over 420 values per dtype; docs/numerics/SCALAR.md has the table.
     //
     //   `mul`, `div`   read the operand at `opmath_t` --
     //                  `original_scalar_value<opmath_t>(2)` in
@@ -9452,14 +9452,14 @@ fn arith_scalar(
     //   `add`, `sub`   have no such branch, so the operand arrives through the
     //                  iterator's common dtype and really is narrowed:
     //                  `bfloat16 + 0.3` adds `0.30078125`
-    //                  (docs/GENERATE.md §3.2), and `alpha` narrows with it
+    //                  (docs/models/GENERATE.md §3.2), and `alpha` narrows with it
     //                  (`scale_by_alpha`).
     //
-    // This shim narrowed for all four until docs/SCALAR.md, which made
+    // This shim narrowed for all four until docs/numerics/SCALAR.md, which made
     // `bfloat16 * 0.3` answer `0.90234375` where upstream answers `0.8984375`.
     // It was found by a sabotage fault that *failed to fail*: the narrowing
     // made "scale the mask" and "scale the input" bit-identical here where
-    // upstream separates them (docs/TRAIN.md §5, S4).
+    // upstream separates them (docs/training/TRAIN.md §5, S4).
     let widen_scalar = matches!(kind, Arith::Mul | Arith::Div);
     let right = if storage.is_int() {
         host_const(other.as_i64() * (alpha as i64), &[acc], left.device())
@@ -9470,7 +9470,7 @@ fn arith_scalar(
     } else {
         // Narrowed to `storage` and widened back, not built at `acc`: torch's
         // promotion makes a python float beside a `bfloat16` tensor a
-        // `bfloat16` operand (docs/GENERATE.md §3.2), so `x + 0.3` adds
+        // `bfloat16` operand (docs/models/GENERATE.md §3.2), so `x + 0.3` adds
         // `0.30078125`. Building the scalar at `float` would add `0.3`.
         //
         // **`alpha` is narrowed too, and separately, and the product is
@@ -9480,7 +9480,7 @@ fn arith_scalar(
         // bf16(alpha))` matches upstream 300/300 and the `f64` product 202/300
         // (`float16`: 400/400 against 260/400). `bfloat16([0.0]) + 0.3` with
         // `alpha=0.3` is `0x1.72p-4` upstream and was `0x1.70p-4` here. This
-        // could not have been seen before docs/SCALAR.md §6's second bullet
+        // could not have been seen before docs/numerics/SCALAR.md §6's second bullet
         // was closed: `add.Scalar`/`sub.Scalar` were not in
         // `_aten_implemented()`, so golden had no builder for them and no case
         // had ever passed either op a non-unit `alpha`.
@@ -9551,7 +9551,7 @@ fn rsub_scalar(
 /// `a @ b` reports `mm.default` for a 2-D pair and
 /// `expand/view/bmm/_unsafe_view` for a batched one, because the decomposition
 /// runs below the parser. `THPVariable_matmul` picks `aten::matmul`, and that
-/// is the key here. Recorded in docs/TENSORBASE.md as a difference in what the
+/// is the key here. Recorded in docs/bindings/TENSORBASE.md as a difference in what the
 /// work queue reports, not in what the call returns.
 fn matmul_default(
     py: Python<'_>,
@@ -9601,7 +9601,7 @@ enum Cmp {
 ///
 /// `le.Tensor` joined this family for `falcon`/`gptj`/`bloom`/`mpt`, which all
 /// build their causal mask as `arange(...) <= arange(...)` on two `int64`
-/// tensors (measured, docs/OPS4.md §1). It is a separate key from `le.Scalar`
+/// tensors (measured, docs/kernels/OPS4.md §1). It is a separate key from `le.Scalar`
 /// -- different schema, different overload -- but the same kernel, exactly as
 /// `lt.Tensor`/`lt.Scalar` already are.
 /// Wraps a Python `int` scalar into an unsigned integer dtype's bit pattern,
@@ -9628,7 +9628,7 @@ fn wrap_unsigned_scalar(v: i64, dtype: TorchDType) -> i64 {
 
 fn compare_common(op: &str, tensor: &Tensor, floating: bool, tag: TorchDType) -> PyResult<Tensor> {
     let _ = tag;
-    // `float8_e4m3fn` refused here until docs/FLOAT8C.md §2. `widen_f64` routes
+    // `float8_e4m3fn` refused here until docs/numerics/FLOAT8C.md §2. `widen_f64` routes
     // it through `F32`, so `eq`/`ne` answer upstream's booleans. `lt`/`le`/
     // `ge`/`gt` are *still* refused for this dtype -- upstream refuses them by
     // kernel name (`lt_cpu` and friends) and the table at the door raises that
@@ -9662,7 +9662,7 @@ fn compare_tensor(
 ) -> PyResult<Py<PyAny>> {
     let lhs = tensor_arg(op, args, kwargs, 0, "self")?;
     let rhs = tensor_arg(op, args, kwargs, 1, "other")?;
-    // Promotes. The result is `bool` for every pair (docs/PROMOTE.md §3), so
+    // Promotes. The result is `bool` for every pair (docs/numerics/PROMOTE.md §3), so
     // the promoted tag is not the *answer's* dtype -- it is the dtype the
     // comparison happens **in**, and that is a load-bearing distinction.
     //
@@ -9738,7 +9738,7 @@ fn bitwise_binary(
     // Both promote, over the same table. `bitwise_or` used to refuse -- not
     // because its rule was unknown (the comment here already recorded that
     // the two had been measured to follow the same table) but because only
-    // `and` had a measured caller. docs/PROMOTE.md re-measured `or`'s own 9x9
+    // `and` had a measured caller. docs/numerics/PROMOTE.md re-measured `or`'s own 9x9
     // grid rather than inheriting `and`'s, and it agrees with
     // `torch.promote_types` in every cell, so the two share one line.
     let tag = promote_operands(op, &lhs, &rhs)?;
@@ -9912,12 +9912,12 @@ enum Unary {
 /// `float32` -- so `tanh` follows the promoting rule and `silu` does not.
 /// (`tanh(bool)` promotes too: `[True, False]` gives `[0.7615942, 0.0]`.)
 ///
-/// `exp` joined this family for `mamba` (docs/OPS4.md), which computes
+/// `exp` joined this family for `mamba` (docs/kernels/OPS4.md), which computes
 /// `A = -exp(A_log)` (`A_log` a plain `float32` parameter) -- measured
 /// `torch.exp` on `int64`/`bool` promotes to `float32` exactly like `tanh`
 /// does, and a `float16` input stays `float16`.
 ///
-/// `log` joined for `mamba` (docs/ARCH20.md §4), whose `init_mamba_weights`
+/// `log` joined for `mamba` (docs/architectures/ARCH20.md §4), whose `init_mamba_weights`
 /// computes `init.copy_(self.A_log, torch.log(A))` while the model is being
 /// *constructed* -- so it is a `from_config` wall, not a forward one. The same
 /// promotion holds, re-measured rather than assumed from `exp`: `log(int64)`,
@@ -9931,7 +9931,7 @@ enum Unary {
 /// "raises on a negative input" is the plausible wrong guess and `mamba`'s
 /// `A = arange(1, state_size+1)` never leaves the positive half to reveal it.
 ///
-/// **`sqrt` joined last, for `deberta`/`deberta_v2` (docs/KERNELS26.md §1).**
+/// **`sqrt` joined last, for `deberta`/`deberta_v2` (docs/kernels/KERNELS26.md §1).**
 /// The asymmetry -- `rsqrt` present since RMSNorm, `sqrt` absent -- stopped
 /// two architectures before any weight multiplied: `DebertaLayerNorm` computes
 /// `(h - mean) / torch.sqrt(var + eps)` by hand instead of calling
@@ -10009,7 +10009,7 @@ fn unary_float(
 /// `aten::expm1(Tensor self) -> Tensor`
 ///
 /// `exp(x) - 1`, computed as one operation rather than two. `mamba`'s wall
-/// (docs/ARCH20.md §4): `init_mamba_weights` inverts softplus with
+/// (docs/architectures/ARCH20.md §4): `init_mamba_weights` inverts softplus with
 /// `dt + torch.log(-torch.expm1(-dt))`, again during construction.
 ///
 /// **It is not in the `unary_float` family even though its dtype rule is
@@ -10067,7 +10067,7 @@ fn expm1_default(
 ///
 /// **A real kernel, not a binding.** candle has no `erfinv`, `libm` is not a
 /// direct dependency of this crate, and there is no closed form -- so this is
-/// the one op in `docs/TAIL3.md`'s list where the arithmetic had to be
+/// the one op in `docs/kernels/TAIL3.md`'s list where the arithmetic had to be
 /// chosen, and choosing it wrong is invisible on the happy path.
 ///
 /// # The algorithm, and why not the obvious one
@@ -10101,7 +10101,7 @@ fn expm1_default(
 /// twelve digits -- while `erfc` of upstream's is `9.998953310354861e-13`,
 /// wrong in the fourth. That whole region is unreachable at `float32`, whose
 /// largest value below one is `1 - 6e-8`, so no `float32` caller can see it;
-/// `docs/TAIL3.md` records it and `pytests/test_tail3.py` pins it by the
+/// `docs/kernels/TAIL3.md` records it and `pytests/test_tail3.py` pins it by the
 /// `erfc` round trip rather than by agreement, because agreeing there would
 /// mean being wrong.
 ///
@@ -10235,7 +10235,7 @@ fn erfinv_scalar(y: f64) -> f64 {
 /// The dtype rule *and its two refusals* are `neg_result_tag` below, so that
 /// the meta kernel refuses the same two inputs. A meta kernel that accepted
 /// `neg(bool_meta)` would advertise a tensor the dense kernel then declines to
-/// compute -- the divergence docs/E2E_REAL.md §6.1 names.
+/// compute -- the divergence docs/models/E2E_REAL.md §6.1 names.
 fn neg_result_tag(tag: TorchDType) -> PyResult<TorchDType> {
     if tag == TorchDType::Bool {
         return Err(pyo3::exceptions::PyRuntimeError::new_err(
@@ -10419,7 +10419,7 @@ fn neg_default(
     op: &str,
 ) -> PyResult<Py<PyAny>> {
     // The key is a parameter because `prims.neg` is this exact kernel
-    // under another name (docs/PRIMS.md), and a refusal that named the aten
+    // under another name (docs/kernels/PRIMS.md), and a refusal that named the aten
     // spelling for a call that never mentioned aten would send the reader to
     // the wrong op.
     #[allow(non_snake_case)]
@@ -10445,7 +10445,7 @@ fn neg_default(
     // **It used to be a host round trip** -- `to_vec1::<i64>()`, `wrapping_neg`
     // in Rust, `from_vec` back -- which is why `aten.neg.default` and
     // `prims.neg.default` were refused on `mps`, and a Llama forward reaches
-    // it twice per layer in `rotate_half` (docs/MPSFWD.md §3). `0 - x` is the
+    // it twice per layer in `rotate_half` (docs/devices/MPSFWD.md §3). `0 - x` is the
     // same wrap: `0i64.wrapping_sub(i64::MIN)` is `i64::MIN`, exactly what
     // `wrapping_neg` gives, and candle's `sub` is Rust's `-` on `i64`, which
     // wraps in a release build the same way. The subtraction happens in
@@ -10731,7 +10731,7 @@ fn unbind_int(
 
 /// `aten::relu(Tensor self) -> Tensor`
 ///
-/// Opened `opt`, `nemotron` and `persimmon` (docs/ARCH.md). The whole op is one
+/// Opened `opt`, `nemotron` and `persimmon` (docs/architectures/ARCH.md). The whole op is one
 /// line of arithmetic and every interesting thing about it is in *which* line.
 ///
 /// **`relu` is not `max(x, 0)`.** Two measured results rule that reading out:
@@ -10817,7 +10817,7 @@ fn silu_default(
 
 /// `aten::glu(Tensor self, int dim=-1) -> Tensor` -- the gated linear unit.
 ///
-/// `docs/GLU.md`'s seven ASR encoders (`parakeet` x3, `lasr` x2, `cohere_asr`,
+/// `docs/kernels/GLU.md`'s seven ASR encoders (`parakeet` x3, `lasr` x2, `cohere_asr`,
 /// `parakeet_tdt`) all stop here: `torch._C._nn.glu` is what `F.glu` binds to
 /// (measured -- `torch/nn/functional.py` spells `F.glu` as a direct call to
 /// `torch._C._nn.glu(input, dim)`, no Python-level composition in between),
@@ -10978,7 +10978,7 @@ fn sigmoid_default(
 /// **It copies; it is not a view.** Measured:
 /// `torch.flip(x, [0]).data_ptr() != x.data_ptr()`. That matters here because
 /// a negative-stride view is exactly what candle's `Layout` cannot express, so
-/// an op that *had* to alias would have been another docs/VIEWS.md §6.4 entry.
+/// an op that *had* to alias would have been another docs/kernels/VIEWS.md §6.4 entry.
 /// It does not, so this is a complete implementation rather than a recorded
 /// divergence.
 ///
@@ -11338,12 +11338,12 @@ fn cumsum_default(
     // reduced-precision floats in `float` (`acc_type<BFloat16>`) and narrows
     // once at the end, so this is the same shape of computation with a wider
     // accumulator: it can differ from torch in the last bit of a long
-    // `bfloat16` run, in the more-accurate direction. docs/TENSORBASE.md.
+    // `bfloat16` run, in the more-accurate direction. docs/bindings/TENSORBASE.md.
     // **The running sum is a device tensor, not a `Vec`.** It used to be
     // `to_vec1` -> a scalar loop -> `from_vec`, which put `aten.cumsum.default`
     // on the `mps` refusal list; a Llama forward reaches it building the
-    // attention mask (docs/MPSFWD.md §3). The rewrite is the shape
-    // docs/VOICE.md used for `cumprod`: `n - 1` narrow/add pairs that never
+    // attention mask (docs/devices/MPSFWD.md §3). The rewrite is the shape
+    // docs/architectures/VOICE.md used for `cumprod`: `n - 1` narrow/add pairs that never
     // leave the device.
     //
     // The *order* is the loop's order, not a parallel scan's: slice `i` is
@@ -11389,7 +11389,7 @@ fn cumsum_default(
 /// `sin(pi*x) / (pi*x)`, with `sinc(0) == 1`.
 ///
 /// BigVGAN's anti-aliased resampler builds its low-pass filter out of this
-/// (docs/VOICE.md rank 6): `kaiser_sinc_filter1d` multiplies a `sinc` ramp by
+/// (docs/architectures/VOICE.md rank 6): `kaiser_sinc_filter1d` multiplies a `sinc` ramp by
 /// a Kaiser window, so it is a *construction*-time wall, not a forward one.
 ///
 /// It follows `unary_float_tag`'s promotion -- measured `sinc(int64)` is
@@ -11446,7 +11446,7 @@ fn sinc_default(
 /// `aten::hann_window(int window_length, *, ScalarType? dtype=None, ...)` and
 /// `aten::hann_window.periodic(int window_length, bool periodic, *, ...)`.
 ///
-/// Rank 1 of docs/VOICE.md: four of the five speech models build this in
+/// Rank 1 of docs/architectures/VOICE.md: four of the five speech models build this in
 /// `__init__` as the analysis window of an STFT, so it is what turns them back
 /// from "refuses at construction" into "refuses in the forward, at `stft`" --
 /// a strictly more informative failure even while `stft` itself stays out of
@@ -11552,7 +11552,7 @@ fn hann_window_default(
 
 /// `aten::cumprod(Tensor self, int dim, *, ScalarType? dtype=None)`.
 ///
-/// Spark-TTS BiCodec's wall (docs/VOICE.md rank 5): the factorised vector
+/// Spark-TTS BiCodec's wall (docs/architectures/VOICE.md rank 5): the factorised vector
 /// quantiser derives its per-level strides with a `cumprod` over the codebook
 /// sizes while the module is being *constructed*, so this is a `from_config`
 /// wall like `linspace`'s and not a forward one.
@@ -11641,7 +11641,7 @@ enum Extremum {
 /// `max` alone, written as `flatten_all().max(0)`, and that was a wrong answer
 /// nobody had asked the right question of: candle's reduction skips NaN, so
 /// `max([3, nan, 1])` came back `3.0` where upstream 2.13.0 gives `nan`
-/// (measured, both sides, docs/E2E_REAL.md). Torch's rule is the IEEE
+/// (measured, both sides, docs/models/E2E_REAL.md). Torch's rule is the IEEE
 /// *maximum*/*minimum* rule rather than `fmax`/`fmin` -- a NaN anywhere in the
 /// input is the answer, because there is no ordering that would let a real
 /// number beat it.
@@ -11794,10 +11794,10 @@ fn amax_default(
 /// last.** candle's reduction and comparison kernels all fold with `|x, y| x <
 /// y`, and every comparison against a NaN is false, so a NaN that is not the
 /// element the accumulator *started* on is skipped. Three ops had shipped that
-/// answer: `max.default`/`min.default` (docs/E2E_REAL.md), `max.other`'s second
-/// operand (docs/SPELLINGS.md §7.2), and `max.dim`, which dropped both the
+/// answer: `max.default`/`min.default` (docs/models/E2E_REAL.md), `max.other`'s second
+/// operand (docs/bindings/SPELLINGS.md §7.2), and `max.dim`, which dropped both the
 /// value and the index. `tensor::amax_keepdim` was written specifically to
-/// avoid it (docs/SEQLEN.md §7.2). Rather than a fourth hand-rolled repair,
+/// avoid it (docs/numerics/SEQLEN.md §7.2). Rather than a fourth hand-rolled repair,
 /// every reduction in the family now asks this one function.
 ///
 /// **`amax`'s `CustomOp1` is not the mechanism here, and the reason is
@@ -11923,7 +11923,7 @@ enum Triangle {
 ///
 /// Every dtype passes through unchanged, `torch.bool` included -- which is the
 /// call GPT-BigCode actually makes: `torch.tril(torch.ones((n, n),
-/// dtype=torch.bool))` as its causal-mask buffer (docs/TORCHSCRIPT.md §6).
+/// dtype=torch.bool))` as its causal-mask buffer (docs/graph/TORCHSCRIPT.md §6).
 ///
 /// Rank is checked first and refused with upstream's own wording; a 1-D or
 /// 0-D input has no diagonal to speak of.
@@ -11948,7 +11948,7 @@ fn tril_triu(
     }
     // Contiguous first -- and this is defensive rather than load-bearing,
     // which was measured rather than assumed. Removing it was injected as a
-    // deliberate fault (docs/TRIL.md §5, fault 3) and **no test failed**:
+    // deliberate fault (docs/kernels/TRIL.md §5, fault 3) and **no test failed**:
     // candle's `WCond` matches on `contiguous_offsets()` and falls back to
     // `strided_index()` for all three operands, so a transposed `on_true` is
     // read by position-in-the-matrix already. `tril(x.t())`,
@@ -12005,7 +12005,7 @@ fn tril_triu(
 /// **The NaN rule is IEEE `maximum`/`minimum`, not `fmax`/`fmin`: a NaN on
 /// *either* side wins.** candle's `broadcast_maximum` is `|x, y| x > y`
 /// elementwise, which propagates a NaN in the first operand (nothing displaces
-/// it) and drops one in the second. docs/SPELLINGS.md §7.2 found that
+/// it) and drops one in the second. docs/bindings/SPELLINGS.md §7.2 found that
 /// asymmetry and pinned it as a failing golden case rather than fixing it;
 /// this is the fix. The correction is a mask over the *broadcast* shape, since
 /// either operand's NaN has to reach every element it broadcasts to --
@@ -12022,7 +12022,7 @@ fn extremum_other(
 ) -> PyResult<Py<PyAny>> {
     let lhs = tensor_arg(op, args, kwargs, 0, "self")?;
     let rhs = tensor_arg(op, args, kwargs, 1, "other")?;
-    // Promotes over the lattice (docs/PROMOTE.md §3). Both operands are
+    // Promotes over the lattice (docs/numerics/PROMOTE.md §3). Both operands are
     // brought to the common dtype before the comparison, for `operand_in`'s
     // reason -- the elementwise maximum of a narrowed pair is not always the
     // narrowing of the maximum.
@@ -12092,7 +12092,7 @@ fn extremum_other(
 ///
 /// Both correct spellings give query head `i` the key/value head `i / n_rep`;
 /// tiling gives it `i % n_rep`. Tiling produces a same-shaped,
-/// same-magnitude, entirely wrong answer -- the failure mode docs/ARCH.md
+/// same-magnitude, entirely wrong answer -- the failure mode docs/architectures/ARCH.md
 /// §5.1 records for `gelu`, where the logits look reasonable and are not.
 /// This uses the `unsqueeze`/`expand`/`reshape` spelling, which is
 /// `repeat_interleave` along one axis and is what transformers' own
@@ -12146,7 +12146,7 @@ fn repeat_kv_heads(op: &str, kv: &Tensor, query_heads: usize) -> PyResult<Tensor
 /// re-exported by `torch/return_types.py`. This shim does not own that
 /// machinery, so the pair is a `collections.namedtuple` with the same two
 /// field names: index access and `.values`/`.indices` both work, and the type
-/// is not `torch.return_types.max`. Recorded in docs/TENSORBASE.md.
+/// is not `torch.return_types.max`. Recorded in docs/bindings/TENSORBASE.md.
 ///
 /// One cache per overload rather than one shared type, because the type's
 /// `__name__` is the only thing distinguishing them and `repr()` prints it:
@@ -12186,7 +12186,7 @@ fn extremum_result_type(py: Python<'_>, which: Extremum) -> PyResult<&'static Py
 /// `CustomOp1` is not the mechanism, and for the measurement that says the
 /// index upstream reports is the *first* NaN's.
 ///
-/// `min.dim` had no kernel at all until now; docs/SPELLINGS.md §7.2 left it and
+/// `min.dim` had no kernel at all until now; docs/bindings/SPELLINGS.md §7.2 left it and
 /// `min.other` named in `overloads.json`/`methods.json` so they would refuse
 /// with the right name and land on this queue. Written as one function with
 /// `max.dim` rather than copied, so a fourth version of the NaN rule cannot
@@ -12270,7 +12270,7 @@ fn any_from(op: &str, source: &Tensor) -> PyResult<Tensor> {
     // is the same answer -- `x != 0` does not depend on the width it is asked
     // in -- and it is the difference between `aten.all.default` working on
     // `mps` and dying at `Metal contiguous to_dtype U8 F64 not implemented`,
-    // which is where a SmolLM2 forward's mask stopped (docs/MPSFWD.md §2).
+    // which is where a SmolLM2 forward's mask stopped (docs/devices/MPSFWD.md §2).
     // The scalar `0` costs nothing on the device either: candle converts a
     // scalar operand on the host and uploads it (`cmp!`'s `to_dtype` then
     // `to_device`).
@@ -12481,7 +12481,7 @@ fn masked_fill(
 /// The three-tensor select. `falcon`, `gptj`, `bloom` and `mpt` all reach it
 /// the same way -- a `bool` causal mask and two **0-D** `float32` branches
 /// (`scalar_tensor(finfo.min)` and `scalar_tensor(0.0)`) broadcast up to the
-/// mask's shape (measured, docs/OPS4.md §1). That is why all three operands
+/// mask's shape (measured, docs/kernels/OPS4.md §1). That is why all three operands
 /// broadcast here rather than only two: the branches carry no shape at all.
 ///
 /// **The condition's dtype rule is not `masked_fill`'s.** `masked_fill`
@@ -12542,7 +12542,7 @@ fn where_self(
     let rhs = tensor_arg(OP, args, kwargs, 2, "other")?;
 
     where_condition_check(&condition)?;
-    // Promotes over the lattice (docs/PROMOTE.md §3), from the two *value*
+    // Promotes over the lattice (docs/numerics/PROMOTE.md §3), from the two *value*
     // operands only -- the condition's dtype takes no part, exactly as the
     // meta path below already documented for the same-dtype case.
     //
@@ -12655,7 +12655,7 @@ fn where_scalar_tag(tensor: TorchDType, scalar_is_bool: bool, scalar_is_int: boo
 ///
 /// with `min_dtype = torch.finfo(dtype).min`. That single call was the whole
 /// of what stood between this shim and a real pretrained model's *eager*
-/// forward (docs/CKPT2.md §7.1), and the schema for it was already in
+/// forward (docs/models/CKPT2.md §7.1), and the schema for it was already in
 /// `overloads.json` -- only the kernel was missing, so the dispatcher was
 /// resolving the call and then refusing it by name.
 ///
@@ -12687,7 +12687,7 @@ fn where_scalar_tag(tensor: TorchDType, scalar_is_bool: bool, scalar_is_int: boo
 ///
 /// `where.ScalarSelf` and `where.Scalar` stay unimplemented. They are in the
 /// same `overloads.json` entry and would each be a few lines, but no measured
-/// caller reaches them -- the rule docs/E2E_REAL.md §1.2 sets, and the reason
+/// caller reaches them -- the rule docs/models/E2E_REAL.md §1.2 sets, and the reason
 /// this kernel exists at all is that a caller *was* measured reaching it.
 fn where_scalar_other(
     py: Python<'_>,
@@ -12724,7 +12724,7 @@ fn where_scalar_other(
     // asks the *device* to materialise an `f64` fill, and Metal has no `f64`
     // at all, so a GPT-2 forward on `mps` died here with
     // `candle: unsupported const-set f64` in its attention mask
-    // (docs/MPSATTN.md §3). This is a scalar the parser just read out of a
+    // (docs/devices/MPSATTN.md §3). This is a scalar the parser just read out of a
     // Python object, not a byte of any dispatched tensor.
     let other = if tag == TorchDType::Bool {
         host_const(u8::from(value.as_f64() != 0.0), &[], &device).map_err(|e| candle_err(OP, e))?
@@ -12806,7 +12806,7 @@ fn shape_arg(
 /// is check that each extent is expandable; the dense path gets that from
 /// `broadcast_as`, and the meta path, which has no candle handle to hand to
 /// `broadcast_as`, does it itself with upstream's wording. That split is
-/// recorded in docs/META.md §7.2 rather than hidden.
+/// recorded in docs/devices/META.md §7.2 rather than hidden.
 fn expand_target(op: &str, dims: &[usize], requested: &[isize]) -> PyResult<Vec<usize>> {
     if requested.len() < dims.len() {
         return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
@@ -12897,7 +12897,7 @@ fn remainder_i64(a: i64, b: i64) -> PyResult<i64> {
 /// `aten::remainder.Scalar(Tensor self, Scalar other) -> Tensor` and
 /// `aten::remainder.Tensor(Tensor self, Tensor other) -> Tensor`.
 ///
-/// `sam3_video`'s wall (docs/ARCH26.md §5): `Sam3ViTRotaryEmbedding.__init__`
+/// `sam3_video`'s wall (docs/architectures/ARCH26.md §5): `Sam3ViTRotaryEmbedding.__init__`
 /// computes `x_positions = (flattened_indices % end_x) * scale`, so
 /// `TensorBase.__mod__` and therefore `remainder.Scalar` -- during
 /// *construction*, which is why ARCH26.md's forward-only operator trace never
@@ -13055,10 +13055,10 @@ fn fmod_i64(a: i64, b: i64) -> PyResult<i64> {
 /// `aten::fmod.Scalar(Tensor self, Scalar other) -> Tensor` and
 /// `aten::fmod.Tensor(Tensor self, Tensor other) -> Tensor`.
 ///
-/// `docs/SCALAR2.md` §6: no golden case exercised either overload, which is
+/// `docs/numerics/SCALAR2.md` §6: no golden case exercised either overload, which is
 /// how `torch.fmod` stayed off `overloads.json` despite `remainder` -- its
 /// sign-of-the-divisor sibling -- having both overloads implemented since
-/// docs/ARCH26.md. Same dtype rules, same `uint8` scalar-narrowing behaviour
+/// docs/architectures/ARCH26.md. Same dtype rules, same `uint8` scalar-narrowing behaviour
 /// (`fmod(uint8(200), -3)` is `200`, exactly as `remainder`'s doc comment
 /// records for the same pair, because `-3` narrows to `253` before either
 /// kernel sees it), same `Bool` refusal wording (`"fmod_cpu" not implemented
@@ -13457,7 +13457,7 @@ fn div_mode(
     // `div_true_kernel` does, read the divisor with
     // `original_scalar_value<opmath_t>(2)`, and run the whole of
     // `div_floor_floating` in `float` -- narrowing once on store rather than at
-    // every step. docs/SCALAR.md §3.2.
+    // every step. docs/numerics/SCALAR.md §3.2.
     //
     // Here the difference is not one representable step. A floor turns a
     // fractional error into an integer one: `bfloat16(3) // 0.3` is **10**
@@ -13495,7 +13495,7 @@ fn div_mode(
         (Flat::Float(x), Flat::Float(y)) => {
             // The intermediates follow the divisor: `opmath` for the
             // reduced-float scalar branch, the tensor's own dtype otherwise
-            // (docs/KERNELS26.md §9.3 measured that per-step narrowing).
+            // (docs/kernels/KERNELS26.md §9.3 measured that per-step narrowing).
             let narrow = float_narrower(if scalar_at_opmath {
                 TorchDType::Float32
             } else {
@@ -13549,7 +13549,7 @@ fn div_mode(
 /// `aten::norm.ScalarOpt_dim(Tensor self, Scalar? p, int[1] dim,
 ///     bool keepdim=False) -> Tensor`
 ///
-/// The kernel docs/KERNELS26.md §5.4 found behind `weight_norm`, and §8.3's
+/// The kernel docs/kernels/KERNELS26.md §5.4 found behind `weight_norm`, and §8.3's
 /// correction to ARCH26.md: `weight_norm` costs **three** pieces, not two, and
 /// this is the one that was invisible to a traced sweep because
 /// `torch.norm_except_dim` is a composite and it is called at *construction*
@@ -13581,7 +13581,7 @@ fn div_mode(
 /// **Integral and boolean input raise**, with upstream's own wording:
 /// `norm(): input dtype should be either floating point or complex. Got Long
 /// instead.` — the `scalar_type_name` spelling (`Long`, `Bool`), which is the
-/// third of the four namings docs/KERNELS26.md §5.2 tabulates.
+/// third of the four namings docs/kernels/KERNELS26.md §5.2 tabulates.
 ///
 /// Dtype is preserved, including `float16` and `bfloat16` (measured: a `f16`
 /// input gives a `f16` norm), so this does not promote the way a reduction
@@ -13647,7 +13647,7 @@ fn refuse_duplicate_dims(dims: &[usize]) -> PyResult<()> {
 }
 
 /// The accumulate-in-`opmath` reduction walk `norm.ScalarOpt_dim` and
-/// `linalg_vector_norm.default` share (docs/DEMAND1.md §5, docs/DEMAND.md
+/// `linalg_vector_norm.default` share (docs/architectures/DEMAND1.md §5, docs/architectures/DEMAND.md
 /// §0.1 rank 3): both compute the same six-arm `ord`/`p` family --
 ///
 /// ```text
@@ -13681,7 +13681,7 @@ fn norm_pow_walk(
     // narrowed exactly once, at the end. Reducing with candle keeps every
     // partial sum in the storage dtype.
     //
-    // docs/SCALAR.md §5 recorded the resulting disagreement -- `bfloat16`
+    // docs/numerics/SCALAR.md §5 recorded the resulting disagreement -- `bfloat16`
     // 8/10, `float16` 8/10, `float32` 1/10, with `p=2` agreeing exactly
     // everywhere -- and left it as an accumulate-where change with its own
     // digest question. Re-measured before this rewrite over a 3x4 tensor at
@@ -13856,7 +13856,7 @@ fn norm_pow_walk(
 /// `aten::linalg_vector_norm(Tensor self, Scalar ord=2, int[1]? dim=None,
 ///     bool keepdim=False, *, ScalarType? dtype=None) -> Tensor`
 ///
-/// docs/DEMAND.md §0.1 rank 3, measured in full in docs/DEMAND1.md §5. A
+/// docs/architectures/DEMAND.md §0.1 rank 3, measured in full in docs/architectures/DEMAND1.md §5. A
 /// **distinct leaf** from `aten.norm.ScalarOpt_dim` above -- upstream gives
 /// each its own dispatch registration -- but the same `ord`/`p` family, which
 /// is why this shares `norm_pow_walk` rather than re-deriving it.
@@ -14134,7 +14134,7 @@ fn weight_norm_interface_default(
 /// **Tiling, not broadcasting.** `expand` above produces a view whose strides
 /// are zero; `repeat` materialises a copy, and `[1,2,3].repeat(2, 3)` is
 /// `(2, 9)` -- the *last* repeat multiplies the existing dimension and the
-/// earlier ones are new leading dimensions. docs/ARCH26.md §8 found this op
+/// earlier ones are new leading dimensions. docs/architectures/ARCH26.md §8 found this op
 /// missing across four of the six architectures (`deberta`, `deberta_v2`,
 /// `sew_d`, `sam3_video`), and it is the wall both DeBERTas landed on the
 /// moment `sqrt` existed.
@@ -14161,7 +14161,7 @@ fn weight_norm_interface_default(
 /// when every repeat is `1` candle returns `self.clone()`, and a candle clone
 /// is an `Arc` clone. `x.repeat(1, 1)` would then *share storage with `x`*,
 /// so `x.repeat(1,1).fill_(0)` would zero `x`. Upstream's `repeat` always
-/// materialises. That is the `_to_copy` defect docs/VIEWS.md §6 records,
+/// materialises. That is the `_to_copy` defect docs/kernels/VIEWS.md §6 records,
 /// wearing a new hat: correct values, corrupted input, and every golden case
 /// green because they all read the result.
 ///
@@ -14255,7 +14255,7 @@ fn repeat_default(
 
 /// `aten::as_strided(Tensor(a) self, SymInt[] size, SymInt[] stride,
 /// SymInt? storage_offset=None) -> Tensor(a)` -- **a read-only view, where
-/// upstream's is a two-way one.** docs/STRIDED.md.
+/// upstream's is a two-way one.** docs/kernels/STRIDED.md.
 ///
 /// Upstream returns a tensor that shares the receiver's storage with a layout
 /// the caller supplies outright, so writes propagate in **both** directions:
@@ -14282,7 +14282,7 @@ fn repeat_default(
 /// `storage.rs::StridedBarrier` bars in-place writes to the result's storage
 /// and to the base's for as long as the result is alive, so the two
 /// propagations upstream has and this does not are refusals rather than wrong
-/// numbers. docs/STRIDED.md §2 and §4.
+/// numbers. docs/kernels/STRIDED.md §2 and §4.
 ///
 /// **The receiver must be contiguous, and that check is not tidiness.**
 /// Upstream's `as_strided` addresses the *storage*, ignoring the receiver's own
@@ -14347,7 +14347,7 @@ fn as_strided_default(
              layout, so answering here would return upstream's shape with \
              elements read from the wrong places. Call .contiguous() first only \
              if you meant the logical order -- it is not the same view. \
-             docs/STRIDED.md §3",
+             docs/kernels/STRIDED.md §3",
             layout.stride()
         )));
     }
@@ -14415,7 +14415,7 @@ fn as_strided_default(
         .map_err(|e| candle_err(OP, e))?;
 
     // The barrier is taken over the *base* and the *result*, before either is
-    // handed to Python, and the handle lives on the result. docs/STRIDED.md §2.
+    // handed to Python, and the handle lives on the result. docs/kernels/STRIDED.md §2.
     let barrier = crate::storage::StridedBarrier::new(&base, &out);
     let mut wrapped = if input.tag() == TorchDType::Bool {
         PyTensorBase::boolean(out)?
@@ -14519,7 +14519,7 @@ fn view_dtype(
 /// otherwise, while `reshape` falls back to a copy. This shim copies in both
 /// cases, so a `view` that upstream would reject succeeds here. That is a
 /// divergence in the safe direction (the values are right either way) and it
-/// is recorded in docs/TENSORBASE.md rather than papered over.
+/// is recorded in docs/bindings/TENSORBASE.md rather than papered over.
 fn reshape_like(
     py: Python<'_>,
     args: &Bound<'_, PyTuple>,
@@ -14567,16 +14567,16 @@ fn transpose_int(
 ///
 /// The most-called op of the four this round opens: `falcon` sends every weight
 /// through `permute([1, 0])` and all four send attention through
-/// `permute([0, 2, 1, 3])` (measured, docs/OPS4.md §1).
+/// `permute([0, 2, 1, 3])` (measured, docs/kernels/OPS4.md §1).
 ///
 /// **Upstream this is an alias, and this shim's is not.** Measured on torch
 /// 2.13.0: `permute(x, [1, 0])` shares `x.data_ptr()`, comes back
 /// non-contiguous with the strides swapped, and writing through it changes `x`.
 /// candle's `permute` also shares storage (it clones the `Arc` and permutes the
-/// layout), and **that is now observable**: since docs/VIEWS.md §6 the in-place
+/// layout), and **that is now observable**: since docs/kernels/VIEWS.md §6 the in-place
 /// ops write through the receiver's layout into the buffer it points at, so a
 /// write through a permuted result reaches the base exactly as it does
-/// upstream. docs/OPS4.md §5 has the original probe and docs/VIEWS.md §6.3 the
+/// upstream. docs/kernels/OPS4.md §5 has the original probe and docs/kernels/VIEWS.md §6.3 the
 /// twenty-eight-row table this op is one line of.
 ///
 /// The refusals were read off torch rather than invented, and the first one
@@ -14775,12 +14775,12 @@ fn contiguous_default(
     // the copy when the input is a last-two-swapped view and defers to candle
     // for everything else, including the already-contiguous case (where candle
     // clones the handle rather than the buffer, which is what makes
-    // `contiguous.default` an aliasing op in the table of docs/VIEWS.md §6 --
+    // `contiguous.default` an aliasing op in the table of docs/kernels/VIEWS.md §6 --
     // that has to keep holding, and does, because the fast exit is the first
     // thing it checks).
     //
     // Bit-identical by construction: every output element is a copy of one
-    // input element. docs/KERNELS26.md §7.
+    // input element. docs/kernels/KERNELS26.md §7.
     let out = contiguous_blocked(input.tensor()?)
         .map_err(|e| candle_err(OP, e))?;
     finish(py, out, input.tag())
@@ -14797,7 +14797,7 @@ fn clone_default(
     op: &str,
 ) -> PyResult<Py<PyAny>> {
     // The key is a parameter because `prims.clone` is this exact kernel
-    // under another name (docs/PRIMS.md), and a refusal that named the aten
+    // under another name (docs/kernels/PRIMS.md), and a refusal that named the aten
     // spelling for a call that never mentioned aten would send the reader to
     // the wrong op.
     #[allow(non_snake_case)]
@@ -14815,7 +14815,7 @@ fn clone_default(
 /// no-op, and **the sharing half now agrees**: `x.detach().fill_(0)` zeroes
 /// `x`, as it does upstream. candle's clone was always an `Arc` clone; what
 /// was missing was a write that reached storage, and that is
-/// `PyTensorBase::write_into` (docs/VIEWS.md §6).
+/// `PyTensorBase::write_into` (docs/kernels/VIEWS.md §6).
 fn detach_default(
     py: Python<'_>,
     args: &Bound<'_, PyTuple>,
@@ -14830,7 +14830,7 @@ fn detach_default(
 ///
 /// Upstream's cheapest op: a new tensor object over the same storage, with no
 /// autograd stripping and no copy. **Both halves agree now** -- for the same
-/// reason `detach` above does, since docs/VIEWS.md §6: an in-place write
+/// reason `detach` above does, since docs/kernels/VIEWS.md §6: an in-place write
 /// through either of the two is seen by the other.
 ///
 /// It reaches a Llama forward through GQA's `expand`/`reshape` chain, where the
@@ -14850,9 +14850,9 @@ fn alias_default(
 // `prims.*` -- the reference operators upstream writes its decompositions over
 // ---------------------------------------------------------------------------
 //
-// docs/PRIMS.md. `torch._refs` and `torch._decomp` are written over `prims`,
+// docs/kernels/PRIMS.md. `torch._refs` and `torch._decomp` are written over `prims`,
 // not over aten, so a decomposition rule that upstream already ships stops
-// here on a `prims.*` name rather than on a missing rule. docs/DECOMP.md §12.4
+// here on a `prims.*` name rather than on a missing rule. docs/graph/DECOMP.md §12.4
 // measured that: of the 24 ops in real captured graphs that need lowering for
 // NNAPI, thirteen refuse for exactly this reason.
 //
@@ -15145,7 +15145,7 @@ fn to_copy_default(
         // same reason `any_from` stopped widening: Metal has no `U8 -> F64`,
         // so `bool_mask.to("mps")` died with `Metal contiguous to_dtype U8 F64
         // not implemented` on a tensor that was *already* a mask
-        // (docs/MPSFWD.md §4). The answer does not depend on the width the
+        // (docs/devices/MPSFWD.md §4). The answer does not depend on the width the
         // comparison is asked in.
         let moved = input
             .tensor()?
@@ -15178,7 +15178,7 @@ fn to_copy_default(
     // 2.13.0, `y = x.to(torch.float32); y.fill_(0)` leaves `x` alone upstream,
     // and without this it would zero `x` here. `Tensor::copy` is candle's deep
     // copy; the dtype- and device-changing paths skip it, because those have
-    // already allocated. docs/VIEWS.md §6.3.
+    // already allocated. docs/kernels/VIEWS.md §6.3.
     let out = if out.dtype() == had_dtype && stayed_put {
         out.copy().map_err(|e| candle_err(OP, e))?
     } else {
@@ -15201,7 +15201,7 @@ fn new_ones_default(
 /// `aten::new_zeros(Tensor self, SymInt[] size, *, ScalarType? dtype=None,
 ///     Layout? layout=None, Device? device=None, bool? pin_memory=None) -> Tensor`
 ///
-/// `bart`'s wall (docs/DEMAND.md rank 5):
+/// `bart`'s wall (docs/architectures/DEMAND.md rank 5):
 /// `BartForConditionalGeneration.forward` -> `shift_tokens_right`, which
 /// allocates the shifted copy with `input_ids.new_zeros(input_ids.shape)`.
 /// Generic code duplicated across the whole BART-derived family (`bart`,
@@ -15232,7 +15232,7 @@ fn new_zeros_default(
 /// `aten::new_empty(Tensor self, SymInt[] size, *, ScalarType? dtype=None,
 ///     Layout? layout=None, Device? device=None, bool? pin_memory=None) -> Tensor`
 ///
-/// `rwkv`'s wall, and the last of docs/DEMAND8.md §2.6's five models. Measured
+/// `rwkv`'s wall, and the last of docs/architectures/DEMAND8.md §2.6's five models. Measured
 /// on 2.13.0: the schema is `new_zeros`'s **character for character**, and so
 /// is every defaulting rule -- `x.new_empty(())` is 0-d, `x.new_empty(0)` is
 /// empty, an explicit `dtype=` beats the receiver's, `device="meta"` gives a
@@ -15711,7 +15711,7 @@ fn index_tensor(
 // These are the only ops that write. They take the *receiver object* rather
 // than a copy of it, compute a whole replacement of the receiver's shape and
 // dtype, and hand it to `write_back` below.
-// docs/FROM_CONFIG.md §2.1 measured `fill_.Scalar` five times and
+// docs/models/FROM_CONFIG.md §2.1 measured `fill_.Scalar` five times and
 // `copy_.default` twice during `AutoModelForCausalLM.from_config`, so a shim
 // without them cannot build a model at all.
 //
@@ -15719,7 +15719,7 @@ fn index_tensor(
 // points at** (`PyTensorBase::write_into`). So an alias -- `detach()`,
 // `alias()`, `unsqueeze`, `view`, or the `select.int`/`slice.Tensor`
 // narrowings behind `x[0] = v` -- sees the write, which is what upstream does
-// and what this file did not do before docs/VIEWS.md §6.
+// and what this file did not do before docs/kernels/VIEWS.md §6.
 //
 // The kernels themselves did not change shape to get there. Each of them
 // already produced a fresh tensor with the receiver's shape and dtype; what
@@ -15857,7 +15857,7 @@ fn fill_inplace(
 /// its `reset_parameters` uses `uniform_`. So `zero_` is not on the op-count
 /// tail the architecture sweep measures; it is on the path *before* it, and a
 /// model that cannot be constructed never reaches the tail at all. That is
-/// why docs/GPT2.md saw `nn.LayerNorm` fail twice over: answering
+/// why docs/models/GPT2.md saw `nn.LayerNorm` fail twice over: answering
 /// `_C._get_cudnn_enabled` only moves the failure to this kernel.
 ///
 /// Zero is representable exactly in every dtype this shim stores, so unlike
@@ -15975,17 +15975,17 @@ fn inplace_cast_check(op: &str, result: TorchDType, dest: TorchDType) -> PyResul
 /// `aten::add_.Tensor`, `sub_.Tensor` and `mul_.Tensor` -- one kernel, because
 /// they differ only in `apply_arith`'s arm.
 ///
-/// `add_` opened `falcon` (docs/TAIL.md): its residual connections write
+/// `add_` opened `falcon` (docs/kernels/TAIL.md): its residual connections write
 /// `hidden_states += attn_output` rather than rebinding the name, so the trace
 /// calls this overload and not `add.Tensor`. `sub_` and `mul_` joined it in
-/// docs/ARCH20.md §8 -- they had no kernel *and* no member, which is why
+/// docs/architectures/ARCH20.md §8 -- they had no kernel *and* no member, which is why
 /// `x -= y` and `x *= y` refused outright.
 ///
 /// **Aliasing is `write_back`'s, the same as every other in-place op in this
 /// file**: the result is computed into a fresh tensor of the receiver's shape
 /// and dtype and then written through the receiver's *layout*, so an alias or
 /// a view taken before this call does observe the update, as upstream's does.
-/// docs/VIEWS.md §6.
+/// docs/kernels/VIEWS.md §6.
 ///
 /// Two rules, both upstream's:
 ///
@@ -16075,7 +16075,7 @@ fn arith_inplace_tensor(
 /// The same branch `finish` makes, factored out because `write_back` takes a
 /// `PyTensorBase` and not a `Py<PyAny>`. Getting it wrong is not silent --
 /// `write_into` compares tags and refuses with an "internal error" -- but it
-/// is only *not* silent because that check exists; before docs/VIEWS.md §6 it
+/// is only *not* silent because that check exists; before docs/kernels/VIEWS.md §6 it
 /// would have retagged the receiver.
 fn tagged(tensor: Tensor, tag: TorchDType) -> PyResult<PyTensorBase> {
     if tag == TorchDType::Bool {
@@ -16127,7 +16127,7 @@ fn arith_inplace_scalar(
     // Built exactly as `arith_scalar` builds it, including the narrow-then-
     // widen for the float case: torch's promotion makes a Python float beside
     // a `bfloat16` tensor a `bfloat16` operand, so `x += 0.3` adds
-    // `0.30078125` there (docs/GENERATE.md §3.2). Building at `acc` would add
+    // `0.30078125` there (docs/models/GENERATE.md §3.2). Building at `acc` would add
     // `0.3` and the in-place form would disagree with the out-of-place one.
     let rhs = if storage.is_int() {
         host_const(other.as_i64() * (alpha as i64), &[acc], lhs.device())
@@ -16262,10 +16262,10 @@ fn exp_inplace(
 /// (measured: `torch.ops.aten.relu_.default` and `torch.ops.aten.relu.default`
 /// are different `OpOverload` objects with different schemas,
 /// `Tensor(a!) self` vs plain `Tensor self`), and `aten.rs` had a kernel for
-/// neither name before this (docs/SPELLINGS.md §6.6 measured zero).
+/// neither name before this (docs/bindings/SPELLINGS.md §6.6 measured zero).
 ///
 /// **Aliasing is `write_back`'s, the same as `add_inplace`/`copy_inplace`/
-/// every other in-place op in this file** (docs/VIEWS.md §6): the result is
+/// every other in-place op in this file** (docs/kernels/VIEWS.md §6): the result is
 /// written through the receiver's layout, so a view or alias taken before this
 /// call observes the update. Upstream `relu_` is an alias-preserving in-place
 /// write (measured: `y = x.view(-1); x.relu_(); y` shows the update through
@@ -16312,7 +16312,7 @@ fn relu_inplace(
 }
 
 /// The in-place sibling of `unary_float`'s family (`cos_`/`sin_`/`erf_`/
-/// `log_`/`reciprocal_`/`tanh_`/`sqrt_`), for `docs/SPELLINGS.md` §9's
+/// `log_`/`reciprocal_`/`tanh_`/`sqrt_`), for `docs/bindings/SPELLINGS.md` §9's
 /// fifteen-name gap. `rsqrt_`/`expm1_`/`log2_`/`sigmoid_` are the same rule
 /// but not `Unary` variants (their out-of-place kernels do not go through
 /// `unary_float` either), so they get their own functions below rather than
@@ -16696,7 +16696,7 @@ fn clamp_min_inplace_refusal(
 /// `vits`'s wall had the out-of-place form (`clamp_min_default`, `x =
 /// torch.clamp_min(...)` reassigned); this is the in-place spelling
 /// (`x.clamp_min_(...)`/`torch.clamp_min_(x, ...)`), which had neither a
-/// kernel nor a table entry before docs/SPELLINGS.md §9 named it. The value
+/// kernel nor a table entry before docs/bindings/SPELLINGS.md §9 named it. The value
 /// is `clamp_values(..., min, None)`, shared with `clamp_min_default` and
 /// `clamp_inplace_default`; the dtype rule is `clamp_min_inplace_refusal`
 /// above, kept separate from `clamp_`'s own `clamp_dtype_refusals` because
@@ -16742,7 +16742,7 @@ fn clamp_min_inplace(
 /// Two of the three leaf-case fields are **already** upstream's answer for
 /// every `TensorBase` this shim has, independent of `detach_`:
 /// `is_leaf` is `property(lambda self: True)` and `grad_fn` is
-/// `property(lambda self: None)` (`bootstrap.py`, docs/BACKWARD2.md §1.4 W5/
+/// `property(lambda self: None)` (`bootstrap.py`, docs/training/BACKWARD2.md §1.4 W5/
 /// W6, neither landed). So the only field `detach_` could actually change
 /// here is `requires_grad`, and *that* would be a one-line `set_requires_grad`
 /// call -- except for the view refusal, which does not depend on
@@ -16774,7 +16774,7 @@ fn detach_inplace_refusal(
     let _ = py;
     Err(not_implemented(
         "aten.detach_.default: torch._C shim refuses this op by name rather than \
-         guessing at it (docs/INPLACE.md). Upstream sets requires_grad=False on a \
+         guessing at it (docs/kernels/INPLACE.md). Upstream sets requires_grad=False on a \
          leaf receiver (is_leaf and grad_fn are already True/None for every tensor \
          this shim has), but raises \"Can't detach views in-place. Use detach() \
          instead.\" unconditionally for a view -- before touching either flag, and \
@@ -16788,7 +16788,7 @@ fn detach_inplace_refusal(
 // ---------------------------------------------------------------------------
 // The two RNG ops
 //
-// docs/RNG.md is the standing decision behind these: candle's CPU backend
+// docs/numerics/RNG.md is the standing decision behind these: candle's CPU backend
 // refuses to be seeded at all, so its `rand_uniform`/`rand_normal` cannot be
 // used here even in principle, and torch's own CPU generator is ported into
 // `rng.rs` instead. What is left for this file is the part that depends on
@@ -16909,7 +16909,7 @@ fn narrow_roundtrip_f32(op: &str, value: f32, storage: candle_core::DType, devic
 /// `aten::uniform_(Tensor(a!) self, float from=0., float to=1., *,
 ///                 Generator? generator=None) -> Tensor(a!)`
 ///
-/// This is the sixth wall on the way to `from_config` (docs/TENSORBASE.md §7):
+/// This is the sixth wall on the way to `from_config` (docs/bindings/TENSORBASE.md §7):
 /// `nn.init.kaiming_uniform_` ends in `tensor.uniform_(-bound, bound)`, so no
 /// `nn.Linear` exists until it does.
 ///
@@ -17000,7 +17000,7 @@ fn uniform_inplace(
 ///     redraws those sixteen *over values it already wrote*.
 ///
 /// So `n=15` and `n=16` produce entirely different sequences from one seed,
-/// and `n=17` differs from `n=16` in its first element too. docs/RNG.md §1.3
+/// and `n=17` differs from `n=16` in its first element too. docs/numerics/RNG.md §1.3
 /// measured all three; the harness cases below them are the regression.
 fn normal_inplace(
     py: Python<'_>,
@@ -17075,9 +17075,9 @@ fn normal_inplace(
 /// `aten::bernoulli_.float(Tensor(a!) self, float p=0.5, *,
 ///                         Generator? generator=None) -> Tensor(a!)`
 ///
-/// The primitive under **training mode** (docs/TRAIN.md). Two callers, and
+/// The primitive under **training mode** (docs/training/TRAIN.md). Two callers, and
 /// they are not the same caller: `nn.Dropout`'s composite decomposes onto it
-/// (docs/TRAIN.md §1), and DeBERTa's `XDropout` reaches for it directly --
+/// (docs/training/TRAIN.md §1), and DeBERTa's `XDropout` reaches for it directly --
 /// `transformers/models/sew_d/modeling_sew_d.py:229` is
 /// `(1 - torch.empty_like(input).bernoulli_(1 - dropout)).to(torch.bool)`,
 /// because it needs the mask itself and not just the masked tensor.
@@ -17181,9 +17181,9 @@ fn bernoulli_inplace_float(
 // ---------------------------------------------------------------------------
 // The eight ops `do_sample=True` stops on
 //
-// docs/GAP.md §4 predicted ten; the coordinating session re-measured a real
+// docs/kernels/GAP.md §4 predicted ten; the coordinating session re-measured a real
 // transformers Llama against `_aten_implemented()` and found eight still
-// missing. docs/SAMPLING.md records what each one turned out to be.
+// missing. docs/models/SAMPLING.md records what each one turned out to be.
 //
 // Seven of the eight are ordinary kernels. `multinomial` is not: it is the only
 // op in this file that *draws*, and a sampled token is only reproducible if it
@@ -17300,7 +17300,7 @@ struct Ordered {
 /// shim answers `[0,2,5,4,1,3]` there. It matters for nothing measured: the
 /// `top_k` warper reads only `values[..., -1]`, and `multinomial`'s
 /// no-replacement path feeds `topk` continuous ratios where ties do not occur.
-/// docs/SAMPLING.md §4 has the measurement; the golden cases keep `topk`'s
+/// docs/models/SAMPLING.md §4 has the measurement; the golden cases keep `topk`'s
 /// index comparison to tie-free inputs and compare the tied ones by value.
 fn order_along(
     op: &str,
@@ -17512,7 +17512,7 @@ fn squeeze_dim(
 
 /// `aten::squeeze.default(Tensor(a) self) -> Tensor(a)`
 ///
-/// docs/DEMAND.md §0.1 rank 2: `squeeze` is declared in both
+/// docs/architectures/DEMAND.md §0.1 rank 2: `squeeze` is declared in both
 /// `overloads.json` and `methods.json` with three overloads --
 /// `squeeze()`, `.dim`, `.dims` -- but the dispatch `match` above only had
 /// an arm for `.dim`. The no-arg overload looked present in the name tables
@@ -17544,7 +17544,7 @@ fn squeeze_default(
 
 /// `aten::squeeze.dims(Tensor(a) self, int[] dim) -> Tensor(a)`
 ///
-/// docs/DEMAND.md §0.1 rank 2 -- the other hole beside `squeeze.default`,
+/// docs/architectures/DEMAND.md §0.1 rank 2 -- the other hole beside `squeeze.default`,
 /// same missing dispatch arm, checked while landing it.
 ///
 /// Each named axis of size 1 is removed; a named axis whose size is not 1
@@ -17674,12 +17674,12 @@ fn split_tensor(
 ///     dim=0) -> Tensor(a)[]`
 ///
 /// `split.Tensor` with the chunk sizes spelled out individually rather than
-/// as one repeated size -- the spelling `gpt_bigcode` (docs/TAIL.md) reaches
+/// as one repeated size -- the spelling `gpt_bigcode` (docs/kernels/TAIL.md) reaches
 /// for `c_attn(x).split((embed_dim, kv_dim, kv_dim), dim=2)`, an *uneven*
 /// three-way unpack (query gets the full embedding width, key and value share
 /// a narrower one under multi-query attention) that `split.Tensor`'s single
 /// repeated size cannot express. `methods.json` already spells this op to a
-/// single kernel key (docs/SPELLINGS.md §4); only the kernel was missing.
+/// single kernel key (docs/bindings/SPELLINGS.md §4); only the kernel was missing.
 ///
 /// Measured against torch 2.13.0:
 ///
@@ -17742,9 +17742,9 @@ fn split_with_sizes(
 
 // ---------------------------------------------------------------------------
 // mamba / mixtral -- the last two of the 20 measured architectures
-// (docs/OPS4.md) with anything unimplemented. Traced with a real
+// (docs/kernels/OPS4.md) with anything unimplemented. Traced with a real
 // `TorchDispatchMode` over `transformers` 5.15.1 + torch 2.13.0 rather than
-// read off a doc comment: docs/OPS4.md's own §0 note is that doc comments
+// read off a doc comment: docs/kernels/OPS4.md's own §0 note is that doc comments
 // have been wrong about upstream three times before, so every rule below was
 // re-measured, not copied from a kernel's docstring.
 // ---------------------------------------------------------------------------
@@ -17770,7 +17770,7 @@ fn split_with_sizes(
 ///
 /// The previous version computed `max(y,0) + log(1 + exp(-|y|))` instead --
 /// mathematically the same function, and never equal to it in floating
-/// point. docs/SCALAR.md §5 recorded the resulting disagreement as open,
+/// point. docs/numerics/SCALAR.md §5 recorded the resulting disagreement as open,
 /// with `softplus(-3)` at `float64` reading `0.048587351573742**06**`
 /// upstream and `…**196**` here. Two separate causes, both closed here:
 ///
@@ -17809,7 +17809,7 @@ fn split_with_sizes(
 /// body and a scalar tail, and the two do not agree: `softplus(-3.0)` in
 /// `float32` is `0x1.8e070e0p-5` in a tensor of fewer than 8 elements and
 /// `0x1.8e07100p-5` in a longer one, measured at n = 1, 2, 3, 4, 7, 8, 16,
-/// 17, 32, 64, 100. That is one ULP and it is the same class docs/LOSS.md
+/// 17, 32, 64, 100. That is one ULP and it is the same class docs/training/LOSS.md
 /// §5.4 records for `_log_softmax`. The `float32` cases therefore use the
 /// ordinary tolerance; `float64`, `float16` and `bfloat16` are all stable
 /// across length and are pinned bit-exactly.
@@ -17945,7 +17945,7 @@ fn convolution_default(
     // length-checked against.
     //
     // **2-D was ARCH26.md §3.2's wall and it turned out to be the small piece,
-    // not the large one** (docs/KERNELS26.md §7): candle already carries
+    // not the large one** (docs/kernels/KERNELS26.md §7): candle already carries
     // `Tensor::conv2d` with the same `(padding, stride, dilation, groups)`
     // signature `conv1d` has, so this is the same thin wrapper twice rather
     // than a second kernel. What it is *not* is a general 2-D convolution --
@@ -18005,13 +18005,13 @@ fn convolution_default(
     // ARCH26.md §3.2 stopped on, is `nn.Conv2d(3, hidden, kernel_size=16,
     // stride=16)` -- square kernel, square stride, no padding.
     // **Per-axis-differing PADDING is lowered rather than refused
-    // (docs/LAST7.md §4).** docs/ARGFORM.md §1 measured that `padding=[0, 5]`
+    // (docs/kernels/LAST7.md §4).** docs/bindings/ARGFORM.md §1 measured that `padding=[0, 5]`
     // is not asymmetric padding at all -- it is two axes each padded
     // symmetrically by a different amount, which upstream computes fine -- and
     // classified the refusal below as a genuine backend limitation. It is a
     // real limitation of candle's `conv2d`, whose padding is one scalar, but it
     // is not a limitation of this shim: the difference can be spent as explicit
-    // zero padding on the input, exactly as docs/RNN.md §2 did for
+    // zero padding on the input, exactly as docs/kernels/RNN.md §2 did for
     // `conv1d(padding='same')` with an odd total. Convolve with the *common*
     // part and pad the remainder, which is zero on one axis by construction
     // because the common part is the minimum.
@@ -18074,7 +18074,7 @@ fn convolution_default(
         // **1-D transposed convolution keeps `groups`; 2-D does not.** That is
         // candle's asymmetry, not upstream's: `conv_transpose1d` takes a
         // `groups` argument and `ParamsConvTranspose2D` has no field for one.
-        // docs/KERNELS26.md §10.3 refused the 1-D case entirely for the
+        // docs/kernels/KERNELS26.md §10.3 refused the 1-D case entirely for the
         // opposite reason -- candle supports it fully and nothing measured
         // reached it. `vits` reaches it now (`modeling_vits.py`'s HiFi-GAN
         // decoder is `nn.ConvTranspose1d(channels, channels//2, kernel,
@@ -18299,7 +18299,7 @@ fn zeros_or_empty_like(
     // change rather than tidiness.** `torch/autograd/__init__.py` `_make_grads`
     // builds its seed with `torch.ones_like(out, memory_format=preserve_format)`
     // and only reaches that line `if out.requires_grad` -- which was `False` for
-    // every intermediate until docs/BACKWARD4.md. With the flag propagating, a
+    // every intermediate until docs/training/BACKWARD4.md. With the flag propagating, a
     // blanket refusal here would have **moved `Tensor.backward()`'s refusal**
     // off `_ImperativeEngine.run_backward` and onto a memory-format argument, so
     // the wall a user hits would have stopped naming the thing that is missing.
@@ -18312,7 +18312,7 @@ fn zeros_or_empty_like(
     // through `tensor()` asked the enum for a candle tensor first, so a meta
     // input was refused with `Cannot copy out of meta tensor; no data!` -- a
     // message about bytes, in answer to a question about a shape. That is the
-    // same mismatch `stride()` had (docs/EXPORT4.md §6.5) and it is why
+    // same mismatch `stride()` had (docs/graph/EXPORT4.md §6.5) and it is why
     // `torch.export` stopped here: `proxy_tensor.py` builds a zero tensor
     // shaped like a value that is still fake, and `_export/non_strict_utils.py`
     // forwards `device="cpu"` with it, so both branches below are live on the
@@ -18396,7 +18396,7 @@ fn floor_divide_default(
 /// *answer*, and closing that gap properly means teaching the resolver
 /// upstream's "numbers as tensors" rule -- a change in `bootstrap.py`, above
 /// this file. Until then, refusing here would stop Mixtral's MoE routing on
-/// an op the shim can already compute. docs/GROUPED_MM.md §6.
+/// an op the shim can already compute. docs/kernels/GROUPED_MM.md §6.
 fn floor_divide_scalar(
     py: Python<'_>,
     args: &Bound<'_, PyTuple>,
@@ -18700,7 +18700,7 @@ fn clamp_inplace_default(
 /// an "internal error" message aimed at whoever wrote the kernel. A
 /// user-reachable refusal belongs at the door with upstream's own wording; the
 /// tag check underneath stays as the structural backstop, the same shape as
-/// `check_meta` sitting over `PyTensorBase::tensor`. docs/VIEWS.md §6.8.
+/// `check_meta` sitting over `PyTensorBase::tensor`. docs/kernels/VIEWS.md §6.8.
 ///
 /// **A float bound against an integral tensor is refused outright, regardless
 /// of the bound's actual value** -- measured `int32.clamp(max=2.0)` raises
@@ -18848,12 +18848,12 @@ fn clamp_result_tag(
 
 /// `aten::clamp(Tensor self, Scalar? min=None, Scalar? max=None) -> Tensor`
 ///
-/// `mamba`'s wall (docs/ARCH20.md §4): `modeling_mamba.py` clamps `dt` and the
+/// `mamba`'s wall (docs/architectures/ARCH20.md §4): `modeling_mamba.py` clamps `dt` and the
 /// discretisation limits out of place, and only the *in-place* sibling had a
-/// kernel -- `clamp_.default` has been implemented since docs/OPS8.md while
+/// kernel -- `clamp_.default` has been implemented since docs/kernels/OPS8.md while
 /// `x.clamp(...)` refused. That asymmetry is the one an in-place-first round
 /// leaves behind, and it is the second instance of it in this file after
-/// `relu`/`relu_` (docs/SPELLINGS.md §6.6) went the other way.
+/// `relu`/`relu_` (docs/bindings/SPELLINGS.md §6.6) went the other way.
 ///
 /// The *value* rule is `clamp_`'s, shared through `clamp_values` -- including
 /// "both bounds absent is an error, not a no-op", which a fresh out-of-place
@@ -19009,7 +19009,7 @@ fn div_inplace_tensor(
 /// (a `torch.bool` mask required, same as that op's doc comment measures),
 /// computed once and written into the receiver through its layout by
 /// `write_back` -- so an alias or view taken before this call sees the write,
-/// as it does upstream. docs/VIEWS.md §6.
+/// as it does upstream. docs/kernels/VIEWS.md §6.
 ///
 /// It is one of the four keys `write_back` lets write into an *expanded*
 /// destination, because upstream does (with a deprecation warning) where it
@@ -19047,7 +19047,7 @@ fn masked_fill_inplace(
 /// else: `scatter` wants an int32/int64 index and index/src/self all of the
 /// same rank, so it refused a bool mask (`Expected dtype int32 or int64 for
 /// index, got bool`) and refused a matrix receiver. Both refusals were
-/// recorded as gaps in docs/GROUPED_MM.md §6.4 and both are closed here, by
+/// recorded as gaps in docs/kernels/GROUPED_MM.md §6.4 and both are closed here, by
 /// doing the address arithmetic directly instead of borrowing another op's.
 ///
 /// **Everything below was measured against torch 2.13.0, not recalled.**
@@ -19099,20 +19099,20 @@ fn masked_fill_inplace(
 ///       * `torch.bool` accumulates as a logical or, because upstream's
 ///         `*dst += *src` on a C++ `bool` promotes and converts back.
 ///     This is what an embedding's backward wants -- a scatter-add into a
-///     zero buffer -- and docs/BACKWARD.md §4.5 records the one-hot
+///     zero buffer -- and docs/training/BACKWARD.md §4.5 records the one-hot
 ///     composition it currently uses instead, at 200 MB for `S=1024`.
 ///
 
 /// The write goes back into the receiver through `write_back`, which puts it
 /// into the buffer the receiver already points at rather than swapping the
 /// wrapper -- so an alias or a view created before the call does see it, as
-/// upstream's does. That was §4 of docs/VIEWS.md's open question and §6 is
+/// upstream's does. That was §4 of docs/kernels/VIEWS.md's open question and §6 is
 /// the answer.
 ///
 /// The kernel itself did not change for it, and that is the useful part: it
 /// already built a whole `dims`-shaped replacement out of `read_flat`, and a
 /// whole replacement of the receiver's shape is exactly what write-through
-/// consumes. docs/VIEWS.md §6.1 has the argument that this shape was never
+/// consumes. docs/kernels/VIEWS.md §6.1 has the argument that this shape was never
 /// the obstacle §4 recorded it as being.
 fn index_put_inplace(
     _py: Python<'_>,
@@ -19298,7 +19298,7 @@ fn index_put_inplace(
     // `zeros(4, bool)` accumulated at `[0, 0, 1]` with `[True, True, True]`
     // is `[True, True, False, False]`, not a 2 anywhere. Writing `o + s`
     // here would put a `2` in a `bool` buffer and break the invariant
-    // docs/BOOL.md §6.3 attaches to the tag.
+    // docs/numerics/BOOL.md §6.3 attaches to the tag.
     let is_bool = tag == TorchDType::Bool;
 
     let mut coord = vec![0usize; result_rank];
@@ -19606,7 +19606,7 @@ fn native_layer_norm_default(
 ///     separates the divisor, and neither one alone does both.
 ///   * **`rstd` is a reciprocal**, not a standard deviation. `1/sqrt(v+eps)`
 ///     and `sqrt(v+eps)` have the same shape and the same dtype and differ
-///     only in the numbers -- docs/KERNELS26.md's "a wrong answer that has the
+///     only in the numbers -- docs/kernels/KERNELS26.md's "a wrong answer that has the
 ///     right shape", in the result no forward reads.
 ///
 /// **The normalisation axes are not the weight axis.** The statistics are
@@ -19878,10 +19878,10 @@ fn optional_tensor_receiver<'py>(
 ///     Tensor? running_mean, Tensor? running_var, bool training,
 ///     float momentum, float eps) -> (Tensor, Tensor, Tensor)`
 ///
-/// docs/DEMAND.md's **rank 1** -- `resnet` and `mobilenet_v2` both stop here,
+/// docs/architectures/DEMAND.md's **rank 1** -- `resnet` and `mobilenet_v2` both stop here,
 /// one layer past a stem `conv2d` that now succeeds, and the same code shape
 /// carries EfficientNet, RegNet and DenseNet. The most generic vision-CNN
-/// primitive there is. Full measurement round in docs/DEMAND1.md §1; the parts
+/// primitive there is. Full measurement round in docs/architectures/DEMAND1.md §1; the parts
 /// that decide the code are repeated here.
 ///
 /// A leaf (`CompositeImplicitAutograd` is `False`); `aten::batch_norm` is the
@@ -20847,7 +20847,7 @@ fn upsample_bilinear2d_default(
 
 /// `aten::acos(Tensor self) -> Tensor`
 ///
-/// `yoso`'s wall (docs/ARCH100.md rank, cum=57). Not in the `unary_float`
+/// `yoso`'s wall (docs/architectures/ARCH100.md rank, cum=57). Not in the `unary_float`
 /// family: candle-core 0.11.0 has no `acos` unary op at all (`unary_op!` in
 /// `tensor.rs` lists `sin`/`cos`/`tanh`/`erf`/... but not `acos`, `asin` or
 /// `atan`), so this is a manual elementwise kernel over `f64::acos` -- the
@@ -20917,8 +20917,8 @@ fn is_all_true_default(
 
 /// `aten::broadcast_tensors(Tensor[] tensors) -> Tensor[]`
 ///
-/// `gemma3n_text`'s wall (docs/ARCH100.md, one architecture) -- but the
-/// higher-value reason to land it is `nn.MSELoss`. `docs/BACKWARD9.md`
+/// `gemma3n_text`'s wall (docs/architectures/ARCH100.md, one architecture) -- but the
+/// higher-value reason to land it is `nn.MSELoss`. `docs/training/BACKWARD9.md`
 /// recorded working around its absence by spelling the loss as
 /// `((o - t) ** 2).mean()` instead of `nn.MSELoss()(o, t)`, because
 /// `torch/functional.py`'s `broadcast_tensors` -- which `F.mse_loss`'s
@@ -20965,7 +20965,7 @@ fn broadcast_tensors_default(
 ///     int[1] padding=[0], int[1] dilation=[1], bool ceil_mode=False)
 ///     -> Tensor`
 ///
-/// `canine`'s wall (docs/ARCH100.md, one architecture). The 1-D twin of
+/// `canine`'s wall (docs/architectures/ARCH100.md, one architecture). The 1-D twin of
 /// `max_pool2d_default` above -- same extent formula, same `ceil_mode`
 /// correction, same `read_flat`/`write_flat` round trip -- collapsed to one
 /// spatial axis instead of two. `max_pool1d` (unlike `max_pool2d`, which has
@@ -21067,7 +21067,7 @@ fn max_pool1d_default(
     // and names a different kernel when it refuses: `"max_pool1d_impl" not
     // implemented for 'Byte'`, not `"max_pool2d"`. Copying the 2-D branch here
     // would have refused two dtypes upstream answers and misnamed the kernel
-    // for the three it does refuse. docs/TAIL1.md §2.
+    // for the three it does refuse. docs/kernels/TAIL1.md §2.
     if !tag.is_floating_point() {
         return Err(pyo3::exceptions::PyNotImplementedError::new_err(format!(
             "\"max_pool1d_impl\" not implemented for '{}'",
@@ -21118,11 +21118,11 @@ fn max_pool1d_default(
 /// `aten::upsample_nearest2d(Tensor self, SymInt[2] output_size,
 ///     float? scales_h=None, float? scales_w=None) -> Tensor`
 ///
-/// `vilt`'s wall (docs/ARCH100.md, `torch._C._nn.upsample_nearest2d`). Sits
+/// `vilt`'s wall (docs/architectures/ARCH100.md, `torch._C._nn.upsample_nearest2d`). Sits
 /// beside `upsample_bilinear2d_default` for the input validation and the
 /// `read_flat`/`write_flat` scaffolding, but **the index rule is nearest's
 /// own, not bilinear's, and was measured rather than assumed** --
-/// `docs/DEMAND8.md` recorded three separate traps in `upsample_bicubic2d`
+/// `docs/architectures/DEMAND8.md` recorded three separate traps in `upsample_bicubic2d`
 /// that only running upstream caught, and this had its own such check:
 ///
 /// ```text
@@ -21193,7 +21193,7 @@ fn upsample_nearest2d_default(
     // (measured, `4x4 -> 3x3` uint8: `[0,1,2,4,5,6,8,9,10]`, identical to the
     // float32 gather). Refusing it here -- as this file first did, by
     // inheriting the neighbours' reasoning -- refuses a dtype upstream
-    // answers. docs/TAIL1.md §2.
+    // answers. docs/kernels/TAIL1.md §2.
     if !(tag.is_floating_point() || tag == TorchDType::UInt8) {
         return Err(pyo3::exceptions::PyNotImplementedError::new_err(format!(
             "\"upsample_nearest2d_channels_last\" not implemented for '{}'",
@@ -21272,7 +21272,7 @@ fn upsample_nearest2d_default(
 
 /// `aten::floor(Tensor self) -> Tensor`
 ///
-/// `swin`'s and `segformer`'s wall (docs/DEMAND7.md §3 rank 1). The twin of
+/// `swin`'s and `segformer`'s wall (docs/architectures/DEMAND7.md §3 rank 1). The twin of
 /// `ceil_default` directly above, and every rule was re-measured on 2.13.0
 /// rather than mirrored from it, because the two differ in exactly one place
 /// that matters and agreeing everywhere else is not a reason to skip the
@@ -21326,7 +21326,7 @@ fn floor_default(
 /// re-measured in place (an integral receiver is the identity, `bool`
 /// refuses with `floor_vml_cpu`) rather than inherited by analogy -- in-place
 /// dtype rules diverge from their out-of-place siblings often enough in this
-/// file (docs/INPLACE.md §2) that the analogy is not evidence.
+/// file (docs/kernels/INPLACE.md §2) that the analogy is not evidence.
 fn floor_inplace(
     py: Python<'_>,
     args: &Bound<'_, PyTuple>,
@@ -21982,7 +21982,7 @@ fn cubic_upsample_coefficients(t: f64, acc32: bool, narrow: fn(f64) -> f64) -> [
 /// dtypes compute in float and narrow once at the end, which is why they agree
 /// with upstream to better than their own epsilon.
 ///
-/// The max is subtracted before the exponential for the reason docs/OPS8.md §3
+/// The max is subtracted before the exponential for the reason docs/kernels/OPS8.md §3
 /// gives for the attention kernel: without it a masked `-inf` and a large logit
 /// both come out NaN. With it, `exp(-inf - max)` is a clean zero. A row that is
 /// *entirely* `-inf` still gives NaN on both sides, and a case pins that.
@@ -22032,12 +22032,12 @@ fn softmax_default(
 
 /// The reduction behind `_softmax.default` and `_safe_softmax.default`, written
 /// out of candle ops so that **no device byte travels to the host** and the op
-/// can leave `MPS_HOST_READBACK_OPS` (docs/MPSATTN.md).
+/// can leave `MPS_HOST_READBACK_OPS` (docs/devices/MPSATTN.md).
 ///
 /// This replaces a `read_flat` + scalar loop (`softmax_body`) that was correct
 /// and computed on the CPU under any label. That was the whole reason
 /// `aten._softmax.default` was refused on `mps`, and it is the op every
-/// **eager** attention block goes through -- `docs/MPSFWD.md` measured that
+/// **eager** attention block goes through -- `docs/devices/MPSFWD.md` measured that
 /// SmolLM2 does *not*, because it takes `scaled_dot_product_attention`, and
 /// concluded from one model that no attention block does. A BERT built with
 /// `attn_implementation="eager"` reaches it twice a layer.
@@ -22049,7 +22049,7 @@ fn softmax_default(
 /// those is one candle op in the same dtype, and candle's CPU `exp` is the same
 /// `f32::exp`. The one thing not pinned by construction is the **summation
 /// order** inside `sum_keepdim`; the golden corpus is the check on that and it
-/// did not move (docs/MPSATTN.md §4).
+/// did not move (docs/devices/MPSATTN.md §4).
 ///
 /// `acc` is `opmath_type<scalar_t>` exactly as before -- `f32` for the reduced
 /// float dtypes, `f64` for `float64` -- so `float16`/`bfloat16` still compute
@@ -22068,7 +22068,7 @@ fn softmax_on_device(
     // rather than answering. The scalar loop this replaced folded them into
     // its `(outer, n, inner) = (1, 1, 1)` special case and answered upstream's
     // values; **nine golden cases caught the omission** when it did not
-    // (docs/MPSATTN.md §4), across every float dtype.
+    // (docs/devices/MPSATTN.md §4), across every float dtype.
     //
     //   * rank 0 -- `max: dimension index 0 out of range for shape []`.
     //     A single element is the whole distribution, so the answer is `1`.
@@ -22093,7 +22093,7 @@ fn softmax_on_device(
         // entirely `-inf` does not answer `-inf`, so the row was not detected,
         // `exp(-inf - max)` underflowed to `0`, and `0 / 0` handed back the
         // `NaN` this branch exists to avoid. It was a *value* test that caught
-        // it (docs/MPSATTN.md §5), which is why there is one.
+        // it (docs/devices/MPSATTN.md §5), which is why there is one.
         //
         // So the criterion is torch's own decomposition instead --
         // `torch/_decomp/decompositions.py::safe_softmax` masks where **every**
@@ -22188,9 +22188,9 @@ fn safe_softmax_default(
 
 /// `aten::_log_softmax(Tensor self, int dim, bool half_to_float) -> Tensor`
 ///
-/// The first half of a cross-entropy forward, and the reason `docs/TRAIN.md`'s
+/// The first half of a cross-entropy forward, and the reason `docs/training/TRAIN.md`'s
 /// 26 of 26 are *lossless* forwards: without it there is no scalar to call
-/// `.backward()` on. `docs/LOSS.md` is the round that landed it.
+/// `.backward()` on. `docs/training/LOSS.md` is the round that landed it.
 ///
 /// It shares `_softmax`'s two refusals verbatim -- `half_to_float=True` is a
 /// CUDA-only fusion and raises on CPU for every dtype, and an integral input
@@ -22378,7 +22378,7 @@ fn log_softmax_body(
 /// `aten::nll_loss_forward(Tensor self, Tensor target, Tensor? weight,
 ///     int reduction, SymInt ignore_index) -> (Tensor output, Tensor total_weight)`
 ///
-/// The second half of a cross-entropy forward (docs/LOSS.md), and the op whose
+/// The second half of a cross-entropy forward (docs/training/LOSS.md), and the op whose
 /// **second return value** is the reason a forward-only test is not enough:
 /// `total_weight` is what `nll_loss_backward` divides by, and every caller in
 /// `transformers` throws it away. Its rules are not derivable from the loss:
@@ -22685,10 +22685,10 @@ fn nll_cascade(
 ///
 /// The **out-of-place** dropout, and the reason it is here is not arithmetic:
 /// `capture` refuses mutation so that a trace stays single-assignment
-/// (docs/CAPTURE.md), and the eager composite `torch.dropout` decomposes onto
+/// (docs/graph/CAPTURE.md), and the eager composite `torch.dropout` decomposes onto
 /// `bernoulli_`, which writes in place. So a `.train()` forward with real
 /// dropout could not be captured at all — `gpt2`, `bert`, `opt` and
-/// `gpt_bigcode`, `docs/TRAIN.md`'s own four. This op is upstream's own answer
+/// `gpt_bigcode`, `docs/training/TRAIN.md`'s own four. This op is upstream's own answer
 /// to the same problem: it is the spelling functionalisation rewrites to, and
 /// it returns the mask rather than hiding it inside an in-place fill.
 ///
@@ -22710,7 +22710,7 @@ fn nll_cascade(
 ///   p out of [0,1]       TORCH_CHECK naming p            no check of its own
 /// ```
 ///
-/// The second is the same distinction `docs/TRAIN.md` §5's S4 fault is about,
+/// The second is the same distinction `docs/training/TRAIN.md` §5's S4 fault is about,
 /// with the sides swapped — and it is a real difference in `bfloat16`/`float16`,
 /// where `x * (1/(1-p))` and `x / (1-p)` disagree by an ULP on some survivors.
 /// Following upstream means each spelling keeps its own answer.
@@ -22733,7 +22733,7 @@ fn nll_cascade(
 ///   the mask's dtype sees what upstream shows it.
 /// * **`train=False` copies.** `output = input.clone()`, so the result is not
 ///   the same object — unlike `_dropout_impl`, whose `p == 0 || !train` branch
-///   returns `input` itself (docs/TRAIN.md §1 pins that identity). Two dropout
+///   returns `input` itself (docs/training/TRAIN.md §1 pins that identity). Two dropout
 ///   spellings, opposite answers to `out is x`.
 ///
 /// `train=None` means `True`: upstream tests `!train.has_value() || *train`.
@@ -22827,8 +22827,8 @@ fn native_dropout_default(
     // that is measured rather than read off `native_dropout_cpu`'s
     // `output.mul_(scale)`. A standalone `x.mul_(1/0.3)` on a `bfloat16` tensor
     // does NOT narrow -- `mul_kernel`'s reduced-float branch takes
-    // `original_scalar_value<opmath_t>`, which is `float` (docs/TRAIN.md §5,
-    // docs/SCALAR.md) -- and the two answers differ:
+    // `original_scalar_value<opmath_t>`, which is `float` (docs/training/TRAIN.md §5,
+    // docs/numerics/SCALAR.md) -- and the two answers differ:
     //
     //     bfloat16, x = -9.875, p = 0.7
     //       x.mul(mask).mul_(scale)  step by step from Python  ->  -33.0
@@ -22837,7 +22837,7 @@ fn native_dropout_default(
     //
     // The narrowed route reproduces upstream on **1280 of 1280** combinations
     // (4 dtypes x 5 values of p x 64 elements); the un-narrowed one misses 41
-    // of 377 in the harness. This is the same family docs/SCALAR.md closed by
+    // of 377 in the harness. This is the same family docs/numerics/SCALAR.md closed by
     // recording that it *has no rule to infer* -- `hardshrink` narrows and
     // `softshrink` widens -- so it is measured per op, and this op narrows.
     let scale = narrow(scale);
@@ -22996,12 +22996,12 @@ fn scatter_src(
 ///
 /// # This is not `scatter.reduce`, and implementing that would not have helped
 ///
-/// `docs/SCATTER.md` says so already and this restates it because the two
+/// `docs/kernels/SCATTER.md` says so already and this restates it because the two
 /// names are one character apart. `aten::scatter.reduce` is a *different op*
 /// with `reduce` restricted to `"add"`/`"multiply"` and no `include_self` at
 /// all. `tapas` needs `amin`, and it needs `include_self=False`; neither
 /// exists on that op. So this is a **real kernel**, not a table row -- the
-/// only one of `docs/TAIL3.md`'s three method walls that is.
+/// only one of `docs/kernels/TAIL3.md`'s three method walls that is.
 ///
 /// # What `include_self` actually does
 ///
@@ -23449,7 +23449,7 @@ fn narrow_through(
 ///
 /// The only op here that draws, and therefore the only one whose *answer*
 /// depends on consuming torch's stream in torch's order. Two facts decide it,
-/// and both were measured rather than assumed (docs/SAMPLING.md §2):
+/// and both were measured rather than assumed (docs/models/SAMPLING.md §2):
 ///
 /// **1. There are two algorithms, and the branch is not the one the argument
 /// name suggests.** `multinomial_out` takes a Gumbel-style fast path when
@@ -23596,7 +23596,7 @@ fn multinomial_default(
         // what the surrounding code makes the natural guess -- put this shim on
         // a different bucket from upstream on 2 of 140 measured bf16 draws.
         //
-        // The measurement is in docs/SAMPLING.md §5: 20,000 draws from a known
+        // The measurement is in docs/models/SAMPLING.md §5: 20,000 draws from a known
         // MT stream bracket every one of the eleven bucket boundaries, and the
         // brackets are ~2e-4 wide, which is a fifth of `bfloat16`'s spacing
         // there. A `bfloat16` cumulative distribution lands outside six of the
@@ -23891,7 +23891,7 @@ fn finish(py: Python<'_>, tensor: Tensor, tag: TorchDType) -> PyResult<Py<PyAny>
 ///
 /// The names were extracted mechanically from the helper call sites rather
 /// than typed out, so a name here cannot disagree with the name the kernel
-/// asks for. docs/DISPATCH.md §4.
+/// asks for. docs/design/DISPATCH.md §4.
 fn interned_name<'py>(py: Python<'py>, name: &str) -> Option<&'py Bound<'py, PyString>> {
     // BORROWED, and borrowed from a process-lifetime cache. `intern!` stores
     // the object in a `PyOnceLock` that is never cleared, so the reference is
@@ -24085,7 +24085,7 @@ fn optional_tensor_arg(
 /// Absent means `fallback`. For most factories that is the CPU -- the
 /// process-wide default device lives above this layer, in the torch-function
 /// mode stack that `bootstrap.py` consults before a call ever reaches the
-/// dispatcher (docs/META.md §8), which is where upstream puts it too.
+/// dispatcher (docs/devices/META.md §8), which is where upstream puts it too.
 pub(crate) fn device_arg_or_label(
     args: &Bound<'_, PyTuple>,
     kwargs: Option<&Bound<'_, PyDict>>,
@@ -24196,7 +24196,7 @@ pub(crate) fn scalar_type_name(dtype: TorchDType) -> &'static str {
         Int64 => "Long",
         Bool => "Bool",
         Float8E4M3FN => "Float8_e4m3fn",
-        // The three complex tags, added by docs/FFT.md and read off real
+        // The three complex tags, added by docs/kernels/FFT.md and read off real
         // errors: `_fft_r2c` on each of `complex32`/`complex64`/`complex128`
         // reports `ComplexHalf`/`ComplexFloat`/`ComplexDouble`. They fall
         // through to `name()` otherwise, which answers `complex64` -- a
@@ -24343,7 +24343,7 @@ fn checked_convert(
 /// admitting a gap.
 ///
 /// This used to say "torch would promote here; the shim does not", and for
-/// five of its six callers that was simply false. docs/PROMOTE.md §1.3
+/// five of its six callers that was simply false. docs/numerics/PROMOTE.md §1.3
 /// measured the full 9x9 grid for each and found the diagonal is the *only*
 /// non-raising cell: the matmul family and the two structured kernels do not
 /// consult `promote_types` at all.
@@ -24427,7 +24427,7 @@ mod widen_tests {
     /// The layout survives. If the widened operand came back contiguous the
     /// values would still be right and the whole point would be gone -- the
     /// GEMM would lose `CblasTrans` and re-gather the weight, which is the
-    /// 69.60 ms that docs/DTYPE_PERF.md §4 measured.
+    /// 69.60 ms that docs/perf/DTYPE_PERF.md §4 measured.
     #[test]
     fn widening_a_transposed_operand_keeps_it_a_transposed_view() {
         let dev = Device::Cpu;
@@ -24783,18 +24783,18 @@ fn max_pool2d_default(
 /// `repeat_interleave.Tensor` then `index_select.default` for
 /// `torch.repeat_interleave(x, torch.tensor([2, 0, 3]), 0)`, and
 /// `repeat_interleave.Tensor(tensor([2, 0, 3]))` alone answers
-/// `tensor([0, 0, 2, 2, 2])`. docs/REPEAT.md §2.
+/// `tensor([0, 0, 2, 2, 2])`. docs/kernels/REPEAT.md §2.
 ///
 /// **The readback is here on purpose, and it is why this op is on two lists.**
 /// The output *length* is `repeats.sum()`, a number that exists only in the
 /// tensor's bytes, so `to_vec1` below is unavoidable rather than a shortcut:
 ///
 ///   * `device.rs::MPS_HOST_READBACK_OPS` -- computing this on the host while
-///     the label says `mps` is the divergence docs/VULKAN3.md §3 caught for
+///     the label says `mps` is the divergence docs/devices/VULKAN3.md §3 caught for
 ///     `nonzero`. `test_shim.py` re-derives that list from the bodies in this
 ///     file and follows helpers **one level by name**, so the `to_vec1` is
 ///     written in the dispatched function rather than behind a second helper
-///     (docs/VOICE3.md's `var`/`std` finding).
+///     (docs/architectures/VOICE3.md's `var`/`std` finding).
 ///   * `capture.rs::DATA_DEPENDENT_SHAPE` -- the output *shape* is a function
 ///     of values, exactly as `nonzero`'s is, so a recorded node would replay at
 ///     the wrong shape on any other input.
@@ -25062,7 +25062,7 @@ fn one_hot_default(
 }
 
 // ---------------------------------------------------------------------------
-// docs/INDEXSEL.md -- the five m2m_100-family position embeddings
+// docs/kernels/INDEXSEL.md -- the five m2m_100-family position embeddings
 // (`index_select`), `argsort`, `where.Scalar`, `new_full`, `reshape_as`,
 // `unflatten`, the free-function spelling of `chunk`, `diff` and the pure
 // aliases `multiply`/`logical_and`.
@@ -25243,7 +25243,7 @@ fn argsort_stable(
 
 /// `aten::where.Scalar(Tensor condition, Scalar self, Scalar other) -> Tensor`
 ///
-/// Both branches are Python scalars -- docs/SCALAR2.md's per-op wrapping
+/// Both branches are Python scalars -- docs/numerics/SCALAR2.md's per-op wrapping
 /// rule applies here and is not `add`'s. Measured against upstream 2.13.0,
 /// the result dtype depends only on the two scalars' *Python types*, never
 /// their values:
@@ -25257,7 +25257,7 @@ fn argsort_stable(
 ///
 /// which is `where.ScalarOther`'s wrapped-number column read against itself
 /// with no tensor operand to anchor either side -- `cpmant` and `git` are
-/// the two measured callers (docs/ARCH100.md).
+/// the two measured callers (docs/architectures/ARCH100.md).
 fn where_scalar_scalar(
     py: Python<'_>,
     args: &Bound<'_, PyTuple>,
@@ -25391,7 +25391,7 @@ fn reshape_as_default(
 
 /// `aten::view_as(Tensor(a) self, Tensor other) -> Tensor(a)`
 ///
-/// From `docs/SETITEM.md`'s next-wall list, two architectures. `torch/
+/// From `docs/bindings/SETITEM.md`'s next-wall list, two architectures. `torch/
 /// _tensor.py` does not intercept it, so `x.view_as(y)` is a `TensorBase`
 /// member and reaches here as its own key.
 ///
@@ -25412,7 +25412,7 @@ fn reshape_as_default(
 /// returns the reshaped values here and raises upstream). `view_as` inherits
 /// that pre-existing laxity rather than adding a new one: making it strict
 /// while `view` stays lax would put two different answers behind one rule.
-/// The gap is one row, recorded in `docs/TAIL3.md` and pinned by a
+/// The gap is one row, recorded in `docs/kernels/TAIL3.md` and pinned by a
 /// `pytests/test_tail3.py` case that asserts the *shim's* answer so the day
 /// `view` is tightened this fails and is revisited.
 ///
@@ -25765,9 +25765,9 @@ fn adaptive_avg_pool1d_default(
     // every case, including the dtypes whose non-empty call raises
     // `"adaptive_avg_pool2d" not implemented for '<Type>'`.
     //
-    // It is also the row that made docs/FLOAT8B.md table D claim upstream
+    // It is also the row that made docs/numerics/FLOAT8B.md table D claim upstream
     // *computes* `adaptive_avg_pool1d` for `float8_e4m3fn`: the generic recipe
-    // had synthesised exactly this output size (docs/FLOAT8C.md §2). Returning
+    // had synthesised exactly this output size (docs/numerics/FLOAT8C.md §2). Returning
     // here, before the dtype gate below, is what makes that claim true for the
     // one input it was ever true for.
     if osize == 0 {
@@ -25991,7 +25991,7 @@ fn adaptive_avg_pool2d_default(
     // sees it is `bootstrap.py`'s `adaptive_avg_pool2d` at line ~6974, which
     // forwards `output_size` to `dispatch(...)` completely unnormalised --
     // that is outside this round's territory (`bootstrap.py` is off limits),
-    // so this item is left exactly as it stood, same shape as docs/PRIMS.md
+    // so this item is left exactly as it stood, same shape as docs/kernels/PRIMS.md
     // §5's `bootstrap.py`-only gap.
     if raw_output_size.len() != 2 {
         return Err(pyo3::exceptions::PyRuntimeError::new_err(
@@ -26093,10 +26093,10 @@ static LINALG_QR_RESULT: std::sync::OnceLock<Py<PyAny>> = std::sync::OnceLock::n
 ///
 /// `rwkv`'s last wall, and a **construction-time** one rather than a forward
 /// one: `_init_weights` calls `nn.init.orthogonal_`, which draws a normal
-/// matrix and factorises it (docs/PRIMS.md §6, docs/DEMAND8.md). Nothing in
+/// matrix and factorises it (docs/kernels/PRIMS.md §6, docs/architectures/DEMAND8.md). Nothing in
 /// the model runs until this answers.
 ///
-/// This is a real kernel and the only one in docs/TAIL1.md's set that is; the
+/// This is a real kernel and the only one in docs/kernels/TAIL1.md's set that is; the
 /// other eight are gathers, comparisons, selections or one `libm` call. It is
 /// **LAPACK's `geqrf` + `orgqr`, transcribed**, not "any valid QR", because a
 /// QR factorisation is only unique up to the signs of `R`'s diagonal and
@@ -26330,7 +26330,7 @@ fn linalg_qr_default(
 /// `aten::scatter_.value(Tensor(a!) self, int dim, Tensor index, Scalar value) -> Tensor(a!)`
 ///
 /// `scatter.src` with the source collapsed to one number, which is the form
-/// **eleven** of the architectures in docs/ARCH100.md actually reach. Measured
+/// **eleven** of the architectures in docs/architectures/ARCH100.md actually reach. Measured
 /// in `transformers` 5.15.1 rather than assumed: every one of the seven
 /// `TensorBase.scatter_` rows is the identical line
 /// `group_mask.scatter_(1, group_idx, 1)` in a DeepSeek-style MoE group router
@@ -26357,8 +26357,8 @@ fn linalg_qr_default(
 ///   * **The index-dtype refusal has different wording.** `scatter.src` says
 ///     `scatter(): Expected dtype int32 or int64 for index, got <name>`;
 ///     the value form says `scatter(): Expected dtype int32/int64 for index`
-///     with no name. Transcribed rather than shared, the way docs/PROMOTE.md
-///     and docs/FLOAT8B.md transcribe rather than unify.
+///     with no name. Transcribed rather than shared, the way docs/numerics/PROMOTE.md
+///     and docs/numerics/FLOAT8B.md transcribe rather than unify.
 ///   * **The scalar goes through `c10::checked_convert`**, exactly as
 ///     `full`/`fill_` do: `float16.scatter(..., 1e6)` and
 ///     `int32.scatter(..., 2**31)` and `uint8.scatter(..., 300)` all raise
@@ -26385,7 +26385,7 @@ fn linalg_qr_default(
 /// in column 0** -- a half-finished write. This kernel checks every index
 /// before it writes anything, so a refusal leaves the receiver untouched.
 /// That difference is an artefact of upstream's loop rather than a documented
-/// behaviour, and docs/SCATTER.md §4 records it instead of a test pinning it.
+/// behaviour, and docs/kernels/SCATTER.md §4 records it instead of a test pinning it.
 fn scatter_value(
     py: Python<'_>,
     args: &Bound<'_, PyTuple>,
@@ -26496,7 +26496,7 @@ fn scatter_value(
 
 /// `aten::scatter_.src`/`aten::scatter_.value`, the in-place pair.
 ///
-/// docs/INPLACE.md §1's shape exactly, and nothing more: the out-of-place
+/// docs/kernels/INPLACE.md §1's shape exactly, and nothing more: the out-of-place
 /// kernel computes a fresh replacement and `write_back` puts it through the
 /// receiver's **layout**, so a view taken before the call sees the write and
 /// `t.scatter_(...) is t` holds because the wrapper is never rebound.
@@ -26510,7 +26510,7 @@ fn scatter_value(
 /// Capture and the eager tape need nothing added here. The op key ends in `_`,
 /// so `capture::is_mutating` already refuses a trace and `note_mutation`
 /// already stamps the storage; `forgive_own_write` is for the ops that mutate
-/// *without* an underscore (`native_batch_norm`, docs/BACKWARD8.md §2.3) and
+/// *without* an underscore (`native_batch_norm`, docs/training/BACKWARD8.md §2.3) and
 /// this is not one, so widening `MUTATES_WITHOUT_UNDERSCORE` to reach it would
 /// forgive a write the guard is supposed to see.
 fn scatter_inplace(
@@ -26532,7 +26532,7 @@ fn scatter_inplace(
 
 /// `aten::masked_scatter(Tensor self, Tensor mask, Tensor source) -> Tensor`
 ///
-/// `higgs_audio_v2`'s wall (docs/ARCH100.md), and `idefics3`/`smolvlm` reach it
+/// `higgs_audio_v2`'s wall (docs/architectures/ARCH100.md), and `idefics3`/`smolvlm` reach it
 /// one line after `bucketize`: the shape is always
 /// `hidden_states.masked_scatter(token_mask.unsqueeze(-1), replacement)` --
 /// a `(B, S, 1)` mask against a `(B, S, H)` receiver, with `source` holding
@@ -26562,7 +26562,7 @@ fn scatter_inplace(
 ///   * **No promotion**: `masked_scatter: expected self and source to have
 ///     same dtypes but gotFloat and Long`. The missing space after `got` is
 ///     upstream's, transcribed rather than tidied, for the same reason
-///     docs/PROMOTE.md keeps its wording.
+///     docs/numerics/PROMOTE.md keeps its wording.
 fn masked_scatter_default(
     py: Python<'_>,
     args: &Bound<'_, PyTuple>,
@@ -26663,13 +26663,13 @@ fn bucketize_position(boundaries: &[f64], value: f64, right: bool) -> i64 {
 ///     out_int32=False, bool right=False) -> Tensor`
 /// `aten::bucketize.Scalar(Scalar self, Tensor boundaries, ...) -> Tensor`
 ///
-/// `idefics3_vision` and `smolvlm_vision` (docs/ARCH100.md), both through the
+/// `idefics3_vision` and `smolvlm_vision` (docs/architectures/ARCH100.md), both through the
 /// identical line `torch.bucketize(fractional_coords, boundaries, right=True)`
 /// in the patched-image position encoder.
 ///
 /// **`right` does not mean what its name suggests, and the boundary values are
 /// where that shows.** Swept against upstream on `boundaries = [1,3,5,7]` with
-/// the values *on* the boundaries, the way docs/FIXES.md swept `-300..300`:
+/// the values *on* the boundaries, the way docs/kernels/FIXES.md swept `-300..300`:
 ///
 /// ```text
 /// value            0  1  2  3  5  7  8
@@ -26697,7 +26697,7 @@ fn bucketize_position(boundaries: &[f64], value: f64, right: bool) -> i64 {
 ///   * **The dtypes need not agree.** An `int64` value against `float32`
 ///     boundaries and the reverse both compare numerically, so both sides are
 ///     widened to `f64` here. That is exact for every dtype this shim stores
-///     except `int64` beyond 2^53; docs/SCATTER.md §5 records the limit.
+///     except `int64` beyond 2^53; docs/kernels/SCATTER.md §5 records the limit.
 ///
 /// Output is `int64`, or `int32` when `out_int32=True`, with `self`'s shape
 /// (0-d for the `Scalar` overload).
@@ -26776,7 +26776,7 @@ fn int_narrower(tag: TorchDType) -> fn(i64) -> i64 {
 /// `aten::prod.dim_int(Tensor self, int dim, bool keepdim=False, *,
 ///     ScalarType? dtype=None) -> Tensor`
 ///
-/// `tapas`' wall (docs/ARCH100.md), reached as
+/// `tapas`' wall (docs/architectures/ARCH100.md), reached as
 /// `torch.prod(torch.tensor(list(index.batch_shape())))` -- a full reduction
 /// of a small `int64` vector. The `dim_int` form is implemented beside it
 /// because it is the same loop over a different index set, and because
@@ -26812,7 +26812,7 @@ fn int_narrower(tag: TorchDType) -> fn(i64) -> i64 {
 /// nor a simple pairwise tree, and for `float16`/`bfloat16` that is visible:
 /// on 64 copies of `1.1`, upstream gives `472.0` where sequential `bfloat16`
 /// gives `482.0`. This kernel is sequential, so reduced-precision products
-/// over long axes can differ in the last places. docs/SCATTER.md §6 has the
+/// over long axes can differ in the last places. docs/kernels/SCATTER.md §6 has the
 /// measurement; the golden cases stay inside the range where the two agree,
 /// because pinning a case to upstream's lane count would be pinning a test to
 /// an accident.
@@ -26920,12 +26920,12 @@ fn prod(
 
 
 // ===========================================================================
-// The FFT -- docs/FFT.md
+// The FFT -- docs/kernels/FFT.md
 // ===========================================================================
 //
-// `docs/COMPLEX.md` set an ordering -- reflect pad, then `Repr::Complex`, then
-// the transform -- and `docs/PAD.md` §4 and `docs/COMPLEX2.md` cleared the
-// first two. This is the third. `docs/VOICE.md` §3 established that
+// `docs/kernels/COMPLEX.md` set an ordering -- reflect pad, then `Repr::Complex`, then
+// the transform -- and `docs/kernels/PAD.md` §4 and `docs/kernels/COMPLEX2.md` cleared the
+// first two. This is the third. `docs/architectures/VOICE.md` §3 established that
 // `candle-core` 0.11.0 has **no FFT of any kind** (the only "fft" hits are a
 // comment in `conv.rs` and a commented-out row in `npy.rs`), so unlike almost
 // everything else in this file there is no candle call to reach for: the
@@ -26950,7 +26950,7 @@ fn prod(
 // thing it is compared against, so the residual is upstream's rounding and not
 // this code's. **A kernel that reads its input back to the host belongs in
 // `MPS_HOST_READBACK_OPS` in `device.rs`; that file was not this round's, so
-// see docs/FFT.md §7.**
+// see docs/kernels/FFT.md §7.**
 
 /// One in-place radix-2 decimation-in-time Cooley--Tukey pass over a complex
 /// array whose length is a power of two.
@@ -27025,7 +27025,7 @@ fn fft_radix2(re: &mut [f64], im: &mut [f64], inverse: bool) {
 /// **This exists because the "n_fft is always a power of two" claim is false,
 /// and it was measured rather than assumed.** Scanning every
 /// `transformers` feature extractor for an `n_fft`/`filter_length` default
-/// (docs/FFT.md §4) finds `whisper` at **400**, `qwen3_asr` at 400 and
+/// (docs/kernels/FFT.md §4) finds `whisper` at **400**, `qwen3_asr` at 400 and
 /// `voxtral_realtime` at 400, alongside 512 (six models), 1024 (`clvp`,
 /// `univnet`) and 16384 (`musicgen_melody`). Refusing non-powers of two by
 /// name -- the shape this round was scoped to consider -- would have refused
@@ -27107,7 +27107,7 @@ fn fft_bluestein(re: &mut Vec<f64>, im: &mut Vec<f64>, inverse: bool) {
 }
 
 /// A DFT of any length, unscaled. Radix-2 where it applies, Bluestein
-/// otherwise -- **no size is refused**, and §4 of docs/FFT.md is why.
+/// otherwise -- **no size is refused**, and §4 of docs/kernels/FFT.md is why.
 fn dft_in_place(re: &mut Vec<f64>, im: &mut Vec<f64>, inverse: bool) {
     let n = re.len();
     if n <= 1 {
@@ -27196,7 +27196,7 @@ fn fft_unrows(
 /// `_fft_r2c(randn(4,8), [0,1], 0, True)` is `(4, 5)` -- the `onesided`
 /// truncation applies to the **last** entry of `dim` only. That is
 /// `torch.fft.rfft2`/`fft_fftn`'s shape, so the multi-axis path is here rather
-/// than refused (docs/COMPLEX.md §3.3 step 5).
+/// than refused (docs/kernels/COMPLEX.md §3.3 step 5).
 ///
 /// **The refusals are upstream's, transcribed from a run.** `float16` and
 /// `bfloat16` are refused with `expected scalar type Double but found Half` --
@@ -27231,7 +27231,7 @@ fn fft_r2c_default(
     let storage = PyDtype::new(tag).storage(OP)?;
     if !matches!(storage, candle_core::DType::F32 | candle_core::DType::F64) {
         // Upstream's own wording, which names `Double` rather than the dtype
-        // it can accept. Transcribed, not tidied (docs/CKPT2.md §4).
+        // it can accept. Transcribed, not tidied (docs/models/CKPT2.md §4).
         return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
             "expected scalar type Double but found {}",
             scalar_type_name(tag)
@@ -27259,7 +27259,7 @@ fn fft_r2c_default(
     // names. A two-level chain through a new helper is invisible to it, and
     // the op would go on quietly reading device bytes on the CPU. So the read
     // is written in the body of every kernel that does one, and all five keys
-    // are in `MPS_HOST_READBACK_OPS` (docs/FFT.md section 7).
+    // are in `MPS_HOST_READBACK_OPS` (docs/kernels/FFT.md section 7).
     let read = |t: &Tensor, perm: &[usize]| -> PyResult<Vec<f64>> {
         t.permute(perm)
             .and_then(|t| t.contiguous())
@@ -27379,7 +27379,7 @@ fn fft_one_axis_c2c(
 ///
 /// Complex in, complex out. It falls out of `_fft_r2c` -- the same
 /// `dft_in_place` with the imaginary part read from the pair instead of being
-/// zeroed -- which is the only reason it is here: `docs/COMPLEX2.md` §5's rule
+/// zeroed -- which is the only reason it is here: `docs/kernels/COMPLEX2.md` §5's rule
 /// is that surface costs a comparison, and this one costs nothing extra
 /// because `test_fft.py` has to pin the direction and normalisation codes
 /// anyway.
@@ -27420,7 +27420,7 @@ fn fft_c2c_default(
     // names. A two-level chain through a new helper is invisible to it, and
     // the op would go on quietly reading device bytes on the CPU. So the read
     // is written in the body of every kernel that does one, and all five keys
-    // are in `MPS_HOST_READBACK_OPS` (docs/FFT.md section 7).
+    // are in `MPS_HOST_READBACK_OPS` (docs/kernels/FFT.md section 7).
     let read = |t: &Tensor, perm: &[usize]| -> PyResult<Vec<f64>> {
         t.permute(perm)
             .and_then(|t| t.contiguous())
@@ -27479,7 +27479,7 @@ fn fft_c2r_default(
         return Err(not_implemented(format!(
             "{OP}: only a single transformed axis is implemented, got dim={dims_arg:?} \
              -- upstream does a c2c over the leading axes first; call _fft_c2c on those \
-             and _fft_c2r on the last (docs/FFT.md §3)"
+             and _fft_c2r on the last (docs/kernels/FFT.md §3)"
         )));
     }
     if last_dim_size <= 0 {
@@ -27501,7 +27501,7 @@ fn fft_c2r_default(
     // names. A two-level chain through a new helper is invisible to it, and
     // the op would go on quietly reading device bytes on the CPU. So the read
     // is written in the body of every kernel that does one, and all five keys
-    // are in `MPS_HOST_READBACK_OPS` (docs/FFT.md section 7).
+    // are in `MPS_HOST_READBACK_OPS` (docs/kernels/FFT.md section 7).
     let read = |t: &Tensor, perm: &[usize]| -> PyResult<Vec<f64>> {
         t.permute(perm)
             .and_then(|t| t.contiguous())
@@ -27636,7 +27636,7 @@ fn stft_call_desc(
     )
 }
 
-/// `aten::stft` and `aten::stft.center` -- **the deliverable of docs/FFT.md.**
+/// `aten::stft` and `aten::stft.center` -- **the deliverable of docs/kernels/FFT.md.**
 ///
 /// ```text
 /// aten::stft(Tensor self, int n_fft, int? hop_length=None, int? win_length=None,
@@ -27655,7 +27655,7 @@ fn stft_call_desc(
 /// all; it is here because it is a real upstream overload with a real schema,
 /// and because implementing it lets the centred transform be exercised at the
 /// aten level while `torch._C._nn.pad`'s `reflect` branch is still missing from
-/// `bootstrap.py` (docs/PAD.md §5, docs/FFT.md §6).
+/// `bootstrap.py` (docs/kernels/PAD.md §5, docs/kernels/FFT.md §6).
 ///
 /// The framing, which is the half of this op that is not the transform:
 ///
@@ -27682,7 +27682,7 @@ fn stft_call_desc(
 /// **This shim's frame extraction is a gather, where upstream's is
 /// `as_strided`.** Upstream's frames alias the input's storage; these are
 /// copied. That is a narrowing in the same family as
-/// `view_as_complex`'s (docs/COMPLEX2.md §6.1) and it is unobservable for the
+/// `view_as_complex`'s (docs/kernels/COMPLEX2.md §6.1) and it is unobservable for the
 /// same reason: the next thing that happens to the frames is `mul` by the
 /// window, and nothing in this shim can write through them in between. It is
 /// also why `aten.as_strided.default` is still unimplemented after this round
@@ -27742,7 +27742,7 @@ fn stft_kernel(
     if input.is_complex_repr() || tag.is_complex() {
         return Err(not_implemented(format!(
             "{op}: a complex input routes to aten::_fft_c2c upstream and this shim's \
-             stft is built on _fft_r2c only (docs/FFT.md §5). Real inputs are \
+             stft is built on _fft_r2c only (docs/kernels/FFT.md §5). Real inputs are \
              implemented."
         )));
     }
@@ -27783,7 +27783,7 @@ fn stft_kernel(
                 return Err(not_implemented(format!(
                     "{op}: pad_mode={other:?} -- 'reflect' and 'replicate' are \
                      implemented; 'circular' is a new_empty/slice/copy_ composite \
-                     upstream (docs/PAD.md §3) and 'constant' has no aten kernel on \
+                     upstream (docs/kernels/PAD.md §3) and 'constant' has no aten kernel on \
                      this path"
                 )));
             }
@@ -27914,7 +27914,7 @@ fn stft_kernel(
     } else {
         // `return_complex=False` is `view_as_real` of the complex answer: a
         // trailing axis of 2. This is the form the golden harness can compare,
-        // because it is real on both sides (docs/FFT.md §3).
+        // because it is real on both sides (docs/kernels/FFT.md §3).
         let stacked = Tensor::stack(&[&re, &im], re.dims().len()).map_err(|e| candle_err(op, e))?;
         finish(py, stacked, tag)
     }
@@ -27922,14 +27922,14 @@ fn stft_kernel(
 
 
 // ---------------------------------------------------------------------------
-// docs/VOICE3.md -- the walls seven rounds stopped at, by name.
+// docs/architectures/VOICE3.md -- the walls seven rounds stopped at, by name.
 //
 // `rwkv`'s `diag`, `vilt`'s `_unique2`, `llama4`'s `im2col`, `f5-tts`'s
 // `col2im`, `bigvgan`'s `kaiser_window` (and the `i0` under it), and `voice`'s
 // `upsample_nearest1d` and `var`.
 //
 // **Two of the seven were checked for being aliases first and are not.**
-// docs/ARCH100.md measured missing *names* outnumbering missing *kernels* 49
+// docs/architectures/ARCH100.md measured missing *names* outnumbering missing *kernels* 49
 // to 22 in this tail, so each op was looked for under another spelling before
 // a kernel was written:
 //
@@ -28077,7 +28077,7 @@ fn chbevl_f64(x: f64, array: &[f64]) -> f64 {
 /// disagreement is not a rounding artefact but a different function: upstream
 /// answers `i0(0.0f) == 0.9999999403953552`, not `1.0`, because the
 /// coefficients themselves are `float`. `hann_window_default` had the same
-/// shape of finding and reached the same conclusion (docs/VOICE.md §4.1);
+/// shape of finding and reached the same conclusion (docs/architectures/VOICE.md §4.1);
 /// this op is the second instance and the reason the rule is written down.
 ///
 /// `f16`/`bf16` go through here too and narrow once at the end, which is
@@ -28159,7 +28159,7 @@ fn i0_default(
 /// `aten::kaiser_window.periodic(int window_length, bool periodic, *, ...)` and
 /// `aten::kaiser_window.beta(int window_length, bool periodic, float beta, *, ...)`.
 ///
-/// `bigvgan`'s construction wall and docs/VOICE.md rank 7 -- the one entry on
+/// `bigvgan`'s construction wall and docs/architectures/VOICE.md rank 7 -- the one entry on
 /// that list that was left open because it needs a modified Bessel function
 /// and nothing else in the shim had one.
 ///
@@ -28615,7 +28615,7 @@ fn var_correction(
 /// `torch.std` is a **leaf**, not a composite over `var`: it dispatches
 /// straight to `aten::std.correction`, so there was no existing kernel it
 /// reached under another name and `linalg_vector_norm` is not a substitute
-/// (no mean subtraction). docs/BIND2.md §4.
+/// (no mean subtraction). docs/bindings/BIND2.md §4.
 ///
 /// The `correction` trap is `var`'s, identically: the default is **1**, and
 /// getting it wrong scales by `sqrt(n/(n-1))` -- 0.05% at `n = 1000` and
@@ -28702,7 +28702,7 @@ fn optional_shape(
 ///     bool return_counts=False) -> (Tensor, Tensor, Tensor)`
 ///
 /// **`vilt`'s wall**, and the one it reached only because a previous round gave
-/// it `upsample_nearest2d` (docs/BINDINGS.md): `modeling_vilt.py:144` is
+/// it `upsample_nearest2d` (docs/bindings/BINDINGS.md): `modeling_vilt.py:144` is
 /// `valid_idx[:, 0].unique()`, and `Tensor.unique` -> `torch.unique` ->
 /// `torch._unique2` with all three flags at their defaults.
 ///
@@ -28855,7 +28855,7 @@ fn sliding_blocks(size: i64, kernel: i64, dilation: i64, padding: i64, stride: i
 /// `aten::im2col(Tensor self, int[2] kernel_size, int[2] dilation,
 ///     int[2] padding, int[2] stride) -> Tensor`
 ///
-/// **`llama4`'s vision tower** (docs/COMPLEX2.md §8) -- `F.unfold` *is* this
+/// **`llama4`'s vision tower** (docs/kernels/COMPLEX2.md §8) -- `F.unfold` *is* this
 /// binding, patchifying the image before the projection. `f5-tts` needs its
 /// inverse, which is the next function.
 ///
@@ -28975,7 +28975,7 @@ fn im2col_default(
 /// `aten::col2im(Tensor self, SymInt[2] output_size, int[2] kernel_size,
 ///     int[2] dilation, int[2] padding, int[2] stride) -> Tensor`
 ///
-/// **`f5-tts`'s wall**, `F.fold`, and docs/VOICE.md rank 15 ranks it with
+/// **`f5-tts`'s wall**, `F.fold`, and docs/architectures/VOICE.md rank 15 ranks it with
 /// `im2col` because vocos needs the pair.
 ///
 /// **It is not `im2col`'s inverse, and the difference is the op.** Where two
@@ -29118,12 +29118,12 @@ fn col2im_default(
 /// `aten::upsample_nearest1d(Tensor self, SymInt[1] output_size,
 ///     float? scales=None) -> Tensor`
 ///
-/// docs/VOICE.md rank 14 -- `bigvgan` upsamples its latent sequence with
+/// docs/architectures/VOICE.md rank 14 -- `bigvgan` upsamples its latent sequence with
 /// `F.interpolate(..., mode="nearest")` on a 3-D tensor, which binds
 /// `torch._C._nn.upsample_nearest1d` and not the 2-D op.
 ///
 /// **Not an alias of `upsample_nearest2d`**, which is the first thing that was
-/// checked (docs/ARCH100.md's 49-to-22 finding). The index arithmetic is
+/// checked (docs/architectures/ARCH100.md's 49-to-22 finding). The index arithmetic is
 /// shared and is `nearest_neighbor_compute_source_index` --
 /// `floor(dst * scale)` with the scale INVERTED from the argument and no
 /// half-pixel correction -- but the schema, the rank check
@@ -29235,26 +29235,26 @@ fn upsample_nearest1d_default(
 }
 
 // ===========================================================================
-// docs/RNN.md -- the two kernels this round added, kept in one contiguous
+// docs/kernels/RNN.md -- the two kernels this round added, kept in one contiguous
 // block at the end of the file (and their dispatch arms in one contiguous run)
 // so a merge that splices by category does not have to hunt for them.
 //
 // `torch.conv1d`, the third name this round was pointed at, needed NO kernel
 // and no code here at all: `bootstrap.py` has bound it to
-// `aten.convolution.default` since docs/ARCH20.md. See docs/RNN.md §1 for what
+// `aten.convolution.default` since docs/architectures/ARCH20.md. See docs/kernels/RNN.md §1 for what
 // its two architectures actually stop on, which is not the name.
 // ===========================================================================
 
 /// `aten::upsample_linear1d(Tensor self, SymInt[1] output_size,
 ///     bool align_corners, float? scales=None) -> Tensor`
 ///
-/// `sam_vision_model` / `sam_hq_vision_model` (docs/ARCH200.md §2), and
-/// docs/VOICE.md rank 14's sibling: `F.interpolate(x_3d, mode="linear")`
+/// `sam_vision_model` / `sam_hq_vision_model` (docs/architectures/ARCH200.md §2), and
+/// docs/architectures/VOICE.md rank 14's sibling: `F.interpolate(x_3d, mode="linear")`
 /// binds `torch._C._nn.upsample_linear1d`, not the 2-D op.
 ///
 /// **Not an alias of `upsample_bilinear2d`, and its kinship was verified
-/// rather than assumed** -- docs/GLU.md §2 flagged that kinship as "likely but
-/// unverified" and docs/DEMAND8.md recorded three traps in the *bicubic*
+/// rather than assumed** -- docs/kernels/GLU.md §2 flagged that kinship as "likely but
+/// unverified" and docs/architectures/DEMAND8.md recorded three traps in the *bicubic*
 /// sibling. Measured against upstream 2.13.0 (`torch.ops.aten.
 /// upsample_linear1d.default`), one at a time:
 ///
@@ -29433,7 +29433,7 @@ fn upsample_linear1d_default(
 
     // The host readback lives HERE, in the dispatched function, not behind a
     // helper -- `device.rs`'s `MPS_HOST_READBACK_OPS` derivation follows
-    // helpers only one level by name (docs/VOICE3.md).
+    // helpers only one level by name (docs/architectures/VOICE3.md).
     let source = match read_flat(OP, input.tensor()?, tag)? {
         Flat::Float(values) => values,
         Flat::Int(values) => values.into_iter().map(|v| v as f64).collect(),
@@ -29468,7 +29468,7 @@ fn upsample_linear1d_default(
 ///     bool has_biases, int num_layers, float dropout, bool train,
 ///     bool bidirectional, bool batch_first) -> (Tensor, Tensor, Tensor)`
 ///
-/// `parakeet_rnnt` and `parakeet_tdt` (docs/ARCH200.md §2). Their
+/// `parakeet_rnnt` and `parakeet_tdt` (docs/architectures/ARCH200.md §2). Their
 /// `ParakeetRNNTDecoder` is an `nn.LSTM(..., batch_first=True)`, and
 /// `nn.LSTM.forward` calls `_VF.lstm(input, hx, self._flat_weights,
 /// self.bias, self.num_layers, self.dropout, self.training,
@@ -29631,7 +29631,7 @@ fn lstm_input(
     let narrow = float_narrower(tag);
 
     // Every readback is in this function, not behind a helper, for
-    // `MPS_HOST_READBACK_OPS`'s one-level-by-name derivation (docs/VOICE3.md).
+    // `MPS_HOST_READBACK_OPS`'s one-level-by-name derivation (docs/architectures/VOICE3.md).
     let flat_of = |t: &PyTensorBase| -> PyResult<Vec<f64>> {
         match read_flat(OP, t.tensor()?, tag)? {
             Flat::Float(v) => Ok(v),
@@ -29789,7 +29789,7 @@ fn lstm_input(
     Ok(PyTuple::new(py, triple)?.into_any().unbind())
 }
 
-// docs/TAIL4.md -- `index_copy_`, `round`, `logsumexp`, `t_`
+// docs/kernels/TAIL4.md -- `index_copy_`, `round`, `logsumexp`, `t_`
 //
 // Four kernels and one argument-form fix, kept in one block because a second
 // agent was adding ops to this file at the same time and scattered additions
@@ -29830,7 +29830,7 @@ fn invalid_index_of(error: &candle_core::Error) -> Option<(usize, usize)> {
 /// # It is next to `index_add_` and it agrees with it about almost nothing
 ///
 /// The two ops differ by one word in their names and this shim's first draft
-/// of `scatter_reduce` was wrong for exactly this reason (docs/TAIL3.md §3), so
+/// of `scatter_reduce` was wrong for exactly this reason (docs/kernels/TAIL3.md §3), so
 /// every rule below was measured on `index_copy_` itself rather than inherited
 /// from the kernel three thousand lines above. Four of them differ:
 ///
@@ -30505,7 +30505,7 @@ fn logsumexp_default(
 /// this. `torch/nn/init.py:705`'s `orthogonal_` does `flattened.t_()` whenever
 /// the weight it is initialising has `rows < cols`, and `_init_weights` reaches
 /// the first such weight partway down `rwkv`'s module list -- which is why
-/// docs/VOICE3.md saw the line number move *backwards*, from 710 to 705.
+/// docs/architectures/VOICE3.md saw the line number move *backwards*, from 710 to 705.
 ///
 /// # It is the first in-place op in this file that changes the receiver's shape
 ///
@@ -30517,7 +30517,7 @@ fn logsumexp_default(
 /// kernel from silently retagging a tensor.
 ///
 /// So this is the second caller of `replace_with`, and the aliasing question
-/// docs/VIEWS.md §6 asks about every in-place op has to be answered again:
+/// docs/kernels/VIEWS.md §6 asks about every in-place op has to be answered again:
 /// **the alias survives**, because candle's `transpose` shares the storage
 /// `Arc` and rebuilds only the `Layout`. Measured on both sides:
 ///
@@ -30639,7 +30639,7 @@ fn legacy_tensor_type_name(tag: TorchDType) -> &'static str {
 /// # It is not `bitwise_not`, and integers are where that shows
 ///
 /// `~x` and `bitwise_not` already worked, which is exactly the trap:
-/// `docs/TAIL1.md` measured the same distinction for the `and` pair and found
+/// `docs/kernels/TAIL1.md` measured the same distinction for the `and` pair and found
 /// the two genuinely diverge. Measured here for the `not` pair, on
 /// `[0, 1, 2, -1, 3]`:
 ///
@@ -30697,7 +30697,7 @@ fn logical_not_default(
 }
 
 // ===========================================================================
-// The complex shape ops -- docs/COMPLEX3.md
+// The complex shape ops -- docs/kernels/COMPLEX3.md
 // ===========================================================================
 //
 // Five kernels, one block, all guarded from the contiguous run near the top of
@@ -30713,7 +30713,7 @@ fn logical_not_default(
 // **The invariant every one of them has to satisfy: `im` gets the same
 // treatment as `re`.** That is not a stylistic point. A shape op written as
 // "do it to `re`, hand back a `Dense`" returns the right shape, the right
-// element count and a plausible magnitude, and `docs/COMPLEX2.md` §2.3
+// element count and a plausible magnitude, and `docs/kernels/COMPLEX2.md` §2.3
 // measured what that class of mistake costs -- six of ten sampled ops
 // computing silently. So none of these builds its result from one half: each
 // ends at `PyTensorBase::complex(re, im)`, whose four invariants (same dims,
@@ -30723,10 +30723,10 @@ fn logical_not_default(
 // **None of these reads its input back to the host.** They are candle shape
 // calls on two tensors, so none belongs in `MPS_HOST_READBACK_OPS`
 // (`device.rs`); the only kernels in this file that do are the FFT ones, and
-// they were classified by docs/FFT.md §7.
+// they were classified by docs/kernels/FFT.md §7.
 //
 // **All five are narrowings against upstream in the same one way**, and it is
-// the narrowing `view_as_complex` already carries (docs/COMPLEX2.md §6):
+// the narrowing `view_as_complex` already carries (docs/kernels/COMPLEX2.md §6):
 // upstream's `slice` and `view` return *aliases* of their base, and these
 // return copies. A pair-of-tensors representation cannot alias an interleaved
 // buffer, and `view_as_complex` allocates unconditionally, so **no complex
@@ -30789,7 +30789,7 @@ fn to_copy_reaches_complex(args: &Bound<'_, PyTuple>, kwargs: Option<&Bound<'_, 
 ///     through a message written here, so the reader gets the one refusal that
 ///     names the dtype and says which half would have been lost. Upstream
 ///     *does* answer this one (it discards the imaginary part with a warning);
-///     this shim does not, and that is the same rule `docs/COMPLEX2.md` §2.1
+///     this shim does not, and that is the same rule `docs/kernels/COMPLEX2.md` §2.1
 ///     set for every untaught op. `z.to(torch.float32)` is one of the ten
 ///     probes in `test_complex.py`'s refusal sweep and stays there.
 fn complex_to_copy(
@@ -30832,7 +30832,7 @@ fn complex_to_copy(
         t.to_device(&device)
             .and_then(|t| t.to_dtype(component))
             // `copy()` unconditionally, for `_to_copy`'s own reason
-            // (docs/VIEWS.md §6.3) and for this representation's: a complex
+            // (docs/kernels/VIEWS.md §6.3) and for this representation's: a complex
             // tensor in this shim never shares storage with anything, and
             // `to_device`/`to_dtype` both return an `Arc` clone when there is
             // nothing to do.
@@ -30861,7 +30861,7 @@ fn complex_to_copy(
 /// empty result mean, and the way to make that checkable is for the complex
 /// arm to be the dense arm with `re` and `im` in place of one tensor.
 ///
-/// `docs/BIND3.md` §6 measured this refusing on a genuine shim complex tensor
+/// `docs/bindings/BIND3.md` §6 measured this refusing on a genuine shim complex tensor
 /// (an `stft` output), which is what puts `fft_fftn`'s `s=` argument out of
 /// reach independently of `_to_copy`: trimming an axis is a slice.
 ///
@@ -30924,7 +30924,7 @@ fn complex_slice(
 /// `aten::constant_pad_nd(Tensor self, SymInt[] pad, Scalar value=0) -> Tensor`,
 /// on a complex receiver.
 ///
-/// The second op `docs/BIND3.md` §6 measured refusing on a genuine complex
+/// The second op `docs/bindings/BIND3.md` §6 measured refusing on a genuine complex
 /// tensor, and the other half of why `fft_fftn`'s `s=` was unreachable:
 /// growing an axis is a pad.
 ///
@@ -31026,16 +31026,16 @@ fn complex_constant_pad_nd(
 /// `aten::view(Tensor(a) self, SymInt[] size) -> Tensor(a)` and
 /// `aten::_unsafe_view`, on a complex receiver.
 ///
-/// **`llama4`'s vision tower stops here.** `docs/BIND3.md` §5 got the patch
+/// **`llama4`'s vision tower stops here.** `docs/bindings/BIND3.md` §5 got the patch
 /// embedding agreeing with upstream to the last digit and then stopped past
 /// `im2col`, in `Llama4VisionRotaryEmbedding`'s `reshape_for_broadcast`, at
 /// `freqs_ci.view(*shape)` -- refused because `view` was not among the ops
 /// taught the representation. It is the only op that tower needed that
-/// `docs/COMPLEX2.md` had not already taught.
+/// `docs/kernels/COMPLEX2.md` had not already taught.
 ///
 /// `re.elem_count()` is the element count `-1` is resolved against, and that
 /// is the *complex* element count -- `Repr::Complex`'s shape is `re`'s shape
-/// (docs/COMPLEX2.md §1.2), so there is no trailing 2 to hide and no factor of
+/// (docs/kernels/COMPLEX2.md §1.2), so there is no trailing 2 to hide and no factor of
 /// two to correct for. Resolving against `re.elem_count() * 2` would put the
 /// wrong wildcard in without ever failing a shape check on `re` alone.
 ///
@@ -31061,7 +31061,7 @@ fn complex_view(
 }
 
 /// `aten::complex(Tensor real, Tensor imag) -> Tensor` -- the direct
-/// constructor, and the third row of `docs/BIND3.md` §6's gap table.
+/// constructor, and the third row of `docs/bindings/BIND3.md` §6's gap table.
 ///
 /// `view_as_complex` and `polar` were the only two entrances the
 /// representation had, and neither is what a caller reaches for when they
@@ -31120,12 +31120,12 @@ fn complex_default(
 }
 
 // ===========================================================================
-// docs/LAST7.md -- `TensorBase.unfold`, the sliding-window view
+// docs/kernels/LAST7.md -- `TensorBase.unfold`, the sliding-window view
 // ===========================================================================
 
 /// `aten::unfold(Tensor(a) self, int dimension, int size, int step) -> Tensor(a)`
 ///
-/// **Not `nn.Unfold`.** `F.unfold` is `im2col` (docs/BIND3.md, `im2col_default`
+/// **Not `nn.Unfold`.** `F.unfold` is `im2col` (docs/bindings/BIND3.md, `im2col_default`
 /// further up this file); this is the `TensorBase` method, which slides a
 /// window of `size` along one axis with a stride of `step` and appends the
 /// window as a **new trailing dimension**. `univnet`'s
@@ -31142,7 +31142,7 @@ fn complex_default(
 /// z = torch.arange(6.); w = z.unfold(0, 3, 1); z[1] = -5.     -> w[0, 1] is -5.
 /// ```
 ///
-/// docs/STRIDED.md establishes why candle 0.11.0 cannot produce that view --
+/// docs/kernels/STRIDED.md establishes why candle 0.11.0 cannot produce that view --
 /// the struct that joins a `Layout` to a shared `Storage` has no public fields
 /// -- and `unfold` is the same class of op for the same reason: consecutive
 /// windows share `size - step` elements, so the second stride is *smaller than
@@ -31155,7 +31155,7 @@ fn complex_default(
 ///
 /// **The receiver's own layout is respected, unlike `as_strided`.** That is not
 /// a shortcut, it is the difference between the two ops: `as_strided` addresses
-/// the raw storage and ignores the receiver's strides (docs/STRIDED.md §4.1),
+/// the raw storage and ignores the receiver's strides (docs/kernels/STRIDED.md §4.1),
 /// while `unfold` is defined on the receiver's *logical* index space. Measured:
 /// `torch.arange(12.).reshape(3, 4).t().unfold(0, 2, 1)` reads the transposed
 /// order, not the storage order. So a `.contiguous()` here is sound where the
@@ -31289,7 +31289,7 @@ fn unfold_default(
     };
 
     // Both directions of upstream's view are refused rather than silently lost.
-    // docs/LAST7.md §3, docs/STRIDED.md §2 for the mechanism.
+    // docs/kernels/LAST7.md §3, docs/kernels/STRIDED.md §2 for the mechanism.
     let barrier = crate::storage::StridedBarrier::new(&base, &out);
     let mut wrapped = if input.tag() == TorchDType::Bool {
         PyTensorBase::boolean(out)?

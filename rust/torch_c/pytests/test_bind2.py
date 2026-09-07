@@ -1,15 +1,15 @@
 """Four items four earlier rounds each stopped one binding short of, because
 `bootstrap.py` and `tools/golden/reach_allow.json` belonged to somebody else
-each time. docs/BIND2.md is the write-up; this is the proof.
+each time. docs/bindings/BIND2.md is the write-up; this is the proof.
 
-Per docs/BINDINGS.md's own warning (`mish` was a binding onto a kernel that
+Per docs/bindings/BINDINGS.md's own warning (`mish` was a binding onto a kernel that
 had been removed), every kernel this file exercises was independently
 confirmed present in `_C._aten_implemented()` first -- see
 `test_kernels_this_file_binds_are_actually_implemented` below, which fails
 loudly if a future change removes one of them out from under this file.
 
 Golden (`tools/golden/compare.py`) dispatches by key and cannot see whether
-any Python spelling reaches an arm -- docs/REACH.md's point, and
+any Python spelling reaches an arm -- docs/bindings/REACH.md's point, and
 `test_pad.py`'s `test_torch_rms_norm_reaches_its_kernel_in_the_vendored_tree`
 is the pattern this file follows: run the vendored tree in a **separate
 process**, in the spelling a user actually writes (`F.avg_pool2d(...)`,
@@ -28,7 +28,7 @@ _REPO_ROOT = os.path.abspath(os.path.join(_CKPT_VENDOR_DIR, "..", "..", ".."))
 
 
 def test_kernels_this_file_binds_are_actually_implemented():
-    """docs/BINDINGS.md's check: confirm the kernel before trusting the
+    """docs/bindings/BINDINGS.md's check: confirm the kernel before trusting the
     binding. `mish`'s binding was two lines onto a kernel that had been
     removed; this is what would have caught it.
     """
@@ -54,12 +54,12 @@ def test_kernels_this_file_binds_are_actually_implemented():
 def test_torch_std_landed_as_a_kernel_and_not_as_a_table_row():
     """The inversion this test was written to demand.
 
-    `docs/BIND2.md` §4 was told `torch.std` might need only an
+    `docs/bindings/BIND2.md` §4 was told `torch.std` might need only an
     `overloads.json` row, checked instead of assuming, and found it dispatches
     straight to `aten::std.correction` as a **leaf** -- not a composite over
     `var`, and not reachable through `linalg_vector_norm`, which subtracts no
     mean. So it sized a kernel and left it, and wrote this test to fail the
-    moment one arrived. `docs/VOICE3.md` wrote it in the same batch.
+    moment one arrived. `docs/architectures/VOICE3.md` wrote it in the same batch.
 
     What is asserted now is the thing that made it a kernel question rather
     than a binding one: **`std` is not `var().sqrt()`**. VOICE3 measured that
@@ -72,7 +72,7 @@ def test_torch_std_landed_as_a_kernel_and_not_as_a_table_row():
     import math
 
     assert "aten.std.correction" in set(_C._aten_implemented()), (
-        "std's kernel is gone -- docs/BIND2.md §4 sized it and docs/VOICE3.md "
+        "std's kernel is gone -- docs/bindings/BIND2.md §4 sized it and docs/architectures/VOICE3.md "
         "landed it"
     )
 
@@ -151,7 +151,7 @@ print(json.dumps(out))
 
 
 def test_avg_pool2d_matches_upstream_through_F_avg_pool2d():
-    """docs/BIND2.md item 1 -- `F.avg_pool2d`, the exact spelling
+    """docs/bindings/BIND2.md item 1 -- `F.avg_pool2d`, the exact spelling
     `nn.AvgPool2d.forward` uses, and the arguments that exercise
     `ceil_mode`/`count_include_pad` together, which `avg_pool2d_default`'s
     own docstring calls out as the pair a naive port gets backwards.
@@ -167,7 +167,7 @@ def test_avg_pool2d_matches_upstream_through_F_avg_pool2d():
 
 
 def test_einsum_ellipsis_matches_upstream_through_torch_einsum():
-    """docs/BIND2.md item 2 -- `longt5`'s exact equation form,
+    """docs/bindings/BIND2.md item 2 -- `longt5`'s exact equation form,
     `'...qhd,...khd->...hqk'`, through `torch.einsum` itself."""
     shim = _run_vendored(_PROBE, use_shim=True)
     if shim is None:
@@ -180,7 +180,7 @@ def test_einsum_ellipsis_matches_upstream_through_torch_einsum():
 
 
 def test_pad_six_modes_match_upstream_through_F_pad():
-    """docs/BIND2.md item 3 -- all six kernels, through `F.pad(..., mode=...)`
+    """docs/bindings/BIND2.md item 3 -- all six kernels, through `F.pad(..., mode=...)`
     at every rank they support, not through `_aten_dispatch` directly (that is
     `test_pad.py`'s job and was already true before this round -- what this
     round adds is that `F.pad` reaches them at all).
@@ -196,7 +196,7 @@ def test_pad_six_modes_match_upstream_through_F_pad():
 
 
 def test_pad_circular_still_refuses_by_name():
-    """The mode this round did NOT wire (docs/PAD.md §3): a wrong padding
+    """The mode this round did NOT wire (docs/kernels/PAD.md §3): a wrong padding
     should fail loudly, not silently approximate with reflect/replicate."""
     probe = """
 import torch

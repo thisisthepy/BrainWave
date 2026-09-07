@@ -75,7 +75,7 @@ fn link_ios_python_framework(target: &str) {
              *contains* Python.framework (for the python-build-standalone iOS \
              distribution, that is the `arm64-iphoneos` directory), and set \
              PYO3_CONFIG_FILE with suppress_build_script_link_lines=true \
-             alongside it. See docs/RUST_CROSSBUILD.md §0.5 and docs/TORCH_C.md."
+             alongside it. See docs/platform/RUST_CROSSBUILD.md §0.5 and docs/design/TORCH_C.md."
         ),
     };
 

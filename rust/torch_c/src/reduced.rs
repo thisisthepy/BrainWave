@@ -1,12 +1,12 @@
 //! The `float16`/`bfloat16` conversions, and the fused form of `opmath_in`.
 //!
 //! `aten::opmath_in` says what torch computes reduced floats in: `float`, for
-//! every arithmetic kernel, narrowed back exactly once. docs/BF16.md measured
+//! every arithmetic kernel, narrowed back exactly once. docs/numerics/BF16.md measured
 //! why that rule is not optional -- without it `add.Tensor` truncates, the
 //! truncation is *biased*, and a 30-layer residual stream turns 1 ulp into a
 //! logit difference of 11.75.
 //!
-//! This module is about what that rule costs, which docs/QUANT.md §3 measured
+//! This module is about what that rule costs, which docs/graph/QUANT.md §3 measured
 //! and nobody had looked at before: on the host, `float16` was **6.2x slower
 //! than `float32`** at `mm` 128 and **27x** at the decoding shape, and
 //! `bfloat16` was slower everywhere too. The rule was not the reason. Two
@@ -18,7 +18,7 @@
 //!     `asm!("fcvt s, h")`. Inline assembly is opaque to the vectoriser, so
 //!     the loop stays scalar: **1.7 Gelem/s, against 8.3 for the same
 //!     conversion written with `fcvtl` over 8 elements at a time** (measured,
-//!     docs/DTYPE.md §2). `bfloat16` escapes the worst of it only because its
+//!     docs/numerics/DTYPE.md §2). `bfloat16` escapes the worst of it only because its
 //!     widening is a shift that LLVM does vectorise.
 //!   * **the widening was materialised.** `a.to_dtype(F32) + b.to_dtype(F32)`
 //!     then `.to_dtype(BF16)` writes three whole `float32` tensors to memory to
@@ -34,7 +34,7 @@
 //! widen/compute/narrow element by element.
 //!
 //! What this does **not** do is make reduced precision beat `float32` at
-//! everything. It cannot -- see docs/DTYPE.md §4. Conversion instructions cost
+//! everything. It cannot -- see docs/numerics/DTYPE.md §4. Conversion instructions cost
 //! more than the arithmetic they feed, so an op only wins when the halved
 //! memory traffic pays for them.
 
@@ -52,7 +52,7 @@ use core::arch::aarch64::*;
 // which is not a micro-optimisation. `vec![0f32; n]` zeroes four megabytes
 // before the conversion writes over them, and that costs a third of the
 // conversion: `float16 -> float32` over a million elements is 0.104 ms into a
-// zeroed buffer and 0.070 ms into raw capacity (measured, docs/DTYPE.md §2.3).
+// zeroed buffer and 0.070 ms into raw capacity (measured, docs/numerics/DTYPE.md §2.3).
 // candle's `unary_map` avoids it by `.map().collect()`-ing, so a fast kernel
 // that allocated the obvious way would have handed the saving straight back.
 //
@@ -161,7 +161,7 @@ unsafe fn narrow_f16_into(src: &[f32], dst: *mut f16) {
 /// `float32 -> bfloat16`, round to nearest even, NaN quieted.
 ///
 /// The rounding is why this is spelled out rather than left to a shift:
-/// truncating here is exactly the fault docs/BF16.md §2 found, and it is
+/// truncating here is exactly the fault docs/numerics/BF16.md §2 found, and it is
 /// invisible to any check with a tolerance.
 ///
 /// # Safety
@@ -328,7 +328,7 @@ pub fn to_dtype(t: &Tensor, target: DType) -> candle_core::Result<Tensor> {
         (DType::F16 | DType::BF16, DType::F32) => t.apply_op1_no_bwd(&Widen),
         (DType::F32, DType::F16 | DType::BF16) => t.apply_op1_no_bwd(&Narrow(target)),
         // **The one route in this crate that is a correctness fix and not a
-        // speed one** (docs/FLOAT8C.md §1). candle 0.11.0's converter reaches
+        // speed one** (docs/numerics/FLOAT8C.md §1). candle 0.11.0's converter reaches
         // `F8E4M3 -> F64` through `WithDType::to_f64`, whose macro-generated
         // body calls itself; release-mode LLVM makes that `.L1: jmp .L1`, so
         // `x.to(torch.float64)` on a float8 tensor spins forever instead of
@@ -527,7 +527,7 @@ impl candle_core::CustomOp2 for FusedOp {
 /// -pass form writes a `float32` tensor per operand and one for the result:
 /// 30 bytes of traffic per element against 6, and on `float16` `add` that is
 /// the difference between 1.85 ms and 0.07 ms for a million elements
-/// (docs/DTYPE.md §3). The `float16` fused kernel is *faster than the same
+/// (docs/numerics/DTYPE.md §3). The `float16` fused kernel is *faster than the same
 /// `add` in `float32`* -- which is the only place in this round where lowering
 /// the dtype buys speed rather than costing it.
 pub fn fused_arith(
@@ -578,7 +578,7 @@ mod tests {
 
     /// Every `float16` bit pattern, and every `bfloat16` one, through the
     /// widening kernels. `half` is the reference because it is what the
-    /// numbers in docs/BF16.md were pinned against.
+    /// numbers in docs/numerics/BF16.md were pinned against.
     #[test]
     fn reduced_kernels_agree_with_half_on_every_f16_bit_pattern() {
         let all: Vec<f16> = (0..=u16::MAX).map(f16::from_bits).collect();
@@ -609,7 +609,7 @@ mod tests {
     }
 
     /// The narrowing rounds like `half`, which rounds like torch. A truncating
-    /// kernel would pass a tolerance check and fail this one -- docs/BF16.md
+    /// kernel would pass a tolerance check and fail this one -- docs/numerics/BF16.md
     /// §2.3 is about exactly that difference.
     #[test]
     fn reduced_narrowing_rounds_to_nearest_even_including_nan_and_the_tail() {

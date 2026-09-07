@@ -1,11 +1,11 @@
 """GGML block formats, reimplemented from the format rather than from candle.
 
-**This file is the verification axis.** docs/QUANT2.md §2 is the argument for
+**This file is the verification axis.** docs/graph/QUANT2.md §2 is the argument for
 it; what follows is the argument in short.
 
 Every other judgement in this repository is bit equality against upstream.
 Quantisation cannot be judged that way -- it is lossy by construction, at 7.5%
-relative RMS for Q4K on random weights (docs/QUANT.md §7) -- so "close to
+relative RMS for Q4K on random weights (docs/graph/QUANT.md §7) -- so "close to
 upstream" is the only thing a comparison against upstream could ever say, and a
 tolerance wide enough to admit that is wide enough to admit a wrong kernel.
 
@@ -29,7 +29,7 @@ independently establish that either matches `llama.cpp`. The line references in
 each function are to the upstream C this file was transcribed from (the same
 ones candle's own source cites), so that claim is at least checkable by hand.
 A GGUF file written by `llama.cpp` compared against `_quantized_blob` would
-close it, and there is none on this host (docs/QUANT2.md §8).
+close it, and there is none on this host (docs/graph/QUANT2.md §8).
 
 **Float semantics are explicit.** Every arithmetic step that Rust performs in
 `f32` is rounded back to `f32` here through `struct`, because Python's floats
@@ -313,7 +313,7 @@ def round_trip_bound(fmt, block):
         # a naive half-step bound of 0.1206.
         #
         # This is why Q4_0 is worse than Q4K at the same four bits (8.5%
-        # against 7.5% relative RMS, docs/QUANT.md §7): the k-quant carries a
+        # against 7.5% relative RMS, docs/graph/QUANT.md §7): the k-quant carries a
         # per-sub-block minimum and so has no wasted end.
         d, qmax, steps = f32(amax / 8.0), 8, 1.0
     else:

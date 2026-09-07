@@ -1,8 +1,8 @@
-"""docs/BIND4.md -- four small `bootstrap.py` items, each located by a round
+"""docs/bindings/BIND4.md -- four small `bootstrap.py` items, each located by a round
 that could not fix it because `bootstrap.py` was not its file.
 
   1. `torch.conv1d(padding="same")` with an ODD `dilation * (kernel - 1)` --
-     `lasr_ctc`/`lasr_encoder`'s wall (docs/RNN.md §1.2). Not a kernel: both
+     `lasr_ctc`/`lasr_encoder`'s wall (docs/kernels/RNN.md §1.2). Not a kernel: both
      `aten.constant_pad_nd.default` and `aten.convolution.default` were
      already implemented and golden-compared. The fix is a four-line
      transcription of upstream's own lowering, measured with a
@@ -10,27 +10,27 @@ that could not fix it because `bootstrap.py` was not its file.
      symmetrically with `total // 2`.
 
   2. `torch._C._nn.upsample_linear1d` -- `sam_vision_model`/
-     `sam_hq_vision_model`'s wall (docs/RNN.md §3.1). Not a kernel either:
+     `sam_hq_vision_model`'s wall (docs/kernels/RNN.md §3.1). Not a kernel either:
      `aten.upsample_linear1d.default` was already implemented, golden- and
      bit-compared. The gap was one `_install_nn` line, shaped like
      `upsample_nearest1d`'s one line above it -- and the discriminator is the
-     same trap docs/BIND3.md §3.1 found there: the fourth argument's TYPE,
+     same trap docs/bindings/BIND3.md §3.1 found there: the fourth argument's TYPE,
      not the arity, since both the `.vec` and leaf schemas here take four
      arguments.
 
   3. `torch.zeros((..., 0-dim int Tensor, ...), dtype=..., device=...)` --
-     `fastspeech2_conformer`'s wall (docs/TAIL4.md §8.2). Measured against
-     real upstream torch 2.13.0 before being added, per docs/ARGFORM.md's own
+     `fastspeech2_conformer`'s wall (docs/kernels/TAIL4.md §8.2). Measured against
+     real upstream torch 2.13.0 before being added, per docs/bindings/ARGFORM.md's own
      bar: a 0-dim integral Tensor inside a `SymInt[]` size list is upstream's
      general size-list parsing rule (also measured against `torch.ones`,
      `torch.empty`, `Tensor.view`), but installed only for `zeros`, the same
      scoping `div`'s wrapped-number rule uses one function above it.
 
-  4. `torch._C._nn.avg_pool2d` -- confirmed still bound (docs/BIND2.md).
+  4. `torch._C._nn.avg_pool2d` -- confirmed still bound (docs/bindings/BIND2.md).
      `nystromformer` and `univnet` were checked and found NOT actionable from
      this file: `nystromformer` stops on `aten.convolution.default`'s
      asymmetric-padding refusal, a candle backend limitation in `aten.rs`
-     (docs/ARGFORM.md §1's own verdict, re-measured here); `univnet` stops on
+     (docs/bindings/ARGFORM.md §1's own verdict, re-measured here); `univnet` stops on
      `TensorBase.unfold`, a missing kernel, also in `aten.rs`. Neither has a
      line to add here.
 
@@ -101,7 +101,7 @@ rec("conv1d_same_strided_refused",
 # -- 2. F.interpolate(mode="linear") -> torch._C._nn.upsample_linear1d ------
 # The four call shapes upstream's binding itself accepts, discriminated by
 # the TYPE of the fourth argument (a sequence is `.vec`'s `scale_factors`; a
-# float is the leaf's `scales`) -- docs/BIND3.md §3.1's trap, one line above
+# float is the leaf's `scales`) -- docs/bindings/BIND3.md §3.1's trap, one line above
 # this name in `torch._C._nn`.
 line = torch.arange(2 * 3 * 4, dtype=torch.float32).reshape(2, 3, 4)
 for w in (1, 2, 3, 5, 7, 9, 16):
@@ -275,7 +275,7 @@ def test_f_interpolate_linear_agrees_with_upstream():
     """The spelling `sam_vision_model`/`sam_hq_vision_model` actually write:
     `F.interpolate(x_3d, mode="linear")`, both `align_corners` values, over
     enough output widths to cross the FUSED-multiply-add ULP boundary
-    docs/RNN.md §3 measured (golden's float32 tolerance would not catch it,
+    docs/kernels/RNN.md §3 measured (golden's float32 tolerance would not catch it,
     but this compares upstream's own float64-widened output, not bits)."""
     for w in (1, 2, 3, 5, 7, 9, 16):
         _agree("interp_linear_size_%d_ac0" % w)
@@ -331,7 +331,7 @@ def test_upsample_linear1d_uint8_still_refused():
 
 def test_upsample_linear1d_binding_reaches_the_kernel_key():
     """The kernel was really there before this binding was written, checked
-    the way docs/BINDINGS.md's `mish` was not."""
+    the way docs/bindings/BINDINGS.md's `mish` was not."""
     assert "upsample_linear1d" in _C._shim_nn_implemented
     assert "aten.upsample_linear1d.default" in set(_C._aten_implemented())
 
@@ -375,7 +375,7 @@ def test_zeros_multi_element_tensor_still_refused():
 
 
 def test_avg_pool2d_is_still_bound():
-    """docs/BIND2.md's binding, confirmed still present rather than assumed
+    """docs/bindings/BIND2.md's binding, confirmed still present rather than assumed
     to have survived every round since."""
     assert "avg_pool2d" in _C._shim_nn_implemented
     assert "aten.avg_pool2d.default" in set(_C._aten_implemented())

@@ -19,7 +19,7 @@ IMPORT_TORCH.md records that the vendored tree is not edited. Registering from
 ``torchnative`` uses the extension point upstream published for exactly this.
 
 **What this backend is, and is not.** It is the honest world_size-1 case, not a
-simulation of a larger one. ``docs/DISTRIBUTED.md`` has the table; the short
+simulation of a larger one. ``docs/distributed/DISTRIBUTED.md`` has the table; the short
 version is that reductions are the identity, ``broadcast`` and ``barrier`` are
 no-ops that are *true* rather than convenient, the gather/scatter family
 copies, and ``send``/``recv`` refuse by name because no amount of local work

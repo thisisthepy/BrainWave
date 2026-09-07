@@ -1,11 +1,11 @@
 """Lower a captured trace from ATen to Core ATen.
 
-docs/DECOMP.md is the measurement this module exists to make; docs/CAPTURE.md
+docs/graph/DECOMP.md is the measurement this module exists to make; docs/graph/CAPTURE.md
 §5 is the gap it closes. The short version of both:
 
     `_capture_end` records **ATen** -- whatever the dispatcher was asked for.
     ExecuTorch's Edge dialect is defined over **Core ATen**, a named subset.
-    The smallest example in docs/CAPTURE.md records `aten.t.default`, which is
+    The smallest example in docs/graph/CAPTURE.md records `aten.t.default`, which is
     outside that subset. So a pass has to stand between capture and any
     delegate, and this is it.
 
@@ -36,7 +36,7 @@ already there. Lowering `aten.t.default(%c0)` is:
 2. `_capture_begin(placeholders)`, call upstream's decomposition, `_capture_end`;
 3. splice the resulting sub-trace into the parent in place of the node.
 
-Which means the capture layer's refusals (docs/CAPTURE.md §4) guard the pass
+Which means the capture layer's refusals (docs/graph/CAPTURE.md §4) guard the pass
 for free. A decomposition that branches on a tensor *value* reaches
 `aten._local_scalar_dense.default` and poisons its own sub-recording, and the
 pass then refuses that op by name instead of emitting a graph that is only
@@ -164,7 +164,7 @@ def core_ops() -> frozenset[str]:
     overload` in the `_C` shim answered `[]` for every op, so
     `torch.Tag.core in op.tags` was False for all 120 implemented ops and a
     classifier built on it would call nothing core and refuse whole programs
-    (docs/DECOMP.md §2). The shim reads the file's real tags now, and the two
+    (docs/graph/DECOMP.md §2). The shim reads the file's real tags now, and the two
     agree on every implemented op -- `test_core_ops_and_op_tags_agree` diffs
     them, so this is a measured agreement and not a second copy of one answer.
 
@@ -231,7 +231,7 @@ def decomposition_table_source() -> tuple[str, str | None]:
     function that is missing>")`: the full table is a `CustomDecompTable`,
     whose constructor enumerates every CompositeImplicitAutograd registration
     through `torch._C._dispatch_get_registrations_for_dispatch_key`, and this
-    `_C` is a Python shim with no C++ dispatcher to enumerate. docs/DECOMP.md §3
+    `_C` is a Python shim with no C++ dispatcher to enumerate. docs/graph/DECOMP.md §3
     lists which ops that costs.
     """
     _load_table()
@@ -290,7 +290,7 @@ class DecomposedTrace:
     the object exists.
 
     `replay` goes back through `_aten_dispatch`, the same door capture recorded
-    at, for the reason docs/CAPTURE.md §3 gives: agreement with eager is then
+    at, for the reason docs/graph/CAPTURE.md §3 gives: agreement with eager is then
     evidence about the *rewrite*, not about two implementations happening to
     match.
     """
@@ -508,7 +508,7 @@ def _schema_of(op: str):
     None when the shim has no text for it -- a placeholder schema answers
     `arguments` with an empty list, which is indistinguishable from a nullary
     op, so it has to be told apart here rather than silently used
-    (docs/SCHEMA.md §6).
+    (docs/bindings/SCHEMA.md §6).
     """
     import torch
 
@@ -532,7 +532,7 @@ def _as_the_dispatcher_would_call_it(op, args, kwargs):
     that op is `torch._refs.transpose(a, dim0, dim1)`, whose first parameter is
     `a`. Calling it with the recording's kwargs raises `TypeError: transpose()
     got an unexpected keyword argument 'self'`, which is what
-    `aten.t.default` -- the op docs/CAPTURE.md §5 named -- used to die of on
+    `aten.t.default` -- the op docs/graph/CAPTURE.md §5 named -- used to die of on
     its *second* round, after its own rule had already succeeded.
 
     Upstream never has this problem because the C++ dispatcher hands a kernel

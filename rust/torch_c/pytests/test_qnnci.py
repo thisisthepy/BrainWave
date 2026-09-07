@@ -1,4 +1,4 @@
-"""Tests for docs/QNNCI.md -- the CI job that produces the QNN artefact.
+"""Tests for docs/devices/QNNCI.md -- the CI job that produces the QNN artefact.
 
 **Why a new file rather than more of `test_qnn.py`.** `test_qnn.py` is about
 `torchnative.export.qnn`'s behaviour, and its three fixtures all skip by name
@@ -21,7 +21,7 @@ Two halves:
   Every branch, including the ones a successful run never takes. The dangerous
   artefact here is not a corrupt file; it is a perfectly good `.pte` that
   silently fell back to portable CPU kernels, loads, runs, and returns the
-  right answer (docs/QNN.md §6.2).
+  right answer (docs/devices/QNN.md §6.2).
 * **the workflow's honesty** -- does the job actually upload something, does
   the verification run before the upload, and is any assertion disabled? This
   repository has shipped a workflow whose default pointed at an unpublished
@@ -37,7 +37,7 @@ REPO = pathlib.Path(__file__).resolve().parents[3]
 WORKFLOW = REPO / ".github/workflows/qnn-lower.yml"
 SCRIPT = REPO / "tools/ci/qnn_lower.py"
 QNN_MODULE = REPO / "torchnative/src/main/torchnative/export/qnn.py"
-DOC = REPO / "docs/QNNCI.md"
+DOC = REPO / "docs/devices/QNNCI.md"
 
 
 def _skip(reason):
@@ -96,7 +96,7 @@ def test_a_clean_qnn_artefact_clears_both_gates():
 def test_a_program_with_no_qnn_delegate_is_never_uploaded():
     """The silent fallback, in its purest form.
 
-    docs/QNN.md §6.2 row 1: whatever `QnnPartitioner` declined stays in the
+    docs/devices/QNN.md §6.2 row 1: whatever `QnnPartitioner` declined stays in the
     program as portable CPU kernels. A `.pte` with zero QNN segments still
     loads, still runs and still returns the right answer -- so nothing about
     running it says it is not what this job would be labelling it. It has to
@@ -127,7 +127,7 @@ def test_the_backend_id_is_checked_independently_of_is_qnn():
 
 
 def test_an_artefact_for_the_wrong_silicon_is_refused_before_it_is_pushed():
-    """docs/QNN.md §5 step 7's `assert ok, why`.
+    """docs/devices/QNN.md §5 step 7's `assert ok, why`.
 
     v75 built, v73 device. QNN catches this itself -- at backend init, on the
     phone, by aborting the method load (§6.3) -- so the cost of missing it here
@@ -149,10 +149,10 @@ def test_an_artefact_for_the_wrong_silicon_is_refused_before_it_is_pushed():
 
 
 def test_poor_coverage_fails_the_job_and_keeps_the_artefact():
-    """The docs/QNN.md §11 case, and the reason integrity and coverage split.
+    """The docs/devices/QNN.md §11 case, and the reason integrity and coverage split.
 
     §11: `delegated_fraction` for a real `LlamaMLP` under `QnnPartitioner` is
-    UNKNOWN and may be poor, citing docs/REFOLD.md §1.1 -- three occasions of
+    UNKNOWN and may be poor, citing docs/graph/REFOLD.md §1.1 -- three occasions of
     assuming coverage and being wrong. If it IS poor, the artefact is still a
     genuine QNN program and it is still the answer to the question §11 asked.
     The job goes red; the evidence survives.
@@ -167,7 +167,7 @@ def test_poor_coverage_fails_the_job_and_keeps_the_artefact():
     assert not verdict.ok, "poor coverage passed the job"
     assert verdict.integrity_ok, (
         "poor coverage was classified as an integrity failure, which would "
-        "suppress the upload and destroy the measurement docs/QNN.md §11 asked "
+        "suppress the upload and destroy the measurement docs/devices/QNN.md §11 asked "
         "for"
     )
     assert len(verdict.coverage) == 1, verdict.coverage
@@ -208,7 +208,7 @@ def test_a_missing_delegated_fraction_is_refused_rather_than_defaulted():
 
 
 def test_the_threshold_is_strictly_greater_than():
-    """docs/QNN.md §5 step 6 is `> 0.9`, not `>= 0.9`. Kept strict."""
+    """docs/devices/QNN.md §5 step 6 is `> 0.9`, not `>= 0.9`. Kept strict."""
     at = QL.verify_facts(
         _facts(delegation_over={"delegated_fraction": 0.9}), "SM8550"
     )
@@ -220,7 +220,7 @@ def test_the_threshold_is_strictly_greater_than():
 
 
 def test_the_threshold_cannot_be_lowered_from_the_command_line():
-    """docs/QNN.md §11 warns against tuning this number until it passes.
+    """docs/devices/QNN.md §11 warns against tuning this number until it passes.
 
     A `--min-delegated-fraction` flag would make that a one-word edit to a
     workflow input, invisible in the diff of any file that records a
@@ -233,12 +233,12 @@ def test_the_threshold_cannot_be_lowered_from_the_command_line():
                  or "min" in o.lower()}
     assert not offenders, (
         f"the lowering script grew a way to relax its own threshold: "
-        f"{sorted(offenders)}. docs/QNN.md §11: if the number is poor, that is "
+        f"{sorted(offenders)}. docs/devices/QNN.md §11: if the number is poor, that is "
         f"the finding -- record it, do not dial the assertion down to it."
     )
     assert QL.MIN_DELEGATED_FRACTION == 0.9, (
         f"MIN_DELEGATED_FRACTION is {QL.MIN_DELEGATED_FRACTION}, but "
-        f"docs/QNN.md §5 step 6 asserts > 0.9. If this was lowered to make a "
+        f"docs/devices/QNN.md §5 step 6 asserts > 0.9. If this was lowered to make a "
         f"run green, that is the thing §11 says not to do."
     )
 
@@ -262,7 +262,7 @@ def test_the_backend_id_here_matches_the_one_the_qnn_module_uses():
 
 
 def test_the_default_soc_is_the_device_this_project_actually_has():
-    """CLAUDE.md §7 and docs/QNN.md §5.1: SM8550, read off the device.
+    """CLAUDE.md §7 and docs/devices/QNN.md §5.1: SM8550, read off the device.
 
     The doc's example command line says SM8650, which is HTP v75 against this
     device's v73. Defaulting to the doc's example rather than the measurement
@@ -273,7 +273,7 @@ def test_the_default_soc_is_the_device_this_project_actually_has():
 
 
 def test_the_fraction_is_reported_on_every_path_including_the_red_ones():
-    """docs/QNN.md §11 asked for the number, not for a pass/fail.
+    """docs/devices/QNN.md §11 asked for the number, not for a pass/fail.
 
     The paths where somebody wants it most are the failing ones, so it is
     checked on all three: clean, poor coverage, and integrity-refused.
@@ -388,7 +388,7 @@ def test_the_workflow_exists_and_parses():
 def test_the_job_uploads_an_artefact():
     """A job that verifies and uploads nothing has produced nothing.
 
-    docs/QNN.md §5 step 8 wants three files copied to the host holding the
+    docs/devices/QNN.md §5 step 8 wants three files copied to the host holding the
     device. The `.pte` is the one this repository cannot make anywhere else.
     """
     doc = _yaml()
@@ -515,7 +515,7 @@ def test_the_job_runs_the_extracted_script_rather_than_inline_logic():
 
 
 def test_the_runner_is_pinned_and_not_latest():
-    """docs/QNN.md's numbers are keyed to hosts; `ubuntu-latest` moves."""
+    """docs/devices/QNN.md's numbers are keyed to hosts; `ubuntu-latest` moves."""
     doc = _yaml()
     if doc is None:
         return _skip("pyyaml is not installed in this interpreter")
@@ -523,7 +523,7 @@ def test_the_runner_is_pinned_and_not_latest():
         runs_on = str(job["runs-on"])
         assert "ubuntu-latest" not in runs_on, (
             f"job {name!r} runs on `ubuntu-latest`. Pin the image: the QNN SDK "
-            f"host requirement in docs/QNN.md §1.1 is version-specific and a "
+            f"host requirement in docs/devices/QNN.md §1.1 is version-specific and a "
             f"rolling image changes it without a commit."
         )
         assert re.search(r"ubuntu-\d\d\.\d\d", runs_on), runs_on
@@ -554,7 +554,7 @@ def test_the_soc_default_agrees_across_the_workflow_and_the_script():
 def test_the_workflow_header_says_what_it_does_not_prove():
     """`verify-published-wheel.yml` is the model and this is the habit copied.
 
-    docs/QNN.md §6.4 is a paragraph that has to stay true. A job that produces
+    docs/devices/QNN.md §6.4 is a paragraph that has to stay true. A job that produces
     a QNN artefact is the most tempting moment in this whole round to let
     "lowered for the HTP" slide into "ran on the HTP".
     """
@@ -567,7 +567,7 @@ def test_the_workflow_header_says_what_it_does_not_prove():
 
 
 def test_every_version_the_job_pins_is_pinned_in_one_place():
-    """Four numbers from docs/QNN.md §1.1, each declared once.
+    """Four numbers from docs/devices/QNN.md §1.1, each declared once.
 
     `test_release.py`'s docstring records what a second copy of a version costs
     here: CI's default stayed three releases behind and the green runs the
@@ -597,7 +597,7 @@ def test_every_version_the_job_pins_is_pinned_in_one_place():
 
 
 def test_the_sdk_version_is_asserted_against_executorchs_own_answer():
-    """docs/QNN.md §1.1: the SDK version is read, never transcribed.
+    """docs/devices/QNN.md §1.1: the SDK version is read, never transcribed.
 
     The workflow pins the expected value, but what it compares against must be
     `qnn.qnn_sdk_version()` -- ExecuTorch's own `download_qnn_sdk.py` -- rather
@@ -623,7 +623,7 @@ def test_the_sdk_version_is_asserted_against_executorchs_own_answer():
     assert "qnn.qnn_sdk_version()" in code, (
         "no `run:` step calls qnn.qnn_sdk_version(). The workflow's SDK "
         "version check is comparing a literal against a literal, so it cannot "
-        "fail -- docs/QNN.md §1.1 is explicit that the number is read, not "
+        "fail -- docs/devices/QNN.md §1.1 is explicit that the number is read, not "
         "transcribed."
     )
     assert 'os.environ["EXPECTED_QNN_SDK_VERSION"]' in code, (
@@ -642,16 +642,16 @@ def test_the_doc_exists_and_names_the_same_versions():
         return _skip(f"no {DOC.relative_to(REPO)}")
     text = DOC.read_text()
     for pin in ("1.4.1", "2.37.0.250724", "SM8550", "ubuntu-24.04"):
-        assert pin in text, f"docs/QNNCI.md does not mention {pin}"
+        assert pin in text, f"docs/devices/QNNCI.md does not mention {pin}"
 
 
 def test_the_doc_does_not_claim_the_job_has_run():
-    """It never has. docs/QNNCI.md is written before the first dispatch."""
+    """It never has. docs/devices/QNNCI.md is written before the first dispatch."""
     if not DOC.is_file():
         return _skip(f"no {DOC.relative_to(REPO)}")
     text = DOC.read_text()
     assert "has never run" in text or "never been run" in text, (
-        "docs/QNNCI.md must say the job has not run. CLAUDE.md §4: built, "
+        "docs/devices/QNNCI.md must say the job has not run. CLAUDE.md §4: built, "
         "reached and agreed are three different claims, and this job is not "
         "yet even the first."
     )
@@ -660,7 +660,7 @@ def test_the_doc_does_not_claim_the_job_has_run():
 def test_the_doc_states_this_files_own_test_count_correctly():
     """CLAUDE.md §5.3: report "N of M", and do not let N drift.
 
-    docs/QNNCI.md §0 and §5.2 both carry the number of tests in this file. A
+    docs/devices/QNNCI.md §0 and §5.2 both carry the number of tests in this file. A
     stale count is a small lie, but it is the same species as the one
     test_release.py exists for -- four files that have to agree and are edited
     by different hands.
@@ -670,9 +670,9 @@ def test_the_doc_states_this_files_own_test_count_correctly():
     actual = len(re.findall(r"^def test_", pathlib.Path(__file__).read_text(), re.M))
     claimed = set(re.findall(r"\*\*(\d+)\*\* (?:in `rust/torch_c/pytests/test_qnnci\.py`|tests)",
                              DOC.read_text()))
-    assert claimed, "docs/QNNCI.md no longer states a test count for this file"
+    assert claimed, "docs/devices/QNNCI.md no longer states a test count for this file"
     assert claimed == {str(actual)}, (
-        f"docs/QNNCI.md claims {sorted(claimed)} tests in this file; there are "
+        f"docs/devices/QNNCI.md claims {sorted(claimed)} tests in this file; there are "
         f"{actual}."
     )
 

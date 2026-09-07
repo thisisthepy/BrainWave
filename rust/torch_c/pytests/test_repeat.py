@@ -1,4 +1,4 @@
-"""docs/REPEAT.md -- the last three blocked architectures.
+"""docs/kernels/REPEAT.md -- the last three blocked architectures.
 
 Three things landed and they are different in kind, so they are kept apart
 here rather than counted together:
@@ -10,7 +10,7 @@ here rather than counted together:
      schema's **second** argument, and that table binds the receiver into the
      **first**.
   2. `aten::repeat_interleave.Tensor` (`fastspeech2_conformer`) -- a real
-     kernel, in four files at once (docs/LAST7.md §5.2 sized it and
+     kernel, in four files at once (docs/kernels/LAST7.md §5.2 sized it and
      deliberately did not land it).
   3. `sam3_lite_text_text_model` -- re-checked, still **not our gap**.
 
@@ -193,8 +193,8 @@ def test_tensor_where_refuses_what_upstream_refuses_and_in_upstreams_words():
 def test_the_five_where_overloads_are_untouched_by_the_new_method():
     """The method is surface over kernels that already existed.
 
-    docs/BIND5.md §4.1's claim, re-checked on this tree rather than inherited
-    -- docs/BINDINGS.md was told "`mish` just needs a binding" and found the
+    docs/bindings/BIND5.md §4.1's claim, re-checked on this tree rather than inherited
+    -- docs/bindings/BINDINGS.md was told "`mish` just needs a binding" and found the
     kernel gone, so "the kernels are there" is measured here.
     """
     for overload in ("aten.where.self", "aten.where.default",
@@ -280,7 +280,7 @@ def test_repeat_interleave_tensor_refusals_are_upstreams_own_words():
 def test_the_composite_reaches_the_kernel_on_the_spelling_the_model_uses():
     """`torch.repeat_interleave(input, tensor, dim=0)` -- the only spelling.
 
-    docs/LAST7.md §5.2's first bullet: the composite is `setattr` onto the
+    docs/kernels/LAST7.md §5.2's first bullet: the composite is `setattr` onto the
     varfns **after** the table, so it wins, and it used to raise before any
     dispatch happened. A kernel behind it would have been unreachable through
     `modeling_fastspeech2_conformer.py:123`.
@@ -423,7 +423,7 @@ def test_the_two_lists_the_kernel_had_to_join_are_both_asserted_here():
 
 
 def test_sam3_lite_texts_embedding_call_is_refused_by_upstream_too():
-    """docs/ARGFORM.md §3 and docs/BIND5.md both said "not our gap". Re-checked.
+    """docs/bindings/ARGFORM.md §3 and docs/bindings/BIND5.md both said "not our gap". Re-checked.
 
     The call is `torch.embedding(weight, None, ...)` -- a `None` where the
     schema wants `Tensor indices`. Upstream refuses it identically, so closing
@@ -460,11 +460,11 @@ def test_a_single_element_integral_tensor_is_accepted_inside_a_size_list():
         padded_value.as_strided(size=chunked_value_size, stride=...)
 
     where one element of `chunked_value_size` arrives as a **0-dim tensor**.
-    docs/BIND5.md §7 taught `_TypeChecker` upstream's `SymInt` rule for a
+    docs/bindings/BIND5.md §7 taught `_TypeChecker` upstream's `SymInt` rule for a
     *scalar* position; this is the same rule applied per **element** of an int
     list, which is what upstream's parser does and what
     `_coerce_symint_size_tensors` already did for three hand-written
-    composites. docs/REPEAT.md §4.
+    composites. docs/kernels/REPEAT.md §4.
 
     A 0-dim tensor and a one-element 1-D tensor are both accepted upstream,
     and both are asserted, because they take different branches of `numel()`.

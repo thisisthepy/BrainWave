@@ -1,4 +1,4 @@
-"""docs/INDEXSEL.md: index_select, argsort, where.Scalar, new_full,
+"""docs/kernels/INDEXSEL.md: index_select, argsort, where.Scalar, new_full,
 reshape_as, unflatten, chunk (free-function), diff, multiply, logical_and.
 
 Most of `tools/golden/cases.py`'s `CASE_BUILDERS` entries (added alongside
@@ -75,7 +75,7 @@ def test_reshape_as_is_parked_in_awaiting_golden_not_implemented():
 
 # ---------------------------------------------------------------------------
 # Part 2: the real Python spellings, through the full vendored tree, each
-# side in its own process (docs/INDEXSEL.md's bar).
+# side in its own process (docs/kernels/INDEXSEL.md's bar).
 # ---------------------------------------------------------------------------
 
 _SCRIPT = r"""

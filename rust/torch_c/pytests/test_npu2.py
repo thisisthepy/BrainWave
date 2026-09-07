@@ -1,16 +1,16 @@
-"""Tests for docs/NPU2.md -- the round that put a graph on an NPU.
+"""Tests for docs/graph/NPU2.md -- the round that put a graph on an NPU.
 
-docs/RELEASE_0_0_13a0.md §5 carried one entry no round had moved: *nothing has
-run on an NPU*. docs/NPU.md had compiled and run a CoreML model, and had
+docs/platform/RELEASE_0_0_13a0.md §5 carried one entry no round had moved: *nothing has
+run on an NPU*. docs/graph/NPU.md had compiled and run a CoreML model, and had
 serialised an NNAPI blob and decoded it back -- but it drew the line between
 **executed** and **structurally validated** and put NNAPI on the wrong side of
 it, because there is no NNAPI runtime on a Mac.
 
-This file moves both halves, and it separates two claims docs/NPU.md's line
+This file moves both halves, and it separates two claims docs/graph/NPU.md's line
 does not distinguish:
 
 1. **"Ran through CoreML" is not "ran on the NPU."** `MLModel` chooses among
-   CPU, GPU and Neural Engine. The models docs/NPU.md executed ran on the
+   CPU, GPU and Neural Engine. The models docs/graph/NPU.md executed ran on the
    **CPU**, and the reason is the same `float32=True` that made their numerical
    claim meaningful: the Neural Engine is float16 hardware and CoreML does not
    offer it for a float32 program at all. Read from `MLComputePlan`, which is
@@ -21,7 +21,7 @@ does not distinguish:
    "an NPU".
 
 Every test here skips **by name** where the thing it needs is absent -- no
-`coremltools`, no `ANDROID_SERIAL`, no NDK. docs/VULKAN3.md §6.1 is why the
+`coremltools`, no `ANDROID_SERIAL`, no NDK. docs/devices/VULKAN3.md §6.1 is why the
 skip lines say what is missing: a skip with a false reason is counted as a
 pass and is worse than a failure.
 """
@@ -128,7 +128,7 @@ def plan_for(trace, *, float32, compute_units):
 try:
     torch.manual_seed(0)
 
-    # -- 1. the graphs docs/NPU.md actually executed -----------------------
+    # -- 1. the graphs docs/graph/NPU.md actually executed -----------------------
     class Mlp(torch.nn.Module):
         def __init__(self):
             super().__init__()
@@ -273,7 +273,7 @@ try:
         for name in names if "quant" not in name
     }
 
-    # -- 2. docs/REFOLD.md §4's whole model, on the device ------------------
+    # -- 2. docs/graph/REFOLD.md §4's whole model, on the device ------------------
     net = torch.nn.Sequential(
         torch.nn.Conv2d(3, 4, 3, stride=2, padding=1),
         torch.nn.BatchNorm2d(4),
@@ -306,7 +306,7 @@ try:
         "bytes": len(model.as_bytes()),
         "opcodes": [op["opcode"] for op in N.parse_model(model)["operations"]],
         # After constant folding, which is part of the serialisation path
-        # rather than an optimisation on top of it (docs/NPU.md §5).
+        # rather than an optimisation on top of it (docs/graph/NPU.md §5).
         "outside": sorted(
             {n["op"] for n in N.fold_constants(fused)[0].nodes}
             - N.supported_ops()),
@@ -334,7 +334,7 @@ try:
         except D.NnapiDeviceRefused as error:
             out["quant_driver"] = str(error)
 
-    # -- 4. nothing was widened (docs/REFOLD.md's live warning) ------------
+    # -- 4. nothing was widened (docs/graph/REFOLD.md's live warning) ------------
     out["supported_ops"] = sorted(N.supported_ops())
 except Exception as error:  # noqa: BLE001
     import traceback
@@ -383,7 +383,7 @@ def _nnapi_or_skip():
     guess*: several emulators are shared on this machine, so this module never
     picks "the attached one". "No NDK" is a missing toolchain. Reporting either
     as the other would send the next reader to the wrong place, which is
-    docs/VULKAN3.md §6.1's whole lesson.
+    docs/devices/VULKAN3.md §6.1's whole lesson.
     """
     if not os.path.isfile(_CKPT_VENDOR_SHIM):
         print("   (skipped: vendored tree has no _C.abi3.so)")
@@ -409,12 +409,12 @@ def _nnapi_or_skip():
 
 
 def test_the_coreml_models_docs_npu_executed_ran_on_the_cpu():
-    """docs/NPU.md §2's executed claim was a **CPU** claim, and did not say so.
+    """docs/graph/NPU.md §2's executed claim was a **CPU** claim, and did not say so.
 
     "Compiled by macOS and run through `MLModel.predict`" is true and is not
     the same sentence as "ran on the NPU". `MLModel` picks among CPU, GPU and
     Neural Engine, and `MLComputePlan` is CoreML's own answer to which. For
-    all three of docs/NPU.md's float32 graphs, every compute operation's
+    all three of docs/graph/NPU.md's float32 graphs, every compute operation's
     preferred device is the CPU.
 
     This is not a defect in that document -- it is a distinction it did not
@@ -441,7 +441,7 @@ def test_pinning_float32_is_what_puts_the_neural_engine_out_of_reach():
     offer the unit, so no `compute_units` setting can reach it. The Neural
     Engine is float16 hardware.
 
-    That makes docs/NPU.md's `float32=True` and NPU execution mutually
+    That makes docs/graph/NPU.md's `float32=True` and NPU execution mutually
     exclusive, which is worth stating as a measured fact rather than as an
     inference from the previous test. Both halves are measured on one model so
     the comparison cannot be confounded by graph shape.
@@ -487,7 +487,7 @@ def test_a_graph_executes_on_the_neural_engine_and_agrees_with_replay():
 
     executed = result["wide_executed"]
     assert executed["CPU_AND_NE"]["elements"] == 128, executed
-    # float16 arithmetic: docs/NPU.md measured 2.3e-04 for the same reason.
+    # float16 arithmetic: docs/graph/NPU.md measured 2.3e-04 for the same reason.
     assert executed["CPU_AND_NE"]["max_abs_diff"] < 1e-2, executed
     assert result["wide_ne_vs_cpu"] > 0.0, (
         "the Neural Engine and CPU-only runs of the same package agreed bit "
@@ -504,7 +504,7 @@ def test_nnapi_drivers_are_read_from_the_device_rather_than_assumed():
 
     An emulator's NNAPI is backed by software: a reference implementation plus
     whatever sample drivers the system image ships. That is still execution
-    and docs/NPU2.md counts it as such -- but it names the driver, because
+    and docs/graph/NPU2.md counts it as such -- but it names the driver, because
     "NNAPI ran it" and "a CPU reference driver ran it" are different claims and
     this project's method is not to blur them.
     """
@@ -518,7 +518,7 @@ def test_nnapi_drivers_are_read_from_the_device_rather_than_assumed():
 
 
 def test_a_conv_relu_blob_executes_on_nnapi_and_agrees_with_replay():
-    """The claim docs/NPU.md §2 could not make.
+    """The claim docs/graph/NPU.md §2 could not make.
 
     The blob is upstream's -- `torch/backends/_nnapi/serializer.py` wrote every
     byte of it -- and `nnapi_runner.c` replays it operand by operand into
@@ -545,7 +545,7 @@ def test_a_conv_relu_blob_executes_on_nnapi_and_agrees_with_replay():
 
 
 def test_the_whole_model_executes_on_nnapi_and_the_control_is_orders_larger():
-    """docs/REFOLD.md §4's deliverable, executed rather than decoded.
+    """docs/graph/REFOLD.md §4's deliverable, executed rather than decoded.
 
     The same network, the same fold, the same 1,156-byte blob and the same
     eight opcodes by value -- and now the numbers it computes on a device,
@@ -584,7 +584,7 @@ def test_a_driver_that_does_not_claim_the_operations_refuses_by_name():
     `nnapi-sample_quant` is a quantised-only sample driver, so it claims 0 of
     the 8 operations and compiling for it must fail. If it ever succeeded, the
     device name passed to `createForDevices` would not be deciding anything and
-    every "this driver ran it" claim in docs/NPU2.md would be unfounded.
+    every "this driver ran it" claim in docs/graph/NPU2.md would be unfounded.
     """
     result = _nnapi_or_skip()
     if result is None:
@@ -597,7 +597,7 @@ def test_a_driver_that_does_not_claim_the_operations_refuses_by_name():
 
 
 def test_executing_on_a_device_widened_nothing():
-    """docs/REFOLD.md's live warning, honoured rather than quoted.
+    """docs/graph/REFOLD.md's live warning, honoured rather than quoted.
 
     That document measured `mobilenet_v2` getting *worse* under a bigger
     table -- 203 nodes to 1,191 -- and left the standing instruction that more

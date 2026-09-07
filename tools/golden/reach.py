@@ -11,13 +11,13 @@ with a dispatch key it took from its own case table. It therefore cannot see
      (`squeeze.default`, `squeeze.dims`, `where.ScalarSelf` arrived this way),
   2. a kernel that no Python spelling reaches — `_aten_implemented()` lists it,
      golden compares it, and nothing in `torch.*` or `Tensor.*` can call it
-     (twenty-two names in docs/SPELLINGS.md, six more in its §9),
+     (twenty-two names in docs/bindings/SPELLINGS.md, six more in its §9),
   3. a spelling that exists and dispatches but that no test ever *spells* —
-     golden proves the kernel, not the door to it (docs/DEMAND5.md's
+     golden proves the kernel, not the door to it (docs/architectures/DEMAND5.md's
      `torch.roll`).
 
 Each of those was found by a human noticing or a model tripping over it, four
-times. This file is the structural version. docs/REACH.md is the inventory it
+times. This file is the structural version. docs/bindings/REACH.md is the inventory it
 produced and the reasoning behind the allowlist.
 
 Cost: no builds, no upstream import in the default path, one zero-argument
@@ -144,7 +144,7 @@ def _blank_line_comments(text: str) -> str:
     Line-based rather than `tokenize`-based, and that is the whole point: a
     third of this suite's coverage lives inside *road scripts* — Python source
     held as a triple-quoted string and run in a vendored-tree subprocess
-    (docs/SPELLINGS.md §9). To the tokenizer those are one STRING token, so a
+    (docs/bindings/SPELLINGS.md §9). To the tokenizer those are one STRING token, so a
     `#` comment inside one is not a comment at all, and the paragraph inside a
     road script that says `torch.roll(...)` was read as a call to it. The
     scanner is deliberately naive about multi-line strings for the same reason:
@@ -356,7 +356,7 @@ def check(module, repo_root=REPO_ROOT, allow_path=ALLOW_PATH) -> list:
             "shape 1 (partial): %d declared overload keys have no dispatch arm, "
             "above the recorded ceiling of %d. A name still resolves through its "
             "other overloads, so this is a ratchet rather than a hard zero -- but "
-            "it may not grow. See docs/REACH.md §2."
+            "it may not grow. See docs/bindings/REACH.md §2."
             % (len(report["shape1_dead_keys"]), ceiling)
         )
 

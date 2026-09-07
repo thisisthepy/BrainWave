@@ -63,7 +63,7 @@ keywords = ["pytorch", "on-device", "edge", "federated-learning", "test-time-ada
 
 # Pre-alpha on purpose. The Python surface here is still a skeleton; the working
 # part of this project is the `torch._C` replacement under `rust/torch_c`. That
-# is built into the platform wheels (docs/WHEEL.md) -- it was *not* in the
+# is built into the platform wheels (docs/platform/WHEEL.md) -- it was *not* in the
 # `0.0.1a0` `py3-none-any` distribution, which is why that one cannot
 # `import torch`. See the README's Status section.
 #
@@ -102,11 +102,11 @@ Source = "https://github.com/thisisthepy/torchnative"
 
 [project.optional-dependencies]
 # Aggregation, transport and privacy live behind this extra so that using
-# adaptation alone does not pull in the federated stack. See docs/DESIGN.md §10.
+# adaptation alone does not pull in the federated stack. See docs/design/DESIGN.md §10.
 federated = []
 
 # Backend selection, and the shape of it is forced by packaging rather than
-# chosen (docs/WHEEL.md §13). A wheel filename carries no backend axis -- pip
+# chosen (docs/platform/WHEEL.md §13). A wheel filename carries no backend axis -- pip
 # selects on the python, abi and platform tags alone, and the `build tag` slot
 # it does have is a tie-breaker it never selects on -- so CPU, GPU and NPU
 # builds cannot sit side by side under one platform tag. Upstream torch hits
@@ -114,7 +114,7 @@ federated = []
 # 4 platforms by 6 pythons, and the CUDA builds live on a separate index.
 #
 # So one binary carries all three and chooses at runtime. That is possible here
-# because the accelerator paths are dlopened rather than linked: docs/VULKAN.md
+# because the accelerator paths are dlopened rather than linked: docs/devices/VULKAN.md
 # measured `libvulkan` absent from NEEDED, so a device with no driver loses the
 # GPU path and not `import torch`, and NNAPI and CoreML compile at runtime with
 # the same property.
@@ -155,7 +155,7 @@ where = ["torchnative/src/main"]
 # `src/main/torch` is. `vendor/vendor_torch.sh` assembles the whole upstream
 # Python tree here and `vendor/install_shim.sh` puts our `_C` in the hole it
 # leaves. Excluding it is what produced the `py3-none-any` distribution on PyPI,
-# which installs and then cannot `import torch`. See docs/WHEEL.md.
+# which installs and then cannot `import torch`. See docs/platform/WHEEL.md.
 #
 # The tree is not in git (/.gitignore), so this has nothing to find until those
 # two scripts have run. `tools/wheel/build.py` refuses to build in that state
@@ -207,4 +207,4 @@ torchnative = ["**/*"]
 [tool.ppp]
 # Platform source sets follow the pypackpack layout: src/main is scanned for
 # top-level Python packages, which is what lets one package provide both
-# `torch` and `torchnative`. See docs/DESIGN.md §10.
+# `torch` and `torchnative`. See docs/design/DESIGN.md §10.

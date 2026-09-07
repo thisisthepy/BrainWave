@@ -49,7 +49,7 @@ Method, and its limits
   a known shape goes to `unclassified` rather than being guessed at. A wrong
   classification here becomes a wrong roadmap.
 * Construction failures and forward failures are counted separately. `rwkv`
-  (docs/PRIMS.md §6) reached its forward only after two walls fell and its
+  (docs/kernels/PRIMS.md §6) reached its forward only after two walls fell and its
   remaining wall is `torch.linalg.qr` inside `_init_weights` -- a construction
   problem. If half the failures are construction the headline means something
   different, so the split is always reported.

@@ -10,7 +10,7 @@ on one side or the other:
     this file and it is the round's verifiable value.
   * **not testable here, and not faked** -- that a kernel runs on a GPU. There
     is no test below that would pass by skipping and there is no test below
-    that asserts CUDA computes. `docs/CUDA.md` §6 is a numbered procedure for a
+    that asserts CUDA computes. `docs/devices/CUDA.md` §6 is a numbered procedure for a
     machine that has a GPU, and §8 says in as many words what "CUDA support"
     does and does not mean after this round.
 
@@ -20,7 +20,7 @@ this host the test either asserts the *classifier* for that state (saying so in
 its own name) or asserts the *source* (saying so in its own name). Neither is
 called a measurement.
 
-docs/MPSATTN.md §3.1 is the trap this file is built to avoid: it records that a
+docs/devices/MPSATTN.md §3.1 is the trap this file is built to avoid: it records that a
 source-scanning proof of "the GPU did it" can be defeated by moving the thing
 the scan greps for one call deeper. So nothing here reads the source to
 establish *device* behaviour. Source reads are used only for claims that are
@@ -45,7 +45,7 @@ REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(
 CARGO_TOML = os.path.join(REPO, "rust", "torch_c", "Cargo.toml")
 ATEN_RS = os.path.join(REPO, "rust", "torch_c", "src", "aten.rs")
 DEVICE_RS = os.path.join(REPO, "rust", "torch_c", "src", "device.rs")
-CUDA_MD = os.path.join(REPO, "docs", "CUDA.md")
+CUDA_MD = os.path.join(REPO, "docs", "devices", "CUDA.md")
 WORKFLOW = os.path.join(REPO, ".github", "workflows", "build-cuda-wheel.yml")
 
 # The five names `CUDA_REFUSAL_REASONS` publishes. Spelled here as well so that
@@ -164,7 +164,7 @@ def test_asking_for_cuda_on_this_build_refuses_and_names_not_built():
     # And candle's own words survive to the end unedited, because the token is
     # this crate's judgement and the text is the evidence for it.
     assert "has not been built with cuda support" in text, text
-    assert "docs/CUDA.md" in text, text
+    assert "docs/devices/CUDA.md" in text, text
 
 
 def test_the_refusal_names_the_index_it_was_asked_for():
@@ -198,7 +198,7 @@ def test_the_refusals_this_host_cannot_enter_are_still_named_one_by_one():
     **This tests the classifier, not the machine**, and the name says so. What
     it establishes is that if a driver returns `CUDA_ERROR_NO_DEVICE` the user
     is told `no_device` and not something vaguer; what it does not establish is
-    that any driver ever did. `docs/CUDA.md` §8 keeps those apart.
+    that any driver ever did. `docs/devices/CUDA.md` §8 keeps those apart.
 
     It is here rather than only in `cargo test` because the thing under test is
     the **loaded artefact's** classifier, reached the way a caller reaches it.
@@ -248,7 +248,7 @@ def test_every_reason_is_documented_in_cuda_md():
     doc = _read(CUDA_MD)
     for reason in _C._shim_cuda_refusal_reasons():
         assert f"`{reason}`" in doc, (
-            f"docs/CUDA.md never mentions the refusal reason {reason!r}")
+            f"docs/devices/CUDA.md never mentions the refusal reason {reason!r}")
 
 
 # ---------------------------------------------------------------------------
@@ -268,7 +268,7 @@ def test_the_cuda_readback_list_is_the_mps_one_and_is_re_derived_from_aten_rs():
     `test_the_mps_readback_list_is_what_the_kernels_actually_do` is: comparing
     two source reads would agree with itself after a change nobody rebuilt.
 
-    docs/VOICE3.md §6 is why the derivation is not trusted past where it goes --
+    docs/architectures/VOICE3.md §6 is why the derivation is not trusted past where it goes --
     it follows helper calls one level, by name, and `var`/`std` reached the list
     through nothing until the read was spelled at each dispatch target. That
     blind spot is covered by `test_every_host_readback_in_aten_is_classified`
@@ -310,7 +310,7 @@ def test_the_cuda_readback_list_is_the_mps_one_and_is_re_derived_from_aten_rs():
 def test_the_readback_gate_is_more_necessary_on_cuda_than_it_was_on_metal():
     """The one CUDA-specific finding, pinned so it is not lost.
 
-    docs/MPS.md §2 measured that thirteen of fourteen silent CPU fallbacks on
+    docs/devices/MPS.md §2 measured that thirteen of fourteen silent CPU fallbacks on
     `mps` were on the **integer** path: the float path goes through
     `read_flat`'s `widen_f64` and Metal has no `F32 -> F64`, so it raised. CUDA
     implements `f64`. The same kernels that were noisy on Metal are silent on
@@ -322,7 +322,7 @@ def test_the_readback_gate_is_more_necessary_on_cuda_than_it_was_on_metal():
     text = _read(os.path.join(REPO, "rust", "torch_c", "src", "aten.rs"))
     assert "fn read_flat" in text
     assert "widen_f64" in text, (
-        "read_flat no longer widens through f64 -- docs/CUDA.md §5's argument "
+        "read_flat no longer widens through f64 -- docs/devices/CUDA.md §5's argument "
         "about why cuda is quieter than metal needs re-measuring")
 
 
@@ -334,7 +334,7 @@ def test_the_dispatcher_gates_cuda_before_it_runs_a_kernel():
     """The gate is in front of the kernel, not behind it.
 
     A source read, and it is a claim about source: where a call sits in the
-    dispatcher. It is not evidence that anything ran on a GPU -- docs/MPSATTN.md
+    dispatcher. It is not evidence that anything ran on a GPU -- docs/devices/MPSATTN.md
     §3.1's warning is about using a scan for *that*, and nothing here does.
     """
     text = _read(ATEN_RS)
@@ -381,7 +381,7 @@ def test_cuda_cannot_reach_the_android_ios_or_wasm_builds():
     `windows`, and Android is `android`, iOS is `ios`, wasm is `emscripten` or
     `unknown`. None of them match, **with or without** the cfg key -- which is
     the property that makes the target list the half that cannot be switched
-    off. `docs/CUDA.md` §2 records which cross builds were actually run.
+    off. `docs/devices/CUDA.md` §2 records which cross builds were actually run.
     """
     toml = _read(CARGO_TOML)
     entry = re.search(r"\[target\.'cfg\(([^\n]*torch_c_cuda[^\n]*)\)'\.dependencies\]", toml)
@@ -438,8 +438,8 @@ def test_a_counter_moves_on_the_one_runtime_event_this_host_can_produce():
 
     This is deliberately not a claim that the GPU counters work. It is a claim
     that the counters are runtime instruments rather than constants, which is
-    the property docs/MPSATTN.md §3.1 says source-scanning evidence lacks. The
-    three that need a GPU are exercised by the procedure in docs/CUDA.md §6.
+    the property docs/devices/MPSATTN.md §3.1 says source-scanning evidence lacks. The
+    three that need a GPU are exercised by the procedure in docs/devices/CUDA.md §6.
     """
     if _C._cuda_probe()["built"]:
         print("   (not asserted: on a cuda build resolve() may succeed, so a "
@@ -458,7 +458,7 @@ def test_a_counter_moves_on_the_one_runtime_event_this_host_can_produce():
 def test_the_gpu_evidence_is_not_the_kind_mpsattn_says_can_be_defeated():
     """The counters must not be a re-spelling of a source scan.
 
-    docs/MPSATTN.md §3.1 records that moving a `read_flat` one call deeper
+    docs/devices/MPSATTN.md §3.1 records that moving a `read_flat` one call deeper
     passes both of the `mps` derivation tests while keeping the readback. The
     defence here is that `device_free_bytes` is read from the **driver** at call
     time -- it is not in this repository at all, so nothing in this repository
@@ -472,7 +472,7 @@ def test_the_gpu_evidence_is_not_the_kind_mpsattn_says_can_be_defeated():
     assert "mem_get_info()" in text, (
         "device_free_bytes no longer comes from the driver -- if it is now "
         "computed from this crate's own bookkeeping it is defeatable in exactly "
-        "the way docs/MPSATTN.md §3.1 describes")
+        "the way docs/devices/MPSATTN.md §3.1 describes")
     assert "fn note_cuda_dispatch" in text
     # One door, counted at the door. If `note_cuda_dispatch` grew call sites
     # inside kernels, a kernel could be added that forgets it.
@@ -512,7 +512,7 @@ def test_the_cuda_workflow_claims_a_build_and_not_a_computation():
 
 
 def test_the_gpu_procedure_is_present_and_is_valid_python():
-    """The procedure in docs/CUDA.md §6 has to still parse.
+    """The procedure in docs/devices/CUDA.md §6 has to still parse.
 
     A copy-pasteable procedure that stopped being copy-pasteable is worse than
     no procedure, because it is read as tested. This does not run it -- there is
@@ -523,12 +523,12 @@ def test_the_gpu_procedure_is_present_and_is_valid_python():
     """
     doc = _read(CUDA_MD)
     blocks = re.findall(r"<!-- CUDA_PROCEDURE_PYTHON -->\n```python\n(.*?)```", doc, re.S)
-    assert blocks, "docs/CUDA.md has no marked procedure block"
+    assert blocks, "docs/devices/CUDA.md has no marked procedure block"
     for block in blocks:
-        compile(block, "<docs/CUDA.md §6>", "exec")
+        compile(block, "<docs/devices/CUDA.md §6>", "exec")
         for name in sorted(set(re.findall(r"_C\.(_[A-Za-z0-9_]+)", block))):
             assert hasattr(_C, name), (
-                f"docs/CUDA.md §6 calls _C.{name}, which this build does not have")
+                f"docs/devices/CUDA.md §6 calls _C.{name}, which this build does not have")
 
 
 def test_this_file_never_claims_cuda_computes():

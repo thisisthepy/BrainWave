@@ -1,6 +1,6 @@
-"""Tests for docs/LAST7.md -- the four architectures that needed `aten.rs`.
+"""Tests for docs/kernels/LAST7.md -- the four architectures that needed `aten.rs`.
 
-`docs/ARCH200.md` left 7 of 297 architectures blocked. Four of them were routed
+`docs/architectures/ARCH200.md` left 7 of 297 architectures blocked. Four of them were routed
 to this round because their walls looked like `aten.rs` work:
 
     torch.repeat_interleave(Tensor repeats)   fastspeech2_conformer
@@ -9,14 +9,14 @@ to this round because their walls looked like `aten.rs` work:
     per-axis-differing convolution padding    nystromformer
 
 **Two of the four were kernels and two were not**, and the split is the first
-thing docs/LAST7.md says. `unfold` is a real missing kernel. The conv padding
+thing docs/kernels/LAST7.md says. `unfold` is a real missing kernel. The conv padding
 is not a missing kernel and not an argument form either -- it is a lowering,
 and the refusal it replaces was a real candle limitation that a decomposition
 walks around. `multinomial` is an argument form in `bootstrap.py`'s type
 checker and needs nothing here at all. `repeat_interleave.Tensor` is a real
 kernel, and it is the one this round did **not** land: see
 `test_repeat_interleave_with_a_tensor_repeats_now_lands_in_all_four_files`,
-which is that pin **inverted** by docs/REPEAT.md rather than deleted.
+which is that pin **inverted** by docs/kernels/REPEAT.md rather than deleted.
 
 Every number below was measured against real torch 2.13.0 in a separate
 process before it was written down. The values live in
@@ -86,7 +86,7 @@ def test_unfold_reads_the_receivers_logical_order_not_its_storage():
     """The line between this op and `as_strided`, and it is a real difference.
 
     `as_strided` addresses the raw storage and refuses a non-contiguous
-    receiver by name (docs/STRIDED.md §4.1). `unfold` is defined on the
+    receiver by name (docs/kernels/STRIDED.md §4.1). `unfold` is defined on the
     receiver's *logical* index space, so a transposed receiver must read the
     transposed order -- measured upstream, and it is why this kernel
     materialises rather than refusing.
@@ -178,7 +178,7 @@ def test_writing_through_an_unfold_window_is_refused_rather_than_lost():
         y = torch.arange(6.); v = y.unfold(0, 3, 1); v[0, 0] = 99.
           -> y[0] is 99.
 
-    candle 0.11.0 cannot build that view (docs/STRIDED.md §1: the struct that
+    candle 0.11.0 cannot build that view (docs/kernels/STRIDED.md §1: the struct that
     joins a `Layout` to a shared `Storage` has no public fields), and
     consecutive windows share `size - step` elements, so no composition of
     `narrow`/`reshape`/`transpose` produces the stride either. So this gathers,
@@ -202,7 +202,7 @@ def test_writing_through_an_unfold_window_is_refused_rather_than_lost():
 def test_writing_to_the_base_of_a_live_unfold_is_refused_too():
     """The other direction, which is the one a per-result flag cannot reach.
 
-    docs/STRIDED.md §3: propagation runs forward from the mark and the exposure
+    docs/kernels/STRIDED.md §3: propagation runs forward from the mark and the exposure
     runs backward from it, so the key has to be the *storage*. Same mechanism
     here, and the same reason it works: `z[1] = -5.` after `w = z.unfold(...)`
     shows through `w` upstream.
@@ -364,12 +364,12 @@ def test_a_transposed_convolution_is_not_touched_by_the_lowering():
 def test_multinomial_with_a_tensor_num_samples_now_matches_upstreams_symint_rule():
     """The inversion this test was written to demand, landed in the same batch.
 
-    `docs/LAST7.md` §5 traced `vilt`'s wall to upstream's **argument parser**
+    `docs/kernels/LAST7.md` §5 traced `vilt`'s wall to upstream's **argument parser**
     rather than to a missing kernel -- `aten.multinomial.default` was already
     here and already golden-compared -- and said the fix belonged in
     `bootstrap.py`'s `_TypeChecker`, which was another round's file. It wrote
     this test to fail the moment that landed, and named the document to update.
-    `docs/BIND5.md` landed it hours later.
+    `docs/bindings/BIND5.md` landed it hours later.
 
     What is asserted now is the **shape of the rule**, not merely that the
     accepting case accepts. Upstream's `SymInt` coercion is: one element by
@@ -432,11 +432,11 @@ print(json.dumps(out))
 def test_repeat_interleave_with_a_tensor_repeats_now_lands_in_all_four_files():
     """fastspeech2_conformer's wall -- **closed**, and this is the inversion.
 
-    This test used to assert the refusal. docs/LAST7.md §5.2 left the kernel
+    This test used to assert the refusal. docs/kernels/LAST7.md §5.2 left the kernel
     unwritten on purpose and pinned the absence here with the file list in its
     own docstring, because landing `aten::repeat_interleave.Tensor` alone would
     have reddened the suite and left the architecture blocked anyway. All four
-    files landed together in docs/REPEAT.md, so the pin is inverted rather than
+    files landed together in docs/kernels/REPEAT.md, so the pin is inverted rather than
     deleted -- and it is inverted into the **stronger** claim, because a test
     that only checked the values would pass with `capture.rs` and `device.rs`
     left untouched. Those two are the halves LAST7 said would go red, so they

@@ -2,7 +2,7 @@
 dispatches, captured on UPSTREAM torch under `TorchDispatchMode`.
 
 Not part of the suite -- it needs the network, the NVIDIA checkpoint and a
-voicestudio checkout, none of which the gate has. docs/VOICE4.md §2 is the
+voicestudio checkout, none of which the gate has. docs/architectures/VOICE4.md §2 is the
 setup; point `TORCH_C_VOICE4_ASSETS` at it and run this with upstream torch:
 
     TORCH_C_VOICE4_ASSETS=/path/to/assets \

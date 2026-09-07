@@ -18,14 +18,14 @@ That is raised by `modeling_utils.local_torch_dtype`, which guards
 reads only `quantization_config` and `config.quantization_config` -- nothing in
 transformers is keyed on `dtype`, so there is no public hook that a bare
 `dtype=torch.int8` could reach. Opening it means editing transformers, which is
-the one thing this project does not do (`docs/DESIGN.md` §1: a facade defeats
-the reason an embedded CPython is worth having). See `docs/INT8B.md` §1.
+the one thing this project does not do (`docs/design/DESIGN.md` §1: a facade defeats
+the reason an embedded CPython is worth having). See `docs/numerics/INT8B.md` §1.
 
 *With this config* it is ours, because `_get_dtype` calls
 `hf_quantizer.update_dtype(dtype)` before that guard is reached, so a quantizer
 can widen it. `update_dtype` below accepts `torch.int8` there, reads it as a
 statement about weights rather than activations, and says so. It is not honoured
-literally: `docs/QUANT.md` §2.1 and `docs/INT8.md` §1 close that door
+literally: `docs/graph/QUANT.md` §2.1 and `docs/numerics/INT8.md` §1 close that door
 independently -- candle-core 0.11's `DType` has no `I8`, at any version
 including `main`, so there is no `torch.int8` *tensor* on this stack to load
 into. What the caller gets is `q8_0` weights and `float32` activations, and
@@ -43,7 +43,7 @@ this repository. `HfQuantizer._process_model_before_weight_loading` runs while
 the model is still a meta-device skeleton, so the leaves can be swapped *before*
 the checkpoint is read, and each weight is quantised as it comes off disk. The
 dense tensor's only reference is the conversion op's local, so it is freed
-immediately and the dense model is never assembled. `docs/HFQUANT.md` has the
+immediately and the dense model is never assembled. `docs/graph/HFQUANT.md` has the
 measurement.
 
 **What it does not change.** Everything in `torchnative/quant/__init__.py`'s
@@ -77,7 +77,7 @@ _MISSING_SHIM = (
     "torch._C has no `_quantize`. torchnative's quantisation lives in this "
     "repository's `torch._C` shim, not in upstream torch -- the import that is "
     "live is {module}. Put `torchnative/src/main` on PYTHONPATH "
-    "(docs/VENDOR.md), or use a format-free load."
+    "(docs/platform/VENDOR.md), or use a format-free load."
 )
 
 
@@ -86,7 +86,7 @@ _TIED = (
     "it -- no tensor arrives for this layer, and there is nothing to quantise before "
     "the load. Quantising it afterwards would also break the tie and *cost* memory: "
     "the dense copy stays alive inside the embedding and the quantised head is an "
-    "additional one (2.10x all-in against 2.38x leaving it dense, docs/QUANT2.md §5.4)."
+    "additional one (2.10x all-in against 2.38x leaving it dense, docs/graph/QUANT2.md §5.4)."
 )
 
 _TIED_WAY_OUT = (
@@ -97,7 +97,7 @@ _TIED_WAY_OUT = (
 # Integer dtypes a caller may reasonably put in `dtype=` meaning "quantise the
 # weights". Only `int8` is here: `q8_0` is a *signed* 8-bit block format, so
 # `torch.uint8` would not be the same request and is left to the refusal below.
-# There is no `torch.int8` tensor on this stack either way (docs/INT8.md §1),
+# There is no `torch.int8` tensor on this stack either way (docs/numerics/INT8.md §1),
 # which is why this widens rather than honouring the spelling literally.
 _WEIGHT_DTYPES = (torch.int8,)
 
@@ -125,7 +125,7 @@ def _probe_shape(fmt, in_features, _cache={}):
 
     The wall is not exotic. SmolLM2-135M is 576 wide and `576 % 256 == 64`, so
     every 256-element k-quant (`q2_k` `q3_k` `q4_k` `q5_k` `q6_k`) is
-    unavailable for it -- docs/QUANT2.md §5.2.
+    unavailable for it -- docs/graph/QUANT2.md §5.2.
 
     `device="cpu"` is not decoration: this runs inside `from_pretrained`'s
     `torch.device("meta")` context, and a meta probe would have no storage to
@@ -148,7 +148,7 @@ class TorchnativeConfig(QuantizationConfigMixin):
         format: a GGML block format, in GGUF's spelling. `FORMATS()` lists what
             the loaded build accepts. Defaults to `"q8_0"`, which is the only
             format measured to leave SmolLM2-135M's greedy generation unchanged
-            (docs/QUANT2.md §5.3 -- `q4_0` collapses at 29.5% relative RMS on
+            (docs/graph/QUANT2.md §5.3 -- `q4_0` collapses at 29.5% relative RMS on
             the same model).
         modules_to_not_convert: layer names to leave dense, transformers'
             spelling of the choice `quantize_` leaves to its `predicate`.
@@ -161,7 +161,7 @@ class TorchnativeConfig(QuantizationConfigMixin):
             `lm_head` is 63% of the parameters and the layer whose error lands
             straight on the logits, and because the model ties it to the
             embedding, replacing it *breaks the tie and costs memory* -- 2.10x
-            all-in against 2.38x with it left dense (docs/QUANT2.md §5.4).
+            all-in against 2.38x with it left dense (docs/graph/QUANT2.md §5.4).
             Pass `[]` to convert everything including it, or a list of names to
             choose exactly. The resolved list is recorded on the quantizer and
             reported by `model.torchnative_quantization`, so which behaviour
@@ -269,7 +269,7 @@ class TorchnativeHfQuantizer(HfQuantizer):
                 "this checkpoint declares quant_method='torchnative', but a "
                 "torchnative-quantised model cannot be serialised in the first "
                 "place: `QuantizedLinear.qweight` is deliberately absent from "
-                "`state_dict()` (docs/QUANT2.md §4), and writing one out means "
+                "`state_dict()` (docs/graph/QUANT2.md §4), and writing one out means "
                 "writing GGUF, which this repository has no container for (§7). "
                 "So there is no such checkpoint, and this config only applies to "
                 "a dense one."
@@ -287,7 +287,7 @@ class TorchnativeHfQuantizer(HfQuantizer):
         """Deal with `bfloat16` here rather than at the first forward.
 
         candle's `QMatMul::forward` takes `f32` and `f16` activations and
-        nothing else (docs/QUANT2.md §7, wall 4). `bfloat16` is not an exotic
+        nothing else (docs/graph/QUANT2.md §7, wall 4). `bfloat16` is not an exotic
         request -- it is what SmolLM2-135M's own `config.json` asks for, so it
         is the default path and not a corner. Left alone it would load fine and
         fail inside the first matmul with candle's phrasing, which names
@@ -308,7 +308,7 @@ class TorchnativeHfQuantizer(HfQuantizer):
         if dtype == torch.bfloat16:
             logger.warning_once(
                 "torchnative quantisation cannot run bfloat16 activations (candle's "
-                "QMatMul accepts float32 and float16 only, docs/QUANT2.md §7 wall 4), "
+                "QMatMul accepts float32 and float16 only, docs/graph/QUANT2.md §7 wall 4), "
                 "so the model is being loaded in float32 instead. Every tensor that is "
                 "not replaced -- the embedding above all -- is therefore twice the size "
                 "it would have been. Pass dtype=torch.float16 to avoid that."
@@ -321,7 +321,7 @@ class TorchnativeHfQuantizer(HfQuantizer):
                 f"The weights are being quantised to "
                 f"{self.quantization_config.format} by the quantization_config, which is "
                 "the nearest thing this stack has to it -- there is no torch.int8 tensor "
-                "here at all, because candle-core 0.11 has no I8 dtype (docs/INT8.md §1). "
+                "here at all, because candle-core 0.11 has no I8 dtype (docs/numerics/INT8.md §1). "
                 "Activations are loaded in float32, so model.dtype will report "
                 "torch.float32 and not the dtype you passed; model.torchnative_quantization "
                 "records what actually happened."
@@ -330,7 +330,7 @@ class TorchnativeHfQuantizer(HfQuantizer):
         if dtype not in (torch.float32, torch.float16):
             raise ValueError(
                 f"torchnative quantisation cannot run {dtype} activations: candle's "
-                "QMatMul accepts float32 and float16 only (docs/QUANT2.md §7, wall 4). "
+                "QMatMul accepts float32 and float16 only (docs/graph/QUANT2.md §7, wall 4). "
                 "Pass dtype=torch.float32 to from_pretrained."
             )
         return dtype

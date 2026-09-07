@@ -1,11 +1,11 @@
 """The scatter family, `bucketize` and `prod`, through the spellings the
-architectures actually use (docs/SCATTER.md).
+architectures actually use (docs/kernels/SCATTER.md).
 
 `tools/golden/cases.py` compares these kernels against upstream at the
 `_aten_dispatch` level, which is the right place for dtype and boundary
 coverage and the wrong place for two questions this file exists to answer:
 
-  * **Does the user-level spelling reach the kernel at all?** docs/ARCH100.md's
+  * **Does the user-level spelling reach the kernel at all?** docs/architectures/ARCH100.md's
     finding was that missing *bindings* outnumber missing kernels 49 to 22, and
     `aten.scatter.value` is that finding in one op -- the schema was already in
     both transcribed tables and only the dispatch arm was missing, so a kernel
@@ -14,7 +14,7 @@ coverage and the wrong place for two questions this file exists to answer:
   * **Does the in-place form write through a view?** `scatter_` returns `self`
     whichever way it is implemented, so a test that reads the return value
     passes against a kernel that computed into a fresh buffer and handed it
-    back -- docs/VIEWS.md §6's failure exactly. The cases here read the
+    back -- docs/kernels/VIEWS.md §6's failure exactly. The cases here read the
     **base**.
 
 Both sides are measured. Every expectation is computed by running the same
@@ -360,7 +360,7 @@ def _agree(name):
 def test_the_group_router_seven_architectures_share_one_scatter_line():
     """`group_mask.scatter_(1, group_idx, 1)` -- the identical line in
     `exaone_moe`, `glm4_moe`, `glm4_moe_lite`, `mistral4`, `nemotron_h` and
-    `solar_open` (measured in transformers 5.15.1, docs/SCATTER.md §2).
+    `solar_open` (measured in transformers 5.15.1, docs/kernels/SCATTER.md §2).
 
     Three things at once, because the router needs all three: the values, that
     the receiver itself changed (not a copy), and that the return is the same
@@ -418,7 +418,7 @@ def test_jetmoes_gates_do_not_disturb_the_zeros_they_came_from():
 
 
 def test_scatter_writes_through_a_strided_view_and_not_into_a_copy():
-    """docs/VIEWS.md §6's failure shape, asked of the new op.
+    """docs/kernels/VIEWS.md §6's failure shape, asked of the new op.
 
     `base[:, 1]` is stride-4 and offset-1, so a kernel that wrote a contiguous
     `dst[..numel]` would corrupt the neighbouring columns rather than write
@@ -483,12 +483,12 @@ def test_masked_scatter_refuses_a_source_shorter_than_the_mask():
 
 
 def test_bucketize_is_measured_on_the_boundaries_and_not_between_them():
-    """docs/SCATTER.md §5.
+    """docs/kernels/SCATTER.md §5.
 
     `right=False` and `right=True` agree on every value that is **not** a
     boundary, so a sweep of interior points passes against either. These seven
     values include all four boundaries, which is the only place the two
-    columns differ -- the same shape docs/FIXES.md's `-300..300` sweep had.
+    columns differ -- the same shape docs/kernels/FIXES.md's `-300..300` sweep had.
     """
     got = _agree("bucketize_on_the_boundaries")
     if got is None:
@@ -616,7 +616,7 @@ def test_every_op_this_round_added_is_advertised_and_dispatchable():
 
 
 def test_reduce_is_absent_by_name_rather_than_by_omission():
-    """docs/SCATTER.md §2: **none** of the eleven architectures passes
+    """docs/kernels/SCATTER.md §2: **none** of the eleven architectures passes
     `reduce=`, so no kernel was written for it -- and this asserts the refusal
     is the *unimplemented-op* one, which is a precise work item, rather than an
     overload-resolution failure, which is a vague one.
@@ -630,7 +630,7 @@ def test_reduce_is_absent_by_name_rather_than_by_omission():
         assert "aten.scatter.reduce" in str(exc), str(exc)
     else:
         raise AssertionError(
-            "aten.scatter.reduce answers -- docs/SCATTER.md §2 says it should "
+            "aten.scatter.reduce answers -- docs/kernels/SCATTER.md §2 says it should "
             "not exist yet; if it now does, this test has served its purpose "
             "and the doc needs updating with it"
         )

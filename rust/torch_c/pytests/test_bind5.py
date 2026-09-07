@@ -1,9 +1,9 @@
-"""docs/BIND5.md -- one argument form across three architectures, and
+"""docs/bindings/BIND5.md -- one argument form across three architectures, and
 `torch.export`'s step two.
 
   1. `Tensor.new_zeros((..., 0-dim int Tensor, ...))` -- `led` and
-     `longformer`'s shared wall (docs/STRIDED.md §6). The same argument form
-     docs/BIND4.md §3 landed for `torch.zeros`, arriving at a *method* this
+     `longformer`'s shared wall (docs/kernels/STRIDED.md §6). The same argument form
+     docs/bindings/BIND4.md §3 landed for `torch.zeros`, arriving at a *method* this
      time. `chunks_count` in the borrowed
      `_sliding_chunks_query_key_matmul` is a 0-dim int64 Tensor, confirmed by
      instrumenting the real call rather than read off the source.
@@ -11,7 +11,7 @@
   1b. **The refusals, which is the half BIND4 shipped wrong.** `int(item)`
      applied to every Tensor element made this build accept a FLOAT 0-dim
      Tensor (`torch.zeros((2, tensor(3.5)))` gave a (2, 3) tensor) and a BOOL
-     one, both of which upstream refuses -- docs/ARGFORM.md's "more permissive
+     one, both of which upstream refuses -- docs/bindings/ARGFORM.md's "more permissive
      than the thing it replaces". Nothing could see it because nothing
      asserted it. Every one of upstream's three lines is asserted below,
      against a live upstream, **including the exception type**, because
@@ -19,8 +19,8 @@
      and answers `RuntimeError` where the rest answer `TypeError`.
 
   2. `torch._C._NodeBase` / `_NodeIter` / `_fx_map_arg` / `_fx_map_aggregate`
-     -- docs/EXPORT.md §6 item **2**, taken only because item 1 (the
-     dispatcher entrance) landed first in `aten.rs` (docs/DISPATCH3.md).
+     -- docs/graph/EXPORT.md §6 item **2**, taken only because item 1 (the
+     dispatcher entrance) landed first in `aten.rs` (docs/design/DISPATCH3.md).
      `torch.fx.Graph()` now constructs. The `_sort_key` arithmetic is the
      part a plausible implementation gets wrong and is separated here by
      inserting nodes in the MIDDLE of a graph, where a monotonic counter --
@@ -135,7 +135,7 @@ rec("zeros_plain_tuple", lambda: torch.zeros((2, 3, 5), dtype=torch.float32))
 rec("zeros_varargs", lambda: torch.zeros(2, 3))
 
 # --- the device-context question, for the METHOD ---------------------------
-# docs/BIND4.md §3.1: a wrapper that skips to the inner table-driven closure
+# docs/bindings/BIND4.md §3.1: a wrapper that skips to the inner table-driven closure
 # detaches `DeviceContext`, which matches by object identity.  A tensor method
 # is not among `_device_constructors()`'s 36 names, so the answer here should
 # be the RECEIVER's device either way -- asserted rather than assumed.
@@ -466,7 +466,7 @@ def test_new_zeros_led_and_longformer_spelling_now_computes():
     """`_sliding_chunks_query_key_matmul`'s literal call, borrowed verbatim by
     `modeling_led.py:440` and `modeling_longformer.py:796`: four elements, one
     of them a 0-dim int64 Tensor.  Confirmed to be a Tensor by instrumenting
-    the real model, not read off the source (docs/BIND5.md §1)."""
+    the real model, not read off the source (docs/bindings/BIND5.md §1)."""
     _agree("new_zeros_led_spelling")
 
 
@@ -514,7 +514,7 @@ def test_new_zeros_keys_on_element_count_not_on_ndim():
 
 
 def test_a_float_tensor_in_a_size_list_is_refused_as_upstream_refuses_it():
-    """**The defect docs/BIND4.md §3 shipped.** `int(item)` took `tensor(3.5)`
+    """**The defect docs/bindings/BIND4.md §3 shipped.** `int(item)` took `tensor(3.5)`
     to 3 and built a (2, 3) tensor; upstream raises.  Asserted for a
     whole-valued float too, because "it had no fractional part" is the
     plausible excuse for accepting it and upstream does not make it."""
@@ -556,7 +556,7 @@ def test_a_negative_size_tensor_refuses_but_not_with_upstreams_class():
 
 
 def test_zeros_own_accepted_forms_survive_the_tightening():
-    """The three `torch.zeros` spellings docs/BIND4.md §3 landed still work --
+    """The three `torch.zeros` spellings docs/bindings/BIND4.md §3 landed still work --
     the refusals above are a narrowing of that change, not a revert of it."""
     _agree("zeros_tensor_in_tuple")
     _agree("zeros_plain_tuple")
@@ -564,7 +564,7 @@ def test_zeros_own_accepted_forms_survive_the_tightening():
 
 
 def test_the_wrappers_are_transparent_to_a_device_context():
-    """docs/BIND4.md §3.1's trap, asked of both wrappers.
+    """docs/bindings/BIND4.md §3.1's trap, asked of both wrappers.
 
     `DeviceContext.__torch_function__` matches its constructors by OBJECT
     IDENTITY off the `torch` module, so a wrapper that skips to the inner
@@ -578,11 +578,11 @@ def test_the_wrappers_are_transparent_to_a_device_context():
 
 
 def test_the_size_list_rule_is_installed_at_exactly_two_call_sites():
-    """docs/ARGFORM.md §2's scoping, as source structure.
+    """docs/bindings/ARGFORM.md §2's scoping, as source structure.
 
     Upstream takes a Tensor in EVERY `SymInt[]` position -- `new_ones`,
     `new_empty`, `new_full`, `ones`, `empty`, `view` were all measured to
-    accept it (docs/BIND5.md §1).  This build installs it for the two
+    accept it (docs/bindings/BIND5.md §1).  This build installs it for the two
     spellings three architectures actually write, and folding it into
     `_TypeChecker` would open all of them at once with no matching
     measurement for each.  Pinned here so that generalising it is a
@@ -598,7 +598,7 @@ def test_the_size_list_rule_is_installed_at_exactly_two_call_sites():
 
 
 def test_fx_graph_constructs_and_its_root_node_matches_upstreams():
-    """docs/EXPORT.md §4.1 in four lines: an empty `Graph` builds a sentinel
+    """docs/graph/EXPORT.md §4.1 in four lines: an empty `Graph` builds a sentinel
     root `Node`, so the failure was at construction and not at the first
     operator.  Every member of that root is compared, because it is the one
     node no user ever writes and therefore the one whose defaults nothing
@@ -713,7 +713,7 @@ def test_the_positional_and_keyword_spellings_of_it_agree():
     spellings that reach them.  `resolve` has one for positionals and one for
     keywords, and the generated fast path is a THIRD -- which reproduced only
     the sized-int-list coercion and handed the raw Tensor to the dispatcher
-    for this one (docs/BIND5.md §7.2).  The Rust side unpacked it anyway, so
+    for this one (docs/bindings/BIND5.md §7.2).  The Rust side unpacked it anyway, so
     the divergence came back as a plausible answer rather than as an error."""
     _agree("multinomial_tensor")
     _agree("multinomial_tensor_kwarg")
@@ -763,7 +763,7 @@ def test_a_tensor_inside_a_sized_int_LIST_is_still_refused_here():
     This round opened SCALAR `int`/`SymInt` positions only, because that is
     what was measured and what `vilt` needs; the list positions are
     `_coerce_symint_size_tensors`'s two measured spellings and nothing more
-    (docs/BIND5.md §1.2, §7.3).
+    (docs/bindings/BIND5.md §1.2, §7.3).
 
     So this build is NARROWER than upstream here, deliberately, and the test
     says so in both directions -- if a later round opens it, this fails and

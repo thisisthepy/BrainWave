@@ -1,11 +1,11 @@
-"""docs/BIND3.md -- the three `torch._C._nn` bindings docs/VOICE3.md left open,
+"""docs/bindings/BIND3.md -- the three `torch._C._nn` bindings docs/architectures/VOICE3.md left open,
 proven **through the spelling a user writes**.
 
 `tools/golden/cases.py` already compares `aten.im2col.default`,
 `aten.col2im.default` and `aten.upsample_nearest1d.default` element-wise
 against upstream, and this file does not repeat that. Golden compares at the
 **dispatch key** and is structurally blind to whether any Python spelling
-reaches it -- which is the whole reason `docs/REACH.md` and
+reaches it -- which is the whole reason `docs/bindings/REACH.md` and
 `tools/golden/reach.py` exist, and the reason those three kernels sat in
 `reach_allow.json` for a round with a green golden run beside them.
 
@@ -291,7 +291,7 @@ def test_unfold_reaches_im2col_rather_than_some_other_kernel():
 
     Held two ways so that neither alone has to carry it: the name is installed
     (the binding exists), and the kernel it names is advertised. A binding
-    onto a missing kernel is `docs/BINDINGS.md`'s `mish` -- two lines that
+    onto a missing kernel is `docs/bindings/BINDINGS.md`'s `mish` -- two lines that
     were a door onto nothing -- and this is the check that would have caught
     it.
     """
@@ -534,7 +534,7 @@ def test_no_torch_level_spelling_was_invented_for_these_three():
 
     So these are `_nn` bindings and NOT `overloads.json` / `methods.json`
     rows. A table row would have been the easier change and would have put a
-    door on this shim that upstream does not have, which docs/SPELLINGS.md
+    door on this shim that upstream does not have, which docs/bindings/SPELLINGS.md
     refuses. Held from this side too, because the tables are what a later
     round is most likely to reach for.
     """

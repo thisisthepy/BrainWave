@@ -21,7 +21,7 @@
 //!
 //! This is a floor, not a coverage effort. Three ops are implemented. Everything
 //! else raises with its own name, so running a model produces the work queue by
-//! itself, in frequency order (§6). Details in docs/TORCH_C.md.
+//! itself, in frequency order (§6). Details in docs/design/TORCH_C.md.
 // The module must be named `_C` -- that is the name Python imports. rustc's
 // snake-case lint has no opinion worth honouring here.
 #![allow(non_snake_case)]
@@ -77,7 +77,7 @@ fn _tensor_from_flat(
     // BOOL.md §6.3 lists this function as one of the two ways the `torch.bool`
     // invariant could be broken quietly, since arbitrary `f64`s come in here.
     // It used to refuse the tag outright. It now *normalises* instead, for the
-    // reason docs/OVERLOAD.md §6.7 gave when `_tensor_new_from_data` was added:
+    // reason docs/bindings/OVERLOAD.md §6.7 gave when `_tensor_new_from_data` was added:
     // the invariant is kept by construction, not by hope, as long as every byte
     // under a `bool` tag goes through `PyTensorBase::boolean` after being
     // reduced to 0/1. `!= 0` is that reduction, and it is also what torch
@@ -203,7 +203,7 @@ fn walk_data(
 /// conversion, so `torch.tensor([...], device="mps")` died with
 /// `candle: Metal contiguous to_dtype F64 F32 not implemented`. That is where a
 /// GPT-2 forward on `mps` stopped, in `modeling_gpt2.py`'s attention mask
-/// (docs/MPSATTN.md §3).
+/// (docs/devices/MPSATTN.md §3).
 ///
 /// Doing both steps on the CPU first is `aten.rs::host_const`'s argument at
 /// literal scale, and it is **not** a host readback: nothing of any dispatched
@@ -343,7 +343,7 @@ fn _tensor_new_from_data(
 /// Rust extension and then calls exactly one torch function per tensor --
 /// `torch.frombuffer(v["data"], dtype=dtype).reshape(v["shape"])`
 /// (`safetensors/torch.py:468`). Measured: with this function and nothing else,
-/// that path goes from its first wall to a full state dict. See docs/CKPT.md.
+/// that path goes from its first wall to a full state dict. See docs/models/CKPT.md.
 ///
 /// **This copies; upstream aliases.** `torch.frombuffer` upstream returns a
 /// tensor that shares memory with the buffer -- writing to the buffer changes
@@ -353,7 +353,7 @@ fn _tensor_new_from_data(
 /// invisible (the buffer is read once and dropped), and it is recorded rather
 /// than fixed because fixing it means a storage concept candle does not have.
 /// Anything that relies on the aliasing gets wrong answers quietly, so it is
-/// written down here and in docs/CKPT.md rather than left to be discovered.
+/// written down here and in docs/models/CKPT.md rather than left to be discovered.
 ///
 /// The `ValueError` messages are upstream's, transcribed from torch 2.13.0 by
 /// running each failing case. Behaviour, not just wording: `count == 0` is an
@@ -421,7 +421,7 @@ fn _frombuffer(
     // buffer. Sharing it means the dtype narrowing and the `torch.bool`
     // normalisation cannot drift between the safetensors path and the
     // `torch.load` path -- both are checkpoint readers, and the two agreeing is
-    // exactly what docs/CKPT.md §1 measures (worst difference: 0.0).
+    // exactly what docs/models/CKPT.md §1 measures (worst difference: 0.0).
     let wrapped = crate::tensor::from_le_bytes(OP, slice, &[numel as usize], dtype.tag())?;
     let out = crate::tensor::promote(py, wrapped.into_pyobject(py)?.into_any().unbind())?;
     carry_requires_grad(py, out, requires_grad)
@@ -431,7 +431,7 @@ fn _frombuffer(
 ///
 /// The two here (`frombuffer`, `asarray`) used to refuse it, alongside the five
 /// Python-level doors `bootstrap.py::_strip_python_only_kwargs` covers. Those
-/// five now carry the flag (docs/BACKWARD2.md §4.1: the refusal protected a
+/// five now carry the flag (docs/training/BACKWARD2.md §4.1: the refusal protected a
 /// *spelling*, since `.requires_grad_(True)` reaches the same tensor), and
 /// leaving these two refusing would re-create the inconsistency one door over.
 ///
@@ -462,12 +462,12 @@ fn carry_requires_grad(
 /// `dtype=torch.uint8`, plus `device="cpu"` on the `get_tensor` path. The
 /// result is then `.view(real_dtype).reshape(shape)`. Together with
 /// `UntypedStorage.from_file` and `aten::view.dtype` this is what the default
-/// `from_pretrained` route to a safetensors checkpoint costs; docs/CKPT2.md §4.
+/// `from_pretrained` route to a safetensors checkpoint costs; docs/models/CKPT2.md §4.
 ///
 /// **The narrowing is real and is refused by name.** Upstream's `asarray` also
 /// takes tensors, sequences, scalars, numpy arrays and buffer objects, and
 /// implementing those would be re-deriving `torch.tensor`'s conversion rules
-/// with no measured caller -- docs/E2E_REAL.md §1.2 is about exactly that kind
+/// with no measured caller -- docs/models/E2E_REAL.md §1.2 is about exactly that kind
 /// of speculative surface. Anything but a storage stops here with the type it
 /// was given and a pointer at the two functions that do take those.
 ///
@@ -581,7 +581,7 @@ const SURFACE: &str = include_str!("surface.json");
 /// The signature list `torch.<op>(...)` resolves against, per op, in order.
 /// Unlike `SURFACE` this is not generated from the vendored tree -- the tree
 /// carries aten overload *names* and Python-level signatures but nothing that
-/// joins them (docs/OVERLOAD.md §2) -- so it is transcribed and checked by
+/// joins them (docs/bindings/OVERLOAD.md §2) -- so it is transcribed and checked by
 /// `pytests/verify_schemas.py` against an installed upstream torch. Compiled
 /// in the same way: nothing is read from disk at runtime.
 const OVERLOADS: &str = include_str!("overloads.json");
@@ -589,7 +589,7 @@ const OVERLOADS: &str = include_str!("overloads.json");
 /// The same, for `tensor.<method>(...)`. A separate table because upstream has
 /// a separate binding: `THPVariable_mul` (a `TensorBase` method) and the
 /// `_VariableFunctions` entry are different C functions with different
-/// signature lists, which is why docs/C_SURFACE.md counted the two surfaces
+/// signature lists, which is why docs/design/C_SURFACE.md counted the two surfaces
 /// apart -- 50 `TensorBase` members called against 13 hoisted functions.
 /// Checked by the same `pytests/verify_schemas.py`.
 const METHODS: &str = include_str!("methods.json");
@@ -627,7 +627,7 @@ fn run_bootstrap(m: &Bound<'_, PyModule>) -> PyResult<()> {
 /// a job that takes tens of microseconds on one core to four or eight cores and
 /// pays more in wakeups than it saves.
 ///
-/// `docs/PERF_ANDROID.md` §4 has the sweep. On the host (M1, 8 cores, idle) a
+/// `docs/perf/PERF_ANDROID.md` §4 has the sweep. On the host (M1, 8 cores, idle) a
 /// 96x96x96 matmul is 0.0247 ms on one thread and 0.042-0.049 ms threaded --
 /// threading loses 1.7-2.0x -- while 192x192x192 and up win 2-3.4x. The
 /// crossover sits at 2-4 M multiply-adds. On the Android device the crossover
@@ -649,7 +649,7 @@ const GEMM_THREADING_THRESHOLD: usize = 4_000_000;
 /// `AtomicUsize` with a public setter, so this is the whole of the fix.
 ///
 /// `BW_GEMM_THREADING_THRESHOLD` overrides it so the measurement in
-/// `docs/PERF_ANDROID.md` can be re-run without a rebuild.
+/// `docs/perf/PERF_ANDROID.md` can be re-run without a rebuild.
 fn apply_gemm_threading_threshold() {
     let value = std::env::var("BW_GEMM_THREADING_THRESHOLD")
         .ok()

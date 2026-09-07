@@ -1,7 +1,7 @@
 /* nnapi_runner -- execute an upstream `_nnapi/serializer.py` blob on a real
  * NNAPI runtime.
  *
- * docs/NPU2.md is what this file exists for. `torchnative/export/nnapi.py`
+ * docs/graph/NPU2.md is what this file exists for. `torchnative/export/nnapi.py`
  * drives upstream's serialiser and then *decodes* the blob it produced
  * (`parse_model`) -- which proves the layout and nothing about arithmetic.
  * This program is the other half: it reads the same layout and replays it into
@@ -173,7 +173,7 @@ int main(int argc, char **argv) {
            n_operands, n_values, n_operations, n_inputs, n_outputs);
 
     /* Pick the driver. Naming one is the point: "NNAPI ran it" and "this
-     * driver ran it" are different claims (docs/NPU2.md). */
+     * driver ran it" are different claims (docs/graph/NPU2.md). */
     uint32_t n_dev = 0;
     CHECK(ANeuralNetworks_getDeviceCount(&n_dev));
     ANeuralNetworksDevice *chosen = NULL;

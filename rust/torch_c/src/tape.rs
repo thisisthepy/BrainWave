@@ -1,6 +1,6 @@
 //! Reverse mode over a captured trace.
 //!
-//! `docs/AUTOGRAD.md` §6 chose this shape over a `VariableType` equivalent and
+//! `docs/training/AUTOGRAD.md` §6 chose this shape over a `VariableType` equivalent and
 //! gave the reason: upstream's dispatcher has many doors, so recording
 //! gradients there needs a generated wrapper per op; this shim has one door and
 //! the recorder is already one line at the end of it. §6.2 then showed the
@@ -18,7 +18,7 @@
 //! Three properties come from capture rather than from anything here, and they
 //! are the ones a reverse mode is usually built to establish:
 //!
-//! * **Single assignment.** Capture refuses in-place ops (docs/CAPTURE.md §4),
+//! * **Single assignment.** Capture refuses in-place ops (docs/graph/CAPTURE.md §4),
 //!   so no recorded value is ever overwritten between its use and this walk.
 //!   Upstream spends `ADInplaceOrView` and a version counter per tensor on
 //!   exactly this.
@@ -30,11 +30,11 @@
 //!
 //! **The rules are compositions, not kernels.** A derivative here is spelled in
 //! ops the shim already has and dispatched through the same door. That is what
-//! makes the bill in `docs/AUTOGRAD.md` §4 -- "25 need their own kernel" --
+//! makes the bill in `docs/training/AUTOGRAD.md` §4 -- "25 need their own kernel" --
 //! not the bill for this file: the backward runs *outside* a capture region, so
 //! it may use ops capture would refuse to record, and it may recompute rather
 //! than read a saved value. `_scaled_dot_product_flash_attention_for_cpu` is
-//! the case where that matters most and `docs/BACKWARD.md` §5 measures it.
+//! the case where that matters most and `docs/training/BACKWARD.md` §5 measures it.
 
 use std::collections::{HashMap, HashSet};
 
@@ -233,7 +233,7 @@ impl<'py> Operand<'py> {
 /// Both spellings have to be handled and neither is hypothetical: the vendored
 /// tree's `_torch_level_function` binds every argument by name before
 /// dispatching, so a trace holds `aten.sum.default() {'self': %1}` for one op
-/// and `aten.addmm.default(%c1, %in0, %0)` for the next (docs/CAPTURE.md §2).
+/// and `aten.addmm.default(%c1, %in0, %0)` for the next (docs/graph/CAPTURE.md §2).
 /// A rule that read `args[0]` would be right half the time.
 fn bind<'py>(
     py: Python<'py>,
@@ -360,7 +360,7 @@ fn i64_list(operands: &[Option<Operand<'_>>], index: usize, name: &str, op: &str
 /// here has a gradient case in `pytests/test_shim.py` compared against
 /// upstream, and that test asserts its own case list equals this one. A name
 /// added here without a case makes that test fail, which is the only way a
-/// second list of op names stays honest in this repository (docs/AUDIT.md).
+/// second list of op names stays honest in this repository (docs/verification/AUDIT.md).
 pub const RULE_OPS: &[&str] = &[
     "aten._log_softmax.default",
     "aten._safe_softmax.default",
@@ -943,7 +943,7 @@ fn derivative<'py>(
             // `transformers` builds its shifted labels with `F.pad`, so this is
             // on the path of every `labels=` forward. That it is reached at all
             // by *ids* rather than by an activation is what §3 of
-            // docs/BACKWARD.md is about.
+            // docs/training/BACKWARD.md is about.
             let ops = bind(py, node, env, &["self", "pad", "value"])?;
             let source = required(op, &ops, 0, "self")?;
             let shape = source.shape()?;
@@ -1028,7 +1028,7 @@ fn derivative<'py>(
         // The third argument is `dtype`, not `half_to_float`, so this cannot
         // share `_softmax`'s arm even though the expression is identical: the
         // vendored tree binds arguments by *name* before dispatching
-        // (docs/CAPTURE.md §2), so a trace can hold `{'dtype': ...}` and a
+        // (docs/graph/CAPTURE.md §2), so a trace can hold `{'dtype': ...}` and a
         // rule reading `half_to_float` would find nothing there.
         //
         // **A fully-masked row is where the two softmaxes differ, and it is a
@@ -1122,9 +1122,9 @@ fn derivative<'py>(
         // ---------------------------------------------------------- embedding
         //
         // Upstream calls this `embedding_dense_backward` and it is one of the
-        // five ops docs/AUTOGRAD.md §5.1 listed as missing. It is a scatter-add
+        // five ops docs/training/AUTOGRAD.md §5.1 listed as missing. It is a scatter-add
         // into a zero buffer -- `index_put_(accumulate=True)`, which
-        // docs/VIEWS.md §7 landed.
+        // docs/kernels/VIEWS.md §7 landed.
         //
         // **It was a one-hot matrix and a matmul until that flag existed**, and
         // the switch is not only about the `[vocab, tokens]` intermediate the
@@ -1132,9 +1132,9 @@ fn derivative<'py>(
         // compositions are not the same function at reduced precision:
         // upstream's kernel is `*dst += *src` in the receiver's dtype, so the
         // running sum is rounded at every step, while a matmul accumulates in
-        // `float32` (docs/ARCH.md's GEMM accumulate-dtype rule) and rounds
-        // once. docs/VIEWS.md §7.4 measured both against upstream and this one
-        // is the one that agrees; §4.5 of docs/BACKWARD.md measures the
+        // `float32` (docs/architectures/ARCH.md's GEMM accumulate-dtype rule) and rounds
+        // once. docs/kernels/VIEWS.md §7.4 measured both against upstream and this one
+        // is the one that agrees; §4.5 of docs/training/BACKWARD.md measures the
         // difference on the real table. At `float32` they are identical, so the
         // switch cannot move a `float32` gradient -- which is the check that
         // says nothing else came with it.
@@ -1204,7 +1204,7 @@ fn derivative<'py>(
 
 /// `nll_loss_forward` -> the gradient of its first result.
 ///
-/// The three things this has to get right are the three `docs/LOSS.md` §3
+/// The three things this has to get right are the three `docs/training/LOSS.md` §3
 /// found in the forward, read from the other side:
 ///
 /// * the divisor for `reduction=Mean` is `total_weight`, the op's **second**
@@ -1326,18 +1326,18 @@ fn cast_like<'py>(py: Python<'py>, g: Obj<'py>, like: &Obj<'py>) -> PyResult<Obj
 /// implementation omits**: they are the correction for the fact that `mean` and
 /// `rstd` are themselves functions of every element of the row, so a rule that
 /// stops at `rstd * gh` -- which has the right shape, the right dtype and the
-/// right order of magnitude -- is wrong everywhere and looks right. `docs/BACKWARD.md`
+/// right order of magnitude -- is wrong everywhere and looks right. `docs/training/BACKWARD.md`
 /// §7's T3 is the same shape of omission one layer down.
 ///
 /// **`mean` and `rstd` are read off the forward's second and third results**
 /// rather than recomputed. That is what those results are *for* -- the same
-/// reading `docs/LOSS.md` §3.1 made of `nll_loss_forward`'s `total_weight`, and
+/// reading `docs/training/LOSS.md` §3.1 made of `nll_loss_forward`'s `total_weight`, and
 /// it is the reading that matters under mixed precision, where `aten.rs`
 /// measured the statistics following the *parameter* dtype and not the input's.
 /// Recomputing them would silently substitute the input's precision there.
-/// **W11** (docs/BACKWARD8.md §2): the derivative of `native_batch_norm`.
+/// **W11** (docs/training/BACKWARD8.md §2): the derivative of `native_batch_norm`.
 ///
-/// The reason it is here is a measurement, not a checklist. `docs/BACKWARD7.md`
+/// The reason it is here is a measurement, not a checklist. `docs/training/BACKWARD7.md`
 /// §10 row 3 predicted that a model writing a buffer mid-forward -- a KV cache,
 /// a batch-norm running statistic -- would be refused where upstream answers,
 /// and had not checked it against a real model. Checked: a real
@@ -1371,7 +1371,7 @@ fn cast_like<'py>(py: Python<'py>, g: Obj<'py>, like: &Obj<'py>) -> PyResult<Obj
 /// `aten::convolution`'s three gradients, and every one of them is spelled as
 /// another convolution through the same door the forward used.
 ///
-/// **Nothing here is a kernel.** `docs/RELEASE_0_0_13a0.md` §5 lists "there is
+/// **Nothing here is a kernel.** `docs/platform/RELEASE_0_0_13a0.md` §5 lists "there is
 /// still no convolution backward rule" as the reason a vision model does not
 /// train, and the shape of the missing thing is not a new `conv2d`: upstream's
 /// `convolution_backward` is itself three convolutions, and this shim already
@@ -2158,7 +2158,7 @@ fn layer_norm_backward<'py>(
 /// ```
 ///
 /// **The mask is read off the forward's second result, and that is the whole
-/// reason the op returns one.** `docs/LOSS.md` §3.1's reading of
+/// reason the op returns one.** `docs/training/LOSS.md` §3.1's reading of
 /// `nll_loss_forward`'s `total_weight` met for the third time, and here it is
 /// not an optimisation: a dropout mask *cannot* be recomputed. There is no
 /// function of the input that says which elements were dropped, so a rule that
@@ -2183,7 +2183,7 @@ fn layer_norm_backward<'py>(
 ///   2.13.0 at `p = 0.7`, they are *different numbers* in `bfloat16` and
 ///   `float16` and identical in `float32` and `float64`; a plain
 ///   `loss.backward()` takes the first, so this rule does.
-/// * **The scalar is not narrowed to the tensor's dtype.** `docs/SCALAR.md`
+/// * **The scalar is not narrowed to the tensor's dtype.** `docs/numerics/SCALAR.md`
 ///   fixed `mul.Scalar` to follow upstream's un-narrowed
 ///   `original_scalar_value<opmath_t>`, and this rule inherits that by
 ///   spelling the multiply as `mul.Scalar`. A `bfloat16(1/0.3)` here would
@@ -2241,7 +2241,7 @@ fn native_dropout_backward<'py>(
 
 /// `_scaled_dot_product_flash_attention_for_cpu` -> gradients for q, k and v.
 ///
-/// `docs/AUTOGRAD.md` §5.1 named this the one op on SmolLM2's backward path
+/// `docs/training/AUTOGRAD.md` §5.1 named this the one op on SmolLM2's backward path
 /// that is a real CPU kernel with **no** Core ATen decomposition, and therefore
 /// the one thing that would have to be hand-written. That is true of a
 /// *kernel*; it is not true of a *rule*. The tape's backward runs outside a
@@ -2258,7 +2258,7 @@ fn native_dropout_backward<'py>(
 /// Every op in that is one the shim already has. What it costs is a second
 /// forward attention and the memory for one `[B, H, T, S]` probability matrix
 /// per layer -- upstream's fused kernel exists to avoid exactly that, so this
-/// is a correctness-for-memory trade and `docs/BACKWARD.md` §5 measures both
+/// is a correctness-for-memory trade and `docs/training/BACKWARD.md` §5 measures both
 /// sides of it.
 fn sdpa_backward<'py>(
     py: Python<'py>,
@@ -2490,13 +2490,13 @@ pub fn backward<'py>(
 /// The reverse walk, over a record and an `Env` that **already holds the
 /// values**.
 ///
-/// Split out of `backward` for W8 (`docs/BACKWARD7.md`). `backward` is this
+/// Split out of `backward` for W8 (`docs/training/BACKWARD7.md`). `backward` is this
 /// plus `trace.run()` -- a *replay* that reconstructs the forward, which a
 /// `CaptureTrace` needs because it drops its keepalives at `_capture_end`. An
 /// eager tape does not need it: it never stopped holding the values, so its
 /// `Env` is the objects the program actually computed, and handing them
-/// straight to this function is the whole of the reuse `docs/BACKWARD3.md` §4
-/// and `docs/BACKWARD5.md` §4 argued for. Not one derivative rule below knows
+/// straight to this function is the whole of the reuse `docs/training/BACKWARD3.md` §4
+/// and `docs/training/BACKWARD5.md` §4 argued for. Not one derivative rule below knows
 /// which of the two called it, and `derivative()`, `wrt_set()`, `reachable()`
 /// and `wanted()` are shared verbatim.
 pub(crate) fn backward_in<'py>(
@@ -2681,7 +2681,7 @@ pub fn differentiable<'py>(
 ///
 /// `pytests/test_shim.py` asserts that its own gradient-case list equals this,
 /// which is what keeps the table and the cases from drifting -- the failure
-/// mode docs/AUDIT.md found six times is a second list nobody re-reads.
+/// mode docs/verification/AUDIT.md found six times is a second list nobody re-reads.
 #[pyfunction]
 #[pyo3(name = "_tape_rules")]
 pub fn tape_rules(py: Python<'_>) -> PyResult<Bound<'_, PyList>> {

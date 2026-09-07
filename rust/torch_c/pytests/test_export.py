@@ -1,8 +1,8 @@
 """`torch.export` -- what the front end needs, and the wall past the census.
 
-`docs/COMPILE.md` §3 censused the `torch.export` blockers with crude no-ops and
+`docs/graph/COMPILE.md` §3 censused the `torch.export` blockers with crude no-ops and
 recommended spending the `torch.compile` effort here, because none of the 18
-names it found is abi3-impossible.  `docs/EXPORT.md` re-derived that census with
+names it found is abi3-impossible.  `docs/graph/EXPORT.md` re-derived that census with
 **real implementations** (`torchnative.export.upstream`) instead of no-ops and
 found two things the no-op census could not have seen:
 
@@ -11,7 +11,7 @@ found two things the no-op census could not have seen:
 2. **`torch.fx.Graph()` cannot be constructed in this shim**, and **no
    `TorchDispatchMode` ever sees an operator**.  Every graph front end upstream
    has -- export, `make_fx`, Dynamo -- is built on those two, so the census was
-   never the road.  `docs/EXPORT.md` §4.
+   never the road.  `docs/graph/EXPORT.md` §4.
 
 The tests here hold both halves down.  Most of them check that
 `torchnative.export.upstream` does what it says: real `DispatchKeySet`s, a mode
@@ -52,7 +52,7 @@ from torchnative.export import upstream
 
 # --- the census names, BEFORE anything is installed -------------------------
 #
-# docs/EXPORT5.md §7 moved every one of these into `bootstrap.py`, so the
+# docs/graph/EXPORT5.md §7 moved every one of these into `bootstrap.py`, so the
 # question this probe asks changed direction: it used to be "did install()
 # replace the placeholders", and it is now "**are they already implemented
 # before anyone calls anything**". That is the stronger claim and it is the one
@@ -329,7 +329,7 @@ def test_install_leaves_no_stub_among_the_names_it_claims():
 def test_install_is_idempotent_in_the_only_sense_that_matters():
     """A second `install()` must find nothing left to replace.
 
-    Since docs/EXPORT5.md §7 this holds for a stronger reason than it used to:
+    Since docs/graph/EXPORT5.md §7 this holds for a stronger reason than it used to:
     the **first** call finds nothing to replace either, because the names are
     installed by `bootstrap.py` before anything imports them. The assertion is
     unchanged; what changed underneath it is that it can no longer pass by
@@ -341,7 +341,7 @@ def test_install_is_idempotent_in_the_only_sense_that_matters():
     assert r["second_replaced"] == [], r["second_replaced"]
     assert r["replaced"] == [], (
         "install() replaced something, so a census name was still a placeholder "
-        "at import time -- docs/EXPORT5.md §7's hand-off is incomplete: "
+        "at import time -- docs/graph/EXPORT5.md §7's hand-off is incomplete: "
         f"{r['replaced']}"
     )
 
@@ -349,11 +349,11 @@ def test_install_is_idempotent_in_the_only_sense_that_matters():
 def test_the_census_names_are_implemented_by_the_bootstrap_with_no_install_call():
     """The re-derived census, as a test rather than as prose -- **inverted.**
 
-    This used to assert that every name in `docs/EXPORT.md` §2's "was a raising
+    This used to assert that every name in `docs/graph/EXPORT.md` §2's "was a raising
     stub" column appeared in `install()`'s `replaced` list, which was the right
     claim while `torchnative/export/upstream.py` installed them at runtime.
 
-    `docs/EXPORT5.md` §7 moved them into `bootstrap.py`, so `replaced` is now
+    `docs/graph/EXPORT5.md` §7 moved them into `bootstrap.py`, so `replaced` is now
     empty and that assertion would pass vacuously if it were merely relaxed.
     The claim is therefore turned around into the stronger one the hand-off is
     actually for: **each census name is already an implementation before
@@ -369,7 +369,7 @@ def test_the_census_names_are_implemented_by_the_bootstrap_with_no_install_call(
     r = _fixture()
     assert r["census_stubbed_before_any_install"] == [], (
         "these census names were still placeholders at import time, before any "
-        "install() call -- the bootstrap hand-off (docs/EXPORT5.md §7) does not "
+        "install() call -- the bootstrap hand-off (docs/graph/EXPORT5.md §7) does not "
         f"cover them: {r['census_stubbed_before_any_install']}"
     )
     census = {
@@ -393,7 +393,7 @@ def test_the_census_names_are_implemented_by_the_bootstrap_with_no_install_call(
         "_profiler.gather_traceback",
         "_dynamo.guards.set_is_in_mode_without_ignore_compile_internals",
     }
-    # `census` is kept as the explicit list of the twenty names docs/EXPORT.md
+    # `census` is kept as the explicit list of the twenty names docs/graph/EXPORT.md
     # §1 enumerated, so that this test still names *what* it is checking rather
     # than deferring entirely to `installed_names()`. Every one of them must be
     # covered by the probe above, and none of them may be a placeholder.
@@ -448,7 +448,7 @@ def test_the_dispatch_mode_stack_counts_instead_of_answering_zero():
 
     A constant zero is not a stub -- it is an ordinary function with a comment
     saying nothing pushes onto the stack -- and it is nonetheless the shape of
-    silence `docs/COMPILE.md` §5 refuses: `with SomeMode():` would enter, be
+    silence `docs/graph/COMPILE.md` §5 refuses: `with SomeMode():` would enter, be
     reported as absent, and change nothing.
     """
     if not _available():
@@ -503,7 +503,7 @@ def test_inference_mode_is_a_context_manager():
 # ---------------------------------------------------------------------------
 
 def test_the_view_detector_finds_the_views_this_storage_model_can_prove():
-    """`docs/EXPORT.md` §3.2.  `x[1:, 1:]` is proven by a non-zero storage
+    """`docs/graph/EXPORT.md` §3.2.  `x[1:, 1:]` is proven by a non-zero storage
     offset, `x.t()` by non-contiguous strides.  Both agree with upstream on the
     same tensors, measured side by side."""
     if not _available():
@@ -598,12 +598,12 @@ def test_a_graph_front_end_is_not_offered_while_modes_are_not_consulted():
     )
     assert not r["fx_graph_builds"], (
         "torch.fx.Graph() now builds while modes are still not consulted; the "
-        "empty-graph risk in docs/EXPORT.md §4 is live and this test needs the "
+        "empty-graph risk in docs/graph/EXPORT.md §4 is live and this test needs the "
         "graph itself checked, not its absence"
     )
     assert r["fx_graph_refusal"] is not None
 
-    # The hole `docs/BIND3.md` §7 found in this test, named rather than closed.
+    # The hole `docs/bindings/BIND3.md` §7 found in this test, named rather than closed.
     #
     # Every assertion above reads False in *both* columns of the case that
     # matters. A round that installs EXPORT.md §3's census names makes
@@ -627,12 +627,12 @@ def test_a_graph_front_end_is_not_offered_while_modes_are_not_consulted():
         print(
             "    NOTE: a TorchDispatchMode enters and reports depth "
             f"{r['stack_len_inside']} while seeing no operators -- "
-            "docs/EXPORT.md §6, the dispatcher entrance is not landed"
+            "docs/graph/EXPORT.md §6, the dispatcher entrance is not landed"
         )
 
 
 def test_capture_is_the_only_working_front_end_and_records_the_module_it_ran():
-    """`capture.rs` is the oracle `docs/EXPORT.md` §5 compares against.
+    """`capture.rs` is the oracle `docs/graph/EXPORT.md` §5 compares against.
 
     Three ops for `(x * 2 + 1).relu()`, in order.  Upstream's `make_fx` on the
     same module records `aten.mul.Tensor`, `aten.add.Tensor`,

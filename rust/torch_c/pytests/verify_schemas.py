@@ -5,14 +5,14 @@ schema string by schema string.
 Why this exists
 ---------------
 `surface.json` is generated from the vendored tree's own `.pyi` stubs, and
-docs/IMPORT_TORCH.md §1 gives the reason: borrowing names from the upstream
+docs/models/IMPORT_TORCH.md §1 gives the reason: borrowing names from the upstream
 `_C.so` would make the build depend on the binary we are replacing. The
 overload table cannot be produced the same way. The tree carries the aten
 *overload names* (`aten.arange.start_step` and 980 more appear literally in
 `_decomp`/`_meta_registrations`/`_refs`) and it carries Python-level
 signatures (`torch/_C/_VariableFunctions.pyi`), but nothing in it joins the
 two -- a `.pyi` overload does not say which aten overload it lowers to. See
-docs/OVERLOAD.md §2.
+docs/bindings/OVERLOAD.md §2.
 
 So the table is transcribed, and a transcription needs a check. This script
 is that check: it re-derives every schema from an installed upstream torch
@@ -98,7 +98,7 @@ def check(label: str, path: str, torch) -> tuple[int, int]:
 
 # The `_c10d_functional` family, which is not a JSON table but a tuple literal
 # in `bootstrap.py`. Same problem, same answer: the text was transcribed from
-# upstream's own registry (docs/DISTRIBUTED.md), so it needs the same check.
+# upstream's own registry (docs/distributed/DISTRIBUTED.md), so it needs the same check.
 #
 # It is read out of the source with `ast` rather than imported, because
 # importing `bootstrap.py` means importing the shim, and this script has to run
@@ -221,11 +221,11 @@ def _normalise(schema: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# What the shim actually answers (docs/SCHEMA.md)
+# What the shim actually answers (docs/bindings/SCHEMA.md)
 # ---------------------------------------------------------------------------
 #
 # The three checks above compare *tables* against upstream. A table can be
-# right and the answer still wrong: docs/DISTRIBUTED.md §8.1 is exactly that
+# right and the answer still wrong: docs/distributed/DISTRIBUTED.md §8.1 is exactly that
 # case, `overloads.json` matching upstream 255/255 while
 # `torch.ops.aten.add_.Tensor._schema.is_mutable` was False, because the
 # schema the tree reads never came from a table at all. So this asks the shim
@@ -295,7 +295,7 @@ for key in torch._C._aten_implemented():
     }
 out["unanswered"] = torch._C._shim_unanswered_predicates()
 
-# docs/DECOMP.md §3. `_jit_get_operation` used to report `["default"]` for
+# docs/graph/DECOMP.md §3. `_jit_get_operation` used to report `["default"]` for
 # every packet, so `@register_decomposition(aten.transpose)` landed on
 # `aten.transpose.default` -- an overload no torch has. The overload list is
 # read out of `native_functions.yaml` now, and upstream is what it is diffed
@@ -315,7 +315,7 @@ for _key in _packets:
 out["cia"] = torch._C._dispatch_get_registrations_for_dispatch_key(
     "CompositeImplicitAutograd")
 
-# docs/DECOMP.md §2: `OpOverload.tags` was `[]` for every op.
+# docs/graph/DECOMP.md §2: `OpOverload.tags` was `[]` for every op.
 out["tags"] = {}
 for _key in torch._C._aten_implemented():
     _ns, _name, _ov = _key.split(".")
@@ -353,7 +353,7 @@ def check_shim_schemas(torch) -> tuple[int, int]:
     """Every implemented op's `_schema`, character for character, plus
     `is_mutable`.
 
-    The judgement docs/DISTRIBUTED.md §8.1 set. `is_mutable` is checked
+    The judgement docs/distributed/DISTRIBUTED.md §8.1 set. `is_mutable` is checked
     separately from the text rather than being taken as implied by it, because
     the two failures this predicate has had were both invisible in the text:
     it was a bound method (always truthy), then a property over an empty
@@ -366,7 +366,7 @@ def check_shim_schemas(torch) -> tuple[int, int]:
     failures = 0
     for key, entry in sorted(report["ops"].items()):
         # The namespace off the key, not a literal `aten`. The implemented set
-        # is two namespaces since docs/PRIMS.md, and `torch.ops.aten.clone`
+        # is two namespaces since docs/kernels/PRIMS.md, and `torch.ops.aten.clone`
         # exists -- so hardcoding `aten` would silently check
         # `prims.clone.default` against a *different operator's* schema and
         # call it a match, which is worse than the AttributeError
@@ -492,7 +492,7 @@ def check_unanswered(torch) -> tuple[int, int]:
 def check_overload_names(torch) -> tuple[int, int]:
     """Every implemented op's packet must list the overloads upstream lists.
 
-    docs/DECOMP.md §3 is what this exists for. `_jit_get_operation` answered
+    docs/graph/DECOMP.md §3 is what this exists for. `_jit_get_operation` answered
     `["default"]` for every packet, and nothing in the repository could see
     that: the schema checks above ask about one `(name, overload)` at a time
     and are right whatever the *list* says, and in-tree tests have no upstream
@@ -521,7 +521,7 @@ def check_overload_names(torch) -> tuple[int, int]:
 
     The `.out` carve-out is not a convenience. Every missing overload that
     carries a rule is one of torchgen's generated `.out` variants
-    (docs/SCHEMA.md §12's 1148, which need `pyyaml` to generate), and no
+    (docs/bindings/SCHEMA.md §12's 1148, which need `pyyaml` to generate), and no
     `.out` aten key is implemented in this build -- asserted below rather than
     said -- so no recording can contain one and no rule for one can be
     wanted. If a missing overload with a rule ever has another shape, that is
@@ -583,12 +583,12 @@ def check_overload_names(torch) -> tuple[int, int]:
 def check_tags(torch) -> tuple[int, int]:
     """`OpOverload.tags`, per implemented op, against upstream's.
 
-    It was `[]` for everything. docs/DECOMP.md §2 measured one consequence
+    It was `[]` for everything. docs/graph/DECOMP.md §2 measured one consequence
     (`torch.Tag.core in op.tags` False for every op) and the CIA collection
     above is the other (`maybe_aliasing_or_mutating` unreadable, so
     `aten.dropout.default` was collected where upstream excludes it). Both are
     "an empty answer read as a negative", the same shape as
-    docs/DISTRIBUTED.md §8.1 -- and the same reason this is diffed against a
+    docs/distributed/DISTRIBUTED.md §8.1 -- and the same reason this is diffed against a
     real torch rather than asserted in-repo.
 
     A tag name dropped for want of a `_C.Tag` member is a failure here even
@@ -637,7 +637,7 @@ def check_cia_registrations(torch) -> tuple[int, int]:
 
     A name upstream registers and this does not is allowed **only if the file
     does not declare that operator at all** -- the file is not a complete list
-    of aten names (docs/SCHEMA.md §8.2), and 2.13.0's one absentee here is
+    of aten names (docs/bindings/SCHEMA.md §8.2), and 2.13.0's one absentee here is
     `aten::get_gradients`, a TorchScript builtin. A missing name the file
     *does* declare means the scan lost it, which is what dropping
     `torchgen/model.py:872`'s implicit default would do to two thirds of the
@@ -752,7 +752,7 @@ def main() -> int:
     else:
         print(f"  shim _schema text: SKIPPED -- no {VENDOR_SHIM}")
         print("    (run vendor/install_shim.sh; this is the check that would "
-              "have caught docs/DISTRIBUTED.md §8.1)")
+              "have caught docs/distributed/DISTRIBUTED.md §8.1)")
 
     # The other direction is deliberately *not* an error. The tables list the
     # overloads torch's Python bindings expose, which is a subset: `aten::pow`

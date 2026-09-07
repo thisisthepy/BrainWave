@@ -44,7 +44,7 @@ than answering nearby easier ones.
 What it does NOT establish: that the extension loads, that `import torch`
 completes, or that any kernel computes. For Android that gap is closed
 separately by `tools/wheel/verify_android.py`, which runs on a device. For iOS
-it is open -- see docs/WHEEL.md §7.
+it is open -- see docs/platform/WHEEL.md §7.
 
 Exit 0 means every check above passed. Any failure prints `FAIL:` lines and
 exits 1.
@@ -160,7 +160,7 @@ class Expectation:
     extension_member = "torch/_C.abi3.so"
 
     #: `_manager_path()` checks this exists -- but only on non-Windows, where it
-    #: returns `b""` before looking. docs/VENDOR.md wall 4.
+    #: returns `b""` before looking. docs/platform/VENDOR.md wall 4.
     shm_manager_required = True
 
     def check_linkage(self, zf: zipfile.ZipFile, names: list[str],
@@ -540,7 +540,7 @@ class WindowsExpectation(Expectation):
 # Where the Pyodide distribution lives. Same shape as `TARGET_PYTHON_ROOT` above
 # and deliberately a *second* variable rather than a subdirectory of it: the
 # thing being read here is not a CPython distribution. It is a Pyodide one, and
-# the difference is the whole of docs/WASM.md §9.4a -- the tag's version
+# the difference is the whole of docs/platform/WASM.md §9.4a -- the tag's version
 # component exists only in Pyodide's `pyodide-lock.json`, and the CPython inside
 # it answers a different, plausible, wrong tag.
 PYODIDE_ROOT = Path(os.environ.get(
@@ -566,7 +566,7 @@ class PyEmscriptenExpectation(Expectation):
                               `env.__indirect_function_table`; a main-module
                               link defines and exports them, and Emscripten's
                               `dlopen` refuses it. This is the wasm spelling of
-                              "is it a DLL and not an EXE", and docs/WASM.md
+                              "is it a DLL and not an EXE", and docs/platform/WASM.md
                               §9.2 hit it: `ctypes.CDLL` on the global-deps stub
                               is `dlopen`, so *both* wasm members have to be
                               side modules, not only the extension.
@@ -591,7 +591,7 @@ class PyEmscriptenExpectation(Expectation):
                                and not `python313.dll`. Emscripten attributes
                                every undefined symbol to the single import
                                module `env`, so that distinction has no wasm
-                               spelling. docs/WASM.md §9.3 makes this less
+                               spelling. docs/platform/WASM.md §9.3 makes this less
                                costly than it sounds -- the platform tag pins
                                CPython 3.14 and Emscripten 5.0.3 together, so
                                the abi3 field is inert here -- but inert is not
@@ -628,7 +628,7 @@ class PyEmscriptenExpectation(Expectation):
 
     def check_tag(self, problems: list[str]) -> None:
         # `packaging.tags` has no `pyemscripten_platforms`. On the target itself
-        # `sys_tags()` does yield this tag (docs/WASM.md §9.3 read 110 of them
+        # `sys_tags()` does yield this tag (docs/platform/WASM.md §9.3 read 110 of them
         # off the real interpreter), but that generator reads
         # `sys.implementation._multiarch` and Pyodide's own patches, neither of
         # which exists here. Same shape of gap as manylinux and Windows, and
@@ -638,7 +638,7 @@ class PyEmscriptenExpectation(Expectation):
         print("  ! packaging has no pyemscripten_platforms, so unlike the "
               "android and ios tags\n"
               "    this spelling is not confirmed against pip's own generator")
-        # The one thing that *can* be confirmed, and the trap docs/WASM.md §9.4a
+        # The one thing that *can* be confirmed, and the trap docs/platform/WASM.md §9.4a
         # names: the version component is Pyodide's `PYODIDE_ABI_VERSION`, which
         # the CPython inside Pyodide has never heard of. Asking the interpreter
         # instead yields `emscripten_5_0_3_wasm32` -- accepted by `packaging`,
@@ -649,7 +649,7 @@ class PyEmscriptenExpectation(Expectation):
             problems.append(
                 f"no {self.lock} -- the {self.abi_version} in this tag is "
                 "Pyodide's PYODIDE_ABI_VERSION and exists in no other "
-                "machine-readable place (docs/WASM.md §9.4a). Without the "
+                "machine-readable place (docs/platform/WASM.md §9.4a). Without the "
                 "distribution it cannot be checked at all, and it is the one "
                 "component of this tag that is checkable; set "
                 "TORCHNATIVE_PYODIDE")
@@ -690,7 +690,7 @@ class PyEmscriptenExpectation(Expectation):
                 "`dlopen` cannot load it. Both wasm members go through `dlopen` "
                 "(the extension via the import system, the global-deps library "
                 "via `ctypes.CDLL`), so this makes the wheel fail at import "
-                "(docs/WASM.md §9.2)")
+                "(docs/platform/WASM.md §9.2)")
         exports = wasm_exports(data)
         if exports is None:
             problems.append(
@@ -788,7 +788,7 @@ class PyEmscriptenExpectation(Expectation):
               "attributed to `env`,\n"
               "    so the python3.dll-vs-python313.dll test "
               "WindowsExpectation runs has no\n"
-              "    wasm spelling (docs/WASM.md §9.3)")
+              "    wasm spelling (docs/platform/WASM.md §9.3)")
 
 
 def _packaging_accepts(exp: Expectation, problems: list[str], **kwargs) -> None:
@@ -1154,7 +1154,7 @@ def self_test(wheel: Path, reference: Path | None) -> int:
 
     if is_wasm:
         # The fault this whole family exists to make catchable, and the reason
-        # docs/WASM.md §9.4b put the checker before the target: an extension
+        # docs/platform/WASM.md §9.4b put the checker before the target: an extension
         # with no entry point is a wheel that installs, imports, and raises
         # ImportError -- no size, tag, architecture or RECORD check sees it.
         faults.append((
@@ -1415,7 +1415,7 @@ def main() -> None:
             problems.append(
                 f"no {deps} -- `_load_global_deps()` computes exactly this name "
                 "on this platform, and without it `import torch` needs "
-                "TORCH_USE_RTLD_GLOBAL=1 (docs/VENDOR.md wall 1)")
+                "TORCH_USE_RTLD_GLOBAL=1 (docs/platform/VENDOR.md wall 1)")
         strays = [n for n in names
                   if n.startswith("torch/lib/libtorch_global_deps") and n != deps]
         if strays and deps:
@@ -1428,7 +1428,7 @@ def main() -> None:
         if exp.shm_manager_required and "torch/bin/torch_shm_manager" not in names:
             problems.append(
                 "no torch/bin/torch_shm_manager -- `_manager_path()` checks it "
-                "exists on every non-Windows platform (docs/VENDOR.md wall 4)")
+                "exists on every non-Windows platform (docs/platform/VENDOR.md wall 4)")
 
         # 4. The archive agrees with itself.
         check_record(zf, dist_info, problems)
@@ -1490,7 +1490,7 @@ def main() -> None:
     print(f"PASS -- {args.wheel.name} is tagged for a platform an installer "
           "will match, and holds binaries for it")
     print("       NOT established here: that it loads, imports, or computes. "
-          "See docs/WHEEL.md §7.")
+          "See docs/platform/WHEEL.md §7.")
 
 
 if __name__ == "__main__":

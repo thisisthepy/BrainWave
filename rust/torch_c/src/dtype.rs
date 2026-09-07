@@ -80,7 +80,7 @@ pub enum TorchDType {
     // unconditionally, before a single byte of the checkpoint is read. Missing
     // any one of the fourteen makes *every* `torch.load` raise
     // `AttributeError: module 'torch' has no attribute 'uint1'` -- measured,
-    // and it was the second wall on that path (docs/CKPT.md §2).
+    // and it was the second wall on that path (docs/models/CKPT.md §2).
     //
     // Nothing can be stored under them: `storage()` returns `None` for all
     // fourteen, so a tensor tagged with one refuses by name rather than
@@ -445,7 +445,7 @@ impl TorchDType {
             // `complex32` is **4**, not 2: it is a pair of `float16`, and
             // `itemsize` is the width of the whole complex element. Measured
             // on 2.13.0 (`torch.complex32.itemsize` is 4) -- this row said 2
-            // until docs/COMPLEX2.md, which is the silent-wrong-number shape:
+            // until docs/kernels/COMPLEX2.md, which is the silent-wrong-number shape:
             // `numel * element_size` would have sized a complex32 buffer at
             // half its bytes. Nothing checked it, because the only assertion
             // in the tree was about `complex64`.
@@ -616,7 +616,7 @@ impl PyDtype {
             // 2.13.0: `torch.bfloat16.to_complex()` is `torch.complex64`,
             // because there is no `complex(bfloat16)` and upstream promotes to
             // the next complex type that can hold it rather than returning the
-            // input. This row returned `bfloat16` until docs/COMPLEX2.md.
+            // input. This row returned `bfloat16` until docs/kernels/COMPLEX2.md.
             //
             // The complex tags map to themselves, as upstream.
             //
@@ -625,7 +625,7 @@ impl PyDtype {
             // or float8 dtype, where this returns the input unchanged. That is
             // a wider change than this round's subject (it turns a total
             // function partial for thirty tags with no measured caller), and
-            // it is written down in docs/COMPLEX2.md §7 rather than left
+            // it is written down in docs/kernels/COMPLEX2.md §7 rather than left
             // silent.
             BFloat16 => Complex64,
             other => other,

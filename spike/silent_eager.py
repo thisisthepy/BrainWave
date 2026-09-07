@@ -2,7 +2,7 @@
 
 `bootstrap.py` already ships `set_eval_frame` as a state cell that remembers a
 callback and installs no PEP 523 hook (rust/torch_c/src/bootstrap.py, the
-`if "_dynamo" in roots:` block).  docs/DYNAMO.md §14 showed that once the
+`if "_dynamo" in roots:` block).  docs/graph/DYNAMO.md §14 showed that once the
 *other* blockers are filled, that cell turns `torch.compile` into a silent eager
 fallback -- no exception, no compilation, no graph.
 

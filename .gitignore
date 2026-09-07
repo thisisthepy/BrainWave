@@ -176,7 +176,7 @@ cython_debug/
 # Rust: build output lives in CARGO_TARGET_DIR on the external volume
 /rust/*/target/
 
-# Vendored upstream trees (docs/VENDOR.md). The torch Python tree alone is
+# Vendored upstream trees (docs/platform/VENDOR.md). The torch Python tree alone is
 # ~1084 modules; it is reproduced by vendor/vendor_torch.sh, never committed.
 #
 # It now lands inside the package, at torchnative/src/main/torch/, so that one

@@ -1,6 +1,6 @@
 """Size the NNAPI gap against graphs captured from the models this project runs.
 
-This is where docs/DECOMP.md §12's tables come from. Like `decomp_sweep.py` it
+This is where docs/graph/DECOMP.md §12's tables come from. Like `decomp_sweep.py` it
 is a measurement script and not a test: it prints a verdict per op and exits 0
 whatever they are, because "how many ops NNAPI already has" is a number that
 moves and a test that pinned it would go red on progress. `test_shim.py` pins
@@ -36,7 +36,7 @@ for the same reason.
 The ops that appear in graphs captured from real model forwards, not the ops
 the shim implements. Those are different populations and the second one
 flatters: an op nothing calls is not a gap. The models are the ones
-docs/DEMAND7.md lists as forwarding and matching upstream, at toy config sizes
+docs/architectures/DEMAND7.md lists as forwarding and matching upstream, at toy config sizes
 -- the op *set* a model reaches does not depend on its width or depth, only on
 its architecture.
 """
@@ -73,7 +73,7 @@ def _models(torch):
     built["vit"] = (tf.ViTModel(cfg).eval(), (torch.ones(1, 3, 32, 32),))
 
     # ResNet is expected to refuse: its residual add is in place, and
-    # docs/CAPTURE.md §4 refuses mutation by name. Kept in the list so the
+    # docs/graph/CAPTURE.md §4 refuses mutation by name. Kept in the list so the
     # refusal is reported rather than quietly shrinking the denominator.
     cfg = tf.ResNetConfig(
         embedding_size=8, hidden_sizes=[8, 16], depths=[1, 1], layer_type="basic",

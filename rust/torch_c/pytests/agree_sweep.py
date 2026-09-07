@@ -3,14 +3,14 @@
 
 Why this exists
 ---------------
-`arch_sweep.py` measures reachability. Both `docs/ARCH100.md` and `docs/ARCH200.md`
+`arch_sweep.py` measures reachability. Both `docs/architectures/ARCH100.md` and `docs/architectures/ARCH200.md`
 end on the same sentence and neither acted on it:
 
     A forward is not a match -- this sweep measures reachability, not numerics.
 
 At the time this script was written 290 of 297 upstream-clean architectures
 forwarded under the shim, and 26 of them had ever been checked for *agreement*
-(the twenty of `docs/ARCH20.md` plus the six of `docs/ARCH26.md`). This script
+(the twenty of `docs/architectures/ARCH20.md` plus the six of `docs/architectures/ARCH26.md`). This script
 closes that gap: it runs the same architecture, with the SAME WEIGHTS and the
 SAME INPUTS, on both sides, and compares the outputs element-wise.
 
@@ -25,7 +25,7 @@ The three traps, and what is done about each
     and `test_agree.py` pins upstream's seeded values so a regression in it is
     a failing test rather than a silently different experiment.
 
-2.  **A tolerance chosen by eye is not a result.** `docs/DEMAND8.md` §1.4 set the
+2.  **A tolerance chosen by eye is not a result.** `docs/architectures/DEMAND8.md` §1.4 set the
     standard: when the two sides differ, ask whether upstream's own float32
     answer is any closer to the truth than the shim's. So every architecture is
     additionally run **upstream in float64** and both float32 answers are scored
@@ -34,24 +34,24 @@ The three traps, and what is done about each
     threshold tighter than that would flag upstream against itself.
 
 3.  **"This model differs" is not a finding; "this op differs" is.** `--bisect`
-    reuses `docs/DEMAND8.md` §1.3's technique: capture every leaf module's input
+    reuses `docs/architectures/DEMAND8.md` §1.3's technique: capture every leaf module's input
     and output upstream, then re-run each leaf under the shim on *upstream's own
     recorded input*, so nothing accumulates and the largest single-op error
     names the operator.
 
 Known-divergent ground already measured, which must be read before calling
-anything here a defect: `docs/MPSFWD.md` (`exp`, `sigmoid`, `silu` differ in the
+anything here a defect: `docs/devices/MPSFWD.md` (`exp`, `sigmoid`, `silu` differ in the
 last ulp between backends; `matmul` and `mul` are bit-identical),
-`docs/VOICE3.md` (upstream's `i0` runs float-rounded coefficients),
-`docs/TAIL4.md` (upstream's `erfinv` is wrong past `1-1e-11`).
+`docs/architectures/VOICE3.md` (upstream's `i0` runs float-rounded coefficients),
+`docs/kernels/TAIL4.md` (upstream's `erfinv` is wrong past `1-1e-11`).
 
-Inherited limits -- `docs/ARCH200.md` §5, restated rather than quietly assumed
+Inherited limits -- `docs/architectures/ARCH200.md` §5, restated rather than quietly assumed
 ------------------------------------------------------------------------------
 * `AutoModel` bodies only: no task heads, no generation loop, no KV cache reuse.
 * Shrunk configs and random weights. Random weights reach the same *operators*
   (`arch_sweep.py --verify-random-weights` is the check for that claim) but they
   do not reach data-*dependent* branches, and they leave BatchNorm running stats
-  at their initial values -- `docs/DEMAND8.md` §1.1 found that this underflows a
+  at their initial values -- `docs/architectures/DEMAND8.md` §1.1 found that this underflows a
   deep convnet's activations to ~1e-23, at which point every relative number
   about it is meaningless. Such architectures are reported as `degenerate`
   rather than as `agree`, because at that scale agreement is unearned.
@@ -217,7 +217,7 @@ def diff_stats(a, b):
 F32_EPS = float(np.finfo(np.float32).eps)      # 1.1920929e-07
 
 # The scale below which a tensor carries no information to disagree about.
-# `docs/DEMAND8.md` §1.1 measured a deep convnet's activations underflowing to
+# `docs/architectures/DEMAND8.md` §1.1 measured a deep convnet's activations underflowing to
 # ~1e-23 under uncalibrated BatchNorm statistics; at that magnitude both sides
 # agree on noise and calling it agreement would be unearned.
 DEGENERATE_SCALE = 1e-12
@@ -355,7 +355,7 @@ def produce_one(model_type, outdir):
     label, kwargs, out = chosen
     rec["inputs"] = label
 
-    # BatchNorm calibration -- docs/DEMAND8.md §1.1, and it is not cosmetic.
+    # BatchNorm calibration -- docs/architectures/DEMAND8.md §1.1, and it is not cosmetic.
     # Freshly-initialised BatchNorm has `running_var=1`/`running_mean=0`, which
     # for a deep convnet drives activations to ~1e-23 by the last block; at that
     # scale a relative comparison compares denormals. One forward in train mode

@@ -17,13 +17,13 @@ records that ``ttadapters`` keeps a full weight copy in ``base_state`` so that
 ``AdaptationEngine.reset()`` has something to restore. A delta narrows that: it
 holds the base of the parameters *it covers*, which for a method that adapts
 normalisation affine parameters is four orders of magnitude smaller than the
-model. docs/ADAPT.md §4 has both numbers on a real checkpoint.
+model. docs/models/ADAPT.md §4 has both numbers on a real checkpoint.
 
 **Why a base copy at all, rather than subtracting the offset back off.**
 Because ``(w + d) - d`` is not ``w`` in floating point, and "reverted" has to
 mean the base weights are the bytes they were. Subtraction is offered as
 :meth:`Delta.revert_by_subtraction` precisely so the two can be compared --
-docs/ADAPT.md §5 measures how far apart they land on a real checkpoint. If they
+docs/models/ADAPT.md §5 measures how far apart they land on a real checkpoint. If they
 were equal the copy would be waste; they are not.
 
 **Lifetime is the axis DESIGN.md §3 deliberately left unnamed.** It withdrew
@@ -47,7 +47,7 @@ other ranks of a process group and returns the aggregate.
 ``publish`` refused until 2026-09-02, and it refused with a check the reader
 could run rather than with a claim about the world -- ``init_process_group(
 backend='local', ..., world_size=2)``. That check started returning
-(docs/TRANSPORT.md) and this method was written on top of it (docs/FEDERATED.md).
+(docs/distributed/TRANSPORT.md) and this method was written on top of it (docs/distributed/FEDERATED.md).
 The two refusals that remain are narrower and are about *this* call rather than
 about the world: an unrecorded delta has nothing to send, and a process group
 that was never initialised has nobody to send to.
@@ -55,7 +55,7 @@ that was never initialised has nobody to send to.
 ``persist`` deliberately does **not** go through ``torch.save``, and the
 reason is no longer the one BACKWARD.md §14 gave. That section said the blocker
 was a storage object aliasing its tensor, which this stack could not honestly
-fake; docs/SAVE.md §2 found the danger was real and the remedy wrong -- what has
+fake; docs/models/SAVE.md §2 found the danger was real and the remedy wrong -- what has
 to refuse is the *write*, not the aliasing -- and ``torch.save`` now works.
 
 What remains is a choice of format rather than a wall: safetensors is a flat,
@@ -192,7 +192,7 @@ class Delta:
         A no-op for an unrecorded delta, because an unrecorded delta is zero.
 
         This is *not* guaranteed to reproduce the weights :meth:`record` read:
-        ``base + (w - base)`` is not ``w`` in floating point. docs/ADAPT.md §5
+        ``base + (w - base)`` is not ``w`` in floating point. docs/models/ADAPT.md §5
         measures the gap; it is what "keeping a delta" costs against "keeping
         the weights".
         """
@@ -248,7 +248,7 @@ class Delta:
     # -- persistence -------------------------------------------------------
     #
     # `torch.save` is **not** what this uses, and that is a finding rather than
-    # a convenience. docs/BACKWARD.md §14 sizes it: two real items and five
+    # a convenience. docs/training/BACKWARD.md §14 sizes it: two real items and five
     # one-liners, and the substantial one -- `Tensor.untyped_storage()` -- is a
     # semantic problem and not a kernel. Upstream a storage *aliases* its
     # tensor; here a storage is a byte buffer that `set_` copies out of
@@ -260,7 +260,7 @@ class Delta:
     # What a delta on the wire actually needs is "tensor -> little-endian
     # bytes" and a container, and safetensors is a container that is a JSON
     # header and a concatenated blob: no pickle, no zip, no storage object. The
-    # reading side already works on this stack (docs/CKPT.md §1), so a delta
+    # reading side already works on this stack (docs/models/CKPT.md §1), so a delta
     # written here is read back by the same library upstream reads it with.
 
     #: safetensors dtype names. Only the dtypes a delta can hold -- a covered
@@ -292,10 +292,10 @@ class Delta:
 
         Through ``tolist()``, which is the only way out of this shim that is
         public -- ``numpy``, ``data_ptr`` and ``untyped_storage`` all refuse --
-        and is what docs/SEQLEN.md's logits sha256 has always used. It is a
+        and is what docs/numerics/SEQLEN.md's logits sha256 has always used. It is a
         conversion rather than a memcpy, and that is stated rather than hidden:
         it costs a Python float per element, so this is a road for a *delta*
-        (137 KiB on a Tent-adapted SmolLM2, docs/ADAPT.md §5.2) and not for a
+        (137 KiB on a Tent-adapted SmolLM2, docs/models/ADAPT.md §5.2) and not for a
         checkpoint.
         """
         import struct
@@ -326,7 +326,7 @@ class Delta:
         ``what`` selects ``"value"`` -- the offset, which is what a send would
         carry -- or ``"base"``, which is what a revert would need. The format
         is safetensors, for the reason the comment above gives; :meth:`load`
-        reads it back and docs/BACKWARD.md §14.4 measures that round trip as
+        reads it back and docs/training/BACKWARD.md §14.4 measures that round trip as
         bit-identical on a real adapted checkpoint.
         """
         import json
@@ -384,8 +384,8 @@ class Delta:
         model it belongs on is the caller's knowledge.
 
         It refused until 2026-09-02, and what it was waiting for was a second
-        rank rather than a serialiser -- docs/SAVE.md §7 sized the three walls
-        and this was the last of them. docs/TRANSPORT.md opened it.
+        rank rather than a serialiser -- docs/models/SAVE.md §7 sized the three walls
+        and this was the last of them. docs/distributed/TRANSPORT.md opened it.
 
         **What this checks before it sends.** FedAvg averages *offsets from a
         common base*: ``sum(w_k (w_k^local - w_global)) / sum(w_k)`` only means

@@ -13,7 +13,7 @@ Why this needs a launcher at all
 
 The Android CPython distribution ships `bin/python3.13`, so `verify_android.py` only
 has to push a tree and run it. **The iOS distribution ships no executable** -- there is
-only `Python.framework/Python`, an `MH_DYLIB` (docs/DEVICE_LOAD_IOS.md). iOS supports
+only `Python.framework/Python`, an `MH_DYLIB` (docs/devices/DEVICE_LOAD_IOS.md). iOS supports
 "an app links the framework and calls `Py_Initialize` itself", not "run the interpreter".
 
 So this script compiles one, from three lines of C:
@@ -57,7 +57,7 @@ and unpacking a wheel into its site-packages would be a side effect on everyone 
 What this cannot answer
 -----------------------
 
-The simulator runs on the host M1; it is not an iPhone. See docs/IOS.md §1. Nothing
+The simulator runs on the host M1; it is not an iPhone. See docs/platform/IOS.md §1. Nothing
 here measures throughput, and verifying the simulator wheel does not verify the device
 wheel -- they differ in Mach-O `LC_BUILD_VERSION.platform` (7 vs 2) and are separate
 artefacts.
@@ -128,7 +128,7 @@ try:
     import platform as _p
     out["platform_system"] = _p.system()
     # The host kernel is visible through this field even though system/release are
-    # the simulator's. docs/IOS.md §4 keeps the evidence.
+    # the simulator's. docs/platform/IOS.md §4 keeps the evidence.
     out["uname_version"] = _p.uname().version
 except Exception as exc:
     out["platform_system"] = "<%s: %s>" % (type(exc).__name__, exc)
@@ -359,7 +359,7 @@ def main() -> None:
         print(f"  platform.system()      {plain.get('platform_system')}")
         print(f"  uname().version        {plain.get('uname_version')}")
         print("                         ^ the HOST kernel. The simulator is not an "
-              "iPhone; see docs/IOS.md §1")
+              "iPhone; see docs/platform/IOS.md §1")
 
         if problems:
             print()

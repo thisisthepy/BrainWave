@@ -1,17 +1,17 @@
 """`torch.export` -- six walls closed, and the seventh named.
 
-`docs/EXPORT.md` §6 gave an ordering and predicted that the wall past the census
+`docs/graph/EXPORT.md` §6 gave an ordering and predicted that the wall past the census
 would be `aten.empty_strided`.  Steps 1 and 2 of that ordering landed (the
 dispatcher consults the mode stack; `_NodeBase` builds), and this round
 re-measured rather than assuming.  The prediction held -- `empty_strided` was
 exactly where export stopped -- and closing it exposed five more, of which one
-was a **defect `docs/EXPORT.md` had itself predicted in prose**:
+was a **defect `docs/graph/EXPORT.md` had itself predicted in prose**:
 `no_dispatch()` had stopped suppressing anything the moment the door learned to
-consult the mode stack.  `docs/EXPORT4.md` is the measurement.
+consult the mode stack.  `docs/graph/EXPORT4.md` is the measurement.
 
 What these tests are for, and what they are careful not to be
 --------------------------------------------------------------
-`docs/EXPORT.md` §4.2 warned that an `ExportedProgram` containing **no
+`docs/graph/EXPORT.md` §4.2 warned that an `ExportedProgram` containing **no
 operators** would print, serialise, and look right.  This round moved export a
 long way and did **not** reach a working `torch.export.export()`, so the risk
 now is the mirror image of that one: a test suite that grows while the thing it
@@ -28,7 +28,7 @@ is about does not.  So:
   upstream torch**, not against a transcription, so a torch upgrade that changes
   them fails here rather than drifting.
 
-`DOCWATCH` markers in `docs/EXPORT4.md` use `ge`, never `eq` on a shared global
+`DOCWATCH` markers in `docs/graph/EXPORT4.md` use `ge`, never `eq` on a shared global
 count.
 
 Everything runs in subprocesses with the vendored tree on `PYTHONPATH`, the same
@@ -408,7 +408,7 @@ def test_is_inference_mode_enabled_answers_and_is_false_by_default():
 
 
 def test_inference_mode_round_trips_through_the_flag_the_predicate_reads():
-    """docs/EXPORT.md §2.2's failure, guarded against in the other direction.
+    """docs/graph/EXPORT.md §2.2's failure, guarded against in the other direction.
 
     §2.2 is about `_len_torch_dispatch_stack` answering a constant `0` while
     something really was pushing onto the stack -- a block that entered,
@@ -588,11 +588,11 @@ def test_meta_stride_keeps_the_dim_range_check_and_leaves_dense_alone():
 
 
 # ---------------------------------------------------------------------------
-# 7. no_dispatch() suppresses -- the defect docs/EXPORT.md §2.4 predicted
+# 7. no_dispatch() suppresses -- the defect docs/graph/EXPORT.md §2.4 predicted
 # ---------------------------------------------------------------------------
 
 def test_no_dispatch_actually_suppresses_now_that_the_door_reads_the_stack():
-    """docs/EXPORT.md §2.4's body, filled -- and this is the test that proves it.
+    """docs/graph/EXPORT.md §2.4's body, filled -- and this is the test that proves it.
 
     §2.4 said entering a counter was correct "**only because this shim never
     consults the mode stack in the first place**", and that when the door
@@ -650,7 +650,7 @@ def test_export_no_longer_stops_at_the_storage_handle_and_returns_a_real_graph()
          same numbers as eager, element-wise against upstream
          (rust/torch_c/pytests/export_sweep.py), then rewrite EXPORT4.md §3."
 
-    That was done -- `docs/EXPORT5.md` §2 closed the meta storage handle, §6
+    That was done -- `docs/graph/EXPORT5.md` §2 closed the meta storage handle, §6
     closed the pre-dispatch wall behind it, and §8 is the three-verdict
     measurement, bit-identical against upstream on four modules at a tolerance
     derived from upstream's own float32-vs-float64 error. So the alarm is
@@ -658,13 +658,13 @@ def test_export_no_longer_stops_at_the_storage_handle_and_returns_a_real_graph()
 
     It still fails in two directions, which is why it is worth keeping:
 
-    * export stops again -- a regression in anything docs/EXPORT4.md or
-      docs/EXPORT5.md landed;
+    * export stops again -- a regression in anything docs/graph/EXPORT4.md or
+      docs/graph/EXPORT5.md landed;
     * export succeeds and the graph is **empty**. That second one is the whole
       reason this test is shaped this way. Before §6, `torch.export.export()`
       returned an `ExportedProgram` that printed, serialised and held a
       placeholder, an output and **no operators** -- exactly the failure
-      docs/EXPORT.md §4.2 predicted in prose. An assertion that only checked
+      docs/graph/EXPORT.md §4.2 predicted in prose. An assertion that only checked
       "did it export" passed on that graph. This one counts the operators.
     """
     if not _available():
@@ -672,21 +672,21 @@ def test_export_no_longer_stops_at_the_storage_handle_and_returns_a_real_graph()
     r = _shim()
     e = r["export"]
     assert e["status"] == "ok", (
-        "torch.export.export() stopped again. docs/EXPORT5.md §8 recorded it "
+        "torch.export.export() stopped again. docs/graph/EXPORT5.md §8 recorded it "
         f"working on this module: {e}"
     )
     ops = e["value"]["ops"]
     assert ops, (
         "torch.export.export() returned an ExportedProgram whose graph holds "
-        "NO operators. That is docs/EXPORT.md §4.2's failure exactly -- it "
+        "NO operators. That is docs/graph/EXPORT.md §4.2's failure exactly -- it "
         "prints, it serialises, and it computes nothing. Do not relax this to "
         "'did it export'; find why the tracing mode stopped seeing operators "
-        "(docs/EXPORT5.md §6 is the last time this happened)."
+        "(docs/graph/EXPORT5.md §6 is the last time this happened)."
     )
     # The module is `(x * 2 + 1).relu()`, so the operators are fixed. The
     # *overload* spellings are deliberately not asserted here -- they are the
-    # known `.Scalar`/`.Tensor` disagreement with upstream (docs/EXPORT.md §5,
-    # docs/EXPORT5.md §9), and `test_dispatch.py` is where that is pinned.
+    # known `.Scalar`/`.Tensor` disagreement with upstream (docs/graph/EXPORT.md §5,
+    # docs/graph/EXPORT5.md §9), and `test_dispatch.py` is where that is pinned.
     packets = [o.rsplit(".", 1)[0] for o in ops]
     assert packets == ["aten.mul", "aten.add", "aten.relu"], ops
 

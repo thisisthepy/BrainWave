@@ -7,7 +7,7 @@
 //! backend for. Storing the label and resolving it on use keeps torch's
 //! semantics and makes the failure land where torch puts it.
 //!
-//! docs/DEVICE_ABS.md §3 is where that decision was re-examined once there was
+//! docs/devices/DEVICE_ABS.md §3 is where that decision was re-examined once there was
 //! something to measure it against. Two things came out of it and live here:
 //!
 //! *The label is validated.* A label that accepts any string is not a label,
@@ -25,7 +25,7 @@
 //! It is true today (CPU only) and it stops being true the moment a second
 //! accelerator of the same kind is addressable -- at which point `PyTensorBase`
 //! has to carry the label the way it already carries `tag` for dtype. See
-//! docs/DEVICE_ABS.md §3.2.
+//! docs/devices/DEVICE_ABS.md §3.2.
 use std::sync::atomic::AtomicU64;
 
 use candle_core::Device;
@@ -238,12 +238,12 @@ impl PyDevice {
             // The one accelerator this build has, and it is one *arm* rather
             // than a subsystem because candle already owns the backend:
             // `Device::Metal(MetalDevice)` is a variant of the same closed enum
-            // that `docs/VULKAN2.md` §5.1 found had nowhere to put a Vulkan
+            // that `docs/devices/VULKAN2.md` §5.1 found had nowhere to put a Vulkan
             // handle. So an `mps` tensor is an ordinary `candle_core::Tensor`
             // and needs no `tensor::Repr` arm, no dispatcher arm and no kernel
             // of ours -- every kernel in this crate that already goes through
             // candle runs on the GPU here because candle's own op does.
-            // docs/VULKAN3.md §1 is why that asymmetry put `mps` first.
+            // docs/devices/VULKAN3.md §1 is why that asymmetry put `mps` first.
             //
             // Not a silent fallback in either direction. Where the Metal
             // feature is not compiled in -- Android, Linux, wasm, all of which
@@ -269,7 +269,7 @@ impl PyDevice {
             // the same structural reason: `Device::Cuda(CudaDevice)` sits beside
             // `Device::Metal(MetalDevice)` in candle's closed enum, so a `cuda`
             // tensor is an ordinary `candle_core::Tensor` -- no `tensor::Repr`
-            // arm, no dispatcher arm, no kernel of ours. docs/CUDA.md §1.
+            // arm, no dispatcher arm, no kernel of ours. docs/devices/CUDA.md §1.
             //
             // **Unlike the `mps` arm this one carries no `#[cfg]`, and that is a
             // property of candle rather than a decision here.** When the `cuda`
@@ -289,7 +289,7 @@ impl PyDevice {
             "meta" => Err(not_implemented(
                 "torch._C shim: the meta device has no backend to resolve to -- a \
                  meta tensor holds shape and dtype and no storage, so this call site \
-                 has to branch on PyDevice::is_meta() before resolving (docs/META.md)",
+                 has to branch on PyDevice::is_meta() before resolving (docs/devices/META.md)",
             )),
             other => Err(not_implemented(format!(
                 "device not available in torch._C shim: {other}"
@@ -356,7 +356,7 @@ impl PyDevice {
     /// this cache would produce two handles that do not consider themselves
     /// equal, and `aten.rs`'s mixed-device gate would then reject two `cuda`
     /// tensors against each other with a message naming the same device twice.
-    /// That failure was *measured* on `mps` (docs/VULKAN3.md §2); it is
+    /// That failure was *measured* on `mps` (docs/devices/VULKAN3.md §2); it is
     /// structural rather than Metal-specific, so it is pre-empted here rather
     /// than rediscovered on the first machine with a GPU.
     ///
@@ -544,7 +544,7 @@ impl PyDevice {
     /// factory consulting it. `bootstrap.py` `_install_torch_function_modes`
     /// and `_torch_level_function` are the other two thirds; without them this
     /// method would make `with torch.device("meta"):` a block that succeeded
-    /// and changed nothing, which docs/DEVICE_ABS.md §7.2 argued is worse than
+    /// and changed nothing, which docs/devices/DEVICE_ABS.md §7.2 argued is worse than
     /// refusing.
     fn __enter__<'py>(slf: &Bound<'py, Self>) -> PyResult<Bound<'py, PyAny>> {
         let py = slf.py();
@@ -641,7 +641,7 @@ fn shim_same_device(left: PyDevice, right: PyDevice) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// The `mps` host-readback gate (docs/MPS.md)
+// The `mps` host-readback gate (docs/devices/MPS.md)
 // ---------------------------------------------------------------------------
 
 /// The ops whose kernels in this crate read a dispatched tensor's bytes back
@@ -682,7 +682,7 @@ fn shim_same_device(left: PyDevice, right: PyDevice) -> bool {
 /// in the file has to be classified by a human before the suite goes green.
 ///
 /// **Four ops left this list by being rewritten, not by being excused**
-/// (docs/MPSFWD.md §3): `aten.neg.default` and `prims.neg.default` are now
+/// (docs/devices/MPSFWD.md §3): `aten.neg.default` and `prims.neg.default` are now
 /// `0 - x` in `int64` on the device instead of a `to_vec1` and `wrapping_neg`
 /// in Rust; `aten.pow.Tensor_Scalar` is `widen_f64` + candle's `powf` (the
 /// same `f64::powf` the host loop called) with squaring-by-multiplication on
@@ -692,12 +692,12 @@ fn shim_same_device(left: PyDevice, right: PyDevice) -> bool {
 /// widening of this gate: the scan re-derives the list from the kernels and
 /// would put them straight back if the readback were still there.
 ///
-/// **Two more left it the same way** (docs/MPSATTN.md): `aten._softmax.default`
+/// **Two more left it the same way** (docs/devices/MPSATTN.md): `aten._softmax.default`
 /// and `aten._safe_softmax.default` are now `max_keepdim` / `broadcast_sub` /
 /// `exp` / `sum_keepdim` / `broadcast_div` on the device instead of `read_flat`
-/// and a scalar loop. That pair is the one `docs/RELEASE_0_0_13a0.md` §5 named
+/// and a scalar loop. That pair is the one `docs/platform/RELEASE_0_0_13a0.md` §5 named
 /// as the reason no transformer forwards on `mps`. §5 was **half right**: the
-/// SDPA path does not go through `_softmax` (docs/MPSFWD.md measured that on
+/// SDPA path does not go through `_softmax` (docs/devices/MPSFWD.md measured that on
 /// SmolLM2 and it still holds), but an **eager** attention block does, twice a
 /// layer, and a BERT with `attn_implementation="eager"` stopped there.
 pub const MPS_HOST_READBACK_OPS: [&str; 85] = [
@@ -831,7 +831,7 @@ pub fn is_metal(device: &Device) -> bool {
 /// that is what this is. The op is not implemented *for mps*; it is
 /// implemented for the CPU, and the message says so and says how to get it.
 pub fn mps_host_readback_gate(op: &str) -> PyResult<()> {
-    host_readback_gate(op, "mps", "an", "_shim_mps_host_readback_ops", "docs/MPS.md")
+    host_readback_gate(op, "mps", "an", "_shim_mps_host_readback_ops", "docs/devices/MPS.md")
 }
 
 /// The same gate for `cuda`, over the same derived list, and **one body**.
@@ -846,7 +846,7 @@ pub fn mps_host_readback_gate(op: &str) -> PyResult<()> {
 /// "the model never touched a readback op" from "the gate fired and something
 /// upstream swallowed it".
 pub fn cuda_host_readback_gate(op: &str) -> PyResult<()> {
-    let verdict = host_readback_gate(op, "cuda", "a", "_shim_cuda_host_readback_ops", "docs/CUDA.md");
+    let verdict = host_readback_gate(op, "cuda", "a", "_shim_cuda_host_readback_ops", "docs/devices/CUDA.md");
     if verdict.is_err() {
         CUDA_READBACK_REFUSALS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
@@ -899,23 +899,23 @@ fn shim_mps_readback_but_allowed() -> Vec<&'static str> {
 // cuda -- the named refusals, the gate, and the runtime evidence
 // ---------------------------------------------------------------------------
 //
-// docs/CUDA.md is the whole argument; this comment says only what a reader of
+// docs/devices/CUDA.md is the whole argument; this comment says only what a reader of
 // this file needs in order not to misread the code below.
 //
 // **What is here and what is deliberately not.** `cuda` costs one `resolve()`
 // arm because `Device::Cuda(CudaDevice)` is already a variant of candle's
-// closed enum -- the `mps` asymmetry (docs/VULKAN3.md §1), not the `vulkan`
+// closed enum -- the `mps` asymmetry (docs/devices/VULKAN3.md §1), not the `vulkan`
 // one. So there is no `Repr::Cuda`, no dispatcher arm and no kernel. What
 // *does* have to exist is everything below: `mps` proved that an accelerator
 // which is an ordinary `Repr::Dense` has no structural protection against this
 // crate's own kernels reading the tensor back and computing on the host
-// (docs/MPS.md §1.1), and `cuda` inherits that exactly.
+// (docs/devices/MPS.md §1.1), and `cuda` inherits that exactly.
 //
 // **And it inherits it in a worse form, which is the one finding here that is
 // about CUDA rather than about accelerators in general.** On Metal the
 // float readback path was *loud*: `read_flat` widens through `f64` and Metal
 // has no `F32 -> F64`, so thirteen of the fourteen probed silent fallbacks
-// were on the integer path and the float ones raised (docs/MPS.md §2). CUDA
+// were on the integer path and the float ones raised (docs/devices/MPS.md §2). CUDA
 // implements `f64`. The same kernels that were noisy on Metal will be silent
 // on CUDA, so the gate matters more here, not less.
 
@@ -955,7 +955,7 @@ pub const CUDA_REFUSAL_REASONS: [&str; 5] = [
 /// is free to be reworded, while the enumerator name is ABI.
 const CUDA_REFUSAL_TOKENS: [(&str, &str); 12] = [
     // No usable driver: the library is there (or the process would not have
-    // loaded at all -- see docs/CUDA.md §3) but it cannot be used.
+    // loaded at all -- see docs/devices/CUDA.md §3) but it cannot be used.
     ("CUDA_ERROR_NOT_INITIALIZED", "no_driver"),
     ("CUDA_ERROR_STUB_LIBRARY", "no_driver"),
     ("CUDA_ERROR_SYSTEM_DRIVER_MISMATCH", "no_driver"),
@@ -1039,29 +1039,29 @@ fn cuda_refusal(index: usize, detail: &str) -> PyErr {
              not a flag on this one: candle pins cudarc to `dynamic-linking`, so a \
              CUDA-enabled `_C.so` names libcuda/libcudart/libcublas as load-time \
              dependencies and would fail to import at all on a machine without \
-             them -- taking `import torch` with it (docs/CUDA.md §3)."
+             them -- taking `import torch` with it (docs/devices/CUDA.md §3)."
         }
         "no_driver" => {
             "The CUDA libraries loaded but the driver did not answer. This is \
              usually a host with the toolkit and no kernel module, or a container \
              started without `--gpus`, or a driver older than the runtime \
-             (docs/CUDA.md §4)."
+             (docs/devices/CUDA.md §4)."
         }
         "no_device" => {
             "The driver answered and there is no such device. Check the index \
              against `_C._cuda_probe()['device_count']`, and CUDA_VISIBLE_DEVICES \
-             (docs/CUDA.md §4)."
+             (docs/devices/CUDA.md §4)."
         }
         "wrong_arch" => {
             "There is a GPU and it is older than the kernels in this build. PTX \
              is forward-compatible only: the driver can JIT sm_N code onto sm_M \
              for M > N and cannot go the other way, and this build's statically \
-             compiled kernels are exact-arch with no JIT at all (docs/CUDA.md §2). \
+             compiled kernels are exact-arch with no JIT at all (docs/devices/CUDA.md §2). \
              Rebuild with CUDA_COMPUTE_CAP set to this device's capability."
         }
         _ => {
             "This build does not recognise that failure. The driver's own words \
-             are above, unedited; docs/CUDA.md §4 has the token table this was \
+             are above, unedited; docs/devices/CUDA.md §4 has the token table this was \
              matched against and is where a new one should be added."
         }
     };
@@ -1173,7 +1173,7 @@ pub fn is_cuda(device: &Device) -> bool {
 /// This is an alias and not a second list, and that is the whole design.
 /// `MPS_HOST_READBACK_OPS` is not a statement about Metal: it is the set of
 /// kernels in `aten.rs` that pull a tensor's bytes to the host and do the
-/// arithmetic in Rust, derived by scanning that file (docs/MPS.md §3.1). What
+/// arithmetic in Rust, derived by scanning that file (docs/devices/MPS.md §3.1). What
 /// makes an op unsafe under an accelerator label is a property of *this
 /// crate's kernel*, not of the accelerator, so the two devices cannot
 /// legitimately disagree -- and a hand-written second list is exactly how they
@@ -1183,7 +1183,7 @@ pub fn is_cuda(device: &Device) -> bool {
 /// both halves against the loaded artefact: that the two tables are equal, and
 /// that the table equals the set re-derived from `aten.rs` right then.
 ///
-/// docs/VOICE3.md §6 is why the derivation is not trusted further than it goes:
+/// docs/architectures/VOICE3.md §6 is why the derivation is not trusted further than it goes:
 /// it follows helper calls **one level, by name**, and `var`/`std` reached the
 /// list through nothing until the read was spelled at each dispatch target.
 /// The companion classification test is what covers the level below that.
@@ -1195,7 +1195,7 @@ pub const CUDA_HOST_READBACK_OPS: &[&str] = &MPS_HOST_READBACK_OPS;
 
 /// Process-wide counters, in the shape `_vulkan_counters()` established.
 ///
-/// **Why counters and not a source-scanning test.** docs/MPSATTN.md §3.1
+/// **Why counters and not a source-scanning test.** docs/devices/MPSATTN.md §3.1
 /// records, against its own round, that moving a `read_flat` one call deeper --
 /// into a helper the scan does not know by name -- passes *both* of the `mps`
 /// derivation tests while keeping the readback. Every check that greps the
@@ -1219,7 +1219,7 @@ pub const CUDA_HOST_READBACK_OPS: &[&str] = &MPS_HOST_READBACK_OPS;
 /// readback gate. `device_free_bytes` says the bytes are on the GPU. Together
 /// with candle's CUDA backend having no silent CPU fallback -- which is a read
 /// of candle's source, not a measurement this round performed -- that is the
-/// argument. docs/CUDA.md §6 is a procedure for someone with a GPU that closes
+/// argument. docs/devices/CUDA.md §6 is a procedure for someone with a GPU that closes
 /// the remaining gap from outside the process, with `nvidia-smi`.
 static CUDA_RESOLVES: AtomicU64 = AtomicU64::new(0);
 static CUDA_DISPATCHES: AtomicU64 = AtomicU64::new(0);
@@ -1413,7 +1413,7 @@ fn cuda_probe_device(_d: &Bound<'_, PyDict>, _device: &Device) -> PyResult<()> {
 ///
 /// **This exists so that four refusals that cannot happen on this machine can
 /// still be tested by name here**, and the test that uses it says so in its own
-/// name. It is not a stand-in for running on a GPU and docs/CUDA.md §8 says
+/// name. It is not a stand-in for running on a GPU and docs/devices/CUDA.md §8 says
 /// exactly what it does and does not establish: that the taxonomy maps the
 /// driver's tokens onto the five names, not that any of those states was ever
 /// entered.
@@ -1453,7 +1453,7 @@ mod cuda_tests {
     /// newer build machine `CUDA_COMPUTE_CAP` reaches this crate *with* a
     /// suffix, and a parser that only handled digits would silently answer
     /// `None` and switch the architecture check off. That is a failure that
-    /// opens rather than closes, which is the direction docs/MPS.md §3.2 says
+    /// opens rather than closes, which is the direction docs/devices/MPS.md §3.2 says
     /// not to accept.
     #[test]
     fn compute_cap_parses_every_spelling_nvcc_uses() {

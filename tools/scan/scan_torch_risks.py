@@ -6,7 +6,7 @@ This is NOT an op-set census. Python torch APIs don't map 1:1 to aten ops
 shim's implementation work. What it *can* do, because it needs no execution,
 is catch a short list of patterns that have actually broken this project
 before -- including in code that has never been run (stubs, unfinished
-architectures). See docs/DESIGN.md §6 ("정적 스캔은 계측이 아니라 조기
+architectures). See docs/design/DESIGN.md §6 ("정적 스캔은 계측이 아니라 조기
 경보로 쓴다") and §9 (the incidents this tool encodes) for the rationale.
 
 Patterns detected, with severity:

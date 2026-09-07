@@ -14,7 +14,7 @@ spelling:
     is exactly the distribution now on PyPI. Overriding `has_ext_modules()` is
     the documented way to correct it.
 
-2.  The extension is a Limited-API build (`abi3-py313`; docs/ABI3.md). Saying so
+2.  The extension is a Limited-API build (`abi3-py313`; docs/design/ABI3.md). Saying so
     turns the tag from `cp313-cp313-<plat>` into `cp313-abi3-<plat>`, which is
     the difference between a wheel that serves 3.13 and one that serves 3.13 and
     every CPython after it. `py_limited_api` is a `bdist_wheel` *command

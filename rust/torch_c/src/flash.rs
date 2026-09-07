@@ -4,7 +4,7 @@
 //! candle formulation it sits beside in `aten.rs`, so nothing reaches it unless
 //! `reference_enabled()` says so. What it is *for* is being a reference: the
 //! one implementation here that is bit-identical to upstream, to hold the fast
-//! path against when a numeric difference has to be localised. docs/SDPA.md
+//! path against when a numeric difference has to be localised. docs/kernels/SDPA.md
 //! §12 has the measurement and the decision; `apply_env` below has the switch.
 //!
 //! `aten::_scaled_dot_product_flash_attention_for_cpu` is not the textbook
@@ -12,7 +12,7 @@
 //! which it recombines the blocks is observable: writing the same mathematics
 //! out flat disagrees with it on **float32** inputs, on most elements, before
 //! any reduced-precision narrowing is involved -- 3562 of 4096, 4.17e-07
-//! apart, measured against upstream alone (docs/SDPA.md §3).
+//! apart, measured against upstream alone (docs/kernels/SDPA.md §3).
 //!
 //! Everything here is a shape of arithmetic rather than a shape of code, so it
 //! is written out longhand instead of being expressed with tensor operations:
@@ -22,7 +22,7 @@
 //! **What this buys, measured.** For `bfloat16` and `float16` the result is
 //! bit-identical to upstream: 0 of 226136 elements differ across eleven shapes
 //! crossed with causal and masked, and 0 of 103680 inside a real SmolLM2-135M
-//! forward (docs/SDPA.md §3, §6). Every arithmetic step is either exact or
+//! forward (docs/kernels/SDPA.md §3, §6). Every arithmetic step is either exact or
 //! reproducible in portable code, because the two matrix products upstream
 //! reaches for reduced-precision inputs are *its own* portable kernel and not
 //! a BLAS.
@@ -30,16 +30,16 @@
 //! **What it does not buy.** For `float32`/`float64` upstream calls the
 //! platform BLAS (Accelerate on this host), whose summation order is not
 //! portable: 159706 of 226136 elements differ, by at most 2.4e-07
-//! (docs/SDPA.md §5). And matching this one kernel does **not** make
+//! (docs/kernels/SDPA.md §5). And matching this one kernel does **not** make
 //! `bfloat16` inference reproducible in general -- perturbing only the GEMM's
 //! accumulation order makes upstream disagree with *itself* on one prompt in
 //! three, so no independent implementation can promise token identity there
-//! (docs/SDPA.md §1).
+//! (docs/kernels/SDPA.md §1).
 //!
 //! Two defects were found in this file by checking those claims rather than
 //! believing the comment that used to assert them, and neither is visible to a
 //! tolerance: eleven of the polynomial constants were decimal literals that
-//! re-rounded the hex values in their own comments (docs/SDPA.md §4.1), and
+//! re-rounded the hex values in their own comments (docs/kernels/SDPA.md §4.1), and
 //! the masked `qk * scale + mask` strode by the accumulator's vector width
 //! instead of the mask dtype's (§4.4).
 
@@ -50,7 +50,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// this kernel instead of candle's tensor ops.
 ///
 /// `false`, because this kernel costs 20x at T=512 and attention is the hot
-/// path of every forward pass (docs/SDPA.md §12 has the measurement and the
+/// path of every forward pass (docs/kernels/SDPA.md §12 has the measurement and the
 /// argument). What the switch buys is a *reference*: an implementation that is
 /// bit-identical to upstream for `bfloat16`/`float16`, to compare the fast
 /// path against when a numeric difference has to be localised. Two defects
@@ -132,7 +132,7 @@ pub enum Narrowing {
 
 /// `float(bfloat16(x))`, rounding to nearest with ties to even.
 ///
-/// The truncating version of this is what docs/BF16.md §2 found in the
+/// The truncating version of this is what docs/numerics/BF16.md §2 found in the
 /// elementwise `add`; it is spelled out here rather than reached through a
 /// tensor round-trip because it runs once per probability.
 pub fn narrow_bf16(x: f32) -> f32 {
@@ -270,7 +270,7 @@ fn exp_u20(x: f32) -> f32 {
 /// This is why a `float32` causal call cannot be reproduced exactly here even
 /// with the right BLAS -- the `-inf` a masked column carries trips the bail
 /// for its whole group, and the replacement is Sleef's kernel, which this
-/// substitutes the platform `expf` for (docs/SDPA.md §5.2).
+/// substitutes the platform `expf` for (docs/kernels/SDPA.md §5.2).
 const U20_SPECIAL_BOUND: f32 = f32::from_bits(0x42ae_af15); // 0x1.5d5e2ap+6
 
 fn exp_u20_group_bails(group: &[f32]) -> bool {
@@ -410,7 +410,7 @@ impl FlashFloat for f64 {
         f64::is_nan(self)
     }
     fn read(tensor: &Tensor) -> candle_core::Result<Vec<f64>> {
-        // `widen_f64` rather than `to_dtype`: docs/FLOAT8C.md §1 -- candle's
+        // `widen_f64` rather than `to_dtype`: docs/numerics/FLOAT8C.md §1 -- candle's
         // `F8E4M3 -> F64` arm does not terminate. This op refuses float8 at the
         // door, so the route matters only if that gate is ever narrowed.
         crate::aten::widen_f64(tensor)?.flatten_all()?.to_vec1::<f64>()
@@ -654,7 +654,7 @@ pub fn attend_head<A: FlashFloat>(
                     // vector body multiplies and adds separately; only the
                     // scalar remainder is one statement and therefore fused
                     // (both measured -- fusing the body disagrees with
-                    // upstream on float16, docs/SDPA.md §4.3).
+                    // upstream on float16, docs/kernels/SDPA.md §4.3).
                     //
                     // The body stops at a multiple of the *mask* dtype's
                     // vector width, not the accumulator's: upstream strides
@@ -663,7 +663,7 @@ pub fn attend_head<A: FlashFloat>(
                     // is eight, so a 70-column block leaves six columns to the
                     // fused remainder rather than two. Reading it as four cost
                     // one element in 226136 -- one logsumexp, whose output was
-                    // unaffected because the shift cancels (docs/SDPA.md §4.4).
+                    // unaffected because the shift cancels (docs/kernels/SDPA.md §4.4).
                     let mask_row = &input.mask[(m + row) * kv_len + n..];
                     let lanes = if narrow == Narrowing::None {
                         A::LANES

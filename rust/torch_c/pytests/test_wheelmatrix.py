@@ -1,7 +1,7 @@
 """Are the nine wheel targets real, and does each one's tag mean what it says?
 
 `tools/wheel/build.py` grew from one architecture per platform to two
-(docs/WHEELMATRIX.md). That change is almost entirely *parameterisation* -- one
+(docs/platform/WHEELMATRIX.md). That change is almost entirely *parameterisation* -- one
 `AndroidTarget` became two, one `LinuxTarget` became two, one `WindowsTarget`
 became two -- and parameterisation is the shape of change this repository has
 been burned by before, because the second instance inherits the first one's
@@ -359,7 +359,7 @@ def test_the_refusing_target_refuses_by_name_with_a_reason():
 
 
 def test_the_refusal_names_what_is_missing_and_not_merely_that_it_failed():
-    """docs/WHEELMATRIX.md §3.3's measurements, kept next to the code that
+    """docs/platform/WHEELMATRIX.md §3.3's measurements, kept next to the code that
     rests on them. A refusal whose reason is unfalsifiable is an excuse."""
     reason = _build._ANDROID_X86_64_REFUSAL
     for fragment in ("x86_64-linux-android", "python-build-standalone",
@@ -450,16 +450,16 @@ def test_build_pys_own_self_test_passes():
 
 
 def test_the_document_exists_and_names_each_target_and_its_verdict():
-    """docs/WHEELMATRIX.md is where "built" and "executed" are kept apart. A
+    """docs/platform/WHEELMATRIX.md is where "built" and "executed" are kept apart. A
     target present in the registry and absent from the document is one whose
     claim nobody wrote down."""
-    doc = REPO / "docs" / "WHEELMATRIX.md"
-    assert doc.exists(), "no docs/WHEELMATRIX.md"
+    doc = REPO / "docs" / "platform" / "WHEELMATRIX.md"
+    assert doc.exists(), "no docs/platform/WHEELMATRIX.md"
     text = doc.read_text()
     for key in _build.EXPECTED_TARGET_KEYS:
-        assert key in text, f"docs/WHEELMATRIX.md does not mention {key}"
+        assert key in text, f"docs/platform/WHEELMATRIX.md does not mention {key}"
     for tag in ("manylinux_2_17_aarch64", "win_arm64", "android_21_x86_64"):
-        assert tag in text, f"docs/WHEELMATRIX.md does not name the tag {tag}"
+        assert tag in text, f"docs/platform/WHEELMATRIX.md does not name the tag {tag}"
 
 
 def test_the_readme_matrix_has_a_column_for_every_new_architecture():

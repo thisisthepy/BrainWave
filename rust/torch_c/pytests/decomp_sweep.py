@@ -1,6 +1,6 @@
 """Run the decomposition pass over every implemented non-core aten op.
 
-This is where docs/DECOMP.md §4's table comes from. It is a measurement script
+This is where docs/graph/DECOMP.md §4's table comes from. It is a measurement script
 and not a test: it prints a verdict per op and exits 0 whatever they are,
 because "how many lower today" is a number that moves and a test that pinned it
 would go red on progress. `test_shim.py` pins the individual ops that matter.
@@ -17,7 +17,7 @@ recalled.
 ## What the population is
 
 `_aten_all_implemented()` minus Core ATen minus what capture refuses by name.
-The last subtraction is not a convenience: docs/CAPTURE.md §4 refuses mutation
+The last subtraction is not a convenience: docs/graph/CAPTURE.md §4 refuses mutation
 and randomness with the op named, so those cannot appear in any trace. They are
 not a decomposition problem, they are not a problem at all.
 
@@ -40,7 +40,7 @@ import sys
 import traceback
 
 
-#: docs/CAPTURE.md §4. `is_mutating` (any op whose name ends in `_`) is derived
+#: docs/graph/CAPTURE.md §4. `is_mutating` (any op whose name ends in `_`) is derived
 #: rather than listed; these are the ones named individually there. Mirrors
 #: `capture.rs`'s `RANDOM` -- an op missing here would be swept as if it were
 #: reproducible and would fail replay on every run.

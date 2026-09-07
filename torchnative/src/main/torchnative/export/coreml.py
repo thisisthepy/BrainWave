@@ -2,7 +2,7 @@
 
 ## Why this does not go through `torch/backends/_coreml`
 
-docs/DECOMP.md §12.6 recorded CoreML as *not measured*, for two reasons, and
+docs/graph/DECOMP.md §12.6 recorded CoreML as *not measured*, for two reasons, and
 this round changes one of them and not the other.
 
 `torch/backends/_coreml/preprocess.py` is a packaging wrapper: it calls
@@ -29,7 +29,7 @@ the OS and run. `verify()` runs it and compares against
 `DecomposedTrace.replay` -- our own graph through `_aten_dispatch` -- on the
 same inputs. That is an executed artefact, and it is the only thing in this
 round that is: the NNAPI blob is *structurally validated* and nothing more,
-because there is no NNAPI runtime on a Mac. docs/NPU.md keeps the two apart.
+because there is no NNAPI runtime on a Mac. docs/graph/NPU.md keeps the two apart.
 
 ## `coreml_ops` and §12.6
 
@@ -77,7 +77,7 @@ def coreml_ops() -> frozenset[str]:
     """The torch op names coremltools' own frontend registry accepts.
 
     Read out of `coremltools.converters.mil.frontend.torch.ops`, which is
-    populated by `@register_torch_op`. This is the authority docs/DECOMP.md
+    populated by `@register_torch_op`. This is the authority docs/graph/DECOMP.md
     §12.6 said to go and read once coremltools existed, and it is read rather
     than copied for the same reason `target.nnapi_ops()` parses `ADDER_MAP`.
 
@@ -400,7 +400,7 @@ def verify(trace, inputs, *, tolerance: float = 2e-5, fold: bool = True,
     `.mlpackage`, the reference side by our own graph through
     `torch._C._aten_dispatch`. Agreement is evidence about the MIL lowering,
     not about two libraries happening to implement an op the same way, for the
-    reason docs/CAPTURE.md §3 gives about replaying through the door capture
+    reason docs/graph/CAPTURE.md §3 gives about replaying through the door capture
     recorded at.
     """
     import numpy as np

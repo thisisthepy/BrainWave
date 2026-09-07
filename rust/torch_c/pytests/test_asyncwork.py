@@ -1,13 +1,13 @@
 """`async_op=True` is genuinely asynchronous here, and this is what holds it.
 
-`docs/COLLECT2.md` §7 measured the previous state and pinned it rather than
+`docs/distributed/COLLECT2.md` §7 measured the previous state and pinned it rather than
 hiding it: `async_op=True` returned a handle that was **already complete**,
 because every collective ran to completion inside the call. Upstream gloo's
 handle is not complete until `wait()`. That was a real difference in contract
 even though no value differed, and §9 listed genuine asynchrony as the first
 thing not built.
 
-It is built now, and `docs/ASYNCWORK.md` is the design. The half that needed
+It is built now, and `docs/distributed/ASYNCWORK.md` is the design. The half that needed
 designing was never the thread. It was **ownership**, and the failure mode this
 file exists to make impossible is the one this repository keeps recording: a
 worker thread that finishes fast enough that every test passes, so that
@@ -26,7 +26,7 @@ the tests would win by luck.
 Every value here is compared against **upstream's own `torch.distributed` over
 gloo** at world 3 and 4, on the same inputs, at a tolerance derived from
 upstream's own float32-vs-float64 error on the same collective
-(`docs/AGREE.md` §2's method), and exactly for integer dtypes. The comparison
+(`docs/numerics/AGREE.md` §2's method), and exactly for integer dtypes. The comparison
 helpers, the ephemeral-port spawn and the child-killing teardown are imported
 from `test_collect2` rather than copied: two copies of a harness are two
 chances for the two sides to stop being given the same thing.
@@ -219,7 +219,7 @@ def aw_run(torch, dist, rank, world, DT, shim):
     # version of this probe had neither -- it issued the two back to back with
     # every rank in lockstep, the async one always finished first, and
     # deleting the guard that prevents the overlap changed nothing it could
-    # see. That escape is recorded in `docs/ASYNCWORK.md` §8.
+    # see. That escape is recorded in `docs/distributed/ASYNCWORK.md` §8.
     #
     # Now **rank 0 -- the hub -- arrives late**, so every leaf has an async
     # exchange genuinely stuck waiting for it at the moment the leaf's calling
@@ -331,7 +331,7 @@ def aw_gloo64(world):
 # ---------------------------------------------------------------------------
 
 def test_is_completed_is_false_before_wait_for_a_collective_that_has_not_finished():
-    """The first half of `docs/COLLECT2.md` §7's divergence, now closed.
+    """The first half of `docs/distributed/COLLECT2.md` §7's divergence, now closed.
 
     This asserts on **rank 0 only**, and the restriction is the thing that
     makes it an assertion rather than a coin toss. The probe holds every other
@@ -339,7 +339,7 @@ def test_is_completed_is_false_before_wait_for_a_collective_that_has_not_finishe
     has not sent a byte; "not finished" is then a fact about the collective and
     not about the scheduler. For a rank that arrives last the honest answer is
     that completion is unspecified, and this test does not pretend otherwise --
-    §6 of `docs/ASYNCWORK.md`.
+    §6 of `docs/distributed/ASYNCWORK.md`.
 
     Both sides are asserted. Upstream gloo is False here too, and if it ever
     stopped being, the claim that this backend now matches upstream's contract
@@ -348,7 +348,7 @@ def test_is_completed_is_false_before_wait_for_a_collective_that_has_not_finishe
     Nullifying the worker thread -- running the body inline in the calling
     thread as it was before this round -- turns this red at every world size,
     because the call itself would then block for the half second and return a
-    finished handle. Confirmed, `docs/ASYNCWORK.md` §8.
+    finished handle. Confirmed, `docs/distributed/ASYNCWORK.md` §8.
     """
     for world in C2_WORLDS:
         ours = c2_ok(aw_shim(world)[0], "incomplete_before_wait")
@@ -392,7 +392,7 @@ def test_wait_is_required_because_the_buffer_before_it_holds_the_input():
 
     Upstream is **recorded and not asserted on**, and that is the one place
     this file declines to make a claim. Gloo's output buffer before `wait()` is
-    upstream's undefined space, and `docs/COLLECT2.md` §8 is the reason to be
+    upstream's undefined space, and `docs/distributed/COLLECT2.md` §8 is the reason to be
     careful here rather than casual: "undefined" is not "unobserved", and a
     test that asserted gloo leaves the input there would be inventing a
     contract upstream does not offer. What is asserted about upstream is only
@@ -589,7 +589,7 @@ def test_an_abandoned_handle_does_not_wedge_or_corrupt_the_next_collective():
     never open. Deleting `_drain_async` left the whole suite green. The probe
     now makes rank 0 -- the hub -- arrive a third of a second late, four times
     over, which holds every leaf's async exchange open across its own
-    synchronous call. `docs/ASYNCWORK.md` §8 records the escape and the fix.
+    synchronous call. `docs/distributed/ASYNCWORK.md` §8 records the escape and the fix.
 
     Every one of the four iterations is compared, not just the last, and
     against upstream's answer for those same inputs -- so a reply delivered to

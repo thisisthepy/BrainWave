@@ -1,7 +1,7 @@
 /* Layer-3 part two: does Emscripten's dlopen actually load our cdylib and run
  * code out of it?
  *
- * This is the question docs/WASM.md §3a puts at the centre of the whole
+ * This is the question docs/platform/WASM.md §3a puts at the centre of the whole
  * feasibility argument. WASI has no dlopen, so on WASI `torch._C` cannot be a
  * wheel at all -- it would have to be compiled into the interpreter. Emscripten
  * is claimed to have dlopen. That claim is read from CPython/Pyodide policy

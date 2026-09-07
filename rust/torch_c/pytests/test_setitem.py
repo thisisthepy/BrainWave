@@ -1,9 +1,9 @@
 """`TensorBase.__setitem__` -- the stepped-slice write, and the one form the
 297-architecture sweep is actually blocked on.
 
-docs/ARCH100.md §2 ranks `TensorBase.__setitem__` first: 13 of the 82 blocked
+docs/architectures/ARCH100.md §2 ranks `TensorBase.__setitem__` first: 13 of the 82 blocked
 architectures stop there, more than any other single name. Running those 13
-(docs/SETITEM.md §1) shows they do not spread across `__setitem__`'s many
+(docs/bindings/SETITEM.md §1) shows they do not spread across `__setitem__`'s many
 overloaded index forms at all. **All 13 stop on one form** -- a slice with
 `step != 1` on the left of an assignment -- in exactly two shapes:
 
@@ -12,12 +12,12 @@ overloaded index forms at all. **All 13 stop on one form** -- a slice with
 
 So this file is not a survey of `__setitem__`. It is about the stepped write,
 and it is written so that it stays a check on **both** sides of the change
-docs/SETITEM.md §2 describes: while the form still refuses, it must refuse by
+docs/bindings/SETITEM.md §2 describes: while the form still refuses, it must refuse by
 name and must never silently no-op; once the lowering lands, it must produce
 upstream's values element for element.
 
 That two-sided shape is deliberate. The refusal exists because
-`aten.slice.Tensor` materialises above step 1 (docs/VIEWS.md §6.4), so the
+`aten.slice.Tensor` materialises above step 1 (docs/kernels/VIEWS.md §6.4), so the
 natural walk narrows to a tensor that does *not* share storage with the
 receiver -- and a write into that tensor is lost with no error at all. A test
 that only pinned "it raises" would have to be deleted when the lowering lands,
@@ -135,7 +135,7 @@ def test_the_interleaved_mrope_write():
 def test_a_stepped_write_never_silently_loses_the_write():
     """The failure mode this area is shaped around, asked directly.
 
-    docs/VIEWS.md §6.4: above step 1, `slice.Tensor` goes through
+    docs/kernels/VIEWS.md §6.4: above step 1, `slice.Tensor` goes through
     `index_select` and materialises, so the obvious walk writes into a buffer
     nobody is holding and returns normally. That is worse than a refusal and
     worse than a wrong number, because nothing anywhere reports it.
@@ -199,7 +199,7 @@ def test_a_negative_step_is_a_value_error_and_not_a_shim_refusal():
 def test_a_negative_start_resolves_against_the_extent():
     """`zeros(6)[-6::2] = [1,2,3]` is [1,0,2,0,3,0] upstream.
 
-    Negative bounds are the trap docs/DEMAND8.md warns about by name: the
+    Negative bounds are the trap docs/architectures/DEMAND8.md warns about by name: the
     neighbouring op is not evidence, because `index_add_`'s indices do not
     wrap while `index_put_`'s do. Here the negative number is a slice BOUND
     rather than an index, and a slice bound resolves against the extent
@@ -220,7 +220,7 @@ def test_index_put_answers_for_the_shapes_a_stepped_write_becomes():
 
     Both architecture shapes become an `index_put_` call with the stepped axis
     as an integer index and every other axis a `None`. Neither had coverage
-    before docs/SETITEM.md: every existing `[None, index]` case has exactly
+    before docs/bindings/SETITEM.md: every existing `[None, index]` case has exactly
     one leading `None`, and the mrope shape needs two.
     """
     # `pe[:, 0::2] = matrix`  ->  [None, [0, 2]]
@@ -289,7 +289,7 @@ def test_index_put_refuses_a_second_index_group_by_name():
 
 
 def test_the_setitem_document_carries_the_patch_it_promises():
-    """docs/SETITEM.md exists to be applied, so its applicability is checked.
+    """docs/bindings/SETITEM.md exists to be applied, so its applicability is checked.
 
     The translation lives in `bootstrap.py`, which belonged to another round;
     the deliverable is therefore a document with an exact patch in it. A
@@ -300,8 +300,8 @@ def test_the_setitem_document_carries_the_patch_it_promises():
     silently rotting until somebody tries it.
     """
     root = pathlib.Path(__file__).resolve().parents[3]
-    doc = root / "docs" / "SETITEM.md"
-    assert doc.exists(), "docs/SETITEM.md is missing -- the patch has no home"
+    doc = root / "docs" / "bindings" / "SETITEM.md"
+    assert doc.exists(), "docs/bindings/SETITEM.md is missing -- the patch has no home"
     text = doc.read_text()
     assert "## 2." in text, "SETITEM.md has no §2 (the patch)"
 

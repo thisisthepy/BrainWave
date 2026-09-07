@@ -1,4 +1,4 @@
-"""Intel NPU: docs/INTELNPU.md, `torchnative.export.intelnpu`.
+"""Intel NPU: docs/devices/INTELNPU.md, `torchnative.export.intelnpu`.
 
 What is checkable here and what is not, stated first because the difference is
 the whole design of this file. This round was written on an arm64 Mac. There is
@@ -17,7 +17,7 @@ So the tests are three kinds, not two:
   `torch.nn.Linear` lowered by `compile_model` and compared against the shim's
   own eager answer. These need `TORCHNATIVE_OPENVINO_C` pointing at an
   `openvino_c` shared library; they skip **by name** otherwise, saying exactly
-  what is missing --- docs/VULKAN3.md section 6.1: a skip with a false reason is
+  what is missing --- docs/devices/VULKAN3.md section 6.1: a skip with a false reason is
   counted as a pass.
 * **Against a real Intel NPU.** Only `test_probe_on_real_hardware`, which needs
   OpenVINO to list an `NPU` device. This file cannot fake it and does not try.
@@ -89,7 +89,7 @@ def test_library_candidates_refuses_darwin_by_name():
         assert "torchnative intelnpu:" in text, text
         assert "'darwin'" in text, text
         assert "Windows and Linux" in text, text
-        assert "docs/INTELNPU.md" in text, text
+        assert "docs/devices/INTELNPU.md" in text, text
         print("ok   intelnpu: darwin refused by name with a reason")
         return
     raise AssertionError("library_candidates('darwin') did not refuse")
@@ -174,7 +174,7 @@ def test_verdict_refuses_partial_offload():
     """NPU present but not alone means part of the graph runs elsewhere.
 
     This is the test that goes red if the assertion is ever weakened to
-    "NPU in devices". docs/NPU2.md caught exactly this on the CoreML side.
+    "NPU in devices". docs/graph/NPU2.md caught exactly this on the CoreML side.
     """
     try:
         verdict_execution_devices(("NPU", "CPU"))
@@ -308,7 +308,7 @@ def test_minimal_ir_is_well_formed_and_shaped_as_declared():
 
 
 def test_minimal_ir_is_f16_not_f32():
-    """f16 on purpose: docs/NPU2.md's CoreML models ran on the CPU because of f32."""
+    """f16 on purpose: docs/graph/NPU2.md's CoreML models ran on the CPU because of f32."""
     assert 'element_type="f16"' in minimal_ir()
     assert "f32" not in minimal_ir()
     print("ok   intelnpu: minimal IR asks for f16, not f32")
@@ -412,7 +412,7 @@ def _assert_refuses(fn, *needles):
 def test_compile_module_refuses_by_name_and_distinguishes_itself_from_compile_model():
     """Two doors, different coverage. Redirecting one to the other would misreport."""
     text = _assert_refuses(
-        compile_module, "compile_module", "docs/INTELNPU.md", "docs/NPU2.md"
+        compile_module, "compile_module", "docs/devices/INTELNPU.md", "docs/graph/NPU2.md"
     )
     assert "compile_model" in text, text
     assert "captured-graph" in text, text
@@ -424,14 +424,14 @@ def test_quantize_refuses_and_points_at_torchnative_quant():
         quantize_,
         "neural-compressor",
         "torchnative.quant.quantize_",
-        "docs/QUANT2.md",
+        "docs/graph/QUANT2.md",
     )
     print("ok   intelnpu: neural-compressor quantization refused, redirected to quant.quantize_")
 
 
 def test_dynamo_backend_refuses_permanently():
-    """Must not weaken: torch.compile is a permanent refusal, docs/COMPILE.md."""
-    text = _assert_refuses(dynamo_backend, "PEP 523", "abi3", "docs/COMPILE.md")
+    """Must not weaken: torch.compile is a permanent refusal, docs/graph/COMPILE.md."""
+    text = _assert_refuses(dynamo_backend, "PEP 523", "abi3", "docs/graph/COMPILE.md")
     assert "will not" in text, text
     print("ok   intelnpu: torch.compile backend refused permanently, naming PEP 523")
 
@@ -527,7 +527,7 @@ _cached = []
 def _openvino_run():
     """Run the real-OpenVINO half in the vendored tree, or return None with a reason.
 
-    A subprocess for the reason docs/NPU2.md's fixture uses one: the shim torch
+    A subprocess for the reason docs/graph/NPU2.md's fixture uses one: the shim torch
     lives in the vendored tree, not on this process's path, and `is_shim` in the
     payload is what proves the measurement was taken against it rather than
     against some other torch that happened to import.
@@ -684,7 +684,7 @@ def test_the_report_names_what_was_left_behind_rather_than_claiming_the_model():
 
     The archived library returns `None` from `lower_linear` for anything it does
     not recognise (`compiler.py:173`) and the caller gets a model it believes is
-    offloaded. docs/NPU2.md is a whole document about that going unnoticed.
+    offloaded. docs/graph/NPU2.md is a whole document about that going unnoticed.
     """
     payload = _openvino_or_skip("offload report")
     if payload is None:
@@ -696,7 +696,7 @@ def test_the_report_names_what_was_left_behind_rather_than_claiming_the_model():
 
 
 def test_the_shim_has_no_numpy_bridge_which_is_why_this_packs_bytes():
-    """docs/INTELNPU.md section 1.5, measured rather than assumed.
+    """docs/devices/INTELNPU.md section 1.5, measured rather than assumed.
 
     The archived library's entire FFI boundary is numpy: `np.ctypeslib.ndpointer`
     argtypes (`backend/bindings.py:14-18`), `.numpy()` at every call site

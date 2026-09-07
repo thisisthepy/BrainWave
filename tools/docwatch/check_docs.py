@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """Standing check for claims `docs/*.md` makes about this tree.
 
-docs/AUDIT.md audited eleven load-bearing documents by hand and found six of
+docs/verification/AUDIT.md audited eleven load-bearing documents by hand and found six of
 eleven carrying a false claim -- not concentrated, but sharing one mechanism
 almost every time: a later, unrelated commit closed a gap the document had
 named, and nobody came back to update the document. AUDIT.md's own
 conclusion is that this argues for a standing check over another manual
-pass. This is that check. docs/DOCWATCH.md is the design record (what was
+pass. This is that check. docs/verification/DOCWATCH.md is the design record (what was
 tried, what was rejected, why).
 
 What it checks
@@ -35,7 +35,8 @@ Usage
 -----
     python3 tools/docwatch/check_docs.py [FILES...]
 
-With no FILES, scans every docs/*.md. Needs a Python environment with real
+With no FILES, scans every docs/**/*.md (recursively -- documents live in
+subfolders; see docs/README.md). Needs a Python environment with real
 upstream torch installed and TORCH_C_ARTEFACT pointing at a built shim (the
 same environment tools/golden/compare.py needs) for anything other than
 `symbol-in-file`/`json-key`:
@@ -114,7 +115,7 @@ _FENCE_RE = re.compile(r"^\s*```")
 
 def parse_markers(paths: list[Path]) -> list[Claim]:
     """A marker inside a fenced code block is documentation ABOUT the
-    marker syntax (docs/DOCWATCH.md is full of these), not a live claim --
+    marker syntax (docs/verification/DOCWATCH.md is full of these), not a live claim --
     skip fenced regions so this tool's own design doc does not get parsed
     as a claim about the tree."""
     claims: list[Claim] = []
@@ -488,7 +489,7 @@ def evaluate(claims: list[Claim], live: LiveFacts | None) -> list[Result]:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("files", nargs="*", help="doc files to check (default: every docs/*.md)")
+    ap.add_argument("files", nargs="*", help="doc files to check (default: every docs/**/*.md, recursively)")
     ap.add_argument("--no-live", action="store_true", help="skip anything needing the shim/harnesses")
     ap.add_argument("--list", action="store_true", help="list discovered markers and exit, without checking")
     ap.add_argument("--python", default=os.environ.get("DOCWATCH_PYTHON", sys.executable),
@@ -498,7 +499,7 @@ def main() -> int:
     if args.files:
         paths = [Path(f).resolve() for f in args.files]
     else:
-        paths = sorted(DOCS_DIR.glob("*.md"))
+        paths = sorted(DOCS_DIR.rglob("*.md"))
 
     claims = parse_markers(paths)
 

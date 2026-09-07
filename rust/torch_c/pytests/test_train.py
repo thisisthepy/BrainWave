@@ -1,6 +1,6 @@
-"""Tests for docs/TRAIN2.md -- convolution's backward, and a model that trains.
+"""Tests for docs/training/TRAIN2.md -- convolution's backward, and a model that trains.
 
-`docs/RELEASE_0_0_13a0.md` §5 states two gaps as one sentence:
+`docs/platform/RELEASE_0_0_13a0.md` §5 states two gaps as one sentence:
 
     No transformer trains through `loss.backward()` yet. ... There is no
     convolution backward rule, so vision models stop.
@@ -16,8 +16,8 @@ file is where it stops being true: `aten.convolution.default`,
 `test_max_pool2d_backward_is_still_refused_by_name` for what it needs.
 
 Every number below is compared against **upstream torch running the identical
-program** in a second interpreter, which is docs/BACKWARD9.md §1's central
-oracle. Nothing here is a literal trajectory: docs/AUDIT.md found that shape of
+program** in a second interpreter, which is docs/training/BACKWARD9.md §1's central
+oracle. Nothing here is a literal trajectory: docs/verification/AUDIT.md found that shape of
 claim stale six times out of eleven, and a hardcoded number is a claim about
 2.13.0 that nothing re-checks.
 
@@ -89,7 +89,7 @@ def _worst(ours, theirs):
 
 # --- 1. convolution's three gradients, over configurations that differ ------
 #
-# docs/RNN.md measured that `lasr`'s own convolution takes an **even** kernel
+# docs/kernels/RNN.md measured that `lasr`'s own convolution takes an **even** kernel
 # where its comment says odd, so the easy path -- square kernel, stride 1,
 # padding 0, groups 1 -- is not where real callers live. Every argument below
 # changes at least one of the three gradients, and each has a case that moves
@@ -122,7 +122,7 @@ out = {"who": "shim" if hasattr(torch._C, "_aten_implemented") else "upstream"}
 
 def det(n, seed):
     # RNG-free: the two interpreters do not share a generator, so a seed would
-    # compare two different programs (docs/BACKWARD9.md §1).
+    # compare two different programs (docs/training/BACKWARD9.md §1).
     return [((seed * 1103515245 + i * 12345) % 2000 - 1000) / 1000.0 for i in range(n)]
 
 
@@ -192,7 +192,7 @@ def test_convolution_gradients_agree_with_upstream_across_stride_padding_dilatio
     shim = _shim(_CONV_SCRIPT)
     assert shim["who"] == "shim", shim["who"]
     if _upstream_torch is None:
-        return  # no upstream torch in this interpreter -- see docs/E2E.md
+        return  # no upstream torch in this interpreter -- see docs/models/E2E.md
     up = _upstream(_CONV_SCRIPT)
     assert up["who"] == "upstream", up["who"]
     assert set(shim["cases"]) == set(up["cases"])
@@ -353,7 +353,7 @@ def test_max_pool2d_backward_is_still_refused_by_name():
     That makes it two pieces of work and not one: a forward that also returns
     indices (`aten.rs`, not this round's territory), and a scatter rule over
     them. Recomputing the argmax inside the rule would be a third
-    implementation of the window geometry -- the thing docs/AUDIT.md keeps
+    implementation of the window geometry -- the thing docs/verification/AUDIT.md keeps
     finding go stale -- so it is not the way in.
     """
     if not _available():
@@ -488,7 +488,7 @@ out["buffers"] = [[float(v) for v in b.reshape(-1)]
 
 # --- accumulation, observed rather than assumed -----------------------------
 #
-# docs/BACKWARD9.md's nullification finding: a training loop stays green when
+# docs/training/BACKWARD9.md's nullification finding: a training loop stays green when
 # `+=` becomes `=`, because `zero_grad(set_to_none=True)` drops `.grad` every
 # step so the loop can never observe accumulation. So it is observed here,
 # outside the loop: two backwards of the *same* loss with no `zero_grad`
@@ -523,7 +523,7 @@ def test_a_convolutional_model_trains_end_to_end_and_agrees_with_upstream():
         touching them, and are what a `model.eval()` afterwards would use.
 
     Bound `1e-05` relative, and the measured worst is far inside it. It is
-    looser than docs/BACKWARD9.md's `2.98e-08` for a reason that is arithmetic
+    looser than docs/training/BACKWARD9.md's `2.98e-08` for a reason that is arithmetic
     and not slack: every quantity here has been through five steps of a
     *convolution*, which sums over `C_in * kH * kW` products per output, and
     then through a batch norm's own reduction. Two float32 summations in
@@ -546,7 +546,7 @@ def test_a_convolutional_model_trains_end_to_end_and_agrees_with_upstream():
     assert losses[-1] < losses[0] * 0.9, losses
 
     if _upstream_torch is None:
-        return  # no upstream torch in this interpreter -- see docs/E2E.md
+        return  # no upstream torch in this interpreter -- see docs/models/E2E.md
     up = _upstream(_VISION_SCRIPT)
     assert up["who"] == "upstream", up["who"]
     assert shim["names"] == up["names"], (shim["names"], up["names"])
@@ -563,7 +563,7 @@ def test_a_convolutional_model_trains_end_to_end_and_agrees_with_upstream():
 
 
 def test_the_training_loop_actually_accumulates_into_dot_grad():
-    """docs/BACKWARD9.md's nullification finding, repeated because it is the
+    """docs/training/BACKWARD9.md's nullification finding, repeated because it is the
     one that a loop test structurally cannot make: **`zero_grad(set_to_none=
     True)` drops `.grad` every step**, so a `+=` silently degraded to `=` never
     shows in a trajectory.
@@ -668,7 +668,7 @@ json.dump(out, sys.stdout)
 
 
 def test_a_tiny_transformer_language_model_trains_and_agrees_with_upstream():
-    """**docs/RELEASE_0_0_13a0.md §5's first clause was already false.**
+    """**docs/platform/RELEASE_0_0_13a0.md §5's first clause was already false.**
 
     "No transformer trains through `loss.backward()` yet" was written beside
     the convolution gap in the same sentence, and only the convolution half was
@@ -680,7 +680,7 @@ def test_a_tiny_transformer_language_model_trains_and_agrees_with_upstream():
     `_log_softmax` -- were all already in `RULE_OPS`.
 
     That is worth a test rather than a correction in prose, because the claim
-    "a transformer trains" is exactly the shape docs/AUDIT.md found going stale
+    "a transformer trains" is exactly the shape docs/verification/AUDIT.md found going stale
     in both directions.
 
     Bound `1e-05` relative, on the trajectory, the first step's gradients and

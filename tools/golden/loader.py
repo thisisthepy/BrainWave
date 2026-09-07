@@ -77,7 +77,7 @@ def load_shim(explicit_path: str | None = None) -> ModuleType:
         tried = ", ".join(_candidate_artefacts(explicit_path))
         raise ShimLoadError(
             "no torch._C artefact found. Tried: "
-            f"{tried}. Build it per docs/TORCH_C.md §7, or pass "
+            f"{tried}. Build it per docs/design/TORCH_C.md §7, or pass "
             "--artefact/TORCH_C_ARTEFACT explicitly."
         )
 
@@ -96,7 +96,7 @@ def load_shim(explicit_path: str | None = None) -> ModuleType:
 def resolve_torch_overload(torch_module, op_name: str):
     """`"aten.add.Tensor"` -> `torch.ops.aten.add.Tensor`.
 
-    Overload is part of the identity (docs/TORCH_C.md §1: "오버로드가 키의
+    Overload is part of the identity (docs/design/TORCH_C.md §1: "오버로드가 키의
     일부입니다"), so this refuses to guess one when it is missing.
     """
     parts = op_name.split(".")

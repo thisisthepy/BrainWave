@@ -1,6 +1,6 @@
 //! The `vulkan` device: a tensor representation that lives outside candle.
 //!
-//! `docs/VULKAN2.md` §5 sized this and deliberately wrote no code. Its finding
+//! `docs/devices/VULKAN2.md` §5 sized this and deliberately wrote no code. Its finding
 //! is the shape of this file: `candle_core::Device` is a closed enum with
 //! nowhere to put a Vulkan handle, so a Vulkan tensor **cannot be a
 //! `candle::Tensor` wearing a label**. It has to be a fourth arm of
@@ -13,7 +13,7 @@
 //! not been taught the Vulkan arm *cannot* read CPU storage off a Vulkan
 //! tensor by forgetting to check -- it gets a `PyResult` it has to handle, and
 //! the only thing it can do with it is raise. **A silent CPU fallback is
-//! structurally impossible**, which is what `docs/VULKAN.md` §5 names as the
+//! structurally impossible**, which is what `docs/devices/VULKAN.md` §5 names as the
 //! worst available outcome. Ops opt in one at a time, by name, in `dispatch`
 //! below; everything else refuses *naming the op*.
 //!
@@ -21,7 +21,7 @@
 //!
 //! * **No performance claim of any kind.** The only Vulkan driver reachable on
 //!   this machine is `kosmickrisp`, a Vulkan-on-Metal translation layer, so a
-//!   number measured here would describe the translator. `docs/VULKAN2.md` §4.4
+//!   number measured here would describe the translator. `docs/devices/VULKAN2.md` §4.4
 //!   says so and nothing in this file or its tests times anything.
 //! * **No fallback.** If the loader is absent, `ones(..., device="vulkan")`
 //!   raises with the loader's own error text. It never quietly returns a CPU
@@ -35,7 +35,7 @@
 //! linking it, so this module compiles and the artefact loads on a machine with
 //! no Vulkan at all -- absence is a value that gets reported, not a link error.
 //! On this host the loader and ICDs already exist inside the Android emulator's
-//! bundle (`docs/VULKAN2.md` §4), and pointing `DYLD_LIBRARY_PATH` and
+//! bundle (`docs/devices/VULKAN2.md` §4), and pointing `DYLD_LIBRARY_PATH` and
 //! `VK_DRIVER_FILES` at `libkosmickrisp_icd.json` gives the real `Apple M1`
 //! GPU. **Those files are the Android SDK's private implementation detail and
 //! this is a development/test path, never a shipping one.**
@@ -86,7 +86,7 @@ spv!(BIAS_ADD_F32_SPV, "bias_add_f32");
 /// Three process-wide counters, incremented at the only three places where
 /// this module can cross the host/device boundary or make the GPU do work.
 ///
-/// **Why these exist rather than a source-scanning test.** `docs/MPSATTN.md`
+/// **Why these exist rather than a source-scanning test.** `docs/devices/MPSATTN.md`
 /// §3.1 records, against its own round, a way to take an op off a refusal list
 /// while keeping its host readback that *both* of that device's derivation
 /// tests would still pass: the per-op scan looks for six helper names in a
@@ -123,7 +123,7 @@ fn push_bytes(push: [u32; 4]) -> [u8; 16] {
 
 /// Instance, device, queue and the two caches, created once per process.
 ///
-/// **Lifetime is the piece `vk_probe` does not have and `docs/VULKAN2.md` §5.2
+/// **Lifetime is the piece `vk_probe` does not have and `docs/devices/VULKAN2.md` §5.2
 /// item 2 names.** The probe builds an instance, a pipeline and a command pool
 /// per dispatch and tears them all down again, which is correct for a probe and
 /// indefensible for a runtime: creating a `VkDevice` per tensor op would put a
@@ -158,7 +158,7 @@ pub struct VkContext {
     /// which is right while there is one queue: the critical section is the
     /// whole record-submit-wait, so a finer lock would buy nothing.
     submit: Mutex<vk::CommandPool>,
-    /// The pipeline cache of `docs/VULKAN2.md` §5.2 item 3. Keyed by kernel
+    /// The pipeline cache of `docs/devices/VULKAN2.md` §5.2 item 3. Keyed by kernel
     /// name; a `&'static str` because the set of kernels is closed and authored
     /// here, not discovered.
     pipelines: Mutex<HashMap<&'static str, Kernel>>,
@@ -199,7 +199,7 @@ fn require(op: &str) -> PyResult<&'static VkContext> {
     context().map_err(|reason| {
         not_implemented(format!(
             "{op}: the vulkan device is not available in this process -- {reason}. \
-             Nothing falls back to the CPU here (docs/VULKAN.md §5): a vulkan \
+             Nothing falls back to the CPU here (docs/devices/VULKAN.md §5): a vulkan \
              tensor is a VkBuffer, so there is nothing to fall back with."
         ))
     })
@@ -289,7 +289,7 @@ unsafe fn init() -> Result<VkContext, String> {
 /// One device allocation, freed when the last tensor naming it is dropped.
 ///
 /// **One allocation per tensor, and that is stated as a limitation rather than
-/// presented as an allocator.** `docs/VULKAN2.md` §5.2 item 3 asks for a
+/// presented as an allocator.** `docs/devices/VULKAN2.md` §5.2 item 3 asks for a
 /// suballocating allocator, and this is not one: a real one matters because
 /// `maxMemoryAllocationCount` is a few thousand on desktop drivers and can be
 /// 4096 on mobile, so a model's worth of weights would exhaust it. It is the
@@ -400,7 +400,7 @@ impl VkContext {
         })
     }
 
-    /// Host to device. The upload half of `docs/VULKAN2.md` §5.2 item 5.
+    /// Host to device. The upload half of `docs/devices/VULKAN2.md` §5.2 item 5.
     unsafe fn upload(&self, buf: &VkBuffer, data: &[f32]) -> Result<(), String> {
         let p = self
             .device
@@ -483,7 +483,7 @@ impl VkContext {
         // legal, which is why widening this did not require recompiling
         // `add_f32.spv` -- and `shaders/compile.sh` reproduced that file
         // byte-for-byte, which is the control that the toolchain here is the
-        // one that produced the committed kernel (docs/VULKAN4.md §3).
+        // one that produced the committed kernel (docs/devices/VULKAN4.md §3).
         let pc = [vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::COMPUTE)
             .offset(0)
@@ -665,7 +665,7 @@ impl VkContext {
 /// the fill is built on the host and *uploaded*, which is the honest minimum --
 /// the bytes really do end up in a `VkBuffer` and really do come back out of
 /// one through `.cpu()`. A `fill` shader would move the loop to the GPU and
-/// prove nothing more about the wiring; `docs/VULKAN2.md` §5.3 says the same.
+/// prove nothing more about the wiring; `docs/devices/VULKAN2.md` §5.3 says the same.
 pub fn factory(
     py: Python<'_>,
     op: &str,
@@ -699,7 +699,7 @@ fn check_dtype(op: &str, tag: TorchDType) -> PyResult<()> {
     Err(not_implemented(format!(
         "{op}: the vulkan device in this build stores float32 only, not {}. \
          The shader is f32 and there is no conversion path that would not be a \
-         silent one (docs/VULKAN3.md).",
+         silent one (docs/devices/VULKAN3.md).",
         tag.name()
     )))
 }
@@ -736,7 +736,7 @@ pub fn dispatch(
 
         // Elementwise, equal shapes, f32. One exactly-rounded IEEE operation
         // per element, so each of these is compared bit-for-bit against the
-        // CPU kernel rather than within a tolerance (docs/VULKAN4.md §4).
+        // CPU kernel rather than within a tolerance (docs/devices/VULKAN4.md §4).
         "aten.add.Tensor" => add_tensor(py, op, args, kwargs),
         "aten.sub.Tensor" => binary(py, op, args, kwargs, "sub_f32", SUB_F32_SPV, true),
         "aten.mul.Tensor" => binary(py, op, args, kwargs, "mul_f32", MUL_F32_SPV, false),
@@ -768,12 +768,12 @@ pub fn dispatch(
         }
 
         // Transpose *materialises* here, because a `VkTensor` has a shape and
-        // no strides. 2-D only; higher ranks refuse by name (docs/VULKAN4.md §6).
+        // no strides. 2-D only; higher ranks refuse by name (docs/devices/VULKAN4.md §6).
         "aten.t.default" => t_default(py, op, args, kwargs),
         "aten.transpose.int" => transpose_int(py, op, args, kwargs),
 
         // The matmuls -- the ops the measured trace says a forward pass
-        // actually spends itself on (docs/VULKAN4.md §2).
+        // actually spends itself on (docs/devices/VULKAN4.md §2).
         "aten.mm.default" => mm(py, op, args, kwargs),
         "aten.addmm.default" => addmm(py, op, args, kwargs),
 
@@ -781,7 +781,7 @@ pub fn dispatch(
             "{other}: not implemented for the vulkan device. This build teaches \
              the vulkan device {} ops by name -- {} -- and every other op \
              refuses here rather than falling back to the CPU \
-             (docs/VULKAN4.md). Move the tensor with .cpu() to compute {other}.",
+             (docs/devices/VULKAN4.md). Move the tensor with .cpu() to compute {other}.",
             vulkan_ops().len(),
             vulkan_ops().join(", ")
         ))),
@@ -886,14 +886,14 @@ fn binary(
 }
 
 /// Broadcasting is refused rather than emulated, by name and with both shapes
-/// in the message. `docs/VULKAN3.md` is explicit that reaching for the CPU
+/// in the message. `docs/devices/VULKAN3.md` is explicit that reaching for the CPU
 /// implementation half a metre away is exactly the silent fallback this device
 /// exists to make impossible.
 fn same_shape(op: &str, a: &VkTensor, b: &VkTensor) -> PyResult<()> {
     if a.shape != b.shape {
         return Err(not_implemented(format!(
             "{op}: the vulkan kernels are elementwise over equal shapes and do \
-             not broadcast {:?} with {:?} (docs/VULKAN4.md §6).",
+             not broadcast {:?} with {:?} (docs/devices/VULKAN4.md §6).",
             a.shape, b.shape
         )));
     }
@@ -908,7 +908,7 @@ fn reject_alpha(
     if let Some(alpha) = crate::aten::optional(args, kwargs, 2, "alpha")? {
         if !alpha.is_none() && alpha.extract::<f64>().unwrap_or(1.0) != 1.0 {
             return Err(not_implemented(format!(
-                "{op}: the vulkan kernel has no alpha (docs/VULKAN4.md §6)."
+                "{op}: the vulkan kernel has no alpha (docs/devices/VULKAN4.md §6)."
             )));
         }
     }
@@ -1054,7 +1054,7 @@ fn transpose_int(
              {rank}-D one {:?}. A `VkTensor` carries a shape and no strides, so a \
              transpose here has to move bytes, and the kernel that moves them is \
              a 2-D one. Higher ranks refuse rather than being permuted by some \
-             other route (docs/VULKAN4.md §6).",
+             other route (docs/devices/VULKAN4.md §6).",
             a.shape
         )));
     }
@@ -1092,7 +1092,7 @@ fn matmul_into(op: &str, a: &VkTensor, b: &VkTensor) -> PyResult<(VkBuffer, usiz
         return Err(not_implemented(format!(
             "{op}: the vulkan matmul kernel is 2-D and was given {:?} and {:?}. \
              Batched matmul (`aten.bmm.default`) is not taught this device \
-             (docs/VULKAN4.md §6).",
+             (docs/devices/VULKAN4.md §6).",
             a.shape, b.shape
         )));
     }
@@ -1153,7 +1153,7 @@ fn addmm(
             if !v.is_none() && v.extract::<f64>().unwrap_or(1.0) != 1.0 {
                 return Err(not_implemented(format!(
                     "{op}: the vulkan device implements addmm with beta = alpha = 1 \
-                     and was given {name} != 1 (docs/VULKAN4.md §6)."
+                     and was given {name} != 1 (docs/devices/VULKAN4.md §6)."
                 )));
             }
         }
@@ -1176,7 +1176,7 @@ fn addmm(
         return Err(not_implemented(format!(
             "{op}: the vulkan device adds a bias of shape [{n}] or [{m}, {n}] and \
              was given {:?}. Wider broadcasting refuses rather than being \
-             emulated (docs/VULKAN4.md §6).",
+             emulated (docs/devices/VULKAN4.md §6).",
             c.shape
         )));
     }
@@ -1197,7 +1197,7 @@ fn addmm(
 }
 
 /// `x.to("vulkan")` for a tensor that is **not** on Vulkan yet -- the upload
-/// half of `docs/VULKAN2.md` §5.2 item 5, which did not exist until this round.
+/// half of `docs/devices/VULKAN2.md` §5.2 item 5, which did not exist until this round.
 ///
 /// **Why this had to be added before anything could be measured.** Before it,
 /// the only way onto this device was `torch.ones`/`zeros`/`empty`, so every
@@ -1205,7 +1205,7 @@ fn addmm(
 /// all-ones agrees with any implementation that sums the right number of ones;
 /// it cannot distinguish a correct kernel from one that transposed an index or
 /// accumulated in the wrong order. Comparing element-wise against upstream on
-/// real data (`docs/VULKAN4.md` §4) needs real data, and this is how it gets
+/// real data (`docs/devices/VULKAN4.md` §4) needs real data, and this is how it gets
 /// there.
 ///
 /// Returns `None` when the call is not a copy *to* vulkan, so the caller falls
@@ -1236,7 +1236,7 @@ pub fn maybe_upload(
         return Err(not_implemented(format!(
             "{op}: the vulkan device cannot change dtype on the way in ({} to \
              {}) -- there is no conversion shader. Cast on the cpu first \
-             (docs/VULKAN4.md §6).",
+             (docs/devices/VULKAN4.md §6).",
             input.tag().name(),
             tag.name()
         )));
@@ -1245,7 +1245,7 @@ pub fn maybe_upload(
     if current.kind != "cpu" {
         return Err(not_implemented(format!(
             "{op}: the vulkan device accepts a copy from the cpu, not from {} \
-             (docs/VULKAN4.md §6).",
+             (docs/devices/VULKAN4.md §6).",
             current.kind
         )));
     }
@@ -1279,7 +1279,7 @@ fn to_copy(
         return Err(not_implemented(format!(
             "{op}: the vulkan device cannot change dtype ({} to {}) -- there is \
              no conversion shader. Bring the tensor to the cpu first \
-             (docs/VULKAN3.md).",
+             (docs/devices/VULKAN3.md).",
             input.tag().name(),
             tag.name()
         )));
@@ -1297,7 +1297,7 @@ fn to_copy(
         }
         other => Err(not_implemented(format!(
             "{op}: the vulkan device can copy to cpu and to vulkan, not to \
-             {other} (docs/VULKAN3.md)."
+             {other} (docs/devices/VULKAN3.md)."
         ))),
     }
 }
@@ -1319,7 +1319,7 @@ fn add_tensor(
     if let Some(alpha) = crate::aten::optional(args, kwargs, 2, "alpha")? {
         if !alpha.is_none() && alpha.extract::<f64>().unwrap_or(1.0) != 1.0 {
             return Err(not_implemented(format!(
-                "{op}: the vulkan kernel is a+b and has no alpha (docs/VULKAN3.md)."
+                "{op}: the vulkan kernel is a+b and has no alpha (docs/devices/VULKAN3.md)."
             )));
         }
     }
@@ -1330,7 +1330,7 @@ fn add_tensor(
     if a.shape != b.shape {
         return Err(not_implemented(format!(
             "{op}: the vulkan kernel adds equal shapes elementwise and does not \
-             broadcast {:?} with {:?} (docs/VULKAN3.md).",
+             broadcast {:?} with {:?} (docs/devices/VULKAN3.md).",
             a.shape, b.shape
         )));
     }
@@ -1432,7 +1432,7 @@ fn vulkan_ops() -> Vec<&'static str> {
 ///
 /// A test asserts the delta across one op. That is a statement about what the
 /// process did rather than about what the source looks like, which is the
-/// distinction `docs/MPSATTN.md` §3.1 says its own evidence failed to make.
+/// distinction `docs/devices/MPSATTN.md` §3.1 says its own evidence failed to make.
 #[pyfunction]
 #[pyo3(name = "_vulkan_counters")]
 fn vulkan_counters(py: Python<'_>) -> PyResult<Py<PyAny>> {

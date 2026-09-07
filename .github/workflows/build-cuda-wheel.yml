@@ -9,7 +9,7 @@
 # kernel ran, and every step below that could be misread as saying otherwise
 # says so in its own output.
 #
-# The procedure that *would* settle whether kernels run is in `docs/CUDA.md` §6
+# The procedure that *would* settle whether kernels run is in `docs/devices/CUDA.md` §6
 # and needs a machine with an NVIDIA GPU. GitHub's hosted runners do not have
 # one; larger GPU runners are a paid feature this repository has not enabled.
 #
@@ -20,7 +20,7 @@
 # job is the *only* compiler that ever sees `device.rs`'s
 # `#[cfg(torch_c_cuda)]` island, and a red run here is a real defect report.
 #
-# It also settles three claims in `docs/CUDA.md` §2 empirically rather than by
+# It also settles three claims in `docs/devices/CUDA.md` §2 empirically rather than by
 # reading crate sources, which is how they were established: that a CUDA build
 # needs nvcc, that it needs `CUDA_COMPUTE_CAP` on a GPU-less machine, and that
 # the resulting `_C.abi3.so` carries libcuda/libcudart/libcublas as **load-time**
@@ -34,7 +34,7 @@ on:
         description: >-
           Compute capability to compile the CUDA kernels for. The default is 75
           (Turing, which is the T4 in Google Colab's free tier and the cheapest
-          GPU a reader of docs/CUDA.md is likely to reach). PTX is
+          GPU a reader of docs/devices/CUDA.md is likely to reach). PTX is
           forward-compatible, so a build at 75 JITs onto anything newer; it will
           NOT run on anything older.
         required: false
@@ -66,12 +66,12 @@ jobs:
       # `detect_compute_cap` reads it first, before trying nvidia-smi.
       #
       # This crate reads it too, at compile time, so that `device.rs` can refuse
-      # a GPU older than these kernels *by name* at `resolve()` (docs/CUDA.md §4).
+      # a GPU older than these kernels *by name* at `resolve()` (docs/devices/CUDA.md §4).
       CUDA_COMPUTE_CAP: ${{ inputs.compute_cap || '75' }}
       # Not the same claim as the CPU wheels' floor -- it is the same floor.
       # abi3-py313, so one binary per platform across CPython versions
-      # (docs/ABI3.md). CUDA does not change that axis; it changes a different
-      # one, and docs/CUDA.md §3 is about exactly which.
+      # (docs/design/ABI3.md). CUDA does not change that axis; it changes a different
+      # one, and docs/devices/CUDA.md §3 is about exactly which.
       PYTHON_VERSION: "3.13"
 
     steps:
@@ -145,7 +145,7 @@ jobs:
           nvcc --version
           echo "CUDA_PATH=$CUDA_PATH"
           ls "$CUDA_PATH/lib64/stubs"
-          # docs/CUDA.md §2, claim 1, checked rather than asserted: `nvcc
+          # docs/devices/CUDA.md §2, claim 1, checked rather than asserted: `nvcc
           # --version`'s fourth line is what cudarc's build script parses.
           nvcc --version | sed -n '4p'
 
@@ -186,7 +186,7 @@ jobs:
 
       # Cargo's own answer to "did the cfg actually reach the dependency table",
       # which is the failure mode that would otherwise produce a green CPU build
-      # wearing this job's name. `cargo tree -e features` is how docs/VULKAN3.md
+      # wearing this job's name. `cargo tree -e features` is how docs/devices/VULKAN3.md
       # §1.3 checked the same thing for Metal.
       - name: The cuda feature really is in the graph
         working-directory: rust/torch_c
@@ -196,7 +196,7 @@ jobs:
           grep -q "candle-core feature \"cuda\"" /tmp/tree.txt
           grep -q "cudarc" /tmp/tree.txt
 
-      # docs/CUDA.md §3's central claim, measured here rather than argued:
+      # docs/devices/CUDA.md §3's central claim, measured here rather than argued:
       # the artefact names CUDA libraries as load-time dependencies, so it
       # cannot be the same wheel as the CPU one.
       - name: What the artefact needs at load time
@@ -206,7 +206,7 @@ jobs:
           readelf -d target/release/lib_C.so | tee /tmp/needed.txt
           for lib in libcuda.so libcudart.so libcublas.so; do
             grep -q "$lib" /tmp/needed.txt \
-              || { echo "expected $lib in NEEDED; docs/CUDA.md §3 is wrong"; exit 1; }
+              || { echo "expected $lib in NEEDED; docs/devices/CUDA.md §3 is wrong"; exit 1; }
           done
           echo "--------------------------------------------------------------"
           echo "The above is why the CUDA build is a SEPARATE WHEEL. On a host"
@@ -229,7 +229,7 @@ jobs:
             echo "unavailable -- there is no GPU on this runner."
           else
             echo "NOTE: it did not import, which is the expected outcome on a"
-            echo "host with no CUDA driver and is the whole of docs/CUDA.md §3."
+            echo "host with no CUDA driver and is the whole of docs/devices/CUDA.md §3."
           fi
 
       # Packaging. Separate from the build claim above on purpose.
@@ -242,7 +242,7 @@ jobs:
           set -eux
           # The CPU index, deliberately: this project does not bundle cuBLAS or
           # cuDNN or NCCL, and pulling upstream's CUDA wheels here would drag in
-          # gigabytes of exactly the thing docs/CUDA.md §3 says we do not ship.
+          # gigabytes of exactly the thing docs/devices/CUDA.md §3 says we do not ship.
           python -m pip install --index-url https://download.pytorch.org/whl/cpu torch
           python -c "import torch, os; print(torch.__version__)"
           SRC=$(python -c "import sysconfig; print(sysconfig.get_paths()['purelib'])")
@@ -285,7 +285,7 @@ jobs:
               driver. Their classifier is tested in test_cuda.py; the
               states themselves are not entered here.
 
-          To settle those, follow the numbered procedure in docs/CUDA.md §6
+          To settle those, follow the numbered procedure in docs/devices/CUDA.md §6
           on a machine with an NVIDIA GPU.
           ================================================================
           EOF

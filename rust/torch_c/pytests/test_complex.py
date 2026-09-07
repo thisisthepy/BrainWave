@@ -1,7 +1,7 @@
 """Complex tensors: the imaginary part survives, and everything else refuses.
 
-`docs/COMPLEX.md` sized this and left it unstarted because `tensor.rs` was
-another round's file; `docs/COMPLEX2.md` is the round that built it. What
+`docs/kernels/COMPLEX.md` sized this and left it unstarted because `tensor.rs` was
+another round's file; `docs/kernels/COMPLEX2.md` is the round that built it. What
 landed is `Repr::Complex { re, im }` -- a *pair* of real candle tensors, not
 interleaved storage -- plus twelve ops taught that arm by name.
 
@@ -18,7 +18,7 @@ Two things are asserted that are not "does it compute":
 1.  **The refusals.** ~400 sites read a tensor's storage through
     `PyTensorBase::tensor()`, which refuses on the complex arm. That is what
     makes dropping the imaginary part unrepresentable rather than merely
-    avoided (docs/VULKAN2.md's standard). `test_every_untaught_op_refuses`
+    avoided (docs/devices/VULKAN2.md's standard). `test_every_untaught_op_refuses`
     walks a sample of them; nullifying that arm in `tensor.rs` (returning `re`)
     turns it red, which was checked rather than assumed.
 2.  **The narrowing.** Upstream's `view_as_complex` genuinely aliases its base;
@@ -141,7 +141,7 @@ out["aliases_its_base"] = pair(v2)[0][0] == 99.0
 
 # 8. every name `_complex_ops()` advertises, asked whether it actually answers
 #    for a complex tensor. Derived rather than restated: the point is to catch
-#    the list drifting in either direction (docs/COMPLEX3.md §8.1 drifted short
+#    the list drifting in either direction (docs/kernels/COMPLEX3.md §8.1 drifted short
 #    and nothing failed, because "sorted, unique, reachable" is true of a list
 #    that is simply incomplete).
 if hasattr(torch._C, "_complex_ops"):
@@ -174,7 +174,7 @@ if hasattr(torch._C, "_complex_ops"):
     # refusing. They do -- but the *bindings* refuse, not the ops, and
     # `_complex_ops()` is a list of **ops**. Probing the spelling would have
     # made this check demand three names be removed from a list they belong on.
-    # (`Tensor.real` and `Tensor.imag` really are missing; docs/COMPLEX3.md
+    # (`Tensor.real` and `Tensor.imag` really are missing; docs/kernels/COMPLEX3.md
     # §6.2 routes them, and `fnet` waits on `real`.)
     answers = {}
     for name in torch._C._complex_ops():
@@ -329,7 +329,7 @@ def test_the_llama4_rope_pipeline_matches_upstream_element_wise():
     """`polar` -> `view_as_complex` -> `[:, :, None, :]` -> `*` ->
     `view_as_real` -> `flatten(3)`, at `llama4`'s own shapes.
 
-    This is the closed pipeline `docs/COMPLEX.md` §3 scoped the round to, run
+    This is the closed pipeline `docs/kernels/COMPLEX.md` §3 scoped the round to, run
     end to end and compared **every element**, not a checksum. The two sums are
     kept as well, because a checksum that agrees while the elements do not is a
     different defect (a permutation) and one worth being able to tell apart.
@@ -373,7 +373,7 @@ def test_view_as_complex_copies_where_upstream_aliases():
 
     Measured on 2.13.0: `base[0,0] = 99.` shows through the complex tensor.
     A pair-of-tensors representation cannot do that, and choosing the pair is
-    what bought the correct `.shape` (docs/COMPLEX.md §3.2).
+    what bought the correct `.shape` (docs/kernels/COMPLEX.md §3.2).
 
     Asserted as a *divergence* -- the two sides are required to disagree --
     rather than skipped, so that it fails if either side changes. If the shim
@@ -389,8 +389,8 @@ def test_view_as_complex_copies_where_upstream_aliases():
     )
     assert shim["aliases_its_base"] is False, (
         "the shim's view_as_complex now aliases its base. That is upstream's "
-        "behaviour and an improvement -- but docs/COMPLEX2.md and "
-        "docs/VIEWS.md record the copy as a narrowing, so remove it there "
+        "behaviour and an improvement -- but docs/kernels/COMPLEX2.md and "
+        "docs/kernels/VIEWS.md record the copy as a narrowing, so remove it there "
         "before removing it here."
     )
 
@@ -403,7 +403,7 @@ def test_view_as_complex_copies_where_upstream_aliases():
 def test_upstream_refusals_are_reproduced_verbatim():
     """The four error messages upstream raises, byte for byte.
 
-    Transcribed from upstream in `docs/COMPLEX.md` §3.3 item 3 and now checked
+    Transcribed from upstream in `docs/kernels/COMPLEX.md` §3.3 item 3 and now checked
     against a live upstream process rather than against the transcription, so
     they cannot drift.
     """
@@ -453,7 +453,7 @@ def test_every_untaught_op_refuses_rather_than_dropping_the_imaginary_part():
     `Repr::Complex` is refused by `PyTensorBase::tensor()`, which is how ~400
     kernels read their inputs. So an op that was never taught the pair cannot
     quietly receive the real half: it gets a `PyResult` whose only content is a
-    refusal. That is `docs/VULKAN2.md`'s standard -- the wrong answer is
+    refusal. That is `docs/devices/VULKAN2.md`'s standard -- the wrong answer is
     unrepresentable, not merely avoided.
 
     Nine ops are sampled here, chosen because each one would return a
@@ -462,8 +462,8 @@ def test_every_untaught_op_refuses_rather_than_dropping_the_imaginary_part():
     right in shape and silently half the data.
 
     **`slice` was the tenth and has been inverted out of this list**, not
-    deleted from the suite. docs/COMPLEX3.md taught `aten.slice.Tensor` the
-    complex arm because `docs/BIND3.md` §6 measured it as one of the two ops
+    deleted from the suite. docs/kernels/COMPLEX3.md taught `aten.slice.Tensor` the
+    complex arm because `docs/bindings/BIND3.md` §6 measured it as one of the two ops
     that put `fft_fftn`'s `s=` argument out of reach, and it is now proven
     element-wise against upstream on *both* components -- including two strided
     forms -- in `pytests/test_cplx2.py::test_slice_keeps_the_imaginary_part_on_every_form`.
@@ -545,7 +545,7 @@ def test_the_refusal_points_at_a_list_that_is_not_stale():
 def test_complex_ops_is_derived_from_behaviour_and_not_only_from_its_own_shape():
     """The staleness check above reads the list's *shape*; this reads its truth.
 
-    `docs/COMPLEX3.md` §8.1 taught five more ops and the list did not follow.
+    `docs/kernels/COMPLEX3.md` §8.1 taught five more ops and the list did not follow.
     Nothing failed, because sorted-unique-reachable is true of a list that is
     simply short -- and a refusal naming a list shorter than the truth tells a
     user an op is unavailable when it works, which is the same class of harm as
@@ -588,7 +588,7 @@ def test_complex_ops_is_derived_from_behaviour_and_not_only_from_its_own_shape()
     assert set(answers) == taught, (sorted(set(answers) ^ taught))
 
     # The *other* direction -- an op that answers and is missing from the list,
-    # which is how docs/COMPLEX3.md §8.1 drifted -- is
+    # which is how docs/kernels/COMPLEX3.md §8.1 drifted -- is
     # `test_every_untaught_op_refuses_rather_than_dropping_the_imaginary_part`
     # above: it asserts each op *not* on the list refuses. Between the two,
     # drift is red either way. Asserting it here would be vacuous, since these
@@ -633,7 +633,7 @@ def test_the_component_mapping_is_the_inverse_of_to_complex():
     # `bfloat16` has no complex partner of its own width, and upstream does
     # not answer the identity for it -- it promotes: `torch.bfloat16
     # .to_complex()` is `torch.complex64`, measured. Pinned here because this
-    # table said `bfloat16` until docs/COMPLEX2.md.
+    # table said `bfloat16` until docs/kernels/COMPLEX2.md.
     assert _C.bfloat16.to_complex() == _C.complex64
     # ...and the complex tags map to themselves.
     for cplx in (_C.complex32, _C.complex64, _C.complex128):

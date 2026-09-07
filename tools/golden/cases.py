@@ -118,7 +118,7 @@ _FULL_FILLS: dict[str, list[tuple[Any, str, str]]] = {
     # float8_e4m3fn: 4 exponent bits, 3 mantissa bits, no infinities. Max
     # finite is 448.0 and every value here is exactly representable, so a
     # rounding disagreement between the two sides shows up as a value
-    # difference rather than as tolerance slack. docs/FLOAT8B.md §5.
+    # difference rather than as tolerance slack. docs/numerics/FLOAT8B.md §5.
     "float8_e4m3fn": [
         (0.0, "match", ""),
         (-1.0, "match", ""),
@@ -197,7 +197,7 @@ def full_cases(torch_module, c_module, torch_call) -> list[Case]:
     cases: list[Case] = []
 
     # Default dtype inference: torch.full infers int64 from a python int
-    # fill value and float32 from a python float one (docs/TORCH_C.md §2).
+    # fill value and float32 from a python float one (docs/design/TORCH_C.md §2).
     for fill, note in [
         (0, "default-dtype int fill -> expect int64"),
         (-7, "default-dtype int fill -> expect int64"),
@@ -230,7 +230,7 @@ def full_cases(torch_module, c_module, torch_call) -> list[Case]:
             )
         )
 
-    # Keyword-argument coverage (docs/GOLDEN.md, docs/DISPATCH.md §4.1):
+    # Keyword-argument coverage (docs/verification/GOLDEN.md, docs/design/DISPATCH.md §4.1):
     # size/fill_value/dtype all by keyword, not just positionally.
     cases.append(
         Case(
@@ -330,8 +330,8 @@ def add_cases(torch_module, c_module, torch_call) -> list[Case]:
             )
         )
 
-    # Was a known gap (docs/TORCH_C.md §2 called promotion deliberately
-    # unimplemented). docs/PROMOTE.md §4 closed it, so this diffs real values
+    # Was a known gap (docs/design/TORCH_C.md §2 called promotion deliberately
+    # unimplemented). docs/numerics/PROMOTE.md §4 closed it, so this diffs real values
     # now rather than asserting a refusal.
     #
     # The operands are 0.1 and not 1.0 on purpose: `1.0 + 1.0` is 2.0 in
@@ -347,7 +347,7 @@ def add_cases(torch_module, c_module, torch_call) -> list[Case]:
             op="aten.add.Tensor",
             run_torch=lambda: torch_call(af_t, bf_t),
             run_c=lambda: c_module._aten_dispatch("aten.add.Tensor", af_c, bf_c),
-            note="upstream promotes to float64 and adds there (docs/PROMOTE.md §4). "
+            note="upstream promotes to float64 and adds there (docs/numerics/PROMOTE.md §4). "
                  "0.1 is used because 1.0 cannot distinguish a float64 add from a "
                  "float32 add relabelled float64.",
         )
@@ -355,7 +355,7 @@ def add_cases(torch_module, c_module, torch_call) -> list[Case]:
 
     cases.extend(_reduced_float_add_cases(torch_module, c_module, torch_call))
 
-    # docs/DISPATCH.md §4.1: every case above calls the shim positionally, so
+    # docs/design/DISPATCH.md §4.1: every case above calls the shim positionally, so
     # the keyword path through `_aten_dispatch` (what `bootstrap.py`'s
     # `dispatch(key, **bound)` actually sends in production) was never
     # exercised -- a tampered `interned_name` arm for "self"/"other"/"alpha"
@@ -368,7 +368,7 @@ def add_cases(torch_module, c_module, torch_call) -> list[Case]:
             op="aten.add.Tensor",
             run_torch=lambda: torch_call(self=kw_a_t, other=kw_b_t, alpha=2.0),
             run_c=lambda: c_module._aten_dispatch("aten.add.Tensor", self=kw_a_c, other=kw_b_c, alpha=2.0),
-            note="keyword-argument coverage -- see the module note above and docs/GOLDEN.md",
+            note="keyword-argument coverage -- see the module note above and docs/verification/GOLDEN.md",
         )
     )
 
@@ -388,7 +388,7 @@ def add_cases(torch_module, c_module, torch_call) -> list[Case]:
 #
 #   * **Size.** Every other case in this file is at most 24 elements. The
 #     shim's `bfloat16` add narrowed correctly below 32 elements and
-#     truncated at 32 and above (measured; docs/BF16.md §3), because the
+#     truncated at 32 and above (measured; docs/numerics/BF16.md §3), because the
 #     wrong rule lived on a vectorised path nothing here was big enough to
 #     reach. These probes are 64 and 256 elements on purpose.
 #   * **Values.** Tidy constants round the same way under every rule --
@@ -398,7 +398,7 @@ def add_cases(torch_module, c_module, torch_call) -> list[Case]:
 #
 # The failure this guards against is not "slightly less accurate". A biased
 # narrowing pushes every rounded element the same direction, so a residual
-# stream accumulates it: docs/BF16.md measures it reaching an O(1) logit
+# stream accumulates it: docs/numerics/BF16.md measures it reaching an O(1) logit
 # difference and different generated text after 30 layers.
 _REDUCED_FLOAT_DTYPES = ["float16", "bfloat16"]
 
@@ -411,7 +411,7 @@ def _reduced_float_probe(n: int, seed: int, scale: float = 1.0) -> list[float]:
     return out
 
 
-# --- the reduced-float scalar rule (docs/SCALAR.md) ------------------------
+# --- the reduced-float scalar rule (docs/numerics/SCALAR.md) ------------------------
 # When an op folds a Python number into a `float16`/`bfloat16` tensor, upstream
 # reads that number at one of two precisions, and **which one is a property of
 # the individual kernel, not of the op family**: `mul` reads it with
@@ -433,9 +433,9 @@ def _reduced_float_probe(n: int, seed: int, scale: float = 1.0) -> list[float]:
 # The separating scalars below were picked by measuring, not by looking
 # irregular -- `0.1` separates 4 of these 8 values in `float16` and only 1 in
 # `bfloat16`, which is the same near-miss that let `div.Scalar` pass for months
-# (docs/TRAIN.md §4: `bfloat16` rounds both roads of `1/0.3` to `3.328125`).
+# (docs/training/TRAIN.md §4: `bfloat16` rounds both roads of `1/0.3` to `3.328125`).
 #
-#   0.3   5/8 in bfloat16, 3/8 in float16   the value docs/TRAIN.md §5 measured
+#   0.3   5/8 in bfloat16, 3/8 in float16   the value docs/training/TRAIN.md §5 measured
 #   0.7   1/8 in bfloat16, 5/8 in float16   float16's separator, bfloat16's near miss
 #   1.3   5/8 in bfloat16, 4/8 in float16   >1, so the product crosses a binade
 #
@@ -682,7 +682,7 @@ def mm_cases(torch_module, c_module, torch_call) -> list[Case]:
                 b_flat,
                 (2, 2),
                 expect="c_error",
-                note=f"candle's matmul has no kernel for {dtype_name}; torch's CPU addmm does. See docs/TORCH_C.md §2 for int64 specifically -- int32/int16/uint8/bfloat16 have the same gap, found while building this harness.",
+                note=f"candle's matmul has no kernel for {dtype_name}; torch's CPU addmm does. See docs/design/TORCH_C.md §2 for int64 specifically -- int32/int16/uint8/bfloat16 have the same gap, found while building this harness.",
             )
         )
 
@@ -706,7 +706,7 @@ def mm_cases(torch_module, c_module, torch_call) -> list[Case]:
 
     # mm must reject non-2D input on both sides -- candle's matmul batches,
     # torch.mm does not, and the shim explicitly guards against silently
-    # standing in for bmm/matmul (docs/TORCH_C.md §2).
+    # standing in for bmm/matmul (docs/design/TORCH_C.md §2).
     a3_t, a3_c = pair_from_flat(torch_module, c_module, [1.0] * 8, (2, 2, 2), "float32")
     cases.append(
         Case(
@@ -719,7 +719,7 @@ def mm_cases(torch_module, c_module, torch_call) -> list[Case]:
         )
     )
 
-    # Model-scale reduction depths -- the docs/GPT2.md §7 gap. See the long
+    # Model-scale reduction depths -- the docs/models/GPT2.md §7 gap. See the long
     # note above `_gemm_scale_check`.
     for dtype_name, m, k, n, note in [
         ("float32", 8, 512, 8, "GPT-2 small's per-head depth, narrow output"),
@@ -740,7 +740,7 @@ def mm_cases(torch_module, c_module, torch_call) -> list[Case]:
 # --- aten.matmul.default ------------------------------------------------------
 #
 # Landed in `_aten_implemented()` from `IMPLEMENTED_AWAITING_GOLDEN` alongside
-# this builder. docs/LINEAR.md's layout-fallback fix (`gemm_with_layout_fallback`,
+# this builder. docs/perf/LINEAR.md's layout-fallback fix (`gemm_with_layout_fallback`,
 # skip the unconditional `.contiguous()` and copy only when candle refuses the
 # layout) and its N-D x 2-D fold (`batched_matmul`: stack the batch into rows
 # and run one 2-D GEMM instead of broadcasting the 2-D operand up to the
@@ -749,19 +749,19 @@ def mm_cases(torch_module, c_module, torch_call) -> list[Case]:
 # that change -- 48 of 507 bitprobe cases moved, 35 of those newly agreeing
 # with upstream torch, 0 regressed away from it -- while sitting in
 # `IMPLEMENTED_AWAITING_GOLDEN`, where the 2760-case golden suite never ran
-# it at all (docs/LINEAR.md §4.3).
+# it at all (docs/perf/LINEAR.md §4.3).
 #
-# The cases below are picked to land on exactly the axes docs/LINEAR.md names
+# The cases below are picked to land on exactly the axes docs/perf/LINEAR.md names
 # as touched:
 #   * rank combinations -- the fold only fires when the right operand is 2-D
 #     and the left has more dimensions; every other combination still goes
 #     through `broadcast_matmul`, so both branches need cases.
 #   * a transposed-view operand (`t(weight)`) -- the literal shape
 #     `bootstrap.py::linear` hands the kernel for every one of the 211
-#     `F.linear` calls in one SmolLM2-135M forward pass (docs/LINEAR.md §1).
+#     `F.linear` calls in one SmolLM2-135M forward pass (docs/perf/LINEAR.md §1).
 #   * a non-transpose strided operand and a swapped-batch-axis 4-D operand --
 #     both are layouts Accelerate's `MatMul` refuses outright
-#     (`MatMulUnexpectedStriding`/`ab_skip`, docs/LINEAR.md §2) and only reach
+#     (`MatMulUnexpectedStriding`/`ab_skip`, docs/perf/LINEAR.md §2) and only reach
 #     a correct answer through the copy-on-refusal fallback.
 #   * broadcasting batch dimensions -- the shape `bmm_cases` above proves
 #     `bmm` itself must refuse, but `matmul`'s own kernel (`broadcast_matmul`)
@@ -915,7 +915,7 @@ def matmul_cases(torch_module, c_module, torch_call) -> list[Case]:
         )
 
     # batch=1 is the literal shape every one of the 211 `F.linear` calls in a
-    # SmolLM2-135M forward pass takes (docs/LINEAR.md §1's table) -- the fold
+    # SmolLM2-135M forward pass takes (docs/perf/LINEAR.md §1's table) -- the fold
     # branch still fires (rank 3 > rank 2), but this is worth its own case
     # because a kernel that special-cased "batch of one" differently from
     # "batch of several" would only be caught here.
@@ -968,12 +968,12 @@ def matmul_cases(torch_module, c_module, torch_call) -> list[Case]:
     )
 
     # -- a transposed-view operand, dtype-swept -- the actual `F.linear`
-    # shape, and the case docs/LINEAR.md's fold-rule change is really about.
+    # shape, and the case docs/perf/LINEAR.md's fold-rule change is really about.
     # Noisy data + `_exact_value_check` again (see the note above
     # `_MATMUL_MATCH_DTYPES`): this is the strongest of the fold/layout
     # cases, since it exercises the fold branch *and* a non-contiguous
     # operand together. bf16/f16 are included on purpose even though
-    # docs/LINEAR.md §4.1 measured that the layout fallback is a no-op for
+    # docs/perf/LINEAR.md §4.1 measured that the layout fallback is a no-op for
     # them (`opmath_in`'s widening to float32 already materialises a
     # contiguous tensor, so the transposed view never survives to
     # `gemm_with_layout_fallback`) -- that is a claim this suite should
@@ -1003,7 +1003,7 @@ def matmul_cases(torch_module, c_module, torch_call) -> list[Case]:
 
     # -- a genuinely strided (non-transpose) operand: a column-strided slice,
     # which Accelerate's MatMul refuses outright (MatMulUnexpectedStriding,
-    # docs/LINEAR.md §2) and only a correct answer comes back through the
+    # docs/perf/LINEAR.md §2) and only a correct answer comes back through the
     # copy-on-refusal fallback in `gemm_with_layout_fallback`. Noisy data +
     # exact check, same reasoning.
     strided_base_t, strided_base_c = pair_from_flat(torch_module, c_module, _gemm_lcg(64, 18), (4, 16), "float32")
@@ -1024,7 +1024,7 @@ def matmul_cases(torch_module, c_module, torch_call) -> list[Case]:
 
     # -- a swapped-batch-axis 4-D operand: candle's shared `MatMul::ab_skip`
     # needs the batch strides in one of four recognised shapes and refuses a
-    # swapped pair, reachable only at rank 4+ (docs/LINEAR.md §2). Noisy
+    # swapped pair, reachable only at rank 4+ (docs/perf/LINEAR.md §2). Noisy
     # data + exact check, same reasoning.
     swap_base_t, swap_base_c = pair_from_flat(torch_module, c_module, _gemm_lcg(120, 20), (2, 3, 4, 5), "float32")
     swap_t = swap_base_t.transpose(0, 1)
@@ -1125,7 +1125,7 @@ def matmul_cases(torch_module, c_module, torch_call) -> list[Case]:
     )
 
     # -- THREE batch axes (rank 5), which candle refused outright until
-    # `fold_batch_axes_matmul` landed (docs/TAIL3.md). `MatMul::ab_skip`
+    # `fold_batch_axes_matmul` landed (docs/kernels/TAIL3.md). `MatMul::ab_skip`
     # recognises zero, one or two batch axes and rejects everything above,
     # *whatever the strides are* -- so these operands are fully contiguous and
     # were still refused, which is why `.contiguous()` was not the fix. Five
@@ -1168,7 +1168,7 @@ def matmul_cases(torch_module, c_module, torch_call) -> list[Case]:
 
 # --- pre-seeded case builders for ops rust/torch_c does not implement yet --
 #
-# docs/C_SURFACE.md traced a small Llama forward+generate() against real
+# docs/design/C_SURFACE.md traced a small Llama forward+generate() against real
 # upstream torch and found exactly 13 torch.<op> names actually get called
 # (not just referenced -- called): arange, argmax, cat, embedding, empty,
 # full, is_floating_point, isin, ones, pow, randint, rsqrt, tensor. `full`
@@ -1197,7 +1197,7 @@ def matmul_cases(torch_module, c_module, torch_call) -> list[Case]:
 # has not been true since `rust/torch_c/src/rng.rs` ported torch's own
 # generator. The note outlived its reason, and while it did, `randint` really
 # was drawing from the wrong generator and nothing here could see it
-# (docs/RANDINT.md §8). Its cases are now seeded on both sides and compared
+# (docs/kernels/RANDINT.md §8). Its cases are now seeded on both sides and compared
 # element by element, like `uniform_` and `normal_`. `empty` keeps its
 # exemption because *its* reason still holds: uninitialized memory has no
 # correct value, seed or no seed.
@@ -1443,7 +1443,7 @@ def arange_start_step_cases(torch_module, c_module, torch_call) -> list[Case]:
 
 # --- aten.linspace.default ----------------------------------------------------
 #
-# docs/DEMAND.md §0.1 rank 4 -- `ConvNextModel.__init__`'s stochastic-depth
+# docs/architectures/DEMAND.md §0.1 rank 4 -- `ConvNextModel.__init__`'s stochastic-depth
 # rate schedule, a construction-time wall. Leaf upstream
 # (`RangeFactoriesKernel.cpp::linspace_kernel`, fetched and read). Three
 # things this suite exists to pin down, each measured rather than assumed:
@@ -1556,15 +1556,15 @@ def linspace_default_cases(torch_module, c_module, torch_call) -> list[Case]:
 # --- aten.amax.default -------------------------------------------------------
 #
 # `aten::amax(Tensor self, int[1] dim=[], bool keepdim=False) -> Tensor` -- the
-# maximum *value*, no indices. docs/SEQLEN.md §7 is why it exists: SDPA's
+# maximum *value*, no indices. docs/numerics/SEQLEN.md §7 is why it exists: SDPA's
 # softmax wants a maximum for numerical stability and never wants the index,
 # and candle only has the index-producing reduction.
 #
 # **Three of these cases exist because the family has form.** `max.default`
 # answered `3.0` for `max([3, nan, 1])` where upstream answers `nan`, and every
-# case that builder had passed throughout (docs/E2E_REAL.md); `max.other`
+# case that builder had passed throughout (docs/models/E2E_REAL.md); `max.other`
 # dropped a NaN that was present only in its second operand
-# (docs/SPELLINGS.md). Both are candle's `|x, y| x < y` predicate, which is
+# (docs/bindings/SPELLINGS.md). Both are candle's `|x, y| x < y` predicate, which is
 # false against a NaN and therefore skips one. So NaN is checked here from the
 # first position, the middle and the last -- the middle one being the position
 # a wrong kernel gets right by accident.
@@ -1790,7 +1790,7 @@ def argmax_cases(torch_module, c_module, torch_call) -> list[Case]:
                 )
             )
 
-    # Keyword-argument coverage (docs/GOLDEN.md, docs/DISPATCH.md §4.1):
+    # Keyword-argument coverage (docs/verification/GOLDEN.md, docs/design/DISPATCH.md §4.1):
     # self/dim/keepdim all by keyword -- also the "dim" tamper's own example.
     kw_t, kw_c = pair_from_flat(torch_module, c_module, [1, 5, 2, 9, 0, 3], (2, 3), "float32")
     cases.append(
@@ -1809,13 +1809,13 @@ def argmax_cases(torch_module, c_module, torch_call) -> list[Case]:
     # (measured on torch 2.13.0). This build answered `2`: candle's fold is
     # `|x, y| x < y`, every comparison against a NaN is false, and the
     # accumulator never moves onto it. The same predicate, the same fault, as
-    # `max.default` (docs/E2E_REAL.md), `max.other` (docs/SPELLINGS.md §7.2)
-    # and `max.dim` (docs/TRIL.md §3).
+    # `max.default` (docs/models/E2E_REAL.md), `max.other` (docs/bindings/SPELLINGS.md §7.2)
+    # and `max.dim` (docs/kernels/TRIL.md §3).
     #
     # Three positions, and the first one is the trap: a NaN at index 0 seeds
     # the accumulator, so `argmax([nan, 2., 3.])` is `0` even with no NaN
     # handling at all. A suite with only that case passes under the bug --
-    # the same hole docs/SEQLEN.md §7.12 found in `amax`'s first test.
+    # the same hole docs/numerics/SEQLEN.md §7.12 found in `amax`'s first test.
     nan = float("nan")
     for at, where in [(0, "first"), (1, "middle"), (3, "last")]:
         flat = [1.0, 5.0, 2.0, 9.0]
@@ -1883,7 +1883,7 @@ def cat_cases(torch_module, c_module, torch_call) -> list[Case]:
     op = "aten.cat.default"
     cases: list[Case] = []
 
-    # Promotion across the list (docs/PROMOTE.md §4). `cat` takes a
+    # Promotion across the list (docs/numerics/PROMOTE.md §4). `cat` takes a
     # TensorList, so it folds `promote_types` over every entry rather than
     # joining a pair -- the three-entry case is what distinguishes a real
     # fold from a look at the first two.
@@ -1896,7 +1896,7 @@ def cat_cases(torch_module, c_module, torch_call) -> list[Case]:
                 op=op,
                 run_torch=lambda a_t=a_t, b_t=b_t: torch_call([a_t, b_t], 0),
                 run_c=lambda a_c=a_c, b_c=b_c: c_module._aten_dispatch(op, [a_c, b_c], 0),
-                note=f"{why} (docs/PROMOTE.md §3)",
+                note=f"{why} (docs/numerics/PROMOTE.md §3)",
             )
         )
     tri = [
@@ -1910,7 +1910,7 @@ def cat_cases(torch_module, c_module, torch_call) -> list[Case]:
             run_torch=lambda: torch_call([t for t, _ in tri], 0),
             run_c=lambda: c_module._aten_dispatch(op, [c for _, c in tri], 0),
             note="f16 x bf16 escapes to f32, which f64 then wins outright; a fold that "
-                 "stopped after the first pair answers float32 (docs/PROMOTE.md §4)",
+                 "stopped after the first pair answers float32 (docs/numerics/PROMOTE.md §4)",
         )
     )
     # A `(0,)` entry is skipped for its SHAPE but still contributes its DTYPE,
@@ -1924,7 +1924,7 @@ def cat_cases(torch_module, c_module, torch_call) -> list[Case]:
             run_torch=lambda: torch_call([e_t, n_t], 0),
             run_c=lambda: c_module._aten_dispatch(op, [e_c, n_c], 0),
             note="the (0,) entry takes no part in the shape but still promotes the "
-                 "result to float64 (docs/PROMOTE.md §4)",
+                 "result to float64 (docs/numerics/PROMOTE.md §4)",
         )
     )
 
@@ -1996,7 +1996,7 @@ def cat_cases(torch_module, c_module, torch_call) -> list[Case]:
         )
     )
 
-    # Keyword-argument coverage (docs/GOLDEN.md, docs/DISPATCH.md §4.1):
+    # Keyword-argument coverage (docs/verification/GOLDEN.md, docs/design/DISPATCH.md §4.1):
     # tensors/dim both by keyword.
     kwa_t, kwa_c = pair_from_flat(torch_module, c_module, [1, 2, 3, 4], (2, 2), "float32")
     kwb_t, kwb_c = pair_from_flat(torch_module, c_module, [5, 6, 7, 8], (2, 2), "float32")
@@ -2009,7 +2009,7 @@ def cat_cases(torch_module, c_module, torch_call) -> list[Case]:
         )
     )
 
-    # `torch.concat` -- `zoedepth`'s wall after `relu_` (docs/KERNELS26.md
+    # `torch.concat` -- `zoedepth`'s wall after `relu_` (docs/kernels/KERNELS26.md
     # §21). `aten::concat` is `CompositeImplicitAutograd` and its body is
     # `at::cat`; a `TorchDispatchMode` trace fires `aten.cat.default` and
     # nothing else, so the alias is a `bootstrap.py` composite and golden is
@@ -2090,7 +2090,7 @@ def embedding_cases(torch_module, c_module, torch_call) -> list[Case]:
             )
         )
 
-    # Keyword-argument coverage (docs/GOLDEN.md, docs/DISPATCH.md §4.1):
+    # Keyword-argument coverage (docs/verification/GOLDEN.md, docs/design/DISPATCH.md §4.1):
     # weight/indices both by keyword.
     kw_w_t, kw_w_c = pair_from_flat(torch_module, c_module, weight_flat, (vocab, dim), "float32")
     kw_idx_t, kw_idx_c = pair_from_flat(torch_module, c_module, [0, 3, 7, 2], (4,), "int64")
@@ -2147,7 +2147,7 @@ def empty_cases(torch_module, c_module, torch_call) -> list[Case]:
 
 # --- aten.empty_strided.default ------------------------------------------------
 #
-# Contiguous strides only. `docs/EXPORT4.md` records that this shim refuses a
+# Contiguous strides only. `docs/graph/EXPORT4.md` records that this shim refuses a
 # non-contiguous `empty_strided` by name -- candle's Layout has no
 # representation for one on either the meta or the dense path -- so a golden
 # case for one would be a case for a refusal, which `test_export4.py` already
@@ -2286,7 +2286,7 @@ def isin_cases(torch_module, c_module, torch_call) -> list[Case]:
             )
         )
 
-    # Keyword-argument coverage (docs/GOLDEN.md, docs/DISPATCH.md §4.1):
+    # Keyword-argument coverage (docs/verification/GOLDEN.md, docs/design/DISPATCH.md §4.1):
     # elements/test_elements both by keyword.
     kw_e_t, kw_e_c = pair_from_flat(torch_module, c_module, [1, 2, 3, 4, 5], (5,), "float32")
     kw_t_t, kw_t_c = pair_from_flat(torch_module, c_module, [2, 4], (2,), "float32")
@@ -2385,7 +2385,7 @@ def pow_tensor_scalar_cases(torch_module, c_module, torch_call) -> list[Case]:
             )
         )
 
-    # Keyword-argument coverage (docs/GOLDEN.md, docs/DISPATCH.md §4.1):
+    # Keyword-argument coverage (docs/verification/GOLDEN.md, docs/design/DISPATCH.md §4.1):
     # self/exponent both by keyword.
     kw_base_t, kw_base_c = pair_from_flat(torch_module, c_module, [0.0, 1.0, 2.0, -2.0, 4.0], (5,), "float32")
     cases.append(
@@ -2397,7 +2397,7 @@ def pow_tensor_scalar_cases(torch_module, c_module, torch_call) -> list[Case]:
         )
     )
 
-    # The scalar rule (docs/SCALAR.md §3.3), the *narrowing* half of it. Every
+    # The scalar rule (docs/numerics/SCALAR.md §3.3), the *narrowing* half of it. Every
     # exponent above is 2, 0, 0.5 or -1 -- all exactly representable, so this
     # builder passed while the kernel used the parser's `f64` where upstream
     # uses `scalar_t`. Bases are positive so that a fractional exponent has a
@@ -2419,13 +2419,13 @@ def pow_tensor_scalar_cases(torch_module, c_module, torch_call) -> list[Case]:
             # SLEEF's vectorised `powf` against libm's on the tail). A case here
             # would be pinned to whichever road an 8-element tensor happens to
             # take, which is the shape of a test that passes for the wrong
-            # reason. docs/SCALAR.md §3.3.
+            # reason. docs/numerics/SCALAR.md §3.3.
             dtypes=["float16", "bfloat16"],
             values=[3.0, 5.0, 7.0, 11.0, 13.0, 96.0, 2.0, 0.5],
         )
     )
 
-    # docs/FIXES.md: `uint8_tensor ** 256` used to compute silently (the
+    # docs/kernels/FIXES.md: `uint8_tensor ** 256` used to compute silently (the
     # exponent narrowed into `i64` with no range check) where upstream raises
     # `RuntimeError: value cannot be converted to type uint8_t without
     # overflow` -- the same overflow check `fill_`/`full` already have,
@@ -2453,7 +2453,7 @@ def pow_tensor_scalar_cases(torch_module, c_module, torch_call) -> list[Case]:
         )
     )
 
-    # docs/FIXES.md: `float32 ** 0.3` was 1 ULP off on four of the eight
+    # docs/kernels/FIXES.md: `float32 ** 0.3` was 1 ULP off on four of the eight
     # `_scalar_rule_cases` bases (`side_from_scalar` narrowed the exponent
     # `0.3` to its nearest `float32` value *before* the `f64` `powf` call,
     # which upstream measurably does not do for this overload -- narrowing
@@ -2482,12 +2482,12 @@ def pow_tensor_scalar_cases(torch_module, c_module, torch_call) -> list[Case]:
     return cases
 
 
-# --- aten.add.Scalar / aten.sub.Scalar (docs/SCALAR.md §6) -----------------
+# --- aten.add.Scalar / aten.sub.Scalar (docs/numerics/SCALAR.md §6) -----------------
 #
 # The **narrowing** half of the scalar family. `mul.Scalar` and `div.Scalar`
 # read their operand at `opmath_t`; `add` and `sub` have no such branch, so
 # the operand arrives through the iterator's common dtype and really is
-# narrowed. docs/SCALAR.md §3 measured both halves and fixed the widening
+# narrowed. docs/numerics/SCALAR.md §3 measured both halves and fixed the widening
 # one -- and then found that the narrowing one had **no golden coverage at
 # all**, because neither op was in `_aten_implemented()` and `CASE_BUILDERS`
 # had nowhere to hang a builder. Its sabotage fault F3 was caught by two
@@ -2550,10 +2550,10 @@ def _add_sub_scalar_cases(torch_module, c_module, torch_call, op, kind) -> list[
     #   sub.Scalar(bool_t, 3)   -> RuntimeError "Subtraction, the `-` operator,
     #                              with a bool tensor is not supported."
     #
-    # so `add` is a `c_error` (the same over-refusal docs/TAIL.md §2.2 found
+    # so `add` is a `c_error` (the same over-refusal docs/kernels/TAIL.md §2.2 found
     # for `mul.Scalar`) and `sub` is a `both_error`. The shim raises the same
     # `arith_tag` refusal for both, which is why one message could not be
-    # right for both -- docs/TAIL.md §2.2 and the refusal wording it points at.
+    # right for both -- docs/kernels/TAIL.md §2.2 and the refusal wording it points at.
     for scalar, scalar_note in [(3, "int scalar"), (2.5, "float scalar -> float32")]:
         bool_t, bool_c = pair_from_flat(torch_module, c_module, [1, 0, 1], (3,), "bool")
         cases.append(
@@ -2566,7 +2566,7 @@ def _add_sub_scalar_cases(torch_module, c_module, torch_call, op, kind) -> list[
                 note=(
                     "upstream reads True/False as 1/0 and computes arithmetically; the "
                     "shim's blanket bool refusal in arith_tag over-refuses the .Scalar "
-                    "overload (docs/TAIL.md §2.2)"
+                    "overload (docs/kernels/TAIL.md §2.2)"
                     if kind == "add" else
                     "upstream refuses too, and for its OWN reason -- 'Subtraction, the "
                     "`-` operator, with a bool tensor is not supported' -- which is not "
@@ -2575,7 +2575,7 @@ def _add_sub_scalar_cases(torch_module, c_module, torch_call, op, kind) -> list[
             )
         )
 
-    # The scalar rule itself, bit-exact. This is the coverage docs/SCALAR.md
+    # The scalar rule itself, bit-exact. This is the coverage docs/numerics/SCALAR.md
     # §6's second bullet said was missing: `narrow`, the opposite of
     # `mul.Scalar`'s `widen`, and the controls show the separating cases are
     # doing work.
@@ -2640,7 +2640,7 @@ def _add_sub_scalar_cases(torch_module, c_module, torch_call, op, kind) -> list[
     #    it is reached by cancellation: `7.0 + 2.4308… * 2.8817…` is
     #    `-0.00489`, four decades below its operands, so a last-bit
     #    disagreement in the product is a 3e-5 disagreement in the sum. The
-    #    same shape docs/LOSS.md §5.4 records for `_log_softmax`. A `float32`
+    #    same shape docs/training/LOSS.md §5.4 records for `_log_softmax`. A `float32`
     #    case at those operands would fail, so there is not one; the
     #    `float64` case below IS at them, where the same cancellation is
     #    5.5e-14 and inside 1e-9.
@@ -2731,7 +2731,7 @@ def pow_tensor_tensor_cases(torch_module, c_module, torch_call) -> list[Case]:
             )
         )
 
-    # --- MIXED dtypes: the promotion `bloom` needed (docs/ARCH20.md §6) -----
+    # --- MIXED dtypes: the promotion `bloom` needed (docs/architectures/ARCH20.md §6) -----
     #
     # **Every case above uses a same-dtype pair, so none of them could fail
     # when this op refused a mismatch by name.** That was found by sabotage:
@@ -2841,7 +2841,7 @@ def pow_scalar_cases(torch_module, c_module, torch_call) -> list[Case]:
         )
     )
 
-    # The scalar rule, on the *base* rather than the exponent (docs/SCALAR.md
+    # The scalar rule, on the *base* rather than the exponent (docs/numerics/SCALAR.md
     # §3.3). Same narrowing, same blind spot: every base above (2.0, 0.0, -1.0)
     # is exactly representable. The tensor here is the exponent, so its values
     # are small and exact and the scalar is what carries the rounding.
@@ -2874,14 +2874,14 @@ def pow_scalar_cases(torch_module, c_module, torch_call) -> list[Case]:
 # as happily on a generator that is right as on one that is wrong -- and this
 # one was wrong: `randint` was still drawing from candle while `randn` and
 # `rand` had moved, so a seeded run agreed with upstream on floats and
-# disagreed on integers, with no error and no warning (docs/RANDINT.md).
+# disagreed on integers, with no error and no warning (docs/kernels/RANDINT.md).
 #
 # So these are seeded on both sides and compared **element by element**, the
 # same promotion `uniform_`/`normal_` got, plus two things a values-only
 # comparison structurally cannot see:
 #
 #   * **the 2^28 width threshold.** One `randint` element costs one 32-bit
-#     word below that width and two at or above it (docs/RANDINT.md §1). The
+#     word below that width and two at or above it (docs/kernels/RANDINT.md §1). The
 #     header that decides it has an `#ifdef FBCODE_CAFFE2` arm saying 2^32
 #     with a dtype list, which is not the arm the public wheel compiles -- so
 #     the pair at 2^28-1 and 2^28 below is the regression for transcribing the
@@ -2897,7 +2897,7 @@ _RANDINT_DTYPES = ["int64", "int32", "int16", "uint8", "float32", "float64", "fl
 #: is asking. For the integral dtypes this is the representable range, which
 #: upstream refuses outright past (`to - 1 is out of bounds for short`). For
 #: the floating ones it is `2^digits` -- past that upstream does not refuse, it
-#: silently *moves the bound* (docs/RANDINT.md §3.2), which is a real behaviour
+#: silently *moves the bound* (docs/kernels/RANDINT.md §3.2), which is a real behaviour
 #: with its own cases below rather than something to fold into these.
 _RANDINT_DTYPE_LIMITS = {
     "int64": (-(2**63), 2**63 - 1),
@@ -2946,7 +2946,7 @@ def _randint_then_uniform_case(torch_module, c_module, torch_call, op, name, see
 
     The one case shape that catches an integer draw which lands the right
     values by consuming the wrong number of words. `uniform_` is separately
-    pinned bit-for-bit against upstream (docs/RNG.md §1.2), so a disagreement
+    pinned bit-for-bit against upstream (docs/numerics/RNG.md §1.2), so a disagreement
     here is the integer draw's displacement of the stream and nothing else.
     """
 
@@ -2990,7 +2990,7 @@ _RANDINT_SCENARIOS = [
 #: Ranges a float dtype cannot hold exactly. Upstream does not refuse these --
 #: `update_from`/`update_to` move the endpoint to a representable one *before*
 #: the width is computed, so this changes the modulus and can change which side
-#: of the 2^28 threshold the call lands on (docs/RANDINT.md §3.2).
+#: of the 2^28 threshold the call lands on (docs/kernels/RANDINT.md §3.2).
 _RANDINT_NARROWED = [
     ("float32", 0, 2**33, [4], "digits=24: `to` drops to 2^33-512"),
     ("float16", 0, 5000, [4], "digits=11: `to` drops to the previous multiple of 4"),
@@ -3030,7 +3030,7 @@ def randint_low_cases(torch_module, c_module, torch_call) -> list[Case]:
                 )
             )
 
-    # Keyword-argument coverage (docs/GOLDEN.md, docs/DISPATCH.md §4.1):
+    # Keyword-argument coverage (docs/verification/GOLDEN.md, docs/design/DISPATCH.md §4.1):
     # low/high/size/dtype all by keyword.
     cases.append(
         _randint_case(
@@ -3119,7 +3119,7 @@ def randperm_cases(torch_module, c_module, torch_call) -> list[Case]:
 
     Here because it draws from the same engine, not because the surface wanted
     widening: Fisher-Yates, one 32-bit word per swap and `n - 1` of them, with
-    no large-`n` alternative path (docs/RANDINT.md §4 reproduced n up to 50000
+    no large-`n` alternative path (docs/kernels/RANDINT.md §4 reproduced n up to 50000
     with the one loop). `n=0` and `n=1` are the cases that pin the count at
     `max(n - 1, 0)` rather than `n`.
     """
@@ -3189,7 +3189,7 @@ def rsqrt_cases(torch_module, c_module, torch_call) -> list[Case]:
 # --- aten.sqrt.default -----------------------------------------------------
 #
 # `rsqrt` was here from the beginning and `sqrt` was not, which is the
-# asymmetry docs/ARCH26.md §1 found blocking `deberta` and `deberta_v2`:
+# asymmetry docs/architectures/ARCH26.md §1 found blocking `deberta` and `deberta_v2`:
 # both compute an attention temperature or a hand-rolled layer norm through
 # `torch.sqrt` rather than through `nn.LayerNorm`.
 #
@@ -3581,7 +3581,7 @@ def _flip_member_cases(torch_module, c_module) -> list[Case]:
     """`torch.flip(x, [1])` and `x.flip(1)` -- the two spellings.
 
     `vits` uses the free function. `TensorBase.flip` was named as missing in
-    §14 of docs/KERNELS26.md and is the second caller; both table entries land
+    §14 of docs/kernels/KERNELS26.md and is the second caller; both table entries land
     in the same change and both are cased, because golden compares by dispatch
     key and is blind to either."""
     op = "aten.flip.default"
@@ -3673,7 +3673,7 @@ def sqrt_cases(torch_module, c_module, torch_call) -> list[Case]:
 
 # --- aten.remainder.Scalar / aten.remainder.Tensor -------------------------
 #
-# `sam3_video`'s wall (docs/ARCH26.md §5): `Sam3ViTRotaryEmbedding.__init__`
+# `sam3_video`'s wall (docs/architectures/ARCH26.md §5): `Sam3ViTRotaryEmbedding.__init__`
 # computes `x_positions = (flattened_indices % end_x) * scale`, which is
 # `TensorBase.__mod__` and therefore `aten.remainder.Scalar`.
 #
@@ -3948,7 +3948,7 @@ def remainder_tensor_cases(torch_module, c_module, torch_call) -> list[Case]:
 
 # --- aten.fmod.Scalar / aten.fmod.Tensor ------------------------------------
 #
-# docs/SCALAR2.md §6: `torch.fmod` had no row in `overloads.json` at all, so
+# docs/numerics/SCALAR2.md §6: `torch.fmod` had no row in `overloads.json` at all, so
 # `torch.fmod(...)` raised `AttributeError` rather than resolving to a
 # kernel -- unlike `remainder`, its sign-of-the-divisor sibling right above,
 # which had both overloads. `fmod`'s own kernel already existed in spirit
@@ -4221,7 +4221,7 @@ def fmod_tensor_cases(torch_module, c_module, torch_call) -> list[Case]:
 
 # --- aten.norm.ScalarOpt_dim -----------------------------------------------
 #
-# The third piece of `weight_norm`, and the one docs/KERNELS26.md §8.3 records
+# The third piece of `weight_norm`, and the one docs/kernels/KERNELS26.md §8.3 records
 # as invisible to ARCH26.md's method: `torch.norm_except_dim` is a composite (so
 # the op name never appears in the source) and it is called at CONSTRUCTION,
 # while the trace that found `_weight_norm_interface` ran on a forward.
@@ -4272,13 +4272,13 @@ def norm_scalaropt_dim_cases(torch_module, c_module, torch_call) -> list[Case]:
                             "the opposite of the usual reading",
                         )
                     )
-    # --- where the reduction accumulates (docs/SCALAR.md §5) ---------------
+    # --- where the reduction accumulates (docs/numerics/SCALAR.md §5) ---------------
     #
     # **Every case above passed both the old kernel and the new one.** Their
     # data is `[3, -4, 0, 1, -1, 2]` -- integers, exactly representable in
     # all four dtypes, and every partial sum of their squares and absolute
     # values is exact too. So the whole set is blind to *where* the
-    # accumulation happens, which is the thing docs/SCALAR.md §5 measured as
+    # accumulation happens, which is the thing docs/numerics/SCALAR.md §5 measured as
     # wrong: upstream's `norm_kernel_cpu_impl<scalar_t, acc_t>` keeps the
     # running `|x|^p` in `float` for `float16`/`bfloat16` and the old kernel
     # kept it in the storage dtype at every step. Re-measured on a random
@@ -4422,11 +4422,11 @@ def norm_scalaropt_dim_cases(torch_module, c_module, torch_call) -> list[Case]:
 
 # --- aten.linalg_vector_norm.default -----------------------------------------
 #
-# docs/DEMAND.md §0.1 rank 3 -- `sentence_embed`'s `F.normalize`. A distinct
+# docs/architectures/DEMAND.md §0.1 rank 3 -- `sentence_embed`'s `F.normalize`. A distinct
 # leaf from `aten.norm.ScalarOpt_dim` above (`_dispatch_has_kernel_for_dispatch_key`
 # is `False` for this key too, measured), spelled
 # `torch._C._linalg.linalg_vector_norm`, not `torch.<name>`. The kernel shares
-# `norm_pow_walk` with `norm.ScalarOpt_dim` (docs/DEMAND1.md §5, §7), so this
+# `norm_pow_walk` with `norm.ScalarOpt_dim` (docs/architectures/DEMAND1.md §5, §7), so this
 # suite is deliberately smaller than that one's dtype-accumulation sweep --
 # the walk itself is already pinned there -- and concentrates on the four
 # ways this op is not just `norm.ScalarOpt_dim` under a different name:
@@ -4601,7 +4601,7 @@ def linalg_vector_norm_default_cases(torch_module, c_module, torch_call) -> list
 
 # --- aten.squeeze.default / aten.squeeze.dims --------------------------------
 #
-# docs/DEMAND.md §0.1 rank 2, the GOLDEN.md blind-spot shape: `squeeze` is
+# docs/architectures/DEMAND.md §0.1 rank 2, the GOLDEN.md blind-spot shape: `squeeze` is
 # declared in both `overloads.json` and `methods.json` with three overloads
 # -- `squeeze()`, `.dim` (above), `.dims` -- but the dispatch `match` had an
 # arm only for `.dim`. Both the no-arg overload and the multi-dim list
@@ -4922,7 +4922,7 @@ def weight_norm_interface_cases(torch_module, c_module, torch_call) -> list[Case
 
 # --- aten.div.Tensor_mode / aten.div.Scalar_mode ---------------------------
 #
-# `sam3_video`'s second wall, two lines after `remainder`'s (docs/ARCH26.md §5):
+# `sam3_video`'s second wall, two lines after `remainder`'s (docs/architectures/ARCH26.md §5):
 # `Sam3ViTRotaryEmbedding.__init__` builds the y axis of its rotary position
 # grid with `torch.div(flattened_indices, end_x, rounding_mode="floor")`.
 #
@@ -5228,7 +5228,7 @@ def _div_mode_scalar_cases(torch_module, c_module, torch_call) -> list[Case]:
             )
         )
 
-    # The reduced-float scalar rule, docs/SCALAR.md §3.2. `div_floor_kernel` and
+    # The reduced-float scalar rule, docs/numerics/SCALAR.md §3.2. `div_floor_kernel` and
     # `div_trunc_kernel` carry the same `original_scalar_value<opmath_t>(2)`
     # branch `div_true_kernel` does, so BOTH rounding modes widen -- and here a
     # single narrowing step does not shift the answer by one ULP, it shifts it by
@@ -5499,7 +5499,7 @@ def _div_mode_tensor_cases(torch_module, c_module, torch_call) -> list[Case]:
 
 # --- aten.repeat.default ---------------------------------------------------
 #
-# The kernel docs/ARCH26.md §6/§8 found recurring across four of the six
+# The kernel docs/architectures/ARCH26.md §6/§8 found recurring across four of the six
 # architectures (`deberta`, `deberta_v2`, `sew_d`, `sam3_video`), and the wall
 # both DeBERTas landed on the moment `sqrt` was implemented.
 #
@@ -5618,7 +5618,7 @@ def repeat_cases(torch_module, c_module, torch_call) -> list[Case]:
 
 # --- aten.lift_fresh.default (backs `torch.tensor(...)` construction) --------
 #
-# `torch.tensor([...])` -- the 13th name docs/C_SURFACE.md traced -- does
+# `torch.tensor([...])` -- the 13th name docs/design/C_SURFACE.md traced -- does
 # not dispatch through a single clean "construct from Python data" aten op;
 # tracing it with a TorchDispatchMode shows it going through
 # `aten.lift_fresh.default(Tensor self) -> Tensor`, an identity-shaped op
@@ -5657,9 +5657,9 @@ def lift_fresh_cases(torch_module, c_module, torch_call) -> list[Case]:
 
 
 # --- pre-seeded case builders for the ops backing TensorBase's 50 --------
-# actually-used members (docs/C_SURFACE.md §4)
+# actually-used members (docs/design/C_SURFACE.md §4)
 #
-# docs/C_SURFACE.md traced a small Llama forward+generate() against real
+# docs/design/C_SURFACE.md traced a small Llama forward+generate() against real
 # upstream torch (torch 2.13.0) and found 50 `TensorBase` members actually
 # get accessed via a `torch.Tensor` instance -- 49 real API names plus the
 # `__class__` bookkeeping dunder (not a real API, not covered here). Another
@@ -5896,7 +5896,7 @@ def mul_cases(torch_module, c_module, torch_call) -> list[Case]:
 #
 # `mul.Tensor` promotes; `add`/`sub`/`div` in this shim still refuse through
 # `same_dtype`. That split is not tidiness, it is the "no unmeasured
-# implementation" rule (docs/E2E_REAL.md §1.2): `generate()` on a real
+# implementation" rule (docs/models/E2E_REAL.md §1.2): `generate()` on a real
 # pretrained model reaches exactly one promoting multiply and no promoting
 # add. transformers' `_prepare_attention_mask_for_generation` computes
 #
@@ -6049,7 +6049,7 @@ def div_cases(torch_module, c_module, torch_call) -> list[Case]:
 
 
 def _div_promotion_cases(torch_module, c_module, torch_call) -> list[Case]:
-    """`div.Tensor` promotes its operands too, since docs/KERNELS26.md §23.
+    """`div.Tensor` promotes its operands too, since docs/kernels/KERNELS26.md §23.
 
     `sam3_video`'s SAM3 detector divides a `float32` grid by an `int64` stride
     and stopped on `aten.div.Tensor: dtype promotion not implemented ...
@@ -6116,7 +6116,7 @@ def _div_promotion_cases(torch_module, c_module, torch_call) -> list[Case]:
         )
     )
     # ...and the two that used to refuse. The day either gained a promoting
-    # kernel this was to fail and be promoted to `match`; docs/PROMOTE.md §4
+    # kernel this was to fail and be promoted to `match`; docs/numerics/PROMOTE.md §4
     # is that day, so all four members now share one rule and one expectation.
     for other_op, torch_name in (("aten.add.Tensor", "add"), ("aten.sub.Tensor", "sub")):
         l_t, l_c = pair_from_flat(
@@ -6131,7 +6131,7 @@ def _div_promotion_cases(torch_module, c_module, torch_call) -> list[Case]:
                 run_c=lambda l_c=l_c, r_c=r_c, o=other_op: c_module._aten_dispatch(
                     o, l_c, r_c),
                 note="an integral operand never widens a float: float32 x int64 is "
-                     "float32, not float64 (docs/PROMOTE.md §3)",
+                     "float32, not float64 (docs/numerics/PROMOTE.md §3)",
             )
         )
 
@@ -6140,7 +6140,7 @@ def _div_promotion_cases(torch_module, c_module, torch_call) -> list[Case]:
     # and answers 2047, where casting straight to the float32 accumulator
     # subtracts 2049 - 1 and narrows once at the end, answering 2048. Both
     # are labelled float16 and only one is upstream's -- a dtype-only check
-    # passes on either. docs/PROMOTE.md §5.
+    # passes on either. docs/numerics/PROMOTE.md §5.
     for other_op, torch_name in (("aten.sub.Tensor", "sub"), ("aten.add.Tensor", "add")):
         n_t, n_c = pair_from_flat(torch_module, c_module, [2049, 2049], (2,), "int64")
         o_t, o_c = pair_from_flat(torch_module, c_module, [1.0, 1.0], (2,), "float16")
@@ -6310,7 +6310,7 @@ def bitwise_or_tensor_cases(torch_module, c_module, torch_call) -> list[Case]:
     # deliberate. `or` was measured to follow the SAME promotion table as
     # `and` -- both agree with `torch.promote_types` in every storable cell --
     # and it is left refusing only because no measured caller reaches it
-    # (docs/E2E_REAL.md §1.2). If a caller turns up, wiring it is one word in
+    # (docs/models/E2E_REAL.md §1.2). If a caller turns up, wiring it is one word in
     # `bitwise_binary` and these cases become "match".
     #
     # `c_error` and not "both_error": torch computes here, and recording it
@@ -6334,7 +6334,7 @@ def bitwise_or_tensor_cases(torch_module, c_module, torch_call) -> list[Case]:
                 run_c=lambda a_c=a_c, b_c=b_c: c_module._aten_dispatch(op, a_c, b_c),
                 note="`or` was re-measured over its own 9x9 grid rather than inheriting "
                      "`and`'s, and agrees with torch.promote_types in every cell "
-                     "(docs/PROMOTE.md §3), so the two now share one line",
+                     "(docs/numerics/PROMOTE.md §3), so the two now share one line",
             )
         )
     return cases
@@ -6382,7 +6382,7 @@ _CMP_SCENARIOS: list[dict] = [
 
 # --- shared: tensor-tensor dtype promotion -----------------------------------
 #
-# docs/PROMOTE.md §3 measured each op below over the full 9x9 dtype grid
+# docs/numerics/PROMOTE.md §3 measured each op below over the full 9x9 dtype grid
 # against `torch.promote_types` and they agree in every cell, so one list of
 # pairs serves all of them. The pairs are not a sample: each is a cell that
 # some plausible-but-wrong rule gets wrong.
@@ -6415,7 +6415,7 @@ def _promotion_cases(torch_module, c_module, op, torch_call,
                 op=op,
                 run_torch=lambda a_t=a_t, b_t=b_t: torch_call(a_t, b_t),
                 run_c=lambda a_c=a_c, b_c=b_c: c_module._aten_dispatch(op, a_c, b_c),
-                note=f"{why} (docs/PROMOTE.md §3)",
+                note=f"{why} (docs/numerics/PROMOTE.md §3)",
             )
         )
     return cases
@@ -6430,7 +6430,7 @@ def _comparison_precision_cases(torch_module, c_module, op, torch_call):
     and the two operands become the *same number*, so `eq` is True and `lt`
     is False. Comparing in a dtype wide enough to hold both -- which is what
     this shim's kernel does internally -- answers the opposite unless the
-    operands are brought to the common dtype first. docs/PROMOTE.md §5.
+    operands are brought to the common dtype first. docs/numerics/PROMOTE.md §5.
     """
     a_t, a_c = pair_from_flat(torch_module, c_module, [16777217, 16777217], (2,), "int64")
     b_t, b_c = pair_from_flat(
@@ -6442,7 +6442,7 @@ def _comparison_precision_cases(torch_module, c_module, op, torch_call):
             run_torch=lambda: torch_call(a_t, b_t),
             run_c=lambda: c_module._aten_dispatch(op, a_c, b_c),
             note="the int64 operand is narrowed to float32 BEFORE the comparison, so "
-                 "16777217 and 16777216 compare equal (docs/PROMOTE.md §5)",
+                 "16777217 and 16777216 compare equal (docs/numerics/PROMOTE.md §5)",
         )
     ]
 
@@ -6503,7 +6503,7 @@ def lt_scalar_cases(torch_module, c_module, torch_call) -> list[Case]:
             )
         )
 
-    # docs/FIXES.md / docs/SCALAR2.md §6: a negative Python int scalar against
+    # docs/kernels/FIXES.md / docs/numerics/SCALAR2.md §6: a negative Python int scalar against
     # a `uint8` tensor wraps into the dtype's bit pattern before the
     # comparison runs, the same two's-complement rule `floor_divide`'s
     # `uint8` scalar case below uses. Measured on upstream 2.13.0 by sweeping
@@ -6643,7 +6643,7 @@ def slice_cases(torch_module, c_module, torch_call) -> list[Case]:
             )
         )
 
-    # Keyword-argument coverage (docs/GOLDEN.md, docs/DISPATCH.md §4.1):
+    # Keyword-argument coverage (docs/verification/GOLDEN.md, docs/design/DISPATCH.md §4.1):
     # self/dim/start/end/step all by keyword.
     kw_t, kw_c = pair_from_flat(torch_module, c_module, [1, 2, 3, 4, 5, 6, 7, 8], (2, 4), "float32")
     cases.append(
@@ -6666,7 +6666,7 @@ def slice_cases(torch_module, c_module, torch_call) -> list[Case]:
     # stride of `step` over the *input's* storage, and the only public pairing
     # of a storage with a layout is `Tensor::from_storage`, documented as
     # contiguous-only and taking a `Storage` that `Tensor::storage()`
-    # (`pub(crate)`) will not hand over. docs/VIEWS.md §6.4.
+    # (`pub(crate)`) will not hand over. docs/kernels/VIEWS.md §6.4.
     #
     # `__setitem__` refuses a step above 1 by name for exactly this reason, so
     # the door a caller writes through does not reach it; this case reaches it
@@ -6692,7 +6692,7 @@ def slice_cases(torch_module, c_module, torch_call) -> list[Case]:
             expect="diverge",
             note="a step-2 slice aliases upstream and is materialised here, so the write "
                  "reaches the base upstream ([0,2,0,4]) and is lost here ([1,2,3,4]). "
-                 "candle has no public constructor for a stepped view -- docs/VIEWS.md §6.4",
+                 "candle has no public constructor for a stepped view -- docs/kernels/VIEWS.md §6.4",
         )
     )
     return cases
@@ -7264,7 +7264,7 @@ def clone_cases(torch_module, c_module, torch_call) -> list[Case]:
                 )
             )
 
-    # Keyword-argument coverage (docs/GOLDEN.md, docs/DISPATCH.md §4.1):
+    # Keyword-argument coverage (docs/verification/GOLDEN.md, docs/design/DISPATCH.md §4.1):
     # self/memory_format both by keyword. `memory_format` is keyword-only
     # and, unlike every other name here, is never accepted as a value the
     # kernel *reads* -- it is only ever rejected by name (contiguous_format/
@@ -7375,7 +7375,7 @@ def cumsum_cases(torch_module, c_module, torch_call) -> list[Case]:
 
 def as_strided_cases(torch_module, c_module, torch_call) -> list[Case]:
     """`as_strided` is the one op here whose *values* are easy and whose
-    *aliasing* is the whole question. docs/STRIDED.md.
+    *aliasing* is the whole question. docs/kernels/STRIDED.md.
 
     The value cases below are chosen where a plausible wrong gather differs:
     an overlapping stride (`longformer`'s `_chunk`, which is the caller that
@@ -7480,7 +7480,7 @@ def as_strided_cases(torch_module, c_module, torch_call) -> list[Case]:
             expect="c_error",
             note="upstream's as_strided is a two-way view; this is a gather, so the "
                  "write would be lost. storage.rs::StridedBarrier refuses it. "
-                 "docs/STRIDED.md §4",
+                 "docs/kernels/STRIDED.md §4",
         )
     )
     cases.append(
@@ -7500,9 +7500,9 @@ def as_strided_cases(torch_module, c_module, torch_call) -> list[Case]:
                 )[0]
             )(c_module._tensor_from_flat(flat12, [12], dtype=dt.c_dtype(c_module, "float32"))),
             expect="c_error",
-            note="the other direction of the same view, and the one docs/TAIL4.md "
+            note="the other direction of the same view, and the one docs/kernels/TAIL4.md "
                  "§1.2 said no write guard could reach. It is reachable because the "
-                 "key is the storage, not the wrapper. docs/STRIDED.md §4",
+                 "key is the storage, not the wrapper. docs/kernels/STRIDED.md §4",
         )
     )
     return cases
@@ -7588,7 +7588,7 @@ def masked_fill_cases(torch_module, c_module, torch_call) -> list[Case]:
                 )
             )
 
-    # Keyword-argument coverage (docs/GOLDEN.md, docs/DISPATCH.md §4.1):
+    # Keyword-argument coverage (docs/verification/GOLDEN.md, docs/design/DISPATCH.md §4.1):
     # self/mask/value all by keyword.
     cases.append(
         Case(
@@ -7630,12 +7630,12 @@ def max_default_cases(torch_module, c_module, torch_call) -> list[Case]:
     # The case this builder was missing, and its absence was hiding a wrong
     # answer rather than leaving a gap in coverage: candle's reduction *skips*
     # NaN, so `max([3, nan, 1])` came back `3.0` here where upstream gives
-    # `nan` (docs/E2E_REAL.md). Every case above passed throughout. The kernel
+    # `nan` (docs/models/E2E_REAL.md). Every case above passed throughout. The kernel
     # tests for NaN explicitly now, on `max` and `min` alike, and this pins it;
     # `min_default_cases` carries the mirror.
     #
     # Three positions rather than one -- see `min_default_cases`' note for why
-    # `at=0` alone is a case that cannot fail, and docs/TRIL.md §3 for the
+    # `at=0` alone is a case that cannot fail, and docs/kernels/TRIL.md §3 for the
     # audit that made this uniform across the family.
     nan = float("nan")
     for at, where in [(0, "first"), (1, "middle"), (3, "last")]:
@@ -7697,7 +7697,7 @@ def _pair_result_check(t_res, c_res) -> tuple[bool, str]:
     # here, and that index goes straight into `index_select`/`gather`/
     # `embedding`; a shim returning value-identical `int32` passes every other
     # check in this function and breaks downstream instead. `--self-test`
-    # reported this as `_pair_result_check + dtype-last` (docs/HARNESS.md §6).
+    # reported this as `_pair_result_check + dtype-last` (docs/verification/HARNESS.md §6).
     t_idx_dtype, c_idx_dtype = dt.dtype_name(t_indices.dtype), dt.dtype_name(c_indices.dtype)
     if t_idx_dtype != c_idx_dtype:
         return False, f"indices dtype mismatch: torch={t_idx_dtype} c={c_idx_dtype}"
@@ -7763,7 +7763,7 @@ def _extremum_dim_cases(torch_module, c_module, torch_call, op, short) -> list[C
     #
     # **Position matters and `at=0` is the one that cannot fail.** A NaN in
     # element 0 seeds candle's accumulator and nothing displaces it, so even a
-    # kernel with no NaN handling gets `(nan, 0)` right. docs/SEQLEN.md §7.12
+    # kernel with no NaN handling gets `(nan, 0)` right. docs/numerics/SEQLEN.md §7.12
     # recorded the same hole in `amax`'s first test; the middle and last
     # positions are what make this a test.
     nan = float("nan")
@@ -7852,11 +7852,11 @@ def max_dim_cases(torch_module, c_module, torch_call) -> list[Case]:
 
 # --- aten.min.dim -------------------------------------------------------------
 #
-# A new kernel, not a promotion. docs/SPELLINGS.md §7.2 found that `min.dim`
+# A new kernel, not a promotion. docs/bindings/SPELLINGS.md §7.2 found that `min.dim`
 # and `min.other` were listed in `overloads.json`/`methods.json` with **no
 # kernel behind either** -- deliberately, so `torch.min(x, dim=0)` would refuse
 # by name rather than be silently absent, and so the next owner of `aten.rs`
-# would find a precise work item. docs/TRIL.md §3 is that owner. Both now
+# would find a precise work item. docs/kernels/TRIL.md §3 is that owner. Both now
 # compute, both share their implementation with the `max` side, and both share
 # these cases with it -- including the NaN walk, which is the reason they were
 # written together rather than the `min` half being added as a copy.
@@ -7868,7 +7868,7 @@ def min_dim_cases(torch_module, c_module, torch_call) -> list[Case]:
 
 # --- aten.max.other -----------------------------------------------------------
 #
-# Moved out of `IMPLEMENTED_AWAITING_GOLDEN` by this builder (docs/SPELLINGS.md):
+# Moved out of `IMPLEMENTED_AWAITING_GOLDEN` by this builder (docs/bindings/SPELLINGS.md):
 # the kernel already existed and `_aten_dispatch("aten.max.other", ...)` already
 # computed, but nothing in this file compared it against upstream. `torch_call`
 # resolves `torch.ops.aten.max.other` directly -- the real ATen op, which
@@ -7905,13 +7905,13 @@ def _extremum_other_cases(torch_module, c_module, torch_call, op, short) -> list
     # `native_functions.yaml` names these as aliases of) are IEEE
     # maximum/minimum -- a NaN on either side wins.
     #
-    # docs/SPELLINGS.md §7.2 added the first of these while the op was parked
+    # docs/bindings/SPELLINGS.md §7.2 added the first of these while the op was parked
     # in `IMPLEMENTED_AWAITING_GOLDEN`, and it recorded a live defect rather
     # than passing: `max.other([1,nan,3], [5,2,nan])` gave `[5, nan, 3]` here
     # against upstream's `[5, nan, nan]`, and `max.other([1],[nan])` gave `[1]`
     # against `[nan]`. A NaN in the *first* operand propagated correctly
     # because candle's `|x, y| x > y` never displaces an accumulator that
-    # already holds one; a NaN only in the second was skipped. docs/TRIL.md §3
+    # already holds one; a NaN only in the second was skipped. docs/kernels/TRIL.md §3
     # is the fix, and the op is promoted into `_aten_implemented()` in the same
     # change -- so these now run in the main `compare.py` gate.
     #
@@ -7977,7 +7977,7 @@ def maximum_cases(torch_module, c_module, torch_call) -> list[Case]:
 # --- aten.min.other -----------------------------------------------------------
 #
 # The `min` half of the same story as `min.dim` above: listed in the spelling
-# tables with no kernel, implemented in docs/TRIL.md §3 as one function with
+# tables with no kernel, implemented in docs/kernels/TRIL.md §3 as one function with
 # `max.other`, and sharing this builder for the same reason. `torch_call`
 # resolves `torch.ops.aten.min.other` on the upstream side, so the expected
 # values are upstream's own and nothing here is mirrored by hand.
@@ -7989,7 +7989,7 @@ def min_other_cases(torch_module, c_module, torch_call) -> list[Case]:
 
 # --- aten.tril.default / aten.triu.default ------------------------------------
 #
-# GPT-BigCode's last wall (docs/TORCHSCRIPT.md §6) and its mirror.
+# GPT-BigCode's last wall (docs/graph/TORCHSCRIPT.md §6) and its mirror.
 #
 # The `nan`/`inf` matrix below is the case with a job: the tempting
 # implementation is a 0/1 mask of the input's dtype and a broadcast multiply,
@@ -8133,7 +8133,7 @@ def triu_cases(torch_module, c_module, torch_call) -> list[Case]:
 # --- aten.reshape.default ------------------------------------------------------
 #
 # Also moved out of `IMPLEMENTED_AWAITING_GOLDEN` by this builder
-# (docs/SPELLINGS.md). Unlike `view.default` above, this shim's `reshape`
+# (docs/bindings/SPELLINGS.md). Unlike `view.default` above, this shim's `reshape`
 # kernel is not a thin alias: `_install_tensor_views`'s `flatten` composite
 # calls `dispatch("aten.reshape.default", ...)` specifically because the real
 # kernel already carries both of upstream's two decomposition arms -- return a
@@ -8188,7 +8188,7 @@ def reshape_cases(torch_module, c_module, torch_call) -> list[Case]:
             )
         )
     # 0-d -> [1]: the same edge `_install_tensor_views::flatten` uses reshape
-    # for on a scalar tensor (docs/ARCH20.md §5's cohere note).
+    # for on a scalar tensor (docs/architectures/ARCH20.md §5's cohere note).
     zerod_t, zerod_c = pair_from_flat(torch_module, c_module, [7.0], (), "float32")
     cases.append(
         Case(
@@ -8285,7 +8285,7 @@ def sum_dim_cases(torch_module, c_module, torch_call) -> list[Case]:
             ([-1], True, "reduce last dim, keepdim"),
             ([0], False, "reduce first dim"),
             (None, False, "dim=None -- reduce all"),
-            # docs/DECOMP.md §6.1: the decomposition pass rewrites
+            # docs/graph/DECOMP.md §6.1: the decomposition pass rewrites
             # `sum(x)` to `sum(x, dim=[], dtype=None)`, and nothing had
             # ever exercised an empty `dim` list before that pass existed
             # -- this shim's kernel took it literally as "reduce over
@@ -8382,7 +8382,7 @@ def transpose_cases(torch_module, c_module, torch_call) -> list[Case]:
             )
         )
 
-    # Keyword-argument coverage (docs/GOLDEN.md, docs/DISPATCH.md §4.1):
+    # Keyword-argument coverage (docs/verification/GOLDEN.md, docs/design/DISPATCH.md §4.1):
     # self/dim0/dim1 all by keyword -- DISPATCH.md's own microbench example op.
     kw_t, kw_c = pair_from_flat(torch_module, c_module, [1, 2, 3, 4, 5, 6], (2, 3), "float32")
     cases.append(
@@ -8456,7 +8456,7 @@ def view_cases(torch_module, c_module, torch_call) -> list[Case]:
 # --- aten.view.dtype ----------------------------------------------------------
 # The bit-reinterpreting `view`, which is *not* a cast: `1.0` viewed as int32 is
 # 1065353216, not 1. It is how safetensors' default backend spells a
-# checkpoint's dtype (docs/CKPT2.md §4), and the reason it needs comparing
+# checkpoint's dtype (docs/models/CKPT2.md §4), and the reason it needs comparing
 # against upstream rather than reasoning about is that every one of its answers
 # is a bit pattern -- an implementation that quietly converted instead of
 # reinterpreting would produce clean, plausible, wrong numbers.
@@ -8508,7 +8508,7 @@ def view_dtype_cases(torch_module, c_module, torch_call) -> list[Case]:
     # it *has* to, because candle's `Layout` is measured in elements of a
     # storage whose dtype is fixed. There is no reinterpreting Layout to build,
     # publicly or privately, so this is a property of candle's storage model
-    # rather than of its visibility rules. docs/VIEWS.md §6.4.
+    # rather than of its visibility rules. docs/kernels/VIEWS.md §6.4.
     #
     # Recorded rather than fixed, and recorded as a `diverge` so it fails if it
     # ever starts agreeing without this note being updated.
@@ -8533,7 +8533,7 @@ def view_dtype_cases(torch_module, c_module, torch_call) -> list[Case]:
             note="view.dtype aliases upstream and reinterprets through a byte round-trip "
                  "here, so the write reaches the base upstream ([0,0,0,0]) and is lost "
                  "here ([1,2,3,4]). candle's Layout counts elements of a fixed-dtype "
-                 "storage -- docs/VIEWS.md §6.4",
+                 "storage -- docs/kernels/VIEWS.md §6.4",
         )
     )
     return cases
@@ -8581,7 +8581,7 @@ def to_copy_cases(torch_module, c_module, torch_call) -> list[Case]:
     #
     # It is the sharpest defect write-through can produce, because it is a
     # corruption rather than a lost write: upstream leaves `x` alone.
-    # docs/VIEWS.md §6.3.
+    # docs/kernels/VIEWS.md §6.3.
     for dtype_name in ["float32", "int64"]:
         def _write_through_result(is_torch, base, dtype_name=dtype_name):
             if is_torch:
@@ -8641,7 +8641,7 @@ def fill__cases(torch_module, c_module, torch_call) -> list[Case]:
             # `float8_e4m3fn` was `expect="c_error"` here -- a known gap,
             # recorded so the harness would **fail if the gap silently
             # closed**. It closed, and this is that failure being answered:
-            # docs/FLOAT8C.md §3 gave `tensor.rs::flat_storage` an `F8E4M3`
+            # docs/numerics/FLOAT8C.md §3 gave `tensor.rs::flat_storage` an `F8E4M3`
             # arm, so every in-place writer reaches the buffer and the case is
             # an ordinary value comparison against upstream now.
             f8_gap = False
@@ -8655,7 +8655,7 @@ def fill__cases(torch_module, c_module, torch_call) -> list[Case]:
                     note=(
                         "torch._C shim cannot write through a view of candle dtype "
                         "F8E4M3 (tensor.rs::flat_storage); upstream fills it. "
-                        "docs/FLOAT8B.md §4.2"
+                        "docs/numerics/FLOAT8B.md §4.2"
                         if f8_gap
                         else (note or "in-place fill")
                         + " -- compares the mutated operand fill_ returns"
@@ -8709,7 +8709,7 @@ def copy__cases(torch_module, c_module, torch_call) -> list[Case]:
 # The RNG ops' streams are the SAME stream, and these two builders say so.
 #
 # When they were written, `_C` drew from candle and the module note above was
-# right: two independent generators cannot be lined up by a seed. docs/RNG.md
+# right: two independent generators cannot be lined up by a seed. docs/numerics/RNG.md
 # then established that candle's CPU backend *refuses* to be seeded at all, so
 # there was no version of that plan, and torch's own CPU generator was ported
 # into `rust/torch_c/src/rng.rs` instead. That makes the seed mean the same
@@ -8717,7 +8717,7 @@ def copy__cases(torch_module, c_module, torch_call) -> list[Case]:
 # so: seed both generators to the same value inside the run lambdas, then
 # compare the draws **element by element**.
 #
-# What each op may be held to is not the same, and docs/RNG.md §3.3 and §5
+# What each op may be held to is not the same, and docs/numerics/RNG.md §3.3 and §5
 # item 3 are the authority for the split:
 #
 #   * `uniform_` is a masked integer times a power-of-two divisor and an
@@ -8795,7 +8795,7 @@ def _rng_stream_check(*, bitwise: bool, bounds=None):
         return True, (
             f"dtype={t_dtype} shape={t_shape}, {len(t_flat)} draws within "
             f"atol={tol.atol}/rtol={tol.rtol} (bit equality NOT asserted: "
-            f"machine={platform.machine()!r} is outside what docs/RNG.md §3.3 measured)"
+            f"machine={platform.machine()!r} is outside what docs/numerics/RNG.md §3.3 measured)"
         )
 
     return check
@@ -8841,7 +8841,7 @@ def normal__cases(torch_module, c_module, torch_call) -> list[Case]:
     op = "aten.normal_.default"
     cases: list[Case] = []
     # The sizes are not arbitrary. `normal_kernel` branches on
-    # `size >= 16 && is_contiguous()`, and docs/RNG.md §5 item 2 names exactly
+    # `size >= 16 && is_contiguous()`, and docs/numerics/RNG.md §5 item 2 names exactly
     # these five as the ones that cover both sides of it plus the tail
     # redraw: 15 is path B, 16 is path A with no tail, 17 and 20 are path A
     # *rewriting sixteen elements it already computed*, and 32 is path A with
@@ -8895,7 +8895,7 @@ def normal__cases(torch_module, c_module, torch_call) -> list[Case]:
         )
     )
 
-    # Keyword-argument coverage (docs/GOLDEN.md, docs/DISPATCH.md §4.1):
+    # Keyword-argument coverage (docs/verification/GOLDEN.md, docs/design/DISPATCH.md §4.1):
     # self/mean/std all by keyword, seeded the same way `_seeded_inplace`
     # seeds every other case above.
     def _kw_normal_run_torch():
@@ -8955,7 +8955,7 @@ def uniform__cases(torch_module, c_module, torch_call) -> list[Case]:
                             # about one draw in 4096. A shim missing it agrees
                             # with the stream everywhere else.
                             value_check=_rng_stream_check(bitwise=True, bounds=(lo, hi)),
-                            note=why + " -- bit-for-bit; docs/RNG.md §5 item 3 allows this on every platform",
+                            note=why + " -- bit-for-bit; docs/numerics/RNG.md §5 item 3 allows this on every platform",
                         )
                     )
     cases.append(
@@ -8973,7 +8973,7 @@ def uniform__cases(torch_module, c_module, torch_call) -> list[Case]:
         )
     )
 
-    # Keyword-argument coverage (docs/GOLDEN.md, docs/DISPATCH.md §4.1):
+    # Keyword-argument coverage (docs/verification/GOLDEN.md, docs/design/DISPATCH.md §4.1):
     # self/from/to all by keyword. `from` is a Python keyword, so it can only
     # be spelled through `**{"from": ...}`, not `from=...` at the call site --
     # which is itself a real shape `dispatch(key, **bound)` can produce.
@@ -8999,7 +8999,7 @@ def uniform__cases(torch_module, c_module, torch_call) -> list[Case]:
     return cases
 
 
-# --- aten.bernoulli_.float, and the dropout composite over it (docs/TRAIN.md) --
+# --- aten.bernoulli_.float, and the dropout composite over it (docs/training/TRAIN.md) --
 #
 # The whole of training mode rests on this one kernel. `nn.Dropout` decomposes
 # onto it (`empty_like`, `bernoulli_.float`, `div_.Scalar`, `mul.Tensor`) and
@@ -9055,7 +9055,7 @@ def _seeded_stream_after(torch_module, c_module, before_torch, before_c, n=6):
     This is the only case shape that can see a kernel which produced the right
     tensor from the wrong number of draws. `bernoulli_` consumes `numel`
     64-bit words for every `p`, `p == 0` and `p == 1` included (measured,
-    docs/TRAIN.md §2); a shim that skipped the draw would return an identical
+    docs/training/TRAIN.md §2); a shim that skipped the draw would return an identical
     tensor and desynchronise everything after it.
     """
 
@@ -9240,7 +9240,7 @@ def bernoulli__float_cases(torch_module, c_module, torch_call) -> list[Case]:
             )
         )
 
-    # `p` by keyword, the other half of the binding (docs/DISPATCH.md §4.1).
+    # `p` by keyword, the other half of the binding (docs/design/DISPATCH.md §4.1).
     def _kw_run_torch():
         torch_module.manual_seed(0)
         t = pair_from_flat(torch_module, c_module, [0] * 6, (6,), "float32")[0]
@@ -9263,7 +9263,7 @@ def bernoulli__float_cases(torch_module, c_module, torch_call) -> list[Case]:
 
     # 7. The composite. It has no dispatch key of its own -- `aten::dropout` is
     #    CompositeImplicitAutograd and never reaches the dispatcher (measured,
-    #    docs/TRAIN.md §1) -- so it is compared here, through the two Python
+    #    docs/training/TRAIN.md §1) -- so it is compared here, through the two Python
     #    spellings that exist, against upstream's `torch.dropout`.
     cases.extend(_dropout_composite_cases(torch_module, c_module, op))
     return cases
@@ -9530,10 +9530,10 @@ def div__scalar_cases(torch_module, c_module, torch_call) -> list[Case]:
     return cases
 
 
-# --- the eight ops a greedy 2-layer Llama forward stopped on (docs/GAP.md §3) --
+# --- the eight ops a greedy 2-layer Llama forward stopped on (docs/kernels/GAP.md §3) --
 #
 # These are not "more coverage". Before them `_aten_dispatch` refused eight
-# names the forward pass reaches, so the model could not run at all; docs/OPS8.md
+# names the forward pass reaches, so the model could not run at all; docs/kernels/OPS8.md
 # records the run that follows from landing them.
 #
 # Two of the eight are not shaped like anything else in this file and get their
@@ -9750,7 +9750,7 @@ def _einsum_cases(torch_module, c_module) -> list[Case]:
         ("ijk->ik", [(2, 3, 4)], "one operand with a label summed out"),
         ("...c,...c->...", [(2, 3, 4), (2, 3, 4)],
          "an ellipsis expanding to the operands' own leading axes -- "
-         "docs/BIND2.md item 2 -- promoted here from the c_error block "
+         "docs/bindings/BIND2.md item 2 -- promoted here from the c_error block "
          "below the day it landed"),
     ):
         pairs = [operand(shape, i) for i, shape in enumerate(shapes)]
@@ -9992,7 +9992,7 @@ def glu_cases(torch_module, c_module, torch_call) -> list[Case]:
     """`aten.glu(Tensor self, int dim=-1)` -- the seven ASR encoders'
 
     (`parakeet` x3, `lasr` x2, `cohere_asr`, `parakeet_tdt`) shared wall
-    (docs/GLU.md). `a, b = self.chunk(2, dim); return a * sigmoid(b)`.
+    (docs/kernels/GLU.md). `a, b = self.chunk(2, dim); return a * sigmoid(b)`.
 
     Two traps a plausible port misses, both measured against upstream 2.13.0
     rather than assumed:
@@ -10150,7 +10150,7 @@ def _sdpa_math_backend_cases(torch_module, c_module, op) -> list[Case]:
     A non-zero `dropout_p` takes the call off the fused kernel entirely:
     `_scaled_dot_product_flash_attention_for_cpu` refuses dropout, so upstream
     drops to `_scaled_dot_product_attention_math`, a twenty-op sequence
-    (docs/TRAIN.md §4). That backend has no dispatch key of its own -- it is
+    (docs/training/TRAIN.md §4). That backend has no dispatch key of its own -- it is
     reached only through the Python function -- so golden is structurally blind
     to it and the cases live under the key of the backend that does have a
     name. `F.scaled_dot_product_attention` is one function; both of its roads
@@ -10396,7 +10396,7 @@ def sdpa_flash_cpu_cases(torch_module, c_module, torch_call) -> list[Case]:
     # `tensor.rs::scale_and_mask_rows` (`keep = (r + 1).min(cols)`) with no
     # case at all: without it the kernel indexes past the end of the row.
     # Upstream accepts this shape and answers finitely -- measured at three
-    # shapes before these cases were written. docs/SEQLEN.md §8.
+    # shapes before these cases were written. docs/numerics/SEQLEN.md §8.
     for q_len, kv_len in [(5, 2), (9, 3)]:
         qn = _deterministic(1 * 2 * q_len * e, 7)
         kn = _deterministic(1 * 2 * kv_len * e, 8)
@@ -10424,7 +10424,7 @@ def sdpa_flash_cpu_cases(torch_module, c_module, torch_call) -> list[Case]:
 
     # A causal block several rows deep with a scale that is not representable.
     # `0.1` is the value at which narrowing the scale after the multiply rather
-    # than before gives a different `float32` -- the fault docs/SEQLEN.md §8.4
+    # than before gives a different `float32` -- the fault docs/numerics/SEQLEN.md §8.4
     # lists seventh -- and the three-by-three cases above all use the default
     # `1/sqrt(head_dim)`, which for `head_dim=4` is exactly 0.5.
     wide = 9
@@ -10505,7 +10505,7 @@ def sdpa_flash_cpu_cases(torch_module, c_module, torch_call) -> list[Case]:
     )
     cases.extend(_sdpa_gqa_cases(torch_module, c_module, torch_call))
 
-    # Keyword-argument coverage (docs/GOLDEN.md, docs/DISPATCH.md §4.1):
+    # Keyword-argument coverage (docs/verification/GOLDEN.md, docs/design/DISPATCH.md §4.1):
     # query/key/dropout_p/is_causal/scale all by keyword (value stays
     # positional -- it is not in `interned_name`'s table).
     kw_q_t, kw_q_c = pair_from_flat(torch_module, c_module, q_flat, shape, "float32")
@@ -10531,7 +10531,7 @@ def sdpa_flash_cpu_cases(torch_module, c_module, torch_call) -> list[Case]:
 #
 # SmolLM2-135M is `num_attention_heads=9, num_key_value_heads=3`, so a real
 # pretrained forward goes down this path and nothing in the Llama/GPT-2 work
-# before it did (docs/CKPT2.md §7.1).
+# before it did (docs/models/CKPT2.md §7.1).
 #
 # Where the repetition belongs was MEASURED, and the answer is "here, in the
 # aten op" -- not in `F.scaled_dot_product_attention`:
@@ -10557,7 +10557,7 @@ def sdpa_flash_cpu_cases(torch_module, c_module, torch_call) -> list[Case]:
 #
 # Both correct spellings give query head `i` the key/value head `i // 3`;
 # tiling gives it `i % 3`. Tiling produces a same-shaped, same-magnitude,
-# entirely wrong answer -- the failure mode docs/ARCH.md's `gelu` note calls
+# entirely wrong answer -- the failure mode docs/architectures/ARCH.md's `gelu` note calls
 # out, where the logits look fine and are not. The two GQA cases below are
 # built so that the two readings disagree: `n_rep` is 3 and every KV head
 # carries different numbers, so `i // 3` and `i % 3` select different rows
@@ -10701,7 +10701,7 @@ def _sdpa_gqa_cases(torch_module, c_module, torch_call) -> list[Case]:
 # one bfloat16 ulp is invisible to `dtypes.py::TOLERANCES`, and what that cost.
 #
 # **These sixteen run with the reference kernel switched on; the sdpa cases
-# above do not.** `crate::flash` is opt-in because it costs 20x (docs/SDPA.md
+# above do not.** `crate::flash` is opt-in because it costs 20x (docs/kernels/SDPA.md
 # §7), so each case here asks for it in `run_c` and puts the switch back. The
 # split is deliberate rather than left over: the cases before this point are
 # the only coverage the *default* path has in this harness, and moving them
@@ -10782,9 +10782,9 @@ def _sdpa_block_cases(torch_module, c_module, torch_call) -> list[Case]:
     return cases
 
 
-# --- the eight ops `do_sample=True` stops on (docs/SAMPLING.md) --------------
+# --- the eight ops `do_sample=True` stops on (docs/models/SAMPLING.md) --------------
 #
-# docs/GAP.md §4 predicted ten; the coordinating session re-measured a real
+# docs/kernels/GAP.md §4 predicted ten; the coordinating session re-measured a real
 # transformers Llama with `TorchDispatchMode` and found eight `_aten_dispatch`
 # still refused. These are their cases.
 #
@@ -10919,7 +10919,7 @@ def softmax_cases(torch_module, c_module, torch_call) -> list[Case]:
         )
     )
 
-    # Keyword-argument coverage (docs/GOLDEN.md, docs/DISPATCH.md §4.1):
+    # Keyword-argument coverage (docs/verification/GOLDEN.md, docs/design/DISPATCH.md §4.1):
     # self/dim/half_to_float all by keyword.
     kw_t, kw_c = _pair(torch_module, c_module, [1.0, 2.0, 3.0, 0.0, 0.0, 0.0], (2, 3), "float32")
     cases.append(
@@ -11054,7 +11054,7 @@ def squeeze_dim_cases(torch_module, c_module, torch_call) -> list[Case]:
 #     does not: upstream answers `[0,2,5,4,3,1]`, reversing the two 1.0s.
 #     Upstream promises nothing there, so the tied `topk` case below compares
 #     values only, via `_topk_multiset_check`, and every case that compares
-#     indices uses tie-free input. docs/SAMPLING.md §4.
+#     indices uses tie-free input. docs/models/SAMPLING.md §4.
 #
 # `sorted=False` is the same situation one step further: upstream returns a
 # partition artefact (`k=3` of an 8-element tensor gives `[7,6,0]` where
@@ -11092,7 +11092,7 @@ def _topk_multiset_check(t_res, c_res) -> tuple[bool, str]:
     # values, so an `int32` index survives it. The *order* is what this
     # comparator deliberately does not check -- the shape and the dtype are
     # promises, not partition artefacts. `--self-test` reported both as
-    # `_topk_multiset_check + shape-last` / `+ dtype-last` (docs/HARNESS.md §6).
+    # `_topk_multiset_check + shape-last` / `+ dtype-last` (docs/verification/HARNESS.md §6).
     t_idx_shape = tuple(int(x) for x in t_indices.shape)
     c_idx_shape = tuple(int(x) for x in c_indices.shape)
     if t_idx_shape != c_idx_shape:
@@ -11209,7 +11209,7 @@ def sort_cases(torch_module, c_module, torch_call) -> list[Case]:
         )
     )
 
-    # Keyword-argument coverage (docs/GOLDEN.md, docs/DISPATCH.md §4.1):
+    # Keyword-argument coverage (docs/verification/GOLDEN.md, docs/design/DISPATCH.md §4.1):
     # self/dim/descending all by keyword.
     kw_t, kw_c = _pair(torch_module, c_module, _TIED, (6,), "float32")
     cases.append(
@@ -11357,7 +11357,7 @@ def topk_cases(torch_module, c_module, torch_call) -> list[Case]:
             )
         )
 
-    # Keyword-argument coverage (docs/GOLDEN.md, docs/DISPATCH.md §4.1):
+    # Keyword-argument coverage (docs/verification/GOLDEN.md, docs/design/DISPATCH.md §4.1):
     # self/k/dim/largest/sorted all by keyword.
     kw_t, kw_c = _pair(torch_module, c_module, _DISTINCT, (6,), "float32")
     cases.append(
@@ -11472,7 +11472,7 @@ def scatter_src_cases(torch_module, c_module, torch_call) -> list[Case]:
         expect="both_error",
     )
 
-    # Keyword-argument coverage (docs/GOLDEN.md, docs/DISPATCH.md §4.1):
+    # Keyword-argument coverage (docs/verification/GOLDEN.md, docs/design/DISPATCH.md §4.1):
     # self/dim/index/src all by keyword.
     kw_self_t, kw_self_c = _pair(torch_module, c_module, *zeros_35)
     kw_idx_t, kw_idx_c = _pair(torch_module, c_module, [0, 1, 2] * 3, (3, 3), "int64")
@@ -11490,7 +11490,7 @@ def scatter_src_cases(torch_module, c_module, torch_call) -> list[Case]:
 
 # --- aten.scatter.value / aten.scatter_.value / aten.scatter_.src ------------
 #
-# docs/SCATTER.md. `scatter.value` is the overload eleven of docs/ARCH100.md's
+# docs/kernels/SCATTER.md. `scatter.value` is the overload eleven of docs/architectures/ARCH100.md's
 # architectures reach, and it was already declared in both transcribed tables
 # before this round -- only the dispatch arm was missing. So these cases are
 # the first thing that would have caught the gap: `scatter_src_cases` above was
@@ -11702,7 +11702,7 @@ def _scatter_value_shared(op, torch_module, c_module, torch_call) -> list[Case]:
             )
         )
 
-    # Keyword-argument coverage (docs/GOLDEN.md, docs/DISPATCH.md §4.1).
+    # Keyword-argument coverage (docs/verification/GOLDEN.md, docs/design/DISPATCH.md §4.1).
     kw_self_t, kw_self_c = _pair(torch_module, c_module, [0.0] * 6, (2, 3), "float32")
     kw_idx_t, kw_idx_c = _pair(torch_module, c_module, [0, 2], (2, 1), "int64")
     cases.append(
@@ -11776,7 +11776,7 @@ def scatter__src_cases(torch_module, c_module, torch_call) -> list[Case]:
 
 # --- aten.masked_scatter.default ---------------------------------------------
 #
-# docs/SCATTER.md §3. The four things a plausible implementation gets wrong are
+# docs/kernels/SCATTER.md §3. The four things a plausible implementation gets wrong are
 # each one case here: the source is consumed positionally in *its own* logical
 # order, both operands broadcast (not just the mask), the mask must be exactly
 # bool, and neither dtype promotes.
@@ -11938,7 +11938,7 @@ def masked_scatter_cases(torch_module, c_module, torch_call) -> list[Case]:
 
 # --- aten.bucketize.Tensor / aten.bucketize.Scalar ---------------------------
 #
-# docs/SCATTER.md §5. Every value below is **on** a boundary or non-finite,
+# docs/kernels/SCATTER.md §5. Every value below is **on** a boundary or non-finite,
 # because those are the only places `right=False` and `right=True` differ --
 # a sweep of interior points passes against either flag, and against a linear
 # scan too.
@@ -12119,7 +12119,7 @@ def bucketize_scalar_cases(torch_module, c_module, torch_call) -> list[Case]:
 
 # --- aten.prod.default / aten.prod.dim_int -----------------------------------
 #
-# docs/SCATTER.md §6. Three things carry the weight and none of them is the
+# docs/kernels/SCATTER.md §6. Three things carry the weight and none of them is the
 # arithmetic: the empty product is 1, integral inputs widen to int64, and
 # `dtype=` casts the *input*. The reduced-precision cases stay short on
 # purpose -- see the note on upstream's vectorised reduction in `prod`'s doc
@@ -12295,8 +12295,8 @@ def fill__tensor_cases(torch_module, c_module, torch_call) -> list[Case]:
                     _pair(torch_module, c_module, [0, 0, 0, 0], (2, 2), dtype_name)[1],
                     _pair(torch_module, c_module, [3], (), dtype_name)[1],
                 ),
-                # `float8_e4m3fn` was `expect="c_error"` (docs/FLOAT8B.md
-                # §4.1's ten). It computes now -- docs/FLOAT8C.md §1 routes the
+                # `float8_e4m3fn` was `expect="c_error"` (docs/numerics/FLOAT8B.md
+                # §4.1's ten). It computes now -- docs/numerics/FLOAT8C.md §1 routes the
                 # widening around candle's non-terminating arm and §3 lets the
                 # writer reach the buffer -- so it is compared by value like
                 # every other dtype.
@@ -12379,7 +12379,7 @@ def fill__tensor_cases(torch_module, c_module, torch_call) -> list[Case]:
 # `_C._shim_manual_seed(s)` -- so each case starts both generators at the same
 # point in the same stream and the sampled indices can be compared **exactly**.
 #
-# That is only meaningful because docs/RNG.md's port makes the two streams the
+# That is only meaningful because docs/numerics/RNG.md's port makes the two streams the
 # same object. The module note above still says a seed cannot synchronise two
 # independent RNGs; it is right about *independent* ones and no longer
 # describes this codebase (see the uniform_/normal_ builders, which were
@@ -12483,7 +12483,7 @@ def multinomial_cases(torch_module, c_module, torch_call) -> list[Case]:
     refusal("multinomial(all-zero row, with replacement, rejected on both sides)", [0.0, 0.0], (2,), "float32", 2, True,
             "the same refusal from the other kernel -- reached by a different check upstream")
 
-    # Keyword-argument coverage (docs/GOLDEN.md, docs/DISPATCH.md §4.1):
+    # Keyword-argument coverage (docs/verification/GOLDEN.md, docs/design/DISPATCH.md §4.1):
     # self/num_samples/replacement all by keyword. Seeded like
     # `_seeded_multinomial` above so the drawn indices compare exactly
     # rather than only dtype/shape.
@@ -12509,9 +12509,9 @@ def multinomial_cases(torch_module, c_module, torch_call) -> list[Case]:
     return cases
 
 
-# --- the four ops docs/GPT2.md measured a 2-layer GPT-2 stopping on ----------
+# --- the four ops docs/models/GPT2.md measured a 2-layer GPT-2 stopping on ----------
 #
-# Re-measured against `_aten_implemented()` at 78 ops, not docs/GAP.md's 60-op
+# Re-measured against `_aten_implemented()` at 78 ops, not docs/kernels/GAP.md's 60-op
 # snapshot: a GPT-2 that Llama-shaped work had already unblocked still stops on
 # `addmm`, `native_layer_norm`, `split.Tensor` and `tanh`, and on nothing else.
 
@@ -12521,7 +12521,7 @@ _TANH_DTYPES = ["float64", "float32", "float16", "bfloat16"]
 # negative literal is where `_C._tensor_from_flat` and `torch.tensor` disagree
 # (torch wraps -1 to 255, `_tensor_from_flat` saturates to 0), which is a
 # constructor difference and would make this op's cases fail for a reason that
-# has nothing to do with `tanh`. See docs/GPT2.md.
+# has nothing to do with `tanh`. See docs/models/GPT2.md.
 _TANH_PROMOTING_DTYPES = ["int64", "int32", "int16", "uint8"]
 
 
@@ -12582,7 +12582,7 @@ def _addmm_t_case(
 ) -> Case:
     """`mat2` fed in as `t(weight)` -- `bootstrap.py::linear`'s bias branch is
     literally `dispatch("aten.addmm.default", bias, input, _t(weight))`
-    (docs/LINEAR.md §1), and `addmm_default` reaches the same
+    (docs/perf/LINEAR.md §1), and `addmm_default` reaches the same
     `gemm_with_layout_fallback` `matmul_default` does, so this is the same
     fix exercised through the other kernel it landed in. `w_shape` names the
     shape *before* the transpose."""
@@ -12758,7 +12758,7 @@ def addmm_cases(torch_module, c_module, torch_call) -> list[Case]:
     )
 
     # The inherited gap: candle's matmul has no kernel for these, exactly as
-    # `aten.mm.default` already records (docs/TORCH_C.md §2).
+    # `aten.mm.default` already records (docs/design/TORCH_C.md §2).
     for dtype_name in _MM_C_ERROR_DTYPES:
         cases.append(
             _addmm_case(
@@ -12783,7 +12783,7 @@ def addmm_cases(torch_module, c_module, torch_call) -> list[Case]:
         )
 
     # Model-scale, with the bias -- this is `nn.Linear` at a real width, which
-    # is the shape docs/GPT2.md §3.3 measured and §7 left uncovered here.
+    # is the shape docs/models/GPT2.md §3.3 measured and §7 left uncovered here.
     for dtype_name, m, k, n, note in [
         ("float32", 64, 512, 64, "nn.Linear(512, 64) on a batch of 64"),
         ("float32", 8, 1024, 8, "depth 1024, where mm's agreement with torch ends"),
@@ -12795,7 +12795,7 @@ def addmm_cases(torch_module, c_module, torch_call) -> list[Case]:
         )
 
     # `mat2` fed in as `t(weight)` -- the view nn.Linear(bias=True) actually
-    # passes (docs/LINEAR.md §1). Dtype-swept and hand-checkable: same
+    # passes (docs/perf/LINEAR.md §1). Dtype-swept and hand-checkable: same
     # numbers as the "plain" scenario above, since transpose(_ADDMM_W_BASE)
     # == _ADDMM_M2.
     for dtype_name in _MM_MATCH_DTYPES:
@@ -12820,7 +12820,7 @@ def addmm_cases(torch_module, c_module, torch_call) -> list[Case]:
         )
     )
 
-    # Keyword-argument coverage (docs/GOLDEN.md, docs/DISPATCH.md §4.1):
+    # Keyword-argument coverage (docs/verification/GOLDEN.md, docs/design/DISPATCH.md §4.1):
     # self/mat1/mat2/beta/alpha all by keyword.
     kw_s_t, kw_s_c = pair_from_flat(torch_module, c_module, *_ADDMM_SELF, "float32")
     kw_m1_t, kw_m1_c = pair_from_flat(torch_module, c_module, *_ADDMM_M1, "float32")
@@ -12955,7 +12955,7 @@ def split_cases(torch_module, c_module, torch_call) -> list[Case]:
             )
         )
 
-    # Keyword-argument coverage (docs/GOLDEN.md, docs/DISPATCH.md §4.1):
+    # Keyword-argument coverage (docs/verification/GOLDEN.md, docs/design/DISPATCH.md §4.1):
     # self/split_size/dim all by keyword.
     kw_t, kw_c = pair_from_flat(torch_module, c_module, ten, (10,), "float32")
     cases.append(
@@ -12967,7 +12967,7 @@ def split_cases(torch_module, c_module, torch_call) -> list[Case]:
             value_check=_chunk_list_check,
         )
     )
-    # `Tensor.chunk` lowers here (docs/GROUPED_MM.md §6.4). Its cases live
+    # `Tensor.chunk` lowers here (docs/kernels/GROUPED_MM.md §6.4). Its cases live
     # with the other member spellings; this is where they join the suite.
     cases.extend(
         c for c in _chunk_member_cases(torch_module, c_module)
@@ -13218,7 +13218,7 @@ def native_layer_norm_cases(torch_module, c_module, torch_call) -> list[Case]:
         )
     )
 
-    # Keyword-argument coverage (docs/GOLDEN.md, docs/DISPATCH.md §4.1):
+    # Keyword-argument coverage (docs/verification/GOLDEN.md, docs/design/DISPATCH.md §4.1):
     # input/normalized_shape/weight/bias/eps all by keyword. `input`, not
     # `self`, is this schema's own name for the tensor argument.
     kw_x_t, kw_x_c = pair_from_flat(torch_module, c_module, _LN_INPUT, (2, 3, 4), "float32")
@@ -14168,7 +14168,7 @@ def floor_cases(torch_module, c_module, torch_call) -> list[Case]:
 def floor__cases(torch_module, c_module, torch_call) -> list[Case]:
     """`floor_`'s dtype rules re-measured in place rather than inherited from
     `floor_default`: an integral receiver is the identity and only `bool`
-    refuses, with `floor_vml_cpu`. docs/INPLACE.md §2 is why the in-place
+    refuses, with `floor_vml_cpu`. docs/kernels/INPLACE.md §2 is why the in-place
     rules are measured separately at all -- eleven ops in this file have
     in-place rules that differ from their out-of-place siblings'."""
     op = "aten.floor_.default"
@@ -14440,7 +14440,7 @@ def index_add__cases(torch_module, c_module, torch_call) -> list[Case]:
 # for a shim that picked the wrong formula for the unqualified call, and it
 # would fire with 40x the tolerance, not at the edge of it.
 #
-# Measured (docs/ARCH.md §2): Gemma and Gemma-2 pass `"tanh"`; BERT, RoBERTa,
+# Measured (docs/architectures/ARCH.md §2): Gemma and Gemma-2 pass `"tanh"`; BERT, RoBERTa,
 # ELECTRA, DistilBERT, DeBERTa-v2, BART, Falcon, GPT-NeoX, GPT-BigCode,
 # Starcoder2, MPT and ViT all take the default.
 
@@ -14745,7 +14745,7 @@ def gather_cases(torch_module, c_module, torch_call) -> list[Case]:
         )
     )
 
-    # Keyword-argument coverage (docs/GOLDEN.md, docs/DISPATCH.md §4.1):
+    # Keyword-argument coverage (docs/verification/GOLDEN.md, docs/design/DISPATCH.md §4.1):
     # self/dim/index all by keyword (sparse_grad is already exercised by
     # keyword above, in `_gather_case`'s `kwargs={"sparse_grad": True}`).
     kw_s_t, kw_s_c = pair_from_flat(torch_module, c_module, flat, shape, "float32")
@@ -14785,7 +14785,7 @@ def zero__cases(torch_module, c_module, torch_call) -> list[Case]:
                 run_torch=lambda a_t=a_t: torch_call(a_t),
                 run_c=lambda a_c=a_c: c_module._aten_dispatch(op, a_c),
                 # Same closure as `fill_.Scalar`: `flat_storage` grew an
-                # `F8E4M3` arm in docs/FLOAT8C.md §3, so the writer reaches the
+                # `F8E4M3` arm in docs/numerics/FLOAT8C.md §3, so the writer reaches the
                 # buffer and this is a value comparison for every dtype.
                 expect="match",
                 note="in-place: compares the mutated operand zero_ returns",
@@ -14827,10 +14827,10 @@ def zero__cases(torch_module, c_module, torch_call) -> list[Case]:
 
 # --- large-size GEMM cases ---------------------------------------------------
 #
-# docs/GPT2.md §7 left this open: the golden harness only ever multiplied
+# docs/models/GPT2.md §7 left this open: the golden harness only ever multiplied
 # matrices small enough that accumulation order could not matter, so "does the
 # shim's GEMM agree with torch's at model scale" had never been asked here.
-# These cases ask it. What they found is written up in docs/ARCH.md §4; the
+# These cases ask it. What they found is written up in docs/architectures/ARCH.md §4; the
 # short version is that the answer is dtype-dependent and the *flat* tolerance
 # in dtypes.py is the wrong instrument for a reduction of depth k.
 #
@@ -14855,7 +14855,7 @@ def zero__cases(torch_module, c_module, torch_call) -> list[Case]:
 #     is linear in k because it assumes every rounding error has the same sign.
 #     They do not, and a linear bound is loose enough to pass an actively wrong
 #     kernel. sqrt(k) is the statistical growth and still holds with margin at
-#     every size measured (docs/ARCH.md §4 tabulates them).
+#     every size measured (docs/architectures/ARCH.md §4 tabulates them).
 #
 #   * `u(accumulate)`, not `u(storage)`. **torch's CPU GEMM accumulates in
 #     float32 no matter what the tensors are stored as** -- `at::opmath_type`.
@@ -14873,7 +14873,7 @@ def zero__cases(torch_module, c_module, torch_call) -> list[Case]:
 #
 # It is NOT a widened tolerance. At every size measured it is between 5x and
 # 20x tighter than the answer, and it *fails* on an accumulation-dtype
-# mismatch by a factor of 4.4 -- see docs/ARCH.md §4.
+# mismatch by a factor of 4.4 -- see docs/architectures/ARCH.md §4.
 #
 # The checker also re-derives what the default flat-tolerance pipeline would
 # have said, so a verbose run prints both verdicts side by side and nobody has
@@ -15000,11 +15000,11 @@ def _big_gemm_case(torch_module, c_module, torch_call, op, dtype_name, m, k, n,
 
 # --- the four ops falcon/gptj/bloom/mpt all ask for, plus stack and relu -----
 #
-# docs/ARCH.md measured 32 architectures and found the largest single cluster in
+# docs/architectures/ARCH.md measured 32 architectures and found the largest single cluster in
 # the tail: `falcon`, `gptj`, `bloom` and `mpt` are missing *exactly* the same
 # four ops -- `le.Tensor`, `scalar_tensor.default`, `where.self` and
 # `permute.default`. All four are the same idiom, and re-tracing the four models
-# shows it end to end (docs/OPS4.md §1):
+# shows it end to end (docs/kernels/OPS4.md §1):
 #
 #     mask   = arange(...) <= arange(...)          aten.le.Tensor      (int64)
 #     fill   = scalar_tensor(finfo(dtype).min)     aten.scalar_tensor  (0-d f32)
@@ -15152,7 +15152,7 @@ def scalar_tensor_cases(torch_module, c_module, torch_call) -> list[Case]:
         )
     )
 
-    # Keyword-argument coverage (docs/GOLDEN.md, docs/DISPATCH.md §4.1): `s`
+    # Keyword-argument coverage (docs/verification/GOLDEN.md, docs/design/DISPATCH.md §4.1): `s`
     # (the fill value) by keyword -- `device`/`layout` are already exercised
     # by keyword above.
     cases.append(
@@ -15268,8 +15268,8 @@ def where_self_cases(torch_module, c_module, torch_call) -> list[Case]:
         )
     )
 
-    # Was the gap; `where_self` promotes now (docs/PROMOTE.md §4). The full
-    # 9x9 table is in docs/OPS4.md §2 and re-measured in docs/PROMOTE.md §3;
+    # Was the gap; `where_self` promotes now (docs/numerics/PROMOTE.md §4). The full
+    # 9x9 table is in docs/kernels/OPS4.md §2 and re-measured in docs/numerics/PROMOTE.md §3;
     # these are the four rows that would be got wrong by assuming "the wider
     # one wins" (an integral branch never widens a floating one, and float16
     # with bfloat16 escapes to float32).
@@ -15299,7 +15299,7 @@ def where_self_cases(torch_module, c_module, torch_call) -> list[Case]:
         )
     )
 
-    # Keyword-argument coverage (docs/GOLDEN.md, docs/DISPATCH.md §4.1):
+    # Keyword-argument coverage (docs/verification/GOLDEN.md, docs/design/DISPATCH.md §4.1):
     # condition/self/other all by keyword.
     kw_cond_t, kw_cond_c = _pair(torch_module, c_module, [1, 0, 1, 0], (4,), "bool")
     kw_s_t, kw_s_c = _pair(torch_module, c_module, [1.0, 2.0, 3.0, 4.0], (4,), "float32")
@@ -15326,7 +15326,7 @@ def where_self_cases(torch_module, c_module, torch_call) -> list[Case]:
 #
 # with `min_dtype = torch.finfo(dtype).min`, a Python float. It was the one
 # op standing between this shim and a real pretrained model's EAGER forward
-# (docs/CKPT2.md §7.1).
+# (docs/models/CKPT2.md §7.1).
 #
 # What the overload does was measured, not read off the schema. A
 # `TorchDispatchMode` over the call above reports
@@ -15608,7 +15608,7 @@ def permute_cases(torch_module, c_module, torch_call) -> list[Case]:
                           expect="both_error", note=note)
         )
 
-    # Keyword-argument coverage (docs/GOLDEN.md, docs/DISPATCH.md §4.1):
+    # Keyword-argument coverage (docs/verification/GOLDEN.md, docs/design/DISPATCH.md §4.1):
     # self/dims both by keyword.
     kw_t, kw_c = _pair(torch_module, c_module, six, (2, 3), "float32")
     cases.append(
@@ -15721,7 +15721,7 @@ def stack_cases(torch_module, c_module, torch_call) -> list[Case]:
         )
     )
 
-    # Was the gap; `promote_list` closed it (docs/PROMOTE.md §4). `stack`'s
+    # Was the gap; `promote_list` closed it (docs/numerics/PROMOTE.md §4). `stack`'s
     # own 9x9 grid was measured rather than inherited from `cat`'s.
     for lhs_dtype, rhs_dtype, upstream in [
         ("float32", "float64", "float64"),
@@ -15749,7 +15749,7 @@ def stack_cases(torch_module, c_module, torch_call) -> list[Case]:
             torch_module, c_module, torch_call,
             [([1], (1,), "float16"), ([2], (1,), "bfloat16"), ([3], (1,), "float64")],
             note="promote_list folds left over every entry: f16 x bf16 -> f32, then "
-                 "f32 x f64 -> f64 (docs/PROMOTE.md §4)",
+                 "f32 x f64 -> f64 (docs/numerics/PROMOTE.md §4)",
         )
     )
     return cases
@@ -15772,7 +15772,7 @@ def relu_cases(torch_module, c_module, torch_call) -> list[Case]:
         )
     # uint8 with non-negative literals only: `torch.tensor(-1, uint8)` wraps to
     # 255 while `_C._tensor_from_flat` saturates to 0, a constructor difference
-    # docs/GPT2.md §7 already recorded and which has nothing to do with relu.
+    # docs/models/GPT2.md §7 already recorded and which has nothing to do with relu.
     cases.append(
         _unary_case(torch_module, c_module, op, torch_call, "uint8",
                     [0, 1, 2, 255], (4,),
@@ -15841,7 +15841,7 @@ def relu_cases(torch_module, c_module, torch_call) -> list[Case]:
 # --- aten.relu_.default ------------------------------------------------------
 #
 # `relu.default`'s in-place sibling -- `F.relu(x, inplace=True)` traces to
-# this overload, not `relu.default` (docs/SPELLINGS.md §6.6 measured the
+# this overload, not `relu.default` (docs/bindings/SPELLINGS.md §6.6 measured the
 # kernel gap: zero hits before this). The value is `relu.default`'s
 # unchanged; what's new here is the in-place contract, so the cases below
 # follow `add__tensor_cases`'s shape (mutated-receiver comparisons) rather
@@ -15989,7 +15989,7 @@ def le_tensor_cases(torch_module, c_module, torch_call) -> list[Case]:
     return cases
 
 
-# --- the five ops docs/TAIL.md needed to open falcon/bloom/gpt_bigcode ------
+# --- the five ops docs/kernels/TAIL.md needed to open falcon/bloom/gpt_bigcode ------
 #
 # All five already had a kernel in rust/torch_c/src/aten.rs and showed up in
 # `_aten_implemented()` before this file had a builder for any of them --
@@ -16014,7 +16014,7 @@ def le_tensor_cases(torch_module, c_module, torch_call) -> list[Case]:
 #     "matches add.Tensor's own refusal", but that refusal is internal to the
 #     shim, not upstream's -- upstream never refuses bool here. `c_error`.
 #
-# See docs/TAIL.md for the full measurement transcript and the exact
+# See docs/kernels/TAIL.md for the full measurement transcript and the exact
 # `_aten_implemented()` counts this closed.
 
 
@@ -16107,7 +16107,7 @@ def baddbmm_cases(torch_module, c_module, torch_call) -> list[Case]:
     # inf_batch1, batch2, alpha=0)` gives `[[nan, nan], [0, 0]], [[0, 0],
     # [0, 0]]]` on real torch -- NaN leaks through the multiply, which is
     # only *scaled* away afterward, not skipped. This used to be a live
-    # regression trap (`expect="diverge"`, docs/TAIL.md §2.1) because the
+    # regression trap (`expect="diverge"`, docs/kernels/TAIL.md §2.1) because the
     # kernel's `alpha_zero` branch skipped the matmul unconditionally
     # (copying addmm_scale's rule) and answered a clean `self` instead.
     # Fixed: the kernel now always runs the multiply and only skips the
@@ -16123,7 +16123,7 @@ def baddbmm_cases(torch_module, c_module, torch_call) -> list[Case]:
             note="alpha=0 with an inf in batch1 -- 0*inf is nan, and unlike addmm's bias "
                  "quick return, baddbmm's multiply is NOT skipped on real torch, so the NaN "
                  "leaks through on both sides now (was a KNOWN KERNEL BUG, fixed; see "
-                 "docs/TAIL.md §2.1 and docs/KERNELS.md)",
+                 "docs/kernels/TAIL.md §2.1 and docs/kernels/KERNELS.md)",
         )
     )
 
@@ -16172,7 +16172,7 @@ def baddbmm_cases(torch_module, c_module, torch_call) -> list[Case]:
                 expect="c_error",
                 note=f"{dtype_name} with alpha=0 -- used to dodge the gap above (the kernel's old "
                      "alpha_zero quick return skipped the matmul unconditionally, matching torch by "
-                     "accident); now that the multiply always runs (docs/TAIL.md §2.1 fix), this hits "
+                     "accident); now that the multiply always runs (docs/kernels/TAIL.md §2.1 fix), this hits "
                      "the exact same missing-integral-matmul gap as alpha!=0 above",
             )
         )
@@ -16319,7 +16319,7 @@ def baddbmm_cases(torch_module, c_module, torch_call) -> list[Case]:
     )
 
     # Model-scale, batched with the bias -- attention's QK^T scale-and-add,
-    # the shape docs/TAIL.md measured bloom reaching for.
+    # the shape docs/kernels/TAIL.md measured bloom reaching for.
     for dtype_name, note in [
         ("float32", "batched depth 512 with a bias -- bloom's scaled QK^T"),
         ("float16", "the same, in the dtype a device would actually run"),
@@ -16329,7 +16329,7 @@ def baddbmm_cases(torch_module, c_module, torch_call) -> list[Case]:
                            dtype_name, 8, 512, 8, with_bias=True, batch=2, note=note)
         )
 
-    # Keyword-argument coverage (docs/GOLDEN.md, docs/DISPATCH.md §4.1):
+    # Keyword-argument coverage (docs/verification/GOLDEN.md, docs/design/DISPATCH.md §4.1):
     # self/batch1/batch2/beta/alpha all by keyword.
     kw_s_t, kw_s_c = pair_from_flat(torch_module, c_module, *_BADDBMM_SELF, "float32")
     kw_b1_t, kw_b1_c = pair_from_flat(torch_module, c_module, *_BADDBMM_B1, "float32")
@@ -16462,7 +16462,7 @@ def split_with_sizes_cases(torch_module, c_module, torch_call) -> list[Case]:
         )
     )
 
-    # Keyword-argument coverage (docs/GOLDEN.md, docs/DISPATCH.md §4.1):
+    # Keyword-argument coverage (docs/verification/GOLDEN.md, docs/design/DISPATCH.md §4.1):
     # self/split_sizes/dim all by keyword.
     kw_t, kw_c = pair_from_flat(torch_module, c_module, ten, (10,), "float32")
     cases.append(
@@ -16483,7 +16483,7 @@ def split_with_sizes_cases(torch_module, c_module, torch_call) -> list[Case]:
 
 # --- aten.native_dropout.default -----------------------------------------
 #
-# The out-of-place dropout (docs/LOSS.md §7). It exists here because `capture`
+# The out-of-place dropout (docs/training/LOSS.md §7). It exists here because `capture`
 # refuses mutation, so the eager composite's `bernoulli_` made a `.train()`
 # forward unrecordable -- not because anything needed a faster dropout.
 #
@@ -16560,7 +16560,7 @@ def _nd_pair_check(t_res, c_res) -> tuple[bool, str]:
                 return False, (
                     f"{label}[{i}] mismatch: torch={x!r} c={y!r} -- exact agreement "
                     f"is required here; the scale's rounding is the subject "
-                    f"(docs/LOSS.md §7)"
+                    f"(docs/training/LOSS.md §7)"
                 )
     return True, "output and mask both matched exactly"
 
@@ -16808,7 +16808,7 @@ def native_dropout_cases(torch_module, c_module, torch_call) -> list[Case]:
 
 # --- aten._log_softmax.default -------------------------------------------
 #
-# The first half of a cross-entropy forward (docs/LOSS.md). It looks like
+# The first half of a cross-entropy forward (docs/training/LOSS.md). It looks like
 # `softmax_cases` above and one thing in it is not like `_softmax` at all:
 #
 #   **upstream has TWO log-softmax kernels and they do different arithmetic.**
@@ -16895,8 +16895,8 @@ def _bounded_divergence(max_abs: float, max_rel: float):
     repository keeps producing, which is *"these do not agree, here is by how
     much, and the reason is a property of how upstream's wheel was compiled
     rather than of the operator"* -- `_log_softmax` at vocabulary width
-    (docs/LOSS.md §5.4), `softplus`'s Sleef tail and `add.Scalar`'s fused
-    multiply-add (docs/SCALAR.md §8), `norm`'s pairwise `p=2` sum.
+    (docs/training/LOSS.md §5.4), `softplus`'s Sleef tail and `add.Scalar`'s fused
+    multiply-add (docs/numerics/SCALAR.md §8), `norm`'s pairwise `p=2` sum.
 
     Until now those were written into a document and never measured again. A
     number in a document does not fail when it moves. This one does.
@@ -17175,7 +17175,7 @@ def log_softmax_cases(torch_module, c_module, torch_call) -> list[Case]:
             )
         )
 
-    # --- the divergence docs/LOSS.md §5.4 measured, now watched ------------
+    # --- the divergence docs/training/LOSS.md §5.4 measured, now watched ------------
     #
     # §5.4 recorded that at a **real vocabulary width** the `float32`
     # summation-order residual reaches 5.38e-04 relative on the SmolLM2
@@ -17211,14 +17211,14 @@ def log_softmax_cases(torch_module, c_module, torch_call) -> list[Case]:
     cases.append(
         Case(
             name="_log_softmax(float32, [1, 49152] -- REAL VOCABULARY WIDTH) "
-                 "[KNOWN DIVERGENCE, watched: docs/LOSS.md §5.4]",
+                 "[KNOWN DIVERGENCE, watched: docs/training/LOSS.md §5.4]",
             op=op,
             run_torch=lambda t=wide_t: torch_call(t, -1, False),
             run_c=lambda c=wide_c: c_module._aten_dispatch(op, c, -1, False),
             value_check=_bounded_divergence(9e-05, 7e-05),
             note="a serial sum of 49152 terms against upstream's 4-lane one. Not a "
                  "failure and not agreement: the case holds the ceiling, so the number "
-                 "docs/LOSS.md §5.4 wrote down is re-measured on every run",
+                 "docs/training/LOSS.md §5.4 wrote down is re-measured on every run",
         )
     )
 
@@ -17227,7 +17227,7 @@ def log_softmax_cases(torch_module, c_module, torch_call) -> list[Case]:
 
 # --- aten.nll_loss_forward.default ---------------------------------------
 #
-# The second half of a cross-entropy forward (docs/LOSS.md §3). Two things
+# The second half of a cross-entropy forward (docs/training/LOSS.md §3). Two things
 # about it need saying before the case list.
 #
 # **It returns TWO tensors and every caller throws the second away.**
@@ -17298,7 +17298,7 @@ def _nll_pair_check(t_res, c_res) -> tuple[bool, str]:
                 return False, (
                     f"{label}[{i}] mismatch: torch={x!r} c={y!r} -- these must agree BIT "
                     f"FOR BIT; the cascade summation is what this case is about and a "
-                    f"tolerance would absorb it (docs/LOSS.md §3.2)"
+                    f"tolerance would absorb it (docs/training/LOSS.md §3.2)"
                 )
     return True, "output and total_weight both matched exactly"
 
@@ -17896,7 +17896,7 @@ def add__tensor_cases(torch_module, c_module, torch_call) -> list[Case]:
             run_c=lambda: c_module._aten_dispatch(op, int32_dst_c, float_src_c),
             expect="both_error",
             note="'result type Float can't be cast to the desired output type Int'. This was "
-                 "expect='torch_error' until docs/ARCH20.md §8.3: the shim used to cast `other` "
+                 "expect='torch_error' until docs/architectures/ARCH20.md §8.3: the shim used to cast `other` "
                  "down into the receiver's dtype and return a truncated answer where upstream "
                  "raises. `inplace_cast_check` refuses it now, so the two agree",
         )
@@ -18001,7 +18001,7 @@ def mul_scalar_cases(torch_module, c_module, torch_call) -> list[Case]:
             note="torch: bool*2.5 -> tensor([2.5,0.,2.5], dtype=float32); same gap, float scalar",
         )
     )
-    # The blind spot docs/TRAIN.md §5 predicted and docs/SCALAR.md fixed: every
+    # The blind spot docs/training/TRAIN.md §5 predicted and docs/numerics/SCALAR.md fixed: every
     # scalar above (2.0, 0.0, -1.5) is exactly representable in float16 and
     # bfloat16, so this builder passed while the kernel narrowed a scalar
     # upstream widens.
@@ -18019,10 +18019,10 @@ def mul_scalar_cases(torch_module, c_module, torch_call) -> list[Case]:
 
 
 # --- mamba / mixtral -- the last two of the 20 measured architectures ------
-# (docs/OPS4.md) with anything unimplemented. Every rule pinned below was
+# (docs/kernels/OPS4.md) with anything unimplemented. Every rule pinned below was
 # re-measured against torch 2.13.0 with a real `TorchDispatchMode` over
 # `transformers` 5.15.1 rather than copied from a kernel's doc comment --
-# docs/OPS4.md's own note is that doc comments have been wrong about
+# docs/kernels/OPS4.md's own note is that doc comments have been wrong about
 # upstream three times before.
 
 
@@ -18395,7 +18395,7 @@ def log2_cases(torch_module, c_module, torch_call) -> list[Case]:
             )
         )
     # **The case that separates `log2` from `log(x)/ln(2)`.** The sabotage run
-    # for this section (docs/KERNELS26.md §25, fault S12) found that every
+    # for this section (docs/kernels/KERNELS26.md §25, fault S12) found that every
     # case above passes with the division: at `float64` the two differ by
     # 1 ULP, which the harness's `float64` tolerance absorbs, and the powers of
     # two are exact both ways. So the difference has to be compared *exactly*,
@@ -18637,13 +18637,13 @@ def softplus_cases(torch_module, c_module, torch_call) -> list[Case]:
             )
         )
 
-    # --- the formula, and the accumulate-where (docs/SCALAR.md §5) ---------
+    # --- the formula, and the accumulate-where (docs/numerics/SCALAR.md §5) ---------
     #
     # **Every case above this line passed both the old kernel and the new
     # one**, which is the finding rather than an aside. The old kernel used
     # the numerically-stable rewrite `max(y,0) + log(1 + exp(-|y|))` and
     # computed it in the storage dtype; upstream is `log1p(exp(a*beta))/beta`
-    # in `opmath`. docs/SCALAR.md §5 measured the disagreement at every dtype
+    # in `opmath`. docs/numerics/SCALAR.md §5 measured the disagreement at every dtype
     # including `float64` and this suite could not see any of it, for two
     # separate reasons that the cases below fix separately:
     #
@@ -18654,10 +18654,10 @@ def softplus_cases(torch_module, c_module, torch_call) -> list[Case]:
     #   * the comparator. At `bfloat16` the effect is 0.0027 on a value of
     #     0.048, and `dtypes.py` gives `bfloat16` `atol=6e-2`: a tolerance
     #     absorbs it for **every** input. This is the second kind of hole
-    #     docs/LOSS.md §5.4 names, and `_bit_exact` is the instrument.
+    #     docs/training/LOSS.md §5.4 names, and `_bit_exact` is the instrument.
     #
     # The five values are chosen so that each of them separates something:
-    # `-3.0` is docs/SCALAR.md §5's own reported value; `-30.0` is where
+    # `-3.0` is docs/numerics/SCALAR.md §5's own reported value; `-30.0` is where
     # `log(1+tiny)` loses digits that `log1p` keeps; `±1e-9` sits either side
     # of a cancellation in the `max(y,0)` term; `7.0` separates the two in
     # `float64` and in nothing else.
@@ -18668,7 +18668,7 @@ def softplus_cases(torch_module, c_module, torch_call) -> list[Case]:
                 torch_module, c_module, op, torch_call, dtype_name,
                 _separating, (5,),
                 "log1p(exp(y)) in opmath, bit for bit -- a tolerance absorbs the whole "
-                "effect at every dtype (docs/SCALAR.md §5)",
+                "effect at every dtype (docs/numerics/SCALAR.md §5)",
                 value_check=_bit_exact,
             )
         )
@@ -18860,7 +18860,7 @@ def convolution_cases(torch_module, c_module, torch_call) -> list[Case]:
     w_t, w_c = pair_from_flat(torch_module, c_module, list(range(1, 13)), (3, 1, 4), "float32")
 
     # transposed=True, 1-D, **grouped**. This was `c_error` until
-    # docs/KERNELS26.md §24 wired the 1-D transposed path for `vits`, and the
+    # docs/kernels/KERNELS26.md §24 wired the 1-D transposed path for `vits`, and the
     # case flipped on its own -- "gap appears CLOSED: both sides now succeed,
     # promote this case to expect=match and diff real values", which is what
     # `c_error` exists to say. Promoted, and now diffing values.
@@ -18906,7 +18906,7 @@ def convolution_cases(torch_module, c_module, torch_call) -> list[Case]:
         )
     )
 
-    # Keyword-argument coverage (docs/GOLDEN.md, docs/DISPATCH.md §4.1): every
+    # Keyword-argument coverage (docs/verification/GOLDEN.md, docs/design/DISPATCH.md §4.1): every
     # argument by keyword at once -- `input`/`weight`, not `self`/`other`, are
     # this schema's own names for the two tensor arguments, and this op alone
     # accounts for six of the interned-name gap (groups/dilation/padding/
@@ -18921,7 +18921,7 @@ def convolution_cases(torch_module, c_module, torch_call) -> list[Case]:
         [1.0, -1.0, 0.5, 0.0, 0.5, 0.5, 0.5, 0.5, -1.0, 1.0, 0.0, 2.0],
         (3, 1, 4), "float32",
     )
-    # --- 2-D convolution (4-D input), docs/KERNELS26.md §7 -----------------
+    # --- 2-D convolution (4-D input), docs/kernels/KERNELS26.md §7 -----------------
     #
     # `Dinov2`'s patch embedding is the caller ARCH26.md §3.2 stopped on, and
     # its shape is the first row: a square kernel with a matching stride and no
@@ -18989,7 +18989,7 @@ def convolution_cases(torch_module, c_module, torch_call) -> list[Case]:
     # implementing it later flips these to failures rather than being silent.
     #
     # **`padding` used to be the third row here and is not any more**
-    # (docs/LAST7.md §4). It was the row that closed: the difference between the
+    # (docs/kernels/LAST7.md §4). It was the row that closed: the difference between the
     # two axes' paddings is spent as explicit zero padding on the input and the
     # convolution runs with the common remainder, so this case went red as a
     # `c_error` the day the lowering landed. Inverted rather than deleted, and
@@ -19031,7 +19031,7 @@ def convolution_cases(torch_module, c_module, torch_call) -> list[Case]:
             cases.append(
                 make2d(dtype_name, in_shape, w_shape, True, (1, 1), padding,
                        (1, 1), groups,
-                       f"per-axis padding {padding} -- {note}. docs/LAST7.md §4")
+                       f"per-axis padding {padding} -- {note}. docs/kernels/LAST7.md §4")
             )
 
     # **A single value broadcasts to both axes**, which is torch's own
@@ -19099,7 +19099,7 @@ def convolution_cases(torch_module, c_module, torch_call) -> list[Case]:
         )
     )
 
-    # --- transposed 2-D convolution, docs/KERNELS26.md §10 -------------------
+    # --- transposed 2-D convolution, docs/kernels/KERNELS26.md §10 -------------------
     #
     # **The weight layout is `(in_channels, out_channels/groups, kH, kW)` --
     # the opposite of the forward convolution's `(out, in/groups, kH, kW)` --
@@ -19275,7 +19275,7 @@ def convolution_cases(torch_module, c_module, torch_call) -> list[Case]:
             )
         )
     # 1-D transposed (3-D input), ungrouped. Also `c_error` until §24 --
-    # docs/KERNELS26.md §10.3 refused it for "no measured caller", and `vits`
+    # docs/kernels/KERNELS26.md §10.3 refused it for "no measured caller", and `vits`
     # became one.
     cases.append(
         Case(
@@ -19387,7 +19387,7 @@ def zeros_like_cases(torch_module, c_module, torch_call) -> list[Case]:
                 note="explicit dtype override beats the self tensor's dtype",
             )
         )
-    # `memory_format` -- accepted since docs/BACKWARD4.md, where it stopped
+    # `memory_format` -- accepted since docs/training/BACKWARD4.md, where it stopped
     # being reachable-but-refused. `torch/autograd/__init__.py` `_make_grads`
     # builds its seed with `ones_like(out, memory_format=preserve_format)` and
     # only gets there `if out.requires_grad`, which was never true of an
@@ -19453,7 +19453,7 @@ def ones_like_cases(torch_module, c_module, torch_call) -> list[Case]:
                 note="explicit dtype override beats the self tensor's dtype",
             )
         )
-    # `memory_format` -- accepted since docs/BACKWARD4.md, where it stopped
+    # `memory_format` -- accepted since docs/training/BACKWARD4.md, where it stopped
     # being reachable-but-refused. `torch/autograd/__init__.py` `_make_grads`
     # builds `Tensor.backward()`'s seed with
     # `ones_like(out, memory_format=preserve_format)` and only reaches that line
@@ -19548,7 +19548,7 @@ def ge_scalar_cases(torch_module, c_module, torch_call) -> list[Case]:
 #
 # The last of the six comparisons to get its Tensor overload. `le.Tensor`,
 # `lt.Tensor` and `gt.Tensor` all had a kernel and `ge` had only `.Scalar`, so
-# `x >= tensor` resolved through `methods.json` (docs/GROUPED_MM.md §6.4 put
+# `x >= tensor` resolved through `methods.json` (docs/kernels/GROUPED_MM.md §6.4 put
 # both schema strings there) and then refused inside `_aten_dispatch`. The
 # cases mirror `gt.Tensor`'s exactly, because the two are the same kernel
 # under a different `Cmp` -- a divergence between them would be a real one.
@@ -19688,7 +19688,7 @@ def floor_divide_cases(torch_module, c_module, torch_call) -> list[Case]:
         )
     )
 
-    # docs/FIXES.md / docs/SCALAR2.md §6: a negative or overflowing Python int
+    # docs/kernels/FIXES.md / docs/numerics/SCALAR2.md §6: a negative or overflowing Python int
     # scalar against a `uint8` tensor wraps into the dtype's bit pattern
     # before the division runs -- the same rule `lt.Scalar`'s `uint8` cases
     # exercise. `-256` wraps to `0`, which makes the divisor zero and raises,
@@ -19821,7 +19821,7 @@ def floor_divide_scalar_cases(torch_module, c_module, torch_call) -> list[Case]:
         )
     )
 
-    # The reduced-float scalar rule (docs/SCALAR.md §3.2), and with it the
+    # The reduced-float scalar rule (docs/numerics/SCALAR.md §3.2), and with it the
     # `float64` gap that shares its cause: this builder's float coverage was
     # `// 2.0` and `// 0.0`, both of which are exactly representable *and* land
     # on an exact quotient, so `floor(a/b)` and upstream's fmod-based
@@ -19940,7 +19940,7 @@ def histc_cases(torch_module, c_module, torch_call) -> list[Case]:
         )
     )
 
-    # Keyword-argument coverage (docs/GOLDEN.md, docs/DISPATCH.md §4.1):
+    # Keyword-argument coverage (docs/verification/GOLDEN.md, docs/design/DISPATCH.md §4.1):
     # self/bins/min/max all by keyword.
     kw_t, kw_c = pair_from_flat(torch_module, c_module, [0.0, 1.0, 2.0, 3.0, 3.0, -1.0, 4.0], (7,), "float32")
     cases.append(
@@ -20043,7 +20043,7 @@ def clamp__default_cases(torch_module, c_module, torch_call) -> list[Case]:
     # 2.13.0. It is cased because it used to compute: the kernel produced a
     # `uint8` replacement and `replace_with` retagged the receiver from
     # `torch.bool` to `torch.uint8`, which is computing where upstream refuses.
-    # docs/VIEWS.md §6.8.
+    # docs/kernels/VIEWS.md §6.8.
     for bounds, note in (
         ((0, 5), "torch: \"result type Long can't be cast to the desired output type bool\""),
         ((0.0, 1.0), "float bounds name Float in the same message"),
@@ -20447,7 +20447,7 @@ def index_put__cases(torch_module, c_module, torch_call) -> list[Case]:
         )
     )
 
-    # --- the bool mask (docs/VIEWS.md §2) ---------------------------------
+    # --- the bool mask (docs/kernels/VIEWS.md §2) ---------------------------------
     #
     # A mask is a different operation from an integer index, not a cast: it
     # selects the positions where it is true. This was a `c_error` case for as
@@ -20543,7 +20543,7 @@ def index_put__cases(torch_module, c_module, torch_call) -> list[Case]:
         )
     )
 
-    # --- self of rank above 1 (docs/VIEWS.md §3) ---------------------------
+    # --- self of rank above 1 (docs/kernels/VIEWS.md §3) ---------------------------
     #
     # `x[idx] = v` on a matrix, which is the common case and which the
     # scatter-based kernel refused outright ("only a 1-D self/index/values").
@@ -20761,11 +20761,11 @@ def index_put__cases(torch_module, c_module, torch_call) -> list[Case]:
             )
         )
 
-    # --- accumulate=True (docs/VIEWS.md §7) --------------------------------
+    # --- accumulate=True (docs/kernels/VIEWS.md §7) --------------------------------
     #
     # This was one `c_error` case ("torch computes, the shim refuses") for as
     # long as the flag was refused. It is the scatter-add an embedding's
-    # backward wants, and docs/BACKWARD.md §4.5 named it while composing a
+    # backward wants, and docs/training/BACKWARD.md §4.5 named it while composing a
     # one-hot instead at 200 MB for S=1024.
     #
     # The cases below are built so that each of the three things that are
@@ -20788,7 +20788,7 @@ def index_put__cases(torch_module, c_module, torch_call) -> list[Case]:
     # There is no member or `torch.`-level spelling to pair these with:
     # `index_put_` is not in `methods.json` and `__setitem__` always passes
     # `accumulate=False`, so `_aten_dispatch` is the only door. Recorded in
-    # docs/VIEWS.md §7 rather than worked around.
+    # docs/kernels/VIEWS.md §7 rather than worked around.
 
     # (a) The same operands as "index_put_(repeated index) [last write wins]",
     #     with the flag flipped: 1+2+3 = 6 instead of 3.
@@ -20888,7 +20888,7 @@ def index_put__cases(torch_module, c_module, torch_call) -> list[Case]:
     # (e) **`torch.bool` accumulates as a logical or**, because upstream's
     #     `*dst += *src` on a C++ `bool` integer-promotes and converts back.
     #     Writing `o + s` would leave a 2 in a byte the whole `bool` tag
-    #     depends on being 0 or 1 (docs/BOOL.md §6.3) -- and reading the
+    #     depends on being 0 or 1 (docs/numerics/BOOL.md §6.3) -- and reading the
     #     result *as bool* cannot see that, because 2 is still truthy on both
     #     sides. So the result is cast to int64 and the ints are compared;
     #     that is the only shape here that fails an `o + s` kernel.
@@ -21110,7 +21110,7 @@ def index_put__cases(torch_module, c_module, torch_call) -> list[Case]:
         )
     )
 
-    # Keyword-argument coverage (docs/GOLDEN.md, docs/DISPATCH.md §4.1):
+    # Keyword-argument coverage (docs/verification/GOLDEN.md, docs/design/DISPATCH.md §4.1):
     # self/indices/values/accumulate all by keyword.
     kw_self_t, kw_self_c = pair_from_flat(torch_module, c_module, [0.0] * 5, (5,), "float32")
     kw_idx_t, kw_idx_c = pair_from_flat(torch_module, c_module, [4, 3, 2, 1, 0], (5,), "int64")
@@ -21463,7 +21463,7 @@ def min_default_cases(torch_module, c_module, torch_call) -> list[Case]:
     #
     # Walked through three positions rather than left at one. The single case
     # here had the NaN in the middle, which does exercise the fault, but the
-    # rest of this family was audited in docs/TRIL.md §3 and the audit's rule
+    # rest of this family was audited in docs/kernels/TRIL.md §3 and the audit's rule
     # is that a NaN suite states its positions: a suite with only `at=0` cannot
     # fail, because element 0 seeds candle's accumulator and nothing displaces
     # it. Cheap insurance, and it makes the pattern uniform across the six ops
@@ -21566,9 +21566,9 @@ def unbind_int_cases(torch_module, c_module, torch_call) -> list[Case]:
 
 # --- aten._grouped_mm.default ----------------------------------------------
 #
-# The mixture-of-experts GEMM, and the operator docs/OPS4.md §13.3 named as the
+# The mixture-of-experts GEMM, and the operator docs/kernels/OPS4.md §13.3 named as the
 # one thing keeping Mixtral off the "zero missing operators" list. See
-# docs/GROUPED_MM.md for the schema, the four layouts, and the measurements
+# docs/kernels/GROUPED_MM.md for the schema, the four layouts, and the measurements
 # behind every refusal below.
 #
 # Three dtypes, because upstream's CPU kernel takes exactly three (f32, bf16,
@@ -21849,7 +21849,7 @@ def grouped_mm_cases(torch_module, c_module, torch_call) -> list[Case]:
         )
 
     # -- Refusals. Every message below is upstream's own; see
-    # docs/GROUPED_MM.md §2.1 for the table they were measured into.
+    # docs/kernels/GROUPED_MM.md §2.1 for the table they were measured into.
     f32_a = pair_from_flat(torch_module, c_module, _gemm_lcg(m * k, 8201), (m, k), "float32")
     f32_b3 = pair_from_flat(torch_module, c_module, _gemm_lcg(3 * k * n, 8202), (3, k, n), "float32")
     offs3 = _grouped_offs(torch_module, c_module, [5, 9, 24])
@@ -21883,7 +21883,7 @@ def grouped_mm_cases(torch_module, c_module, torch_call) -> list[Case]:
         )
     )
 
-    # The 16-byte stride rule (docs/GROUPED_MM.md §2.2). Both directions:
+    # The 16-byte stride rule (docs/kernels/GROUPED_MM.md §2.2). Both directions:
     # an unaligned leading stride on the 2-D operand, and on the 3-D one.
     thin_a = pair_from_flat(torch_module, c_module, _gemm_lcg(8 * 3, 8204), (8, 3), "float32")
     thin_b = pair_from_flat(torch_module, c_module, _gemm_lcg(3 * 3 * 4, 8205), (3, 3, 4), "float32")
@@ -22053,7 +22053,7 @@ def grouped_mm_cases(torch_module, c_module, torch_call) -> list[Case]:
     return cases
 
 
-# --- the Python-level member spellings (docs/GROUPED_MM.md §6.4) ------------
+# --- the Python-level member spellings (docs/kernels/GROUPED_MM.md §6.4) ------------
 #
 # Everything above calls `torch.ops.aten.<op>.<ov>` on the torch side and
 # `_C._aten_dispatch(key, ...)` on the shim side. That compares the *kernels*,
@@ -22402,7 +22402,7 @@ def _view_write_cases(torch_module, c_module) -> list[Case]:
     preference. Every in-place op returns `self`, so a case that compares the
     return value passes just as well against a kernel that computed into a
     fresh buffer and handed it back -- which is exactly what this shim did
-    until docs/VIEWS.md §6. The whole suite was 3037 cases green while no
+    until docs/kernels/VIEWS.md §6. The whole suite was 3037 cases green while no
     in-place write was visible through any view. A case can only fail that way
     if it reads a name the op never returned.
 
@@ -22535,12 +22535,12 @@ def _view_write_cases(torch_module, c_module) -> list[Case]:
     # `pub(crate)`. It is reachable at a price: an `InplaceOp1` that only reads
     # `CpuStorage::as_ptr` would recover the identity, at one extra write-lock
     # acquisition per in-place op with a tensor operand, on the hot path.
-    # docs/VIEWS.md §6.5 has the argument for not paying it yet.
+    # docs/kernels/VIEWS.md §6.5 has the argument for not paying it yet.
     add("aten.copy_.default",
         "x[0:2].copy_(x[1:3]) -- PARTIALLY overlapping, which upstream refuses",
         "known gap: upstream raises on a partial overlap between source and "
         "destination; this shim reads the source out first and computes "
-        "[[5..8],[9..12],[9..12]] -- docs/VIEWS.md §6.5",
+        "[[5..8],[9..12],[9..12]] -- docs/kernels/VIEWS.md §6.5",
         grid, (3, 4), "float32",
         lambda call, base: call(
             "aten.copy_.default",
@@ -22598,7 +22598,7 @@ def _view_write_cases(torch_module, c_module) -> list[Case]:
             "aten.div_.Tensor", call("aten.select.int", base, 1, 1),
             call("aten.select.int", base, 1, 2)))
 
-    # --- the rest of the in-place arithmetic family (docs/ARCH20.md §8) -----
+    # --- the rest of the in-place arithmetic family (docs/architectures/ARCH20.md §8) -----
     #
     # Same shape as `add_.Tensor` above and here for the same reason: every one
     # of these returns `self`, so a case that read the return value would pass
@@ -22664,7 +22664,7 @@ def _view_write_cases(torch_module, c_module) -> list[Case]:
         lambda call, base: call(
             "aten.exp_.default", call("aten.select.int", base, 1, 0)))
 
-    # --- docs/SPELLINGS.md §9's fourteen-name gap, write-through evidence --
+    # --- docs/bindings/SPELLINGS.md §9's fourteen-name gap, write-through evidence --
     #
     # Same shape as `exp_`/`neg_` above and here for the same reason: every
     # one of these returns `self`, so a return-value case cannot tell a
@@ -22791,7 +22791,7 @@ def _view_write_cases(torch_module, c_module) -> list[Case]:
         )
     )
 
-    # --- scatter_ (docs/SCATTER.md) ----------------------------------------
+    # --- scatter_ (docs/kernels/SCATTER.md) ----------------------------------------
     #
     # Two views, chosen for the two branches of `tensor.rs::write_strided`:
     # `select.int(base, 1, 1)` is stride-4 with offset 1 (the odometer branch),
@@ -22874,7 +22874,7 @@ def _view_write_cases(torch_module, c_module) -> list[Case]:
 
 def _setitem_member_cases(torch_module, c_module) -> list[Case]:
     """`x[...] = v`. `__setitem__` is a walk over the index like
-    `__getitem__`, and since docs/VIEWS.md §6 the basic-index half of that walk
+    `__getitem__`, and since docs/kernels/VIEWS.md §6 the basic-index half of that walk
     writes through the narrowing instead of refusing -- see the member's
     docstring in `bootstrap.py`.
 
@@ -22937,7 +22937,7 @@ def _setitem_member_cases(torch_module, c_module) -> list[Case]:
     # inside the kernel, which was written on top of `scatter` and so wanted
     # an int32/int64 index. **That was a missing kernel capability, not a
     # missing name**, and it was carried here as a `c_error` case until
-    # docs/VIEWS.md §2 closed it. It is a real case now: a mask is a
+    # docs/kernels/VIEWS.md §2 closed it. It is a real case now: a mask is a
     # different operation from an integer index, and the values are diffed.
     pair = pair_from_flat(torch_module, c_module, [0.0] * 4, (4,), "float32")
     mask = pair_from_flat(torch_module, c_module, [True, False, True, False], (4,), "bool")
@@ -22979,7 +22979,7 @@ def _setitem_member_cases(torch_module, c_module) -> list[Case]:
         )
     )
 
-    # --- a receiver of rank above 1 (docs/VIEWS.md §3) ---------------------
+    # --- a receiver of rank above 1 (docs/kernels/VIEWS.md §3) ---------------------
     #
     # `x[idx] = v` on a matrix: the common shape, and the one the kernel
     # refused outright while it was built on `scatter`.
@@ -23173,7 +23173,7 @@ def _setitem_member_cases(torch_module, c_module) -> list[Case]:
     # So the arm choice is carried because it is upstream's measured lowering
     # and because anything that ever observes the trace will depend on it --
     # not because these cases guard it. Written here rather than left for the
-    # key to imply, the same way docs/VIEWS.md §2-§3 handled the `x[:] = 3.0`
+    # key to imply, the same way docs/kernels/VIEWS.md §2-§3 handled the `x[:] = 3.0`
     # case that could not discriminate the two `_lift` rules.
 
     # fill_ arm: destination bigger than the 0-d source.
@@ -23235,18 +23235,18 @@ def _setitem_member_cases(torch_module, c_module) -> list[Case]:
             "float32", [pair], assigned(lambda a: a.__setitem__(slice(0, 4, 2), 0.0)),
             note="was `c_error`: a step above 1 is not a view here, because "
                  "`aten.slice.Tensor` materialises through `index_select`, so the "
-                 "write went into the copy. docs/SETITEM.md lowers it to "
+                 "write went into the copy. docs/bindings/SETITEM.md lowers it to "
                  "`index_put_`, which writes through the receiver's own storage, "
                  "and the harness asked for this promotion by name. The underlying "
                  "view divergence still has its own diverge case in slice_cases "
-                 "-- docs/VIEWS.md §6.4",
+                 "-- docs/kernels/VIEWS.md §6.4",
         )
     )
 
     # --- the two stepped-write shapes the architecture sweep actually uses --
     #
-    # docs/SETITEM.md §1: `TensorBase.__setitem__` is the single name that
-    # blocks the most architectures in docs/ARCH100.md (13 of the 82), and all
+    # docs/bindings/SETITEM.md §1: `TensorBase.__setitem__` is the single name that
+    # blocks the most architectures in docs/architectures/ARCH100.md (13 of the 82), and all
     # 13 of them stop on **one** form -- a stepped slice on the write side.
     # They come in exactly two shapes, and neither is the 1-D `x[0:4:2] = 0.0`
     # pinned above:
@@ -23259,7 +23259,7 @@ def _setitem_member_cases(torch_module, c_module) -> list[Case]:
     # They are `expect="c_error"` for the same reason the case above is, and
     # they are here rather than folded into it because a lowering that handles
     # a 1-D stepped write and not a stepped write at a *later* axis would
-    # close that case and leave these two open. When docs/SETITEM.md §2's
+    # close that case and leave these two open. When docs/bindings/SETITEM.md §2's
     # patch lands, all three flip together and compare.py says so by name.
     pair = pair_from_flat(torch_module, c_module, [0.0] * 12, (3, 4), "float32")
     src = pair_from_flat(
@@ -23273,7 +23273,7 @@ def _setitem_member_cases(torch_module, c_module) -> list[Case]:
             note="[[1,0,2,0],[3,0,4,0],[5,0,6,0]]. The stepped slice is at axis 1, not "
                  "axis 0, so a 1-D-only lowering would not reach it -- which is why "
                  "this case is separate from the 1-D one above. Three architectures "
-                 "were blocked at *construction* by this line -- docs/SETITEM.md §1",
+                 "were blocked at *construction* by this line -- docs/bindings/SETITEM.md §1",
         )
     )
     pair = pair_from_flat(torch_module, c_module, [0.0] * 12, (2, 1, 6), "float32")
@@ -23288,13 +23288,13 @@ def _setitem_member_cases(torch_module, c_module) -> list[Case]:
             note="[[[0,1,0,0,2,0]],[[0,3,0,0,4,0]]]. The ellipsis expands to two full "
                  "slices, so the stepped slice sits at axis 2 of a rank-3 receiver. "
                  "Ten architectures were blocked on this one line in "
-                 "`apply_interleaved_mrope` -- docs/SETITEM.md §1",
+                 "`apply_interleaved_mrope` -- docs/bindings/SETITEM.md §1",
         )
     )
 
     # --- the kernel shapes that lowering rests on, which DO pass today ------
     #
-    # docs/SETITEM.md §2 lowers a stepped write to `index_put_` with the
+    # docs/bindings/SETITEM.md §2 lowers a stepped write to `index_put_` with the
     # positions the slice names as an integer index, so the two cases above
     # can only be closed if `index_put_` already answers for these two shapes.
     # It does, and that is worth pinning separately from the member calls:
@@ -23372,13 +23372,13 @@ def _setitem_member_cases(torch_module, c_module) -> list[Case]:
             run_c=_cast_then_put_c,
             note="upstream's `x[0::2] = [1.7,2.7,3.7]` on an int64 receiver truncates "
                  "toward zero to [1,0,2,0,3,0]; this is that sequence spelled out, so "
-                 "the cast direction is pinned before docs/SETITEM.md §2 relies on it",
+                 "the cast direction is pinned before docs/bindings/SETITEM.md §2 relies on it",
         )
     )
     return cases
 
 
-# --- docs/ARCH20.md: the seven blocked architectures ------------------------
+# --- docs/architectures/ARCH20.md: the seven blocked architectures ------------------------
 #
 # Eleven new keys, and the split between them is the round's own finding: only
 # three are new *kernels* (`log`, `expm1`, `constant_pad_nd`) plus one
@@ -23636,7 +23636,7 @@ def _pad_nd_cases(op: str, mode: str, ndim: int):
     """Golden cases for one of the six `reflection_pad*`/`replication_pad*` ops.
 
     One builder shared by all six because the six kernels are one gather
-    applied per axis (docs/PAD.md §2), so the cases that distinguish a right
+    applied per axis (docs/kernels/PAD.md §2), so the cases that distinguish a right
     implementation from a plausible one are the same cases in every rank.
 
     **The headline pair is reflect-vs-replicate on the same input.** Padding
@@ -23694,7 +23694,7 @@ def _pad_nd_cases(op: str, mode: str, ndim: int):
              "front-to-back reading gives a different shape")
 
         # The distinguishing width. Reflect refuses `pad >= extent`, replicate
-        # does not -- measured, not assumed (docs/PAD.md §2).
+        # does not -- measured, not assumed (docs/kernels/PAD.md §2).
         last = spatial[-1]
         wide = [last - 1, last - 1] + [0, 0] * (ndim - 1)
         case(f"widest legal pad on the last axis ({last - 1})", vals, batched,
@@ -23758,7 +23758,7 @@ def _pad_nd_cases(op: str, mode: str, ndim: int):
 
 
 def _stft_cases(op: str, centred: bool):
-    """`aten.stft.default` / `aten.stft.center` -- docs/FFT.md.
+    """`aten.stft.default` / `aten.stft.center` -- docs/kernels/FFT.md.
 
     **These are golden-comparable only in the `return_complex=False` form**, and
     that is the whole reason `stft` is on this list while the three `_fft_*`
@@ -23844,7 +23844,7 @@ def _stft_cases(op: str, centred: bool):
              window=w16, window_len=16)
         case("n_fft=20 is not a power of two (Bluestein)", sig, (n,), "float32",
              (20, 5, 20, False, True),
-             "whisper's n_fft is 400 and also not a power of two (docs/FFT.md "
+             "whisper's n_fft is 400 and also not a power of two (docs/kernels/FFT.md "
              "§4); this is the same path at a size the harness can afford",
              window=hann(20), window_len=20)
         case("float64", sig, (n,), "float64", (16, 4, 16, False, True),
@@ -23905,20 +23905,20 @@ def _stft_args(rest, window, centred):
     if centred:
         # `center=False`: the centring itself is `torch.stft`'s own Python
         # pad, not this overload's, and the golden harness has no reflect pad
-        # binding to reach (docs/PAD.md §5). What this exercises is the
+        # binding to reach (docs/kernels/PAD.md §5). What this exercises is the
         # ARGUMENT SHIFT, which is what distinguishes the two overloads.
         return head + [False, "reflect"] + tail
     return head + tail
 
 
 def rms_norm_cases(torch_module, c_module, torch_call) -> list[Case]:
-    """`aten.rms_norm.default` -- `nn.RMSNorm`, docs/VOICE.md §1 rank 16 (f5).
+    """`aten.rms_norm.default` -- `nn.RMSNorm`, docs/architectures/VOICE.md §1 rank 16 (f5).
 
     **The cases that matter are the small-magnitude ones.** The default `eps`
     is the *accumulation* dtype's epsilon, so a `float16` input uses
     `finfo(float32).eps` and not `finfo(float16).eps`. On ordinary magnitudes
     the two choices produce identical tensors to every printed digit; at
-    `1e-3` they differ by an order of magnitude (docs/PAD.md §8). A suite that
+    `1e-3` they differ by an order of magnitude (docs/kernels/PAD.md §8). A suite that
     only normalised `arange`-sized values would pass with the wrong constant.
     """
     op = "aten.rms_norm.default"
@@ -24088,7 +24088,7 @@ def constant_pad_nd_cases(torch_module, c_module, torch_call) -> list[Case]:
     return cases
 
 
-# --- the in-place arithmetic family (docs/ARCH20.md §8) ---------------------
+# --- the in-place arithmetic family (docs/architectures/ARCH20.md §8) ---------------------
 
 _INPLACE_ARITH_DTYPES = ["float64", "float32", "float16", "bfloat16", "int64", "int32"]
 
@@ -24125,7 +24125,7 @@ def _inplace_tensor_cases(torch_module, c_module, torch_call, op, spell) -> list
         )
     )
     # The cast check, both directions. The safe one computes; the unsafe one
-    # refuses on BOTH sides (it used to compute here -- docs/ARCH20.md §8.3).
+    # refuses on BOTH sides (it used to compute here -- docs/architectures/ARCH20.md §8.3).
     dst_t, dst_c = pair_from_flat(torch_module, c_module, [1, 2, 3, 4], (2, 2), "float32")
     src_t, src_c = pair_from_flat(torch_module, c_module, [1, 2, 3, 4], (2, 2), "int32")
     cases.append(
@@ -24147,7 +24147,7 @@ def _inplace_tensor_cases(torch_module, c_module, torch_call, op, spell) -> list
             run_c=lambda: c_module._aten_dispatch(op, dst_c, src_c),
             expect="both_error",
             note="result type Float can't be cast to the desired output type Int -- this "
-                 "shim used to compute a truncated answer here (docs/ARCH20.md §8.3)",
+                 "shim used to compute a truncated answer here (docs/architectures/ARCH20.md §8.3)",
         )
     )
     return cases
@@ -24266,7 +24266,7 @@ def mul__scalar_cases(torch_module, c_module, torch_call) -> list[Case]:
     op = "aten.mul_.Scalar"
     cases = _inplace_scalar_cases(torch_module, c_module, torch_call, op, "mul_")
     cases.extend(c for c in _view_write_cases(torch_module, c_module) if c.op == op)
-    # **The one scalar multiply upstream narrows** -- docs/SCALAR.md §2.2.
+    # **The one scalar multiply upstream narrows** -- docs/numerics/SCALAR.md §2.2.
     # `mul.Scalar` widens, `div_.Scalar` widens, `x *= 0.3` widens, and
     # `torch.ops.aten.mul_.Scalar` alone does not (checked over 4096 values x 4
     # scalars x 2 dtypes, so it is not a vectorisation tail). Pinned rather than
@@ -24397,7 +24397,7 @@ def _promoting_unary_inplace_cases(
     torch_module, c_module, torch_call, op, member_spelling, float_probes,
 ) -> list[Case]:
     """The shared shape for `cos_`/`sin_`/`erf_`/`log_`/`reciprocal_`/`tanh_`/
-    `sqrt_`/`rsqrt_`/`expm1_`/`log2_`/`sigmoid_` -- docs/SPELLINGS.md §9's
+    `sqrt_`/`rsqrt_`/`expm1_`/`log2_`/`sigmoid_` -- docs/bindings/SPELLINGS.md §9's
     fifteen-name gap, minus `clamp_min_` (its own dtype refusal, not this
     family's) and `abs_`/`ceil_` (which do not promote out of place either,
     so they have nothing in common with this shape) and `detach_` (refused
@@ -24805,7 +24805,7 @@ def _inplace_member_cases(torch_module, c_module, op, spellings, operands=2) -> 
 
     The `x += y` spellings matter separately from `x.add_(y)`: they go through
     `TensorBase.__iadd__`, a different `methods.json` key, and it was the
-    missing one (docs/ARCH20.md §8)."""
+    missing one (docs/architectures/ARCH20.md §8)."""
     cases: list[Case] = []
     for label, call in spellings:
         def through_base(m, *tensors, call=call):
@@ -24836,7 +24836,7 @@ def _inplace_member_cases(torch_module, c_module, op, spellings, operands=2) -> 
 
 def add__member_cases(torch_module, c_module) -> list[Case]:
     """`add_`/`__iadd__` -- the two members `aten.add_.Tensor` had no way in
-    through until docs/ARCH20.md §8. `falcon`'s residual is `x += y`."""
+    through until docs/architectures/ARCH20.md §8. `falcon`'s residual is `x += y`."""
     return _inplace_member_cases(torch_module, c_module, "aten.add_.Tensor", [
         ("x.add_(y)", lambda m, a, b: a.add_(b)),
         ("x += y", lambda m, a, b: _iadd(a, b)),
@@ -24845,8 +24845,8 @@ def add__member_cases(torch_module, c_module) -> list[Case]:
 
 def relu__member_cases(torch_module, c_module) -> list[Case]:
     """`x.relu_()` -- the member for a kernel that had none since
-    docs/KERNELS.md -- and `torch.relu_(x)`, the free function that had no
-    `overloads.json` entry until docs/KERNELS26.md §21.
+    docs/kernels/KERNELS.md -- and `torch.relu_(x)`, the free function that had no
+    `overloads.json` entry until docs/kernels/KERNELS26.md §21.
 
     `zoedepth` spells the free one (`transformers`' ZoeDepth neck runs
     `torch.relu_` on the fused feature maps), so the member alone was not
@@ -24860,7 +24860,7 @@ def relu__member_cases(torch_module, c_module) -> list[Case]:
 
 # --- aten.full_like.default -------------------------------------------------
 #
-# docs/DEMAND.md rank 3, `t5`/`switch_transformers`. The kernel reuses
+# docs/architectures/DEMAND.md rank 3, `t5`/`switch_transformers`. The kernel reuses
 # `full`'s own `filled_block`, so what these cases have to separate is not the
 # fill arithmetic (`full_cases` already pins that) but the ONE rule that
 # differs: `full` infers the dtype from the fill value, `full_like` takes it
@@ -24975,7 +24975,7 @@ def full_like_cases(torch_module, c_module, torch_call) -> list[Case]:
             run_c=lambda: c_module._aten_dispatch(
                 op, self=kw_c, fill_value=3.0, dtype=dt.c_dtype(c_module, "float64")
             ),
-            note="keyword-argument coverage, per docs/GOLDEN.md's interned_name() effort",
+            note="keyword-argument coverage, per docs/verification/GOLDEN.md's interned_name() effort",
         )
     )
 
@@ -24997,7 +24997,7 @@ def full_like_cases(torch_module, c_module, torch_call) -> list[Case]:
 
 # --- aten.new_zeros.default -------------------------------------------------
 #
-# docs/DEMAND.md rank 5, `bart`'s `shift_tokens_right`. The kernel is literally
+# docs/architectures/DEMAND.md rank 5, `bart`'s `shift_tokens_right`. The kernel is literally
 # `new_ones`'s, with `Tensor::zeros` for `Tensor::ones`, so these cases mirror
 # `new_ones_cases` above row for row -- if the two ever stop agreeing on how
 # the defaults come off the reference tensor, one of the two files is wrong and
@@ -25071,7 +25071,7 @@ def new_zeros_cases(torch_module, c_module, torch_call) -> list[Case]:
 def new_empty_cases(torch_module, c_module, torch_call) -> list[Case]:
     """`aten.new_empty` -- `new_zeros`'s schema with uninitialised contents.
 
-    `rwkv`'s wall (docs/DEMAND8.md §2.6). Every case here is
+    `rwkv`'s wall (docs/architectures/DEMAND8.md §2.6). Every case here is
     `_dtype_shape_only_check`, the same comparator `empty_cases` uses and for
     the same reason: upstream's buffer holds whatever was in that memory, so a
     value comparison would pass or fail by luck and a green coin flip is not a
@@ -25148,7 +25148,7 @@ def new_empty_cases(torch_module, c_module, torch_call) -> list[Case]:
 
 # --- aten.native_batch_norm.default -----------------------------------------
 #
-# docs/DEMAND.md rank 1. The hardest op in this file to test honestly, for two
+# docs/architectures/DEMAND.md rank 1. The hardest op in this file to test honestly, for two
 # reasons that no other entry here has at once:
 #
 #   * **Two of its three results are read by nobody.** `torch.batch_norm`
@@ -25159,7 +25159,7 @@ def new_empty_cases(torch_module, c_module, torch_call) -> list[Case]:
 #     and is invisible to any forward.
 #   * **Its most important effect is not a result at all.** It writes
 #     `running_mean` and `running_var` in place while declaring no alias on any
-#     argument (docs/DEMAND1.md §1.1). A kernel that returns exactly the right
+#     argument (docs/architectures/DEMAND1.md §1.1). A kernel that returns exactly the right
 #     `out` while leaving the running statistics untouched passes any test that
 #     reads only the output.
 #
@@ -25171,7 +25171,7 @@ def new_empty_cases(torch_module, c_module, torch_call) -> list[Case]:
 #
 # One case that would be natural to write is deliberately absent:
 # `training=False` with both running statistics `None`. Upstream **segfaults**
-# there (exit 139, reproduced twice in isolation, docs/DEMAND1.md §1.6), so a
+# there (exit 139, reproduced twice in isolation, docs/architectures/DEMAND1.md §1.6), so a
 # case for it would take the harness process down rather than fail. It is
 # unreachable through any real spelling -- `torch.batch_norm` raises
 # "running_mean must be defined in evaluation mode" first, and the shim raises
@@ -25434,7 +25434,7 @@ def native_batch_norm_cases(torch_module, c_module, torch_call) -> list[Case]:
                 running_var=kv_c, training=True, momentum=0.1, eps=1e-5,
             )),
             value_check=_batch_norm_result_check,
-            note="keyword-argument coverage, per docs/GOLDEN.md's interned_name() effort",
+            note="keyword-argument coverage, per docs/verification/GOLDEN.md's interned_name() effort",
         )
     )
 
@@ -25485,7 +25485,7 @@ def native_batch_norm_cases(torch_module, c_module, torch_call) -> list[Case]:
     # A parameter whose length is not C. Upstream does NOT refuse: measured, a
     # length-2 weight against 3 channels returns bit-identical numbers to the
     # correct length-3 call, having read a third float out of uninitialised
-    # heap (docs/DEMAND1.md §1.6). The shim refuses by name rather than
+    # heap (docs/architectures/DEMAND1.md §1.6). The shim refuses by name rather than
     # reproducing whatever happened to be in memory, so this is `c_error` and
     # says why.
     bad_x_t, bad_x_c = pair_from_flat(
@@ -25596,7 +25596,7 @@ def adaptive_avg_pool2d_cases(torch_module, c_module, torch_call):
         # pybind11 arg-parse error, measured the same way. A case here with a
         # bare `2` would fail with a SILENT DIVERGENCE (checked), because it
         # would be asking the aten op to be more lenient than upstream's own
-        # aten op is. See docs/FIXES.md.
+        # aten op is. See docs/kernels/FIXES.md.
     ]
 
 def where_scalar_self_cases(torch_module, c_module, torch_call):
@@ -25637,10 +25637,10 @@ def roll_default_cases(torch_module, c_module, torch_call):
     ]
 
 
-# --- prims.* (docs/PRIMS.md) -------------------------------------------------
+# --- prims.* (docs/kernels/PRIMS.md) -------------------------------------------------
 #
 # The thirteen reference operators upstream writes its decompositions over.
-# docs/DECOMP.md §12.4 measured that a working upstream decomposition rule
+# docs/graph/DECOMP.md §12.4 measured that a working upstream decomposition rule
 # stops in this shim on a `prims.*` name, not on a missing rule.
 #
 # Nine of the thirteen are an aten kernel under another name -- upstream's own
@@ -26060,7 +26060,7 @@ def prims_split_dim_cases(torch_module, c_module, torch_call) -> list[Case]:
         )
     return cases
 
-# --- docs/INDEXSEL.md: index_select, argsort, where.Scalar, new_full, -------
+# --- docs/kernels/INDEXSEL.md: index_select, argsort, where.Scalar, new_full, -------
 # unflatten, chunk (free-function), diff, multiply, logical_and ------------
 #
 # `TensorBase.reshape_as` is deliberately NOT here -- it has no genuine
@@ -26151,7 +26151,7 @@ def argsort_default_cases(torch_module, c_module, torch_call) -> list[Case]:
     """`aria`'s `torch.argsort(flatten_indices)` and `nllb_moe`'s
     `.argsort(dim=0)`. Ties are the case an unstable sort cannot pass --
     distinct values cannot tell `argsort` and `argsort.stable` apart, so
-    every scenario here repeats a value (docs/ARCH100.md's own warning).
+    every scenario here repeats a value (docs/architectures/ARCH100.md's own warning).
     """
     op = "aten.argsort.default"
     ties_t, ties_c = pair_from_flat(
@@ -26222,7 +26222,7 @@ def argsort_stable_cases(torch_module, c_module, torch_call) -> list[Case]:
 
 def where_scalar_cases(torch_module, c_module, torch_call) -> list[Case]:
     """`cpmant`/`git`'s `where.Scalar` -- both branches are Python scalars,
-    not tensors. docs/SCALAR2.md's rule is per-op, so this pins the
+    not tensors. docs/numerics/SCALAR2.md's rule is per-op, so this pins the
     dtype table `where_scalar_scalar`'s doc comment measured directly:
     bool+bool -> bool, int+bool -> int64, anything+float -> float32.
     """
@@ -26465,7 +26465,7 @@ def diff_default_cases(torch_module, c_module, torch_call) -> list[Case]:
 def multiply_tensor_cases(torch_module, c_module, torch_call) -> list[Case]:
     """`convbert`'s `torch.multiply(mixed_key_conv_attn_layer,
     mixed_query_layer)` -- a pure alias for `mul.Tensor`, measured with a
-    `TorchDispatchMode` logger (docs/INDEXSEL.md). Proven against upstream
+    `TorchDispatchMode` logger (docs/kernels/INDEXSEL.md). Proven against upstream
     rather than assumed: if this were wired to the wrong kernel, or dropped
     `mul`'s promotion, this is the case that would catch it.
     """
@@ -26547,9 +26547,9 @@ def logical_and_cases(torch_module, c_module, torch_call) -> list[Case]:
 
 
 
-# --- docs/TAIL1.md: the eight one-architecture ops, plus QR -------------------
+# --- docs/kernels/TAIL1.md: the eight one-architecture ops, plus QR -------------------
 #
-# Read docs/TAIL1.md §1 for which of these were table rows over an existing
+# Read docs/kernels/TAIL1.md §1 for which of these were table rows over an existing
 # kernel and which were new kernels; the cases below are written so that the
 # *plausible wrong implementation* fails, which for four of them means a very
 # specific input:
@@ -26860,7 +26860,7 @@ def argsort_default_cases(torch_module, c_module, torch_call) -> list[Case]:
 
 def argsort_stable_cases(torch_module, c_module, torch_call) -> list[Case]:
     # Both values of `stable`. They answer the same thing on CPU -- measured,
-    # docs/TAIL1.md §3 -- and comparing both is what says so rather than
+    # docs/kernels/TAIL1.md §3 -- and comparing both is what says so rather than
     # assuming it.
     out: list[Case] = []
     for stable in (True, False):
@@ -27215,7 +27215,7 @@ def _qr_check(t_res, c_res) -> tuple[bool, str]:
 # Every matrix here is full rank on purpose. A rank-deficient input leaves the
 # trailing columns of Q determined by rounding noise -- upstream's own R[1][1]
 # for [[1,2],[2,4],[3,6]] is 8.8e-07 at float32 -- so comparing it element-wise
-# would be comparing two arbitrary answers. docs/TAIL1.md §5 has the
+# would be comparing two arbitrary answers. docs/kernels/TAIL1.md §5 has the
 # measurement; `test_tail1.py` covers that input by its *properties* instead.
 _QR_MATRICES = {
     "3x3": ([12, -51, 4, 6, 167, -68, -4, 24, -41], (3, 3)),
@@ -27310,18 +27310,18 @@ def linalg_qr_cases(torch_module, c_module, torch_call) -> list[Case]:
         )
     )
     return cases
-# --- docs/VOICE.md: the speech-model round -----------------------------------
+# --- docs/architectures/VOICE.md: the speech-model round -----------------------------------
 #
 # Five voicestudio models (Vocos, BigVGAN, Parler-TTS, F5-TTS, Spark-TTS
 # BiCodec) were run from a small config against upstream and against this
 # build. These six ops are the ones that round both reached and could land;
 # `stft`/`istft`/`rfft` and the complex dtypes they return are a candle-level
-# gap, sized in docs/VOICE.md rather than half-built here.
+# gap, sized in docs/architectures/VOICE.md rather than half-built here.
 
 
 # --- aten.hann_window.default / aten.hann_window.periodic --------------------
 #
-# Rank 1 of docs/VOICE.md: four of the five models build this in `__init__`,
+# Rank 1 of docs/architectures/VOICE.md: four of the five models build this in `__init__`,
 # so it is a construction wall. Two things this suite pins:
 #
 #   * `periodic` changes the *divisor*, not the length -- `hann_window(5)` and
@@ -27342,7 +27342,7 @@ def linalg_qr_cases(torch_module, c_module, torch_call) -> list[Case]:
 # 3.10e-06 relative (at the near-zero elements the cancellation magnifies).
 # `_bounded_divergence` asserts a ceiling with headroom on exactly that, so a
 # kernel that agreed exactly still passes and one that drifted further does
-# not. It is the same device docs/SCALAR.md §8 uses for Sleef's `softplus`
+# not. It is the same device docs/numerics/SCALAR.md §8 uses for Sleef's `softplus`
 # tail.
 
 _HANN_DTYPES = ["float64", "float32", "float16", "bfloat16"]
@@ -27443,7 +27443,7 @@ def hann_window_periodic_cases(torch_module, c_module, torch_call) -> list[Case]
 
 # --- aten.sinc.default -------------------------------------------------------
 #
-# BigVGAN's anti-aliased resampler (docs/VOICE.md rank 6). `x == 0` is the
+# BigVGAN's anti-aliased resampler (docs/architectures/VOICE.md rank 6). `x == 0` is the
 # removable singularity and answers exactly 1.0; `x == 1` does *not* answer 0
 # at `float32` but `-2.78e-08`, the residue of pi not being representable --
 # which is why the kernel computes in the output precision rather than in f64.
@@ -27473,7 +27473,7 @@ def sinc_cases(torch_module, c_module, torch_call) -> list[Case]:
 
 # --- aten.clip.default -------------------------------------------------------
 #
-# Vocos spells its output limiter `torch.clip` (docs/VOICE.md rank 3). It is a
+# Vocos spells its output limiter `torch.clip` (docs/architectures/VOICE.md rank 3). It is a
 # true alias of `clamp` and that was measured, not assumed: the promotion
 # ladder, the bool-bound refusal (which names `clamp_scalar_cpu`, not a `clip_`
 # kernel) and the "both bounds absent" wording (`torch.clamp: At least one of
@@ -27537,7 +27537,7 @@ def clip_default_cases(torch_module, c_module, torch_call) -> list[Case]:
 # --- aten.cumprod.default ----------------------------------------------------
 #
 # Spark-TTS BiCodec's factorised vector quantiser derives its per-level strides
-# with this during `__init__` (docs/VOICE.md rank 5). The dtype rule was
+# with this during `__init__` (docs/architectures/VOICE.md rank 5). The dtype rule was
 # re-measured rather than carried over from `cumsum`: `cumprod(bool)` is
 # `int64`, not `bool`.
 
@@ -27582,9 +27582,9 @@ def cumprod_cases(torch_module, c_module, torch_call) -> list[Case]:
     return cases
 
 
-    # docs/VOICE.md -- the voicestudio speech round.
+    # docs/architectures/VOICE.md -- the voicestudio speech round.
 
-# --- docs/TAIL3.md: the walls behind the walls -----------------------------
+# --- docs/kernels/TAIL3.md: the walls behind the walls -----------------------------
 #
 # Six builders, and the split they were written to record: only ONE of the six
 # ops underneath is a new kernel.
@@ -27745,7 +27745,7 @@ def erfinv_default_cases(torch_module, c_module, torch_call) -> list[Case]:
     """`aten.erfinv.default` -- `gemma3n_text`'s wall, reached through the
     VENDORED `torch/distributions/normal.py::icdf`, not through a model file.
 
-    This is the one op in docs/TAIL3.md's list with no kernel anywhere to
+    This is the one op in docs/kernels/TAIL3.md's list with no kernel anywhere to
     alias: candle has no `erfinv`, there is no closed form, and the shim
     computes AS 241 in `f64`. So the cases below are about *arithmetic*, and
     they are chosen where a wrong series shows:
@@ -27832,7 +27832,7 @@ def index_add_default_cases(torch_module, c_module, torch_call) -> list[Case]:
         including when the index is EMPTY, where the temptation is to return
         `self` itself.
       * **negative indices still do not wrap.** `index_put_`'s do; this op's
-        do not (docs/DEMAND8.md), and sharing the body is what keeps that
+        do not (docs/architectures/DEMAND8.md), and sharing the body is what keeps that
         true rather than a second transcription of the rule.
       * **`self` may be non-contiguous**, which the in-place form refuses
         (its `write_back` overlap check) and this one does not.
@@ -27913,7 +27913,7 @@ def index_add_default_cases(torch_module, c_module, torch_call) -> list[Case]:
 def scatter_reduce_two_cases(torch_module, c_module, torch_call) -> list[Case]:
     """`aten.scatter_reduce.two` -- `tapas`' wall, and a REAL kernel.
 
-    docs/SCATTER.md already recorded that this is not `aten.scatter.reduce`:
+    docs/kernels/SCATTER.md already recorded that this is not `aten.scatter.reduce`:
     that op's `reduce` is `"add"`/`"multiply"` only and it has no
     `include_self`, so implementing it would not have moved `tapas`, which
     calls `scatter_reduce(..., reduce="amin", include_self=False)`.
@@ -28068,7 +28068,7 @@ def scatter_reduce_two_cases(torch_module, c_module, torch_call) -> list[Case]:
 
 
 def view_as_default_cases(torch_module, c_module, torch_call) -> list[Case]:
-    """`aten.view_as.default` -- two architectures on docs/SETITEM.md's list.
+    """`aten.view_as.default` -- two architectures on docs/bindings/SETITEM.md's list.
 
     A binding: the body is `aten.view.default`'s. What is checked here is
     that it is `view`'s and not `reshape_as`'s, because **upstream's two are
@@ -28146,7 +28146,7 @@ def _eye_cases(torch_module, c_module, torch_call, op, with_m) -> list[Case]:
     `torch_chunk_gated_delta_rule` stops on `attn + torch.eye(chunk_size,
     dtype=attn.dtype, device=attn.device)` four lines after the
     `MatMulUnexpectedStriding` this round removed, so landing the fold without
-    this would have moved zero architectures (docs/TAIL3.md).
+    this would have moved zero architectures (docs/kernels/TAIL3.md).
 
     What separates a right implementation from a plausible one:
 
@@ -28211,7 +28211,7 @@ def eye_m_cases(torch_module, c_module, torch_call) -> list[Case]:
 
 
 
-# --- docs/VOICE3.md: the seven walls -----------------------------------------
+# --- docs/architectures/VOICE3.md: the seven walls -----------------------------------------
 #
 # `diag` (rwkv), `_unique2` (vilt), `im2col` (llama4), `col2im` (f5-tts),
 # `kaiser_window` + `i0` (bigvgan), `upsample_nearest1d` and `var` (voice).
@@ -29043,7 +29043,7 @@ def upsample_nearest1d_cases(torch_module, c_module, torch_call) -> list[Case]:
     return cases
 
 
-# --- docs/RNN.md: aten.upsample_linear1d.default and aten.lstm.input --------
+# --- docs/kernels/RNN.md: aten.upsample_linear1d.default and aten.lstm.input --------
 #
 # Both builders are kept together at the end of this file, and both registered
 # in one contiguous run below, so a merge that splices by category does not
@@ -29060,8 +29060,8 @@ _LINEAR1D_INPUT = [round(math.sin(i * 1.7) * 3.0 + i / 5.0, 6) for i in range(24
 def upsample_linear1d_cases(torch_module, c_module, torch_call) -> list[Case]:
     """`aten.upsample_linear1d(self, output_size, align_corners, scales=None)`.
 
-    docs/RNN.md §3. `sam_vision_model` / `sam_hq_vision_model`, and
-    docs/VOICE.md rank 14's sibling.
+    docs/kernels/RNN.md §3. `sam_vision_model` / `sam_hq_vision_model`, and
+    docs/architectures/VOICE.md rank 14's sibling.
 
     What separates a plausible wrong implementation here, each measured
     against upstream 2.13.0 rather than carried over from
@@ -29074,7 +29074,7 @@ def upsample_linear1d_cases(torch_module, c_module, torch_call) -> list[Case]:
       * **implementing one convention for both flag values** -- each output
         size runs through both, so the two must differ.
       * **not clamping the source index at 0.** bicubic does not clamp
-        (docs/DEMAND8.md §2.4) and linear does; the `scales=2.0` case reaches
+        (docs/architectures/DEMAND8.md §2.4) and linear does; the `scales=2.0` case reaches
         an unclamped index of -0.25.
       * **not clamping the source index at `in - 1`.** `scales=0.5` on a
         4 -> 8 resample reaches 14.5, past the end of the input.
@@ -29086,7 +29086,7 @@ def upsample_linear1d_cases(torch_module, c_module, torch_call) -> list[Case]:
       * **computing the weights in the input dtype** rather than `opmath_t`.
 
     NOT separated here, and deliberately: the FUSED multiply-add in the source
-    index (docs/RNN.md §3). It is ~3 ULP, which is inside this harness's
+    index (docs/kernels/RNN.md §3). It is ~3 ULP, which is inside this harness's
     `float32` tolerance of 1e-5, so it is proven by bit pattern in
     `pytests/test_rnn.py` instead. A golden case that claimed to check it
     would be a check that cannot fail.
@@ -29294,7 +29294,7 @@ def _lstm_case(
 def lstm_input_cases(torch_module, c_module, torch_call) -> list[Case]:
     """`aten.lstm.input(input, hx, params, has_biases, num_layers, dropout,
     train, bidirectional, batch_first)` -- `parakeet_rnnt` and `parakeet_tdt`
-    (docs/RNN.md §2).
+    (docs/kernels/RNN.md §2).
 
     Every case is a **multi-step** sequence (`seq >= 4`) starting from a
     **non-zero `(h_0, c_0)`**. That is not decoration: a single timestep from
@@ -29441,7 +29441,7 @@ def lstm_input_cases(torch_module, c_module, torch_call) -> list[Case]:
     return cases
 
 
-# --- docs/TAIL4.md: index_copy_, index_copy, round (x4), logsumexp, t_ -----
+# --- docs/kernels/TAIL4.md: index_copy_, index_copy, round (x4), logsumexp, t_ -----
 #
 # One block, appended together, because a second agent was adding builders to
 # this file at the same time.
@@ -29763,7 +29763,7 @@ def round_inplace_decimals_cases(torch_module, c_module, torch_call) -> list[Cas
 
 
 def logical_not_cases(torch_module, c_module, torch_call) -> list[Case]:
-    """docs/TAIL4.md §10. The result is always `bool`, and the values are
+    """docs/kernels/TAIL4.md §10. The result is always `bool`, and the values are
     `bitwise_not`'s for `bool` and nobody else's for anything else."""
     op = "aten.logical_not.default"
     cases: list[Case] = []
@@ -29931,7 +29931,7 @@ def t_inplace_cases(torch_module, c_module, torch_call) -> list[Case]:
     return cases
 
 
-# --- aten.unfold.default (docs/LAST7.md) ------------------------------------
+# --- aten.unfold.default (docs/kernels/LAST7.md) ------------------------------------
 
 
 def repeat_interleave_tensor_cases(torch_module, c_module, torch_call) -> list[Case]:
@@ -29948,7 +29948,7 @@ def repeat_interleave_tensor_cases(torch_module, c_module, torch_call) -> list[C
     0..count` loop skips and an off-by-one emits anyway.
 
     The op does not touch the data being repeated: its answer is the index
-    vector a following `index_select` gathers with (docs/REPEAT.md §2), so the
+    vector a following `index_select` gathers with (docs/kernels/REPEAT.md §2), so the
     values compared here are indices and an order error is a value error.
 
     `output_size` is compared in both registers -- agreeing (a no-op that must
@@ -30054,7 +30054,7 @@ def unfold_cases(torch_module, c_module, torch_call) -> list[Case]:
 
     The non-contiguous receiver is its own case and it is the one that separates
     this op from `as_strided`: `as_strided` addresses the raw storage and
-    refuses a non-contiguous receiver by name (docs/STRIDED.md §4.1), while
+    refuses a non-contiguous receiver by name (docs/kernels/STRIDED.md §4.1), while
     `unfold` is defined on the *logical* index space, so a transposed receiver
     must read the transposed order. A kernel that flattened the receiver without
     materialising it would pass every other case in this builder.
@@ -30063,7 +30063,7 @@ def unfold_cases(torch_module, c_module, torch_call) -> list[Case]:
     direction so that closing one cannot hide the other -- the same register
     `as_strided_cases` uses, for the same reason: upstream's `unfold` is a
     two-way view and this is a gather, so a write is refused rather than
-    silently lost. docs/LAST7.md §3.
+    silently lost. docs/kernels/LAST7.md §3.
     """
     op = "aten.unfold.default"
     cases: list[Case] = []
@@ -30104,7 +30104,7 @@ def unfold_cases(torch_module, c_module, torch_call) -> list[Case]:
                 op, c_module._aten_dispatch("aten.t.default", t_c), 0, 2, 1
             ),
             note="unfold reads the receiver's LOGICAL order, unlike as_strided, "
-                 "which reads the storage. docs/LAST7.md §3.1",
+                 "which reads the storage. docs/kernels/LAST7.md §3.1",
         )
     )
 
@@ -30181,7 +30181,7 @@ def unfold_cases(torch_module, c_module, torch_call) -> list[Case]:
             expect="c_error",
             note="upstream's unfold is a two-way view; this is a gather, so the "
                  "write would be lost. storage.rs::StridedBarrier refuses it. "
-                 "docs/LAST7.md §3",
+                 "docs/kernels/LAST7.md §3",
         )
     )
     cases.append(
@@ -30201,22 +30201,22 @@ def unfold_cases(torch_module, c_module, torch_call) -> list[Case]:
                 )[0]
             )(c_module._tensor_from_flat(flat12, [12], dtype=dt.c_dtype(c_module, "float32"))),
             expect="c_error",
-            note="the other direction of the same view. docs/LAST7.md §3",
+            note="the other direction of the same view. docs/kernels/LAST7.md §3",
         )
     )
     return cases
 
 
 CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
-    # docs/LAST7.md
+    # docs/kernels/LAST7.md
     "aten.unfold.default": unfold_cases,
 
-    # docs/REPEAT.md
+    # docs/kernels/REPEAT.md
     "aten.repeat_interleave.Tensor": repeat_interleave_tensor_cases,
 
     "aten.i0.default": i0_cases,
 
-    # docs/TAIL4.md
+    # docs/kernels/TAIL4.md
     "aten.index_copy_.default": index_copy_inplace_cases,
     "aten.index_copy.default": index_copy_cases,
     "aten.round.default": round_default_cases,
@@ -30253,7 +30253,7 @@ CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
     "aten._grouped_mm.default": grouped_mm_cases,
     "aten.full.default": full_cases,
 
-    # docs/TAIL3.md -- the walls behind the walls. One new kernel
+    # docs/kernels/TAIL3.md -- the walls behind the walls. One new kernel
     # (`scatter_reduce.two`), one new piece of arithmetic (`erfinv`), and
     # three bindings over bodies that already existed.
     "aten.bitwise_xor.Tensor": bitwise_xor_tensor_cases,
@@ -30287,9 +30287,9 @@ CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
     "aten.randperm.default": randperm_cases,
     "aten.rsqrt.default": rsqrt_cases,
     "aten.sqrt.default": sqrt_cases,
-    # docs/KERNELS26.md §17 -- sam3_video.
+    # docs/kernels/KERNELS26.md §17 -- sam3_video.
     "aten.sigmoid.default": sigmoid_cases,
-    # docs/KERNELS26.md §18 -- vits.
+    # docs/kernels/KERNELS26.md §18 -- vits.
     "aten.flip.default": flip_cases,
     "aten.repeat.default": repeat_cases,
     "aten.remainder.Scalar": remainder_scalar_cases,
@@ -30303,7 +30303,7 @@ CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
     "aten._weight_norm_interface.default": weight_norm_interface_cases,
     "aten.lift_fresh.default": lift_fresh_cases,
     # Pre-seeded ahead of implementation for TensorBase's 50 actually-used
-    # members (docs/C_SURFACE.md §4) -- see the longer module note above.
+    # members (docs/design/C_SURFACE.md §4) -- see the longer module note above.
     "aten.sub.Tensor": sub_cases,
     "aten.mul.Tensor": mul_cases,
     "aten.div.Tensor": div_cases,
@@ -30325,12 +30325,12 @@ CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
     "aten.amax.default": amax_cases,
     "aten.any.default": any_default_cases,
     "aten.any.dim": any_dim_cases,
-    # docs/KERNELS26.md §16 -- sam3_video.
+    # docs/kernels/KERNELS26.md §16 -- sam3_video.
     "aten.all.default": all_default_cases,
     "aten.all.dim": all_dim_cases,
     "aten.all.dims": all_dims_cases,
     "aten.clone.default": clone_cases,
-    # prims.* -- docs/PRIMS.md
+    # prims.* -- docs/kernels/PRIMS.md
     "prims.cos.default": _prims_unary_builder("cos"),
     "prims.sin.default": _prims_unary_builder("sin"),
     "prims.erf.default": _prims_unary_builder("erf"),
@@ -30368,7 +30368,7 @@ CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
     "aten.copy_.default": copy__cases,
     "aten.normal_.default": normal__cases,
     "aten.uniform_.default": uniform__cases,
-    # The eight docs/GAP.md §3 measured a greedy 2-layer Llama stopping on.
+    # The eight docs/kernels/GAP.md §3 measured a greedy 2-layer Llama stopping on.
     "aten.bmm.default": bmm_cases,
     "aten._unsafe_view.default": unsafe_view_cases,
     "aten.alias.default": alias_cases,
@@ -30378,7 +30378,7 @@ CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
     "aten.glu.default": glu_cases,
     "aten.t.default": t_cases,
     "aten._scaled_dot_product_flash_attention_for_cpu.default": sdpa_flash_cpu_cases,
-    # The eight docs/SAMPLING.md measured `do_sample=True` stopping on.
+    # The eight docs/models/SAMPLING.md measured `do_sample=True` stopping on.
     "aten._softmax.default": softmax_cases,
     "aten.fill_.Tensor": fill__tensor_cases,
     "aten.le.Scalar": le_scalar_cases,
@@ -30397,58 +30397,58 @@ CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
     "aten.squeeze.default": squeeze_default_cases,
     "aten.squeeze.dims": squeeze_dims_cases,
     "aten.topk.default": topk_cases,
-    # The four docs/GPT2.md measured a 2-layer GPT-2 stopping on, after the
+    # The four docs/models/GPT2.md measured a 2-layer GPT-2 stopping on, after the
     # Llama-shaped work had already cleared everything else.
     "aten.addmm.default": addmm_cases,
     "aten.native_layer_norm.default": native_layer_norm_cases,
-    # docs/KERNELS26.md §19 -- sew_d.
+    # docs/kernels/KERNELS26.md §19 -- sew_d.
     "aten.native_group_norm.default": native_group_norm_cases,
-    # docs/KERNELS26.md §20 -- zoedepth.
+    # docs/kernels/KERNELS26.md §20 -- zoedepth.
     "aten.upsample_bilinear2d.default": upsample_bilinear2d_cases,
-    # docs/RNN.md -- one contiguous run.
+    # docs/kernels/RNN.md -- one contiguous run.
     "aten.upsample_linear1d.default": upsample_linear1d_cases,
     "aten.lstm.input": lstm_input_cases,
-    # docs/DEMAND8.md §2 -- yolos.
+    # docs/architectures/DEMAND8.md §2 -- yolos.
     "aten.upsample_bicubic2d.default": upsample_bicubic2d_cases,
     "aten.split.Tensor": split_cases,
     "aten.tanh.default": tanh_cases,
-    # What widening past the Llama/GPT-2 family asks for (docs/ARCH.md).
+    # What widening past the Llama/GPT-2 family asks for (docs/architectures/ARCH.md).
     "aten.gelu.default": gelu_cases,
     "aten.gather.default": gather_cases,
     "aten.zero_.default": zero__cases,
-    # The four docs/ARCH.md measured falcon, gptj, bloom and mpt all missing --
+    # The four docs/architectures/ARCH.md measured falcon, gptj, bloom and mpt all missing --
     # the same four, in all four models -- plus the next two by architecture
-    # count (docs/OPS4.md).
+    # count (docs/kernels/OPS4.md).
     "aten.le.Tensor": le_tensor_cases,
     "aten.scalar_tensor.default": scalar_tensor_cases,
     "aten.where.self": where_self_cases,
-    # The eager attention mask's own op (docs/GENERATE.md): `torch.where(mask,
+    # The eager attention mask's own op (docs/models/GENERATE.md): `torch.where(mask,
     # tensor, python_scalar)` at masking_utils.py:603.
     "aten.where.ScalarOther": where_scalar_other_cases,
     "aten.permute.default": permute_cases,
     "aten.stack.default": stack_cases,
     "aten.relu.default": relu_cases,
-    # The five ops docs/TAIL.md needed to open falcon/bloom/gpt_bigcode.
+    # The five ops docs/kernels/TAIL.md needed to open falcon/bloom/gpt_bigcode.
     "aten.baddbmm.default": baddbmm_cases,
     "aten.split_with_sizes.default": split_with_sizes_cases,
     "aten._safe_softmax.default": safe_softmax_cases,
-    # docs/LOSS.md -- the cross-entropy forward.
+    # docs/training/LOSS.md -- the cross-entropy forward.
     "aten._log_softmax.default": log_softmax_cases,
     "aten.nll_loss_forward.default": nll_loss_forward_cases,
     "aten.native_dropout.default": native_dropout_cases,
     "aten.add_.Tensor": add__tensor_cases,
     "aten.mul.Scalar": mul_scalar_cases,
-    # docs/SCALAR.md §6: the narrowing half of the family, promoted out of
+    # docs/numerics/SCALAR.md §6: the narrowing half of the family, promoted out of
     # `IMPLEMENTED_AWAITING_GOLDEN` so that a builder could exist for it.
     "aten.add.Scalar": add_scalar_cases,
     "aten.sub.Scalar": sub_scalar_cases,
-    # docs/KERNELS.md: the in-place sibling `F.relu(..., inplace=True)` traces
-    # to, landed as its own kernel (was a measured gap, docs/SPELLINGS.md §6.6).
+    # docs/kernels/KERNELS.md: the in-place sibling `F.relu(..., inplace=True)` traces
+    # to, landed as its own kernel (was a measured gap, docs/bindings/SPELLINGS.md §6.6).
     "aten.relu_.default": relu__cases,
     # mamba and mixtral, the last two of the 20 measured architectures
-    # (docs/OPS4.md) with anything unimplemented.
+    # (docs/kernels/OPS4.md) with anything unimplemented.
     "aten.exp.default": exp_cases,
-    # docs/KERNELS26.md §22 -- sew_d.
+    # docs/kernels/KERNELS26.md §22 -- sew_d.
     "aten.erf.default": erf_cases,
     "aten.sign.default": sign_cases,
     "aten.avg_pool2d.default": avg_pool2d_cases,
@@ -30465,10 +30465,10 @@ CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
     "aten.floor_divide.Scalar": floor_divide_scalar_cases,
     "aten.histc.default": histc_cases,
     "aten.clamp_.default": clamp__default_cases,
-    # docs/ARCH20.md -- the seven blocked architectures, and the in-place
+    # docs/architectures/ARCH20.md -- the seven blocked architectures, and the in-place
     # family that had kernels but no names.
     "aten.clamp.default": clamp_default_cases,
-    # docs/KERNELS26.md §15 -- vits.
+    # docs/kernels/KERNELS26.md §15 -- vits.
     "aten.clamp_min.default": clamp_min_default_cases,
     "aten.log.default": log_cases,
     "aten.expm1.default": expm1_cases,
@@ -30496,39 +30496,39 @@ CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
     # with a TorchDispatchMode logger around torch._tensor_str._str_intern.
     "aten.abs.default": abs_cases,
     "aten.ceil.default": ceil_cases,
-    # docs/DEMAND8.md §2 -- swin and segformer.
+    # docs/architectures/DEMAND8.md §2 -- swin and segformer.
     "aten.floor.default": floor_cases,
     "aten.gt.Tensor": gt_tensor_cases,
     "aten.gt.Scalar": gt_scalar_cases,
     "aten.masked_select.default": masked_select_cases,
     "aten.min.default": min_default_cases,
     "aten.unbind.int": unbind_int_cases,
-    # docs/LINEAR.md: the layout-fallback fix + N-D x 2-D fold, and the case
+    # docs/perf/LINEAR.md: the layout-fallback fix + N-D x 2-D fold, and the case
     # builder that moves this op from IMPLEMENTED_AWAITING_GOLDEN into the
-    # 2760-case golden suite (docs/LINEAR.md §4.3, §6 item 2).
+    # 2760-case golden suite (docs/perf/LINEAR.md §4.3, §6 item 2).
     "aten.matmul.default": matmul_cases,
-    # docs/SPELLINGS.md: the two `IMPLEMENTED_AWAITING_GOLDEN` kernels that
+    # docs/bindings/SPELLINGS.md: the two `IMPLEMENTED_AWAITING_GOLDEN` kernels that
     # fell inside this round's 25-name inventory, moved into real coverage.
     # `max.other`'s builder was written while the op was still parked, and it
-    # found a live NaN defect and held it as a failing case until docs/TRIL.md
+    # found a live NaN defect and held it as a failing case until docs/kernels/TRIL.md
     # §3 fixed the kernel; the op is promoted into `_aten_implemented()` there.
     "aten.max.other": max_other_cases,
     "aten.maximum.default": maximum_cases,
     "aten.reshape.default": reshape_cases,
-    # docs/TRIL.md: GPT-BigCode's last wall and its mirror, plus the `min` half
+    # docs/kernels/TRIL.md: GPT-BigCode's last wall and its mirror, plus the `min` half
     # of the max/min family, which had spelling-table entries and no kernels.
     "aten.tril.default": tril_cases,
     "aten.triu.default": triu_cases,
     "aten.min.dim": min_dim_cases,
     "aten.min.other": min_other_cases,
-    # docs/TRAIN.md: training mode. `bernoulli__float_cases` also carries the
+    # docs/training/TRAIN.md: training mode. `bernoulli__float_cases` also carries the
     # `torch.dropout` composite, which has no dispatch key of its own to be
     # registered under -- `aten::dropout` is CompositeImplicitAutograd and
     # never reaches the dispatcher, so golden is structurally blind to it and
     # it has to ride on the kernel it decomposes onto.
     "aten.bernoulli_.float": bernoulli__float_cases,
     "aten.div_.Scalar": div__scalar_cases,
-    # docs/SPELLINGS.md §9 / docs/INPLACE.md: fourteen in-place ops whose
+    # docs/bindings/SPELLINGS.md §9 / docs/kernels/INPLACE.md: fourteen in-place ops whose
     # out-of-place twins already existed and whose in-place spelling had no
     # kernel at all. `detach_` (the fifteenth name in that inventory) is
     # deliberately refused by name rather than given a kernel -- see
@@ -30549,7 +30549,7 @@ CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
     "aten.abs_.default": abs__cases,
     "aten.ceil_.default": ceil__cases,
     "aten.floor_.default": floor__cases,
-    # docs/DEMAND8.md §2 -- switch_transformers.
+    # docs/architectures/DEMAND8.md §2 -- switch_transformers.
     "aten.index_add_.default": index_add__cases,
     "aten.clamp_min_.default": clamp_min__cases,
     "aten.max_pool2d.default": max_pool2d_cases,
@@ -30559,7 +30559,7 @@ CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
     "aten.nonzero.default": nonzero_default_cases,
     "aten.where.default": where_default_cases,
 
-    # docs/INDEXSEL.md
+    # docs/kernels/INDEXSEL.md
     "aten.index_select.default": index_select_cases,
     "aten.argsort.default": argsort_default_cases,
     "aten.argsort.stable": argsort_stable_cases,
@@ -30571,7 +30571,7 @@ CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
     "aten.multiply.Tensor": multiply_tensor_cases,
     "aten.multiply.Scalar": multiply_scalar_cases,
     "aten.logical_and.default": logical_and_cases,
-    # docs/TAIL1.md -- the eight one-architecture ops of docs/ARCH100.md's
+    # docs/kernels/TAIL1.md -- the eight one-architecture ops of docs/architectures/ARCH100.md's
     # tail, plus `linalg_qr`.
     "aten.acos.default": acos_cases,
     "aten.logical_and.default": logical_and_cases,
@@ -30590,13 +30590,13 @@ CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
 }
 
 
-# --- float8_e4m3fn: the surface docs/FLOAT8C.md opened -----------------------
+# --- float8_e4m3fn: the surface docs/numerics/FLOAT8C.md opened -----------------------
 #
-# docs/FLOAT8B.md put `float8_e4m3fn` into the suite, but the ops it left open
+# docs/numerics/FLOAT8B.md put `float8_e4m3fn` into the suite, but the ops it left open
 # -- the ten that hung and the thirteen that refused -- had **no float8 case at
 # all**, because a case for an op that hangs is a case that hangs the harness.
 # Closing them without adding cases would have left the closure resting on a
-# smoke test, and docs/FLOAT8B.md §5 is explicit that this dtype belongs in the
+# smoke test, and docs/numerics/FLOAT8B.md §5 is explicit that this dtype belongs in the
 # golden suite rather than only there.
 #
 # So these are appended to the *existing* builders rather than replacing them:
@@ -30627,7 +30627,7 @@ def _f8_case(name, op, torch_call, c_module, torch_module, build, expect="match"
         run_torch=lambda: torch_call(*build(0)),
         run_c=lambda: c_module._aten_dispatch(op, *build(1)),
         expect=expect,
-        note=note or "float8_e4m3fn, docs/FLOAT8C.md",
+        note=note or "float8_e4m3fn, docs/numerics/FLOAT8C.md",
     )
 
 
@@ -30661,7 +30661,7 @@ def _float8_extra(op, torch_module, c_module, torch_call) -> list[Case]:
         out.append(case(f"{op}(float8_e4m3fn, float8_e4m3fn)", lambda i: (ones(i), other(i))))
     elif op in ("aten.mm.default", "aten.matmul.default"):
         # candle has no F8E4M3 matmul; this is the f32-widened route
-        # (docs/FLOAT8C.md §4) held against upstream's own values.
+        # (docs/numerics/FLOAT8C.md §4) held against upstream's own values.
         out.append(case(f"{op}(float8_e4m3fn 2x2)", lambda i: (square(i), square(i))))
     elif op == "aten.addmm.default":
         out.append(
@@ -30696,7 +30696,7 @@ def _float8_extra(op, torch_module, c_module, torch_call) -> list[Case]:
             )
     elif op == "aten.adaptive_avg_pool1d.default":
         # `[0]` is the one output size upstream answers for this dtype, and the
-        # reason docs/FLOAT8B.md table D recorded the op as computing at all.
+        # reason docs/numerics/FLOAT8B.md table D recorded the op as computing at all.
         out.append(
             case("aten.adaptive_avg_pool1d.default(float8_e4m3fn, [0]) [empty output, no kernel]",
                  lambda i: (square(i), [0]))
@@ -30738,7 +30738,7 @@ def _float8_extra(op, torch_module, c_module, torch_call) -> list[Case]:
                 run_torch=lambda: torch_call(zero_d(0)),
                 run_c=lambda: cm._aten_dispatch(op, zero_d(1)),
                 value_check=_scalar_match_check,
-                note="float8_e4m3fn; refused before docs/FLOAT8C.md §1",
+                note="float8_e4m3fn; refused before docs/numerics/FLOAT8C.md §1",
             )
         )
     elif op == "aten._to_copy.default":
@@ -30755,7 +30755,7 @@ def _float8_extra(op, torch_module, c_module, torch_call) -> list[Case]:
                         op, _f8_pair(tm, cm, [1.0, 2.0], [2])[1], dtype=dt.c_dtype(cm, t)
                     ),
                     expect="match",
-                    note="float8_e4m3fn widening, docs/FLOAT8C.md §1",
+                    note="float8_e4m3fn widening, docs/numerics/FLOAT8C.md §1",
                 )
             )
     return out

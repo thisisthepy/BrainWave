@@ -1,12 +1,12 @@
-"""`aten.lstm.input` and `aten.upsample_linear1d.default` (docs/RNN.md).
+"""`aten.lstm.input` and `aten.upsample_linear1d.default` (docs/kernels/RNN.md).
 
 Three operator names were this round's target and only two of them were
 operators. `torch.conv1d` is a **name**, bound to `aten.convolution.default`
-by `bootstrap.py` since docs/ARCH20.md; what `lasr_ctc`/`lasr_encoder`
+by `bootstrap.py` since docs/architectures/ARCH20.md; what `lasr_ctc`/`lasr_encoder`
 actually stop on is that composite's refusal of `padding="same"` with an odd
 `dilation * (kernel - 1)`, and the last three tests in this file pin
 upstream's lowering for it so the fix is a transcription rather than a
-re-derivation. See docs/RNN.md §1.
+re-derivation. See docs/kernels/RNN.md §1.
 
 Every number here is measured against real torch 2.13.0 in **its own
 process** (`env -u PYTHONPATH -u TORCH_USE_RTLD_GLOBAL`), the shape
@@ -258,7 +258,7 @@ rec("ul1d_identity_true", lambda: aten.upsample_linear1d(line, [4], True, None))
 # ---------------------------------------------------------------------------
 # conv1d: a NAME, not a kernel. What upstream's composite lowers to for the
 # `padding="same"` case with an ODD `dilation * (kernel - 1)`, recorded from
-# both sides so docs/RNN.md §1's four-line fix is a transcription.
+# both sides so docs/kernels/RNN.md §1's four-line fix is a transcription.
 # ---------------------------------------------------------------------------
 cx = torch.arange(2 * 3 * 9, dtype=torch.float32).reshape(2, 3, 9) / 7
 cw4 = torch.arange(3 * 1 * 4, dtype=torch.float32).reshape(3, 1, 4) / 5
@@ -373,7 +373,7 @@ def _agree_bitwise(name):
     assert got["shape"] == want["shape"], f"{name}: shape"
     assert got["bits"] == want["bits"], (
         f"{name}: float32 bit patterns differ from upstream. This is the "
-        f"fused-multiply-add finding in docs/RNN.md §3 -- an unfused "
+        f"fused-multiply-add finding in docs/kernels/RNN.md §3 -- an unfused "
         f"`scale * (i + 0.5) - 0.5` differs by ~3 ULP and would pass every "
         f"tolerance in the golden harness.\nshim={got['bits']}\nup ={want['bits']}"
     )
@@ -594,7 +594,7 @@ def test_upsample_linear1d_matches_upstream():
 
 
 def test_upsample_linear1d_is_bit_exact_not_merely_close():
-    """The fused multiply-add. `docs/GLU.md` §2 called `upsample_linear1d` a
+    """The fused multiply-add. `docs/kernels/GLU.md` §2 called `upsample_linear1d` a
     likely sibling of `upsample_bilinear2d`; transcribing that kernel's
     unfused `scale * index - 0.5` here gives lambdas `(0.5, 0.5)` where
     upstream gives `(0.49999988, 0.50000012)`, ~3 ULP out, on the 4 -> 7
@@ -615,7 +615,7 @@ def test_upsample_linear1d_explicit_scales():
 
 def test_upsample_linear1d_clamps_the_source_index_at_zero():
     """`align_corners=False` clamps at 0 -- bilinear's rule, NOT bicubic's
-    (docs/DEMAND8.md §2.4 found cubic does not clamp). The unclamped index
+    (docs/architectures/DEMAND8.md §2.4 found cubic does not clamp). The unclamped index
     for the first output here is -0.25, so an unclamped kernel extrapolates
     below the first input value instead of returning it."""
     _agree_bitwise("ul1d_clamp_at_zero")
@@ -630,7 +630,7 @@ def test_upsample_linear1d_clamps_the_source_index_at_zero():
 
 
 def test_upsample_linear1d_out_equals_in():
-    """bicubic has no `out == in` short circuit (docs/DEMAND8.md). Whether
+    """bicubic has no `out == in` short circuit (docs/architectures/DEMAND8.md). Whether
     linear's is observable is a separate question from whether it is there:
     with `align_corners=False` and scale 1 the index arithmetic is exact
     anyway, so this pins the VALUES (an identity) and does not claim to have
@@ -680,7 +680,7 @@ def test_conv1d_is_a_name_not_a_kernel():
     """There is no `aten.conv1d.*` in this shim and there does not need to be.
     `aten::conv1d` is `CompositeImplicitAutograd` upstream and `bootstrap.py`
     binds `torch.conv1d` to `aten.convolution.default`, which has been here
-    since docs/OPS4.md."""
+    since docs/kernels/OPS4.md."""
     both = set(_C._aten_implemented()) | set(_C._aten_implemented_awaiting_golden())
     assert not [k for k in both if k.startswith("aten.conv1d.")], sorted(both)
     assert "aten.convolution.default" in both
@@ -692,14 +692,14 @@ def test_conv1d_forms_that_already_work():
 
 
 def test_conv1d_same_with_odd_total_padding_now_agrees():
-    """`lasr_ctc` and `lasr_encoder`'s ACTUAL wall (docs/RNN.md §1): not the
+    """`lasr_ctc` and `lasr_encoder`'s ACTUAL wall (docs/kernels/RNN.md §1): not the
     name `torch.conv1d`, which exists, but this one branch of its composite.
     `LasrEncoderConvolutionModule` uses `padding="same"` with
     `conv_kernel_size=32` (an EVEN kernel, whose comment says it should be
     odd), so `dilation * (kernel - 1)` is odd and upstream pads
     asymmetrically.
 
-    docs/BIND4.md landed the four-line fix in `bootstrap.py` (pad one zero on
+    docs/bindings/BIND4.md landed the four-line fix in `bootstrap.py` (pad one zero on
     the RIGHT with `aten.constant_pad_nd.default`, then convolve symmetrically
     with `total // 2`) -- both kernels this shim already had. This test is
     the flip the previous docstring called for, not a re-derivation: the next
@@ -723,7 +723,7 @@ def test_conv1d_same_odd_lowers_to_pad_right_then_convolve():
         return
     assert up_same["ok"] == up_hand["ok"], (
         "upstream's conv1d(padding='same') no longer equals "
-        "constant_pad_nd(x,[0,1]) + convolution(...,[1],...) -- docs/RNN.md "
+        "constant_pad_nd(x,[0,1]) + convolution(...,[1],...) -- docs/kernels/RNN.md "
         "§1's proposed four-line fix is no longer the right lowering"
     )
 

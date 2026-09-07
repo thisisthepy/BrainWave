@@ -51,7 +51,7 @@ fi
 # that writes that file; this script never has. So a source change that only
 # this script rebuilds does not reach those four tests -- they would keep
 # testing whatever `install_shim.sh` last installed, silently, with a green
-# result (docs/CAPTURE.md §8).
+# result (docs/graph/CAPTURE.md §8).
 #
 # Refuse by name rather than install it here: installing would make this
 # script a build step for a *different* artefact (the one that ships inside
@@ -109,7 +109,7 @@ fi
 # and is not in this one. Nothing in this script can restore it, because
 # nothing in this script ever saw it.
 #
-# docs/VULKAN3.md §6.1 is what that cost: the four Vulkan tests skipped saying
+# docs/devices/VULKAN3.md §6.1 is what that cost: the four Vulkan tests skipped saying
 # "no vulkan" while the loader was pointed at correctly, and the person who had
 # just supplied the loader had no way to tell. A skip that gives a false reason
 # is worse than a failure, because it is counted as a pass.
@@ -138,13 +138,13 @@ not reach Python. The Vulkan tests will skip -- truthfully, but for a reason
 that is about this process and not about your machine.
 
 Pass it as TORCH_C_DYLD_LIBRARY_PATH instead; this script re-exports it.
-(docs/VULKAN3.md §6.1)
+(docs/devices/VULKAN3.md §6.1)
 EOF
 fi
 
 # The crate's own unit tests, before the Python suite.
 #
-# There are 30 of them and **nothing ran them until docs/TRAIN2.md noticed**.
+# There are 30 of them and **nothing ran them until docs/training/TRAIN2.md noticed**.
 # One had been red for an unknown length of time -- `RULE_OPS` was not sorted,
 # and its own `assert_eq!(sorted, RULE_OPS)` said so to nobody. A test that
 # nothing invokes is not a gate, which is the same finding this repository
@@ -169,7 +169,7 @@ cargo test --release --quiet || exit $?
 # `__main__` guard keeps that import from running anything.
 # `TORCHNATIVE_VULKAN_DYLD`: an opt-in way to let the vulkan tests actually run.
 #
-# docs/VULKAN3.md §6.1 recorded the trap and left it: macOS SIP **strips
+# docs/devices/VULKAN3.md §6.1 recorded the trap and left it: macOS SIP **strips
 # `DYLD_*` from the environment when a protected binary is exec'd**, and
 # `/bin/sh` is one. So `DYLD_LIBRARY_PATH=... sh run.sh` sets a variable that
 # this script can still see and the interpreter it launches cannot -- the
@@ -212,7 +212,7 @@ TORCH_C_ARTEFACT="$stage/_C.abi3.so" \
 # a later commit closed a gap and nobody returned to the document that had
 # named it. The markers assert only what has a single ground truth (an op in
 # `_aten_implemented()`, a key in a table, a count read from a suite's own
-# summary line), so this cannot cry wolf on prose; docs/DOCWATCH.md says what
+# summary line), so this cannot cry wolf on prose; docs/verification/DOCWATCH.md says what
 # it structurally cannot see.
 #
 # README.md is passed explicitly. With no arguments the checker scans `docs/*.md`
@@ -220,6 +220,14 @@ TORCH_C_ARTEFACT="$stage/_C.abi3.so" \
 # reader of the front page sees, were outside the gate while every number in
 # `docs/` was inside it. The claims most likely to be read were the ones least
 # likely to be checked.
+# `find`, not `"$repo_root"/docs/*.md`. A shell glob does not recurse, and the
+# documents now live in `docs/<folder>/` (docs/README.md is the index). With the
+# glob, the moment a document moved into a subfolder it left DOCWATCH silently:
+# the gate stays green and the marker count gets *smaller*, which is the
+# "verification that cannot fail" shape CLAUDE.md §5.5 records. The count is the
+# proof -- it went 1070 -> 1070 across the move, not down.
+# `test_docrefs.py` fails if this glob comes back, here or in check_docs.py.
+doc_files=$(find "$repo_root/docs" -name '*.md' | sort)
 TORCH_C_ARTEFACT="$stage/_C.abi3.so" \
     exec "${PYTHON:-python3}" "$repo_root/tools/docwatch/check_docs.py" \
-        "$repo_root"/docs/*.md "$repo_root/README.md"
+        $doc_files "$repo_root/README.md"

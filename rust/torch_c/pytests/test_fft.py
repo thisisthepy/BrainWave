@@ -1,8 +1,8 @@
 """The FFT: `torch.stft` produces upstream's numbers, and how that was checked.
 
-`docs/COMPLEX.md` set an ordering -- reflect pad, then complex tensors, then the
-transform. `docs/PAD.md` cleared the first and `docs/COMPLEX2.md` the second;
-this file is the third one's evidence. `docs/FFT.md` is the write-up.
+`docs/kernels/COMPLEX.md` set an ordering -- reflect pad, then complex tensors, then the
+transform. `docs/kernels/PAD.md` cleared the first and `docs/kernels/COMPLEX2.md` the second;
+this file is the third one's evidence. `docs/kernels/FFT.md` is the write-up.
 
 **Nothing here is a shape check, and that is the point.** Every failure mode
 this round can have produces a plausible spectrum:
@@ -12,7 +12,7 @@ this round can have produces a plausible spectrum:
   spectrum is its own conjugate. Every input below is deliberately asymmetric,
   and `[1, 2, 4, 8, 3]` is there because it is asymmetric AND of length 5,
   which is the only way to reach the Bluestein path. **This test caught exactly
-  that defect on its first run** (docs/FFT.md §2).
+  that defect on its first run** (docs/kernels/FFT.md §2).
 * a **wrong normalisation** scales everything by `n` or `sqrt(n)`. Uniform, so
   it still looks like a spectrum. All three codes are pinned, in both
   directions, and the sizes 8 and 5 are used so that `n` and `sqrt(n)` are
@@ -60,11 +60,11 @@ MARKER = "shim" if hasattr(torch._C, "_aten_implemented") else "upstream"
 out = {"_marker": MARKER}
 
 if MARKER == "shim":
-    # docs/PAD.md section 5's four-line composite, installed IN THIS PROCESS
+    # docs/kernels/PAD.md section 5's four-line composite, installed IN THIS PROCESS
     # only. `torch._C._nn.pad` lives in `bootstrap.py`, which was not this
     # round's file, and its `reflect` branch is the one line between this shim
     # and `torch.stft(center=True)`. Installing it here exercises the routing
-    # without editing another agent's file -- exactly what docs/PAD.md section
+    # without editing another agent's file -- exactly what docs/kernels/PAD.md section
     # 4 did, and the keys below whose names start with `center_` are the ones
     # that depend on it.
     _d = torch._C._aten_dispatch
@@ -105,7 +105,7 @@ rec("r2c_f64", lambda: torch.ops.aten._fft_r2c.default(x8.double(), [0], 0, True
 rec("r2c_n0", lambda: torch.ops.aten._fft_r2c.default(torch.zeros(0), [0], 0, True))
 rec("r2c_half", lambda: torch.ops.aten._fft_r2c.default(x8.half(), [0], 0, True))
 rec("r2c_long", lambda: torch.ops.aten._fft_r2c.default(torch.arange(8), [0], 0, True))
-# whisper's length: 400 is NOT a power of two (docs/FFT.md section 4)
+# whisper's length: 400 is NOT a power of two (docs/kernels/FFT.md section 4)
 x400 = torch.sin(torch.arange(400.) * 0.017) + 0.3 * torch.cos(torch.arange(400.) * 0.11)
 rec("r2c400", lambda: torch.ops.aten._fft_r2c.default(x400, [0], 0, True))
 
@@ -266,7 +266,7 @@ def test_torch_stft_with_centring_needs_bootstrap_pys_pad_branch_and_then_agrees
     `torch/functional.py:678` does the centring in Python, as
     `F.pad(input.view(...), [n_fft // 2] * 2, pad_mode)`. That reaches
     `torch._C._nn.pad`, which lives in `bootstrap.py` and still refuses every
-    non-constant mode by name; docs/PAD.md section 5 has the exact four-line
+    non-constant mode by name; docs/kernels/PAD.md section 5 has the exact four-line
     patch and `bootstrap.py` was not this round's file either.
 
     So the probe installs that composite **in its own process** and compares.
@@ -291,7 +291,7 @@ def test_whisper_length_400_is_not_a_power_of_two_and_still_agrees():
     """**The measured refutation of "n_fft is always a power of two".**
 
     Scanning every `transformers` feature extractor for an `n_fft` default
-    (docs/FFT.md section 4) finds `whisper`, `qwen3_asr` and `voxtral_realtime`
+    (docs/kernels/FFT.md section 4) finds `whisper`, `qwen3_asr` and `voxtral_realtime`
     at **400**. So this round did not refuse non-powers of two by name; it
     implemented Bluestein's algorithm, and this is the case that exercises it
     at a real model's size.
@@ -317,7 +317,7 @@ def test_a_wrong_twiddle_sign_would_show_here():
     real one and every magnitude alone. `x5` is length 5, so it is the ONLY
     input in this file that reaches `fft_bluestein` -- and that function
     shipped its first build with exactly this defect, caught by exactly this
-    case (docs/FFT.md section 2).
+    case (docs/kernels/FFT.md section 2).
     """
     shim, up = _both()
     if shim is None:
@@ -384,7 +384,7 @@ def test_c2r_reads_last_dim_size_and_not_the_bin_count():
     1..3 -- bin 4 is not part of a 7-point Hermitian spectrum. An
     implementation that reads all five bins returns a signal of the right
     length with the wrong values, and it was wrong by 0.58 on values of order
-    10 before this was measured (docs/FFT.md section 3).
+    10 before this was measured (docs/kernels/FFT.md section 3).
     """
     shim, up = _both()
     if shim is None:
@@ -536,7 +536,7 @@ def test_the_three_fft_ops_are_parked_and_stft_is_advertised():
     `_fft_r2c` and `_fft_c2c` **return** a complex tensor and `_fft_c2r`
     **takes** one, so on at least one side of a golden comparison there is no
     dense storage to read -- the same reason `view_as_complex` is parked
-    (docs/COMPLEX2.md section 5.1). `aten.stft.*` is real on both sides in its
+    (docs/kernels/COMPLEX2.md section 5.1). `aten.stft.*` is real on both sides in its
     `return_complex=False` form, so it is golden-compared, which is what keeps
     the transform itself inside the harness rather than only inside this file.
     """
@@ -553,20 +553,20 @@ def test_the_three_fft_ops_are_parked_and_stft_is_advertised():
 
 def test_as_strided_landed_and_stft_still_does_not_use_it():
     """**Inverted, not deleted** -- this test's previous body asked for exactly
-    this, and `docs/STRIDED.md` is the round it was addressed to.
+    this, and `docs/kernels/STRIDED.md` is the round it was addressed to.
 
     What it said: `as_strided` is unimplemented, `torch.stft` upstream reaches
     it and this `stft` does not, because the frames are extracted with a
-    **gather** rather than a strided view. `docs/VOICE.md` §3 had named the two
+    **gather** rather than a strided view. `docs/architectures/VOICE.md` §3 had named the two
     as `stft`'s walls and only `_fft_r2c` fell.
 
-    `as_strided` has now landed (`docs/STRIDED.md`), and the note that body was
+    `as_strided` has now landed (`docs/kernels/STRIDED.md`), and the note that body was
     written to leave still holds: **`stft` does not have to change.** That is
     the claim worth keeping, so it is what is asserted now, and it is asserted
     about the kernel rather than about the op list -- `stft`'s frames must
     still be an `index_select` gather and not a call into the new op.
 
-    The reason it should stay that way is `docs/STRIDED.md` §2: an
+    The reason it should stay that way is `docs/kernels/STRIDED.md` §2: an
     `as_strided` result bars in-place writes to its base's storage for as long
     as it lives. `stft` would be barring its own input for the duration of the
     window multiply, in exchange for aliasing nothing can observe -- the
@@ -575,7 +575,7 @@ def test_as_strided_landed_and_stft_still_does_not_use_it():
     """
     assert "aten.as_strided.default" in set(_C._aten_implemented()), (
         "as_strided left _aten_implemented(); if it was reverted, invert this "
-        "test back rather than deleting it -- docs/STRIDED.md §1"
+        "test back rather than deleting it -- docs/kernels/STRIDED.md §1"
     )
     path = os.path.join(_REPO_ROOT, "rust", "torch_c", "src", "aten.rs")
     if not os.path.isfile(path):
@@ -595,7 +595,7 @@ def test_as_strided_landed_and_stft_still_does_not_use_it():
     assert "as_strided" not in body, (
         "stft now routes through as_strided. That is a real change and may be "
         "right, but it makes stft bar its input's storage for the duration -- "
-        "docs/STRIDED.md §2, docs/FFT.md §5.2."
+        "docs/kernels/STRIDED.md §2, docs/kernels/FFT.md §5.2."
     )
     assert "index_select" in body, body[:400]
 

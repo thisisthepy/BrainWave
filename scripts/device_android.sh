@@ -1,10 +1,10 @@
 #!/bin/sh
 # Stage the vendored torch tree on an Android device and run it there.
 #
-# `docs/RUST_CROSSBUILD.md` establishes that `aarch64-linux-android` links, and
-# `docs/DEVICE_LOAD.md` establishes that the resulting `_C.so` loads. Neither
+# `docs/platform/RUST_CROSSBUILD.md` establishes that `aarch64-linux-android` links, and
+# `docs/devices/DEVICE_LOAD.md` establishes that the resulting `_C.so` loads. Neither
 # says anything about `import torch`, because linking is not loading and loading
-# is not importing. This script closes that last gap, and `docs/DEVICE.md`
+# is not importing. This script closes that last gap, and `docs/devices/DEVICE.md`
 # records what it found.
 #
 #   ./scripts/device_android.sh build     cross-compile _C for aarch64-linux-android
@@ -18,7 +18,7 @@
 # no choice made, every subcommand that needs one refuses and lists them.
 #
 # `parity` builds its own host `_C` -- deliberately not the shipped one. See
-# cmd_parity, and docs/DEVICE.md §5.1 for what that costs.
+# cmd_parity, and docs/devices/DEVICE.md §5.1 for what that costs.
 #
 # Nothing here installs an app or touches anything outside /data/local/tmp. The
 # emulator is shared with other projects (CLAUDE.md: one device test at a time).
@@ -126,7 +126,7 @@ cmd_stage() {
     done
     cp "$ANDROID_SO" "$stage/site/torch/_C.abi3.so"
 
-    # Wall 4 of docs/VENDOR.md: `_manager_path()` checks this file exists on
+    # Wall 4 of docs/platform/VENDOR.md: `_manager_path()` checks this file exists on
     # every non-Windows platform before it will let the import finish.
     mkdir -p "$stage/site/torch/bin"
     : > "$stage/site/torch/bin/torch_shm_manager"
@@ -179,7 +179,7 @@ cmd_run() {
 
 # The host end of `parity` is NOT the artefact we ship, and that is deliberate.
 #
-# The shipped Apple build links Accelerate (docs/PERF.md §3); the Android build
+# The shipped Apple build links Accelerate (docs/perf/PERF.md §3); the Android build
 # cannot, and calls candle's `gemm` instead. Comparing those two ends bit for
 # bit compares two different BLAS implementations, which can only ever restate
 # something already known -- and it does so loudly enough (8 cases, 1-2 ULP) to
@@ -188,7 +188,7 @@ cmd_run() {
 # on both ends and makes bit equality the right thing to demand again.
 #
 # What that costs: `parity` no longer says anything about the artefact Apple
-# users receive. docs/DEVICE.md §5.1 carries that, because it is a real
+# users receive. docs/devices/DEVICE.md §5.1 carries that, because it is a real
 # difference and not a defect, and it does not go away by being measured
 # differently.
 #
@@ -229,7 +229,7 @@ host_parity_artefact() {
 # `parity` reads a file that `stage` wrote, possibly days ago, from a build that
 # `build` may have replaced since. Neither leaves a receipt, so compare the two
 # by content -- the same reasoning as run.sh's stale-shim refusal
-# (docs/CAPTURE.md §8): a comparison against the wrong artefact is worse than no
+# (docs/graph/CAPTURE.md §8): a comparison against the wrong artefact is worse than no
 # comparison, because it reports a verdict.
 require_fresh_device_artefact() {
     [ -f "$ANDROID_SO" ] || { echo "no $ANDROID_SO -- run '$0 build'" >&2; exit 1; }
@@ -301,7 +301,7 @@ cmd_diff() {
 import json, sys
 
 # Measured on emulator-5554 (pmp_api26, API 26, arm64-v8a) against an
-# aarch64-darwin host -- docs/DEVICE.md records the run. These four cases and
+# aarch64-darwin host -- docs/devices/DEVICE.md records the run. These four cases and
 # only these four differ, by at most 1 ULP, and both sides straddle the
 # correctly-rounded double-precision reference in both directions, so neither is
 # "the wrong one": Apple's libm and bionic's are different implementations of
@@ -310,7 +310,7 @@ import json, sys
 #
 # `exp.default` and `softplus.default` joined `_softmax.default` and
 # `tanh.default` when the battery grew past its original 33 cases
-# (docs/DEVICE.md records the reference-value check): `softplus` calls `exp`
+# (docs/devices/DEVICE.md records the reference-value check): `softplus` calls `exp`
 # internally, so its own 1-ULP divergence is inherited, not independent --
 # the same `expf` call underneath, the same directionless straddle.
 #

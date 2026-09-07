@@ -2,8 +2,8 @@
 
 ## Why this is not a decomposition
 
-docs/DECOMP.md §12.5 measured the thing that makes this pass necessary, and
-docs/NPU.md §7 confirmed it a second time on a different network: running
+docs/graph/DECOMP.md §12.5 measured the thing that makes this pass necessary, and
+docs/graph/NPU.md §7 confirmed it a second time on a different network: running
 upstream's post-autograd table over `mobilenet_v2` **makes it worse**. Ops
 outside NNAPI go 3 -> 6 and nodes go 203 -> 1191, because `native_batch_norm`
 decomposes into `sqrt`, `reciprocal` and `new_zeros`, and NNAPI has none of the
@@ -23,7 +23,7 @@ approximated: the affine is exactly the one the batch-norm kernel applies.
 
 ## The arithmetic, and the reason it is quoted rather than derived
 
-docs/DEMAND1.md §5 records a defect this project already had, found by its own
+docs/architectures/DEMAND1.md §5 records a defect this project already had, found by its own
 golden harness. Upstream's inference batch norm applies a **fused** affine:
 
     alpha = invstd * weight          invstd = rsqrt(running_var + eps)
@@ -49,7 +49,7 @@ not pin the fold, because folding into the weights changes the order of the
 arithmetic fundamentally -- the scale now happens inside the convolution's
 accumulation instead of after it -- so the fused graph is **not** expected to be
 bit-exact against the unfolded one. That claim is measured separately, by
-replaying both graphs on real inputs, and docs/REFOLD.md carries the number.
+replaying both graphs on real inputs, and docs/graph/REFOLD.md carries the number.
 
 ## What it refuses
 
@@ -67,7 +67,7 @@ fusing when one of these does not hold is not. Each is checked:
 * the convolution's result must be used **only** by this batch norm and must
   not be a trace output. Otherwise the unfused value is still needed.
 * the batch norm's `save_mean` / `save_invstd` outputs (slots 1 and 2) must be
-  unused. In eval they are empty (docs/DEMAND1.md §1), but a graph that reads
+  unused. In eval they are empty (docs/architectures/DEMAND1.md §1), but a graph that reads
   them is asking for something the fused convolution does not produce.
 """
 
@@ -104,7 +104,7 @@ class FusionRefused(NotImplementedError):
 def batch_norm_affine(weight, bias, mean, var, eps):
     """`(alpha, beta)` such that `x * alpha + beta` is upstream's eval BN.
 
-    The fused form from docs/DEMAND1.md §5, not the algebraically identical
+    The fused form from docs/architectures/DEMAND1.md §5, not the algebraically identical
     unfused one -- see the module docstring for why the difference is not
     cosmetic. `weight` and `bias` may be `None`, which is how a
     `BatchNorm2d(affine=False)` records.

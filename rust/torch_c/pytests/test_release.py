@@ -12,7 +12,7 @@ mistakes was visible from inside any single file:
     older wheel than the one the README's table says is published.
   * A count marker was written `eq` where a later round could legitimately
     raise the number, which turns a correct improvement into a red suite. That
-    has now happened three times, most recently in `docs/MPS.md`.
+    has now happened three times, most recently in `docs/devices/MPS.md`.
 
 None of this checks whether the release *works* -- the rest of the suite does
 that. It checks that the four files tell one story, and that the story is not
@@ -164,7 +164,7 @@ def test_the_release_notes_exist_and_split_the_work_four_ways():
     """CLAUDE.md 5.3: a release note that reports one number has merged
     implementation, defect fixes, measurement and documentation into a single
     figure that looks like progress. The four headings are the whole point."""
-    notes = REPO / f"docs/RELEASE_{_project_version().replace('.', '_')}.md"
+    notes = REPO / f"docs/platform/RELEASE_{_project_version().replace('.', '_')}.md"
     assert notes.exists(), f"no release notes at {notes.relative_to(REPO)}"
     text = notes.read_text()
     for heading in ("Features added", "Defects fixed", "Measured but not implemented", "Documentation corrected"):
@@ -175,7 +175,7 @@ def test_the_release_notes_state_the_gaps_and_not_only_the_additions():
     """An alpha note that lists what landed and omits that 82 architectures do
     not forward, and that `torch.compile` is recommended for permanent refusal,
     is selling something."""
-    text = (REPO / f"docs/RELEASE_{_project_version().replace('.', '_')}.md").read_text()
+    text = (REPO / f"docs/platform/RELEASE_{_project_version().replace('.', '_')}.md").read_text()
     assert "82" in text and "297" in text, (
         "the notes do not carry the architecture coverage denominator"
     )

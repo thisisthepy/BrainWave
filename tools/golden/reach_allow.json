@@ -1,7 +1,7 @@
 {
   "_README": [
     "Allowlist for tools/golden/reach.py. Every entry is a connection that is",
-    "*absent on purpose*; docs/REACH.md is the inventory and the argument.",
+    "*absent on purpose*; docs/bindings/REACH.md is the inventory and the argument.",
     "",
     "Matched exactly, in both directions. An unlisted gap fails the suite, and an",
     "entry whose gap has since closed fails it too -- so closing a gap deletes its",
@@ -11,26 +11,26 @@
     "for the checker: attribute paths on real upstream torch that the reason is",
     "staking itself on, verified by `reach.py --verify-upstream` (a subprocess",
     "with PYTHONPATH stripped). A reason nobody can put a question to is how",
-    "docs/SPELLINGS.md's deliberate gaps would otherwise become indistinguishable",
+    "docs/bindings/SPELLINGS.md's deliberate gaps would otherwise become indistinguishable",
     "from forgotten ones."
   ],
   "shape1_no_dispatch_arm": {},
   "shape1_dead_overload_keys_ceiling": 110,
   "shape2_kernel_without_spelling": {
     "aten._fft_c2r.default": {
-      "reason": "Upstream has `torch._fft_c2r` (it is a `_VariableFunctions` member) but no `Tensor._fft_c2r`, and this shim deliberately does NOT put a row in `overloads.json` for it. The reason is not that upstream lacks the door -- it is that the door nobody uses is not the one that reaches this kernel: `torch.fft.rfft`/`fft`/`ifft`/`irfft` are C++-level composites that land on `aten::_fft_c2r` through the dispatcher, and `torch.stft` reaches it through `aten::stft`, which IS spelled and IS exercised. Adding `torch._fft_c2r` would add a spelling with no measured caller, which docs/SPELLINGS.md prices as surface. The kernel is proven element-wise against a live upstream in `pytests/test_fft.py` and, through `aten.stft.*`, by the golden harness. Delete this entry if a caller for the bare spelling is found.",
+      "reason": "Upstream has `torch._fft_c2r` (it is a `_VariableFunctions` member) but no `Tensor._fft_c2r`, and this shim deliberately does NOT put a row in `overloads.json` for it. The reason is not that upstream lacks the door -- it is that the door nobody uses is not the one that reaches this kernel: `torch.fft.rfft`/`fft`/`ifft`/`irfft` are C++-level composites that land on `aten::_fft_c2r` through the dispatcher, and `torch.stft` reaches it through `aten::stft`, which IS spelled and IS exercised. Adding `torch._fft_c2r` would add a spelling with no measured caller, which docs/bindings/SPELLINGS.md prices as surface. The kernel is proven element-wise against a live upstream in `pytests/test_fft.py` and, through `aten.stft.*`, by the golden harness. Delete this entry if a caller for the bare spelling is found.",
       "upstream_absent": [
         "torch.Tensor._fft_c2r"
       ]
     },
     "aten._fft_r2c.default": {
-      "reason": "Upstream has `torch._fft_r2c` (it is a `_VariableFunctions` member) but no `Tensor._fft_r2c`, and this shim deliberately does NOT put a row in `overloads.json` for it. The reason is not that upstream lacks the door -- it is that the door nobody uses is not the one that reaches this kernel: `torch.fft.rfft`/`fft`/`ifft`/`irfft` are C++-level composites that land on `aten::_fft_r2c` through the dispatcher, and `torch.stft` reaches it through `aten::stft`, which IS spelled and IS exercised. Adding `torch._fft_r2c` would add a spelling with no measured caller, which docs/SPELLINGS.md prices as surface. The kernel is proven element-wise against a live upstream in `pytests/test_fft.py` and, through `aten.stft.*`, by the golden harness. Delete this entry if a caller for the bare spelling is found.",
+      "reason": "Upstream has `torch._fft_r2c` (it is a `_VariableFunctions` member) but no `Tensor._fft_r2c`, and this shim deliberately does NOT put a row in `overloads.json` for it. The reason is not that upstream lacks the door -- it is that the door nobody uses is not the one that reaches this kernel: `torch.fft.rfft`/`fft`/`ifft`/`irfft` are C++-level composites that land on `aten::_fft_r2c` through the dispatcher, and `torch.stft` reaches it through `aten::stft`, which IS spelled and IS exercised. Adding `torch._fft_r2c` would add a spelling with no measured caller, which docs/bindings/SPELLINGS.md prices as surface. The kernel is proven element-wise against a live upstream in `pytests/test_fft.py` and, through `aten.stft.*`, by the golden harness. Delete this entry if a caller for the bare spelling is found.",
       "upstream_absent": [
         "torch.Tensor._fft_r2c"
       ]
     },
     "aten.alias.default": {
-      "reason": "Upstream exposes no `torch.alias` and no `Tensor.alias` -- `aten::alias` is a dispatcher-internal view op that upstream's own Python surface never names. Inventing a spelling for it would be exactly what docs/SPELLINGS.md refuses (a door upstream does not have). The kernel is reached, and needs to be, through `_aten_dispatch` from traced/exported graphs and through the vendored `__getitem__`'s view path.",
+      "reason": "Upstream exposes no `torch.alias` and no `Tensor.alias` -- `aten::alias` is a dispatcher-internal view op that upstream's own Python surface never names. Inventing a spelling for it would be exactly what docs/bindings/SPELLINGS.md refuses (a door upstream does not have). The kernel is reached, and needs to be, through `_aten_dispatch` from traced/exported graphs and through the vendored `__getitem__`'s view path.",
       "upstream_absent": [
         "torch.alias",
         "torch.Tensor.alias"
@@ -99,7 +99,7 @@
       "reason": "operator spelling. Tests exercise it as syntax (`a + b`, `a @ b`, `~a`), which this check reads as text and cannot attribute back to the dunder. A grep for `.__add__(` would be a lie in the other direction."
     },
     "_grouped_mm": {
-      "reason": "backlog: the kernel is golden-compared by dispatch key, but no test spells the name. docs/REACH.md §3."
+      "reason": "backlog: the kernel is golden-compared by dispatch key, but no test spells the name. docs/bindings/REACH.md §3."
     }
   }
 }

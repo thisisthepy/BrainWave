@@ -1,4 +1,4 @@
-"""docs/STRIDED.md -- `as_strided`, and the barrier that makes a gather honest.
+"""docs/kernels/STRIDED.md -- `as_strided`, and the barrier that makes a gather honest.
 
 `tools/golden/cases.py` compares every value this op answers against upstream
 element-wise, including the five refusal messages, and this file deliberately
@@ -12,8 +12,8 @@ one -- `Layout::new(shape, stride, offset)` is public and
 and allocates a fresh `Arc`, and the nine sites inside candle that do build a
 shallow view write `Tensor_ { storage: self.storage.clone(), layout }` directly
 against a struct with no public field. Both halves of the constructor are
-public and the struct that joins them is not. That was `docs/TAIL3.md` §6's
-refusal and `docs/TAIL4.md` §1's, and neither is overturned here.
+public and the struct that joins them is not. That was `docs/kernels/TAIL3.md` §6's
+refusal and `docs/kernels/TAIL4.md` §1's, and neither is overturned here.
 
 What is new is that the gather's wrongness is made **loud rather than silent**.
 `storage.rs::StridedBarrier` bars in-place writes to the result's storage and
@@ -23,7 +23,7 @@ upstream would have propagated a write and this copy would not is a named
 refusal. That is a narrowing of upstream, and this file's job is to prove it is
 a narrowing rather than a widening -- in both directions, against upstream
 measured in a separate process, and including the two aliasing shapes
-`docs/TAIL4.md` §1.2 named as the ones that defeat every cheaper marker:
+`docs/kernels/TAIL4.md` §1.2 named as the ones that defeat every cheaper marker:
 
   * `z = y.view(-1)` -- a shallow view of the *result*, which gets a fresh
     candle `TensorId` and would escape a `TensorId`-keyed guard;
@@ -333,7 +333,7 @@ def test_upstream_propagates_a_write_THROUGH_the_view_and_this_shim_refuses_it()
 
 
 def test_upstream_propagates_a_write_TO_THE_BASE_and_this_shim_refuses_that_too():
-    """Direction two -- the one `docs/TAIL4.md` §1.2 said no write guard could
+    """Direction two -- the one `docs/kernels/TAIL4.md` §1.2 said no write guard could
     address at all.
 
     Its words: *"There is a third fact that no guard on writes can address:
@@ -360,7 +360,7 @@ def test_the_barrier_holds_through_an_alias_that_gets_a_fresh_candle_TensorId():
 
     candle's `reshape` builds a new `Tensor_` with `id: TensorId::new()` over
     `storage: self.storage.clone()`, so `z` is a different tensor identity on
-    the same buffer. `docs/TAIL4.md` §1.2 named this as the reason a
+    the same buffer. `docs/kernels/TAIL4.md` §1.2 named this as the reason a
     `HashSet<TensorId>` populated at `as_strided` time cannot work: it would be
     defeated by the most ordinary thing a caller does next.
 
@@ -386,7 +386,7 @@ def test_the_barrier_holds_through_an_alias_that_gets_a_fresh_candle_TensorId():
 
 def test_the_barrier_reaches_an_alias_of_the_base_that_PREDATES_the_call():
     """The one that decides between a field and a storage key, and it is why
-    `docs/TAIL4.md` §1.3's sizing was not sufficient.
+    `docs/kernels/TAIL4.md` §1.3's sizing was not sufficient.
 
     That sizing was *"one `bool`/`Option<...>` field on `PyTensorBase` that
     survives aliasing, plus propagation through the view-producing ops"*.
@@ -420,7 +420,7 @@ def test_the_barrier_reaches_an_alias_of_the_base_that_PREDATES_the_call():
 
 def test_the_barrier_lifts_when_the_view_dies_which_is_what_keeps_it_from_poisoning():
     """A permanent poison set keyed on an address is the structure
-    `docs/TAIL4.md` §1.2 rejected, and it rejected it correctly.
+    `docs/kernels/TAIL4.md` §1.2 rejected, and it rejected it correctly.
 
     Its objection: an address is reused after the allocation it named is freed,
     so a permanent entry starts refusing writes to unrelated tensors allocated
@@ -440,7 +440,7 @@ def test_the_barrier_lifts_when_the_view_dies_which_is_what_keeps_it_from_poison
     assert "raised" not in want, want
     assert "raised" not in got, (
         "the base is still barred after the as_strided result was dropped -- "
-        f"the barrier is permanent, which is the failure mode docs/TAIL4.md "
+        f"the barrier is permanent, which is the failure mode docs/kernels/TAIL4.md "
         f"§1.2 named: {got}"
     )
     assert got["ok"] == want["ok"] == [7.0] * 12, (got, want)
@@ -459,7 +459,7 @@ def test_the_barrier_lifts_when_the_view_dies_which_is_what_keeps_it_from_poison
 
 
 def test_the_write_door_is_still_single_which_is_what_makes_the_barrier_total():
-    """Inherited from `docs/TAIL4.md` §1.1, and now load-bearing rather than a
+    """Inherited from `docs/kernels/TAIL4.md` §1.1, and now load-bearing rather than a
     precondition for a sizing.
 
     The barrier is read in exactly one place. That is sufficient **only** while
@@ -484,7 +484,7 @@ def test_the_write_door_is_still_single_which_is_what_makes_the_barrier_total():
     assert len(calls) == 1, (
         f"aten.rs now calls write_into {len(calls)} times. The as_strided "
         "barrier is read inside write_into and was sized against there being "
-        "exactly one caller -- docs/STRIDED.md §2."
+        "exactly one caller -- docs/kernels/STRIDED.md §2."
     )
     assert "fn write_back(" in aten
     assert "pub fn write_into(" in tensor
@@ -492,12 +492,12 @@ def test_the_write_door_is_still_single_which_is_what_makes_the_barrier_total():
 
 
 def test_the_barrier_is_read_at_that_door_and_nullifying_it_is_what_STRIDED_md_measured():
-    """The demonstration `docs/COMPLEX2.md` set as the standard for calling a
+    """The demonstration `docs/kernels/COMPLEX2.md` set as the standard for calling a
     guard real, pinned as source structure.
 
-    `docs/COMPLEX2.md` did not argue that `tensor()`'s non-`Dense` refusal
+    `docs/kernels/COMPLEX2.md` did not argue that `tensor()`'s non-`Dense` refusal
     mattered; it **deleted the refusal and measured what computed anyway** --
-    6 of 10 sampled ops answered silently. `docs/STRIDED.md` §5 does the same
+    6 of 10 sampled ops answered silently. `docs/kernels/STRIDED.md` §5 does the same
     thing for this barrier: with the `write_is_barred` block commented out of
     `write_into` and nothing else changed, the crate builds and
     `x.as_strided(...).fill_(7.)` returns a filled view while leaving `x` at
@@ -522,14 +522,14 @@ def test_the_barrier_is_read_at_that_door_and_nullifying_it_is_what_STRIDED_md_m
     door = tensor[tensor.index("pub fn write_into("):]
     assert "crate::storage::write_is_barred(&dest)" in door, (
         "the as_strided write barrier is no longer read at the write door. If "
-        "it moved, move this assertion; if it was deleted, docs/STRIDED.md §5 "
+        "it moved, move this assertion; if it was deleted, docs/kernels/STRIDED.md §5 "
         "says what that puts back."
     )
     readers = re.findall(r"write_is_barred\s*\(", tensor)
     assert len(readers) == 1, (tensor.count("write_is_barred"), readers)
     # And the registry it reads is keyed on the storage with a keep-alive.
     # Without `keep_alive` the address is free to be reused while the entry
-    # lives, which is precisely docs/TAIL4.md §1.2's objection.
+    # lives, which is precisely docs/kernels/TAIL4.md §1.2's objection.
     assert "pub struct StridedBarrier" in storage
     assert "keep_alive" in storage
     assert "impl Drop for StridedBarrier" in storage
@@ -544,7 +544,7 @@ def test_as_strided_and_unfold_are_the_two_ops_that_take_the_barrier():
     stopped being true: *"If a second op ever needs it, that is a decision worth
     making explicitly -- an op that bars its input's storage is an op that can
     make an unrelated later write fail."* `aten.unfold.default` is that second
-    op (docs/LAST7.md §3): upstream's `Tensor.unfold` is a two-way view for the
+    op (docs/kernels/LAST7.md §3): upstream's `Tensor.unfold` is a two-way view for the
     same reason `as_strided` is, candle cannot build it for the same reason, and
     a gather without the barrier would lose a write in both directions
     silently. So the test is inverted rather than deleted, and it still names

@@ -22,7 +22,7 @@
 //! | replay | run the record with new inputs and get eager's answer |
 //!
 //! What it is deliberately not, and refuses by name rather than approximating
-//! (docs/CAPTURE.md §4): control flow, in-place mutation, dynamic shapes, and
+//! (docs/graph/CAPTURE.md §4): control flow, in-place mutation, dynamic shapes, and
 //! randomness. §6 of DESIGN.md is the rule being followed -- a refusal that
 //! says its own name is worth more than a silent wrong answer, and a capture
 //! layer is a place where silent wrong answers are *cheap to produce*, because
@@ -53,9 +53,9 @@ use crate::tensor::PyTensorBase;
 ///
 /// The whole cost of this module on the ordinary path is one relaxed load of
 /// this flag and a branch that is never taken. That is not an aesthetic
-/// preference: docs/DEVICE_ABS.md §6 measured a `String` allocation per tensor
+/// preference: docs/devices/DEVICE_ABS.md §6 measured a `String` allocation per tensor
 /// argument at +78 ns on `add.Tensor`, a door that costs 346 ns in total, so
-/// anything added here is measured against a small number. docs/CAPTURE.md §7
+/// anything added here is measured against a small number. docs/graph/CAPTURE.md §7
 /// has the A/B for this flag.
 ///
 /// Global rather than thread-local because reading a `thread_local!` costs a
@@ -65,11 +65,11 @@ static CAPTURING: AtomicBool = AtomicBool::new(false);
 
 thread_local! {
     static RECORDER: RefCell<Option<Recorder>> = const { RefCell::new(None) };
-    /// **W8** (docs/BACKWARD7.md): the eager tape. Same `Recorder`, no region.
+    /// **W8** (docs/training/BACKWARD7.md): the eager tape. Same `Recorder`, no region.
     ///
     /// There is no `_eager_begin`. It exists from the first dispatch that
     /// produces a `grad_fn` and lasts until `_eager_backward` frees it, which
-    /// is `docs/BACKWARD5.md` §4's "`CAPTURING` on outside a capture region"
+    /// is `docs/training/BACKWARD5.md` §4's "`CAPTURING` on outside a capture region"
     /// with the gating moved to where it costs nothing -- see `EAGER_ON`.
     static EAGER: RefCell<Option<Recorder>> = const { RefCell::new(None) };
 }
@@ -113,10 +113,10 @@ pub fn eager_enabled_py() -> bool {
     eager_enabled()
 }
 
-/// **W11** (docs/BACKWARD8.md): the largest number of nodes the eager tape
+/// **W11** (docs/training/BACKWARD8.md): the largest number of nodes the eager tape
 /// will hold before it refuses.
 ///
-/// `docs/BACKWARD7.md` §10 row 2 recorded that the tape *"cannot grow without
+/// `docs/training/BACKWARD7.md` §10 row 2 recorded that the tape *"cannot grow without
 /// bound"* was not established, and it was not, because it could not: the tape
 /// is freed by `backward()` and by nothing else, so a program that runs
 /// forwards under grad mode and never differentiates retains every
@@ -125,7 +125,7 @@ pub fn eager_enabled_py() -> bool {
 /// when the caller drops them -- and this is not, because the tape is a
 /// thread-local the outputs do not own.
 ///
-/// **Measured, docs/BACKWARD8.md §4**, a hand-written greedy decode loop on
+/// **Measured, docs/training/BACKWARD8.md §4**, a hand-written greedy decode loop on
 /// real SmolLM2-135M with `use_cache=True`, parameters left exactly as
 /// `from_pretrained` hands them over (every one `requires_grad=True`, which is
 /// why the tape records at all), sizes read with `_eager_tape_bytes`:
@@ -186,7 +186,7 @@ pub fn eager_max_nodes_py() -> usize {
 }
 
 /// Set the bound. `0` means unbounded, which restores exactly the behaviour
-/// `docs/BACKWARD7.md` §10 row 2 described -- kept so that the bound can be
+/// `docs/training/BACKWARD7.md` §10 row 2 described -- kept so that the bound can be
 /// **nullified** and the tests that assert it seen to go red (`CLAUDE.md`
 /// §5.5), not because unbounded is an option anyone should choose.
 #[pyfunction]
@@ -332,21 +332,21 @@ struct Recorder {
     /// holds a strong reference to, so an address can never be reused under us
     /// while the recording is open. That is the price of identity: a trace of a
     /// long model holds its activations until `_capture_end`.
-    /// docs/CAPTURE.md §6.
+    /// docs/graph/CAPTURE.md §6.
     known: HashMap<usize, Ref>,
     /// The declared inputs, held for the identity reason above. A region has
     /// them; an eager tape has none, because everything it reads from outside
     /// itself is a constant.
     input_objects: Vec<Py<PyAny>>,
-    /// **W9** (docs/BACKWARD7.md). Every tensor result the recording produced,
+    /// **W9** (docs/training/BACKWARD7.md). Every tensor result the recording produced,
     /// indexed the way `Ref::Node` indexes it -- `node_objects[n][o]` is the
     /// object of output `o` of node `n`, with `None` in the slots the record
     /// calls `Slot::Other`.
     ///
     /// This was a flat `keepalive: Vec<Py<PyAny>>` before this round, kept
     /// only so that an address could not be reused mid-recording, and dropped
-    /// at `_capture_end`. Reshaped, **it is an `Env`**: `docs/BACKWARD5.md` §4
-    /// found that the thing `docs/BACKWARD2.md` §1.5 asked W8 to invent -- what
+    /// at `_capture_end`. Reshaped, **it is an `Env`**: `docs/training/BACKWARD5.md` §4
+    /// found that the thing `docs/training/BACKWARD2.md` §1.5 asked W8 to invent -- what
     /// keeps the intermediates alive -- already existed and was being thrown
     /// away. A capture region still throws it away (`_capture_end` drops the
     /// whole `Recorder`, and `CaptureTrace.backward()` replays); an eager tape
@@ -442,7 +442,7 @@ impl Recorder {
 
     /// A second `Recorder` over the same values, for `retain_graph=True`.
     ///
-    /// **W12** (`docs/BACKWARD9.md` §3). `eager_backward` *takes* the tape,
+    /// **W12** (`docs/training/BACKWARD9.md` §3). `eager_backward` *takes* the tape,
     /// which is upstream's `retain_graph=False` default and the whole of W9's
     /// lifetime rule. `retain_graph=True` is the caller saying they will
     /// differentiate the same forward again, so the tape has to survive its
@@ -535,7 +535,7 @@ fn is_mutating(op: &str) -> bool {
 /// single-assignment, which is the one property this module exists to keep.
 ///
 /// **The judgement is per call, not per name**, and that is why it lives here
-/// rather than in a widened `is_mutating`. Measured (docs/DEMAND1.md §1.3):
+/// rather than in a widened `is_mutating`. Measured (docs/architectures/DEMAND1.md §1.3):
 /// with `training=False` this op touches nothing -- the running statistics come
 /// back byte-identical and `save_mean`/`save_invstd` are empty. Eval is the
 /// mode a captured inference graph is in and the mode every BatchNorm CNN
@@ -572,12 +572,12 @@ fn mutates_this_call(
 }
 
 // ---------------------------------------------------------------------------
-// W10a: constant freshness (docs/BACKWARD6.md)
+// W10a: constant freshness (docs/training/BACKWARD6.md)
 // ---------------------------------------------------------------------------
 
 /// One monotonic `u64` per **storage**, bumped when an op writes into it.
 ///
-/// The defect this closes is `docs/BACKWARD5.md` §1.3: `PyCaptureTrace` holds
+/// The defect this closes is `docs/training/BACKWARD5.md` §1.3: `PyCaptureTrace` holds
 /// strong references to the caller's live tensors (`const_objects`) and
 /// `run()` copies those references into the replay `Env`, so a trace
 /// differentiates whatever its constants hold **at `backward()` time** -- which
@@ -587,14 +587,14 @@ fn mutates_this_call(
 ///
 /// This is the *snapshot* half of upstream's `c10::VariableVersion` applied to
 /// the 333 values a trace holds rather than to every saved variable
-/// (`docs/BACKWARD5.md` §2). It is deliberately **not** the general version
+/// (`docs/training/BACKWARD5.md` §2). It is deliberately **not** the general version
 /// counter: there is no `ADInplaceOrView` key, no alias set, no view metadata
 /// and no rebasing.
 ///
 /// **Keyed on the storage address, not on the Python object**, and that is
 /// what makes it see a write through a view: in-place ops here go through
 /// `tensor::write_into`, which writes into the buffer the wrapper already
-/// points at (`docs/VIEWS.md` §6), so a base and its views share one candle
+/// points at (`docs/kernels/VIEWS.md` §6), so a base and its views share one candle
 /// `Storage` and therefore one entry. `replace_with` -- `set_` and
 /// `tensor.data = ...` -- rebinds instead, and that shows up as a *different*
 /// key, which the stamp comparison catches as well because a stamp is the pair
@@ -672,9 +672,9 @@ fn inplace_receiver<'py>(
 /// later. It is beside `mark_from_op` rather than inside it because
 /// `mark_from_op` returns early when grad mode is off, and **`optimizer.step()`
 /// runs under `no_grad`** -- putting the bump behind that branch would have
-/// missed the one call this whole round exists for. `docs/BACKWARD5.md` §6
+/// missed the one call this whole round exists for. `docs/training/BACKWARD5.md` §6
 /// sized it as "the door's existing grad-mode branch"; that sizing is wrong by
-/// one branch, and `docs/BACKWARD6.md` §3 records why.
+/// one branch, and `docs/training/BACKWARD6.md` §3 records why.
 ///
 /// The cost on the ordinary path is `is_mutating` -- one `rsplit_once` on a
 /// `&str` already in a register and an `ends_with` on one byte -- and a branch
@@ -711,10 +711,10 @@ pub fn note_mutation(op: &str, args: &Bound<'_, PyTuple>, kwargs: Option<&Bound<
     }
 }
 
-/// **W8's answer to `docs/BACKWARD5.md` §1's 100×-wrong gradient, and the
+/// **W8's answer to `docs/training/BACKWARD5.md` §1's 100×-wrong gradient, and the
 /// reason this round does not need W10b.**
 ///
-/// `docs/BACKWARD5.md` §1.1 measured what a naive eager recorder does with
+/// `docs/training/BACKWARD5.md` §1.1 measured what a naive eager recorder does with
 /// `a = x*1; v = a.view(3); a.mul_(10); (v*v).sum()`: the recorder keys values
 /// on object identity, the view is a *second object over one storage*, the
 /// write goes to the base and the tape differentiates a program the machine
@@ -725,7 +725,7 @@ pub fn note_mutation(op: &str, args: &Bound<'_, PyTuple>, kwargs: Option<&Bound<
 ///
 /// A recorder now exists, and the fix it needs is not that layer. **A tape
 /// that refuses does not have to know what aliases what** -- it has to know
-/// that a write landed on bytes it depends on, and `docs/BACKWARD6.md` §4
+/// that a write landed on bytes it depends on, and `docs/training/BACKWARD6.md` §4
 /// already made that one lookup by keying versions on the candle `Storage`
 /// rather than on the Python object. A base and its views answer the same key,
 /// so the write above is seen without any view metadata, any alias set or any
@@ -733,7 +733,7 @@ pub fn note_mutation(op: &str, args: &Bound<'_, PyTuple>, kwargs: Option<&Bound<
 ///
 /// What is bought is a **refusal**, not a gradient: upstream *differentiates*
 /// A5/A6 and this refuses them, which is strictly less. That is the trade
-/// `docs/AUTOGRAD.md` §6 chose, and the difference between it and W10b is the
+/// `docs/training/AUTOGRAD.md` §6 chose, and the difference between it and W10b is the
 /// difference between "no wrong answer" and "the right answer".
 ///
 /// Cost: on the ordinary path, nothing -- `note_mutation` has already returned
@@ -760,7 +760,7 @@ fn poison_on_write_to_recorded_storage(key: usize) {
              view of the same storage -- would make it differentiate a program that never \
              ran. Upstream refuses the same shape with its version counter; this refuses it \
              by storage. Compute the value again after the write, or do the write under \
-             torch.no_grad() on a tensor no graph depends on (docs/BACKWARD7.md)"
+             torch.no_grad() on a tensor no graph depends on (docs/training/BACKWARD7.md)"
                 .to_string(),
         );
     });
@@ -809,7 +809,7 @@ const METADATA_ONLY: &[&str] = &["aten.is_floating_point.default"];
 /// A recorded node's shape has to be implied by the guards, or a replay on a
 /// different input silently produces a differently shaped answer through a
 /// graph built for the first one. `nonzero` and `where.default` count their
-/// true elements; `repeat_interleave.Tensor` sums its `repeats` (docs/REPEAT.md
+/// true elements; `repeat_interleave.Tensor` sums its `repeats` (docs/kernels/REPEAT.md
 /// §3) -- the same property, arrived at from the other side, and it joined this
 /// list in the same change that gave it a kernel rather than after somebody
 /// noticed a wrong replay.
@@ -924,7 +924,7 @@ fn record_into(
         if rec.poisoned.is_some() {
             return;
         }
-        // **W11** (docs/BACKWARD8.md §4): the bound. Tested before the node is
+        // **W11** (docs/training/BACKWARD8.md §4): the bound. Tested before the node is
         // built rather than after, so the tape never exceeds the number it
         // reports, and only for the eager tape -- a capture region is bounded
         // by its own `_capture_end` and by the caller who wrote it.
@@ -943,7 +943,7 @@ fn record_into(
                  one does not. The values held so far have been released. Run the loop \
                  under torch.no_grad(), which records nothing at all, or call \
                  torch._C._eager_reset() each iteration, or raise the bound with \
-                 torch._C._eager_set_max_nodes(n) (docs/BACKWARD8.md §4)"
+                 torch._C._eager_set_max_nodes(n) (docs/training/BACKWARD8.md §4)"
             ));
             rec.release_values();
             return;
@@ -952,7 +952,7 @@ fn record_into(
         // guards, and an eager tape never replays: it differentiates the
         // values the program actually computed, in `node_objects`. So the
         // three things they refuse mean different things on the two paths.
-        // Randomness is the clearest: docs/CAPTURE.md §9-1 records a gradient
+        // Randomness is the clearest: docs/graph/CAPTURE.md §9-1 records a gradient
         // taken at a *different dropout draw* than the one reported, which is
         // a replay defect, and an eager tape cannot have it because it holds
         // the draw. Mutation is not exempted -- it is refused somewhere else,
@@ -998,7 +998,7 @@ fn record_into(
             }
         }
 
-        // **W11** (docs/BACKWARD8.md §2): forgive this op its *own* write.
+        // **W11** (docs/training/BACKWARD8.md §2): forgive this op its *own* write.
         //
         // Measured on a real `nn.Sequential(Conv2d, BatchNorm2d, ReLU)` in
         // `train()` mode: before this, the tape refused its own forward. The
@@ -1323,7 +1323,7 @@ impl PyCaptureTrace {
     /// Every intermediate shape in the record was *computed from* these, so a
     /// guard that admitted a different one would make each recorded output
     /// shape a false statement. Dynamic shapes are the named gap
-    /// (docs/CAPTURE.md §4), and this is what naming it has to mean.
+    /// (docs/graph/CAPTURE.md §4), and this is what naming it has to mean.
     #[getter]
     fn guards<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
         let mut out = Vec::with_capacity(self.inputs.len());
@@ -1409,7 +1409,7 @@ impl PyCaptureTrace {
         PyList::new(py, self.outputs.iter().map(|r| PyCaptureValue::of(*r)))
     }
 
-    /// The whole record in one dict, in the shape docs/CAPTURE.md §5 argues is
+    /// The whole record in one dict, in the shape docs/graph/CAPTURE.md §5 argues is
     /// the one an `ExportedProgram` is built from.
     fn graph<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         let out = PyDict::new(py);
@@ -1428,7 +1428,7 @@ impl PyCaptureTrace {
     /// about the *record* rather than about two implementations happening to
     /// match. When a delegate arrives it replaces this loop, and the eager
     /// comparison is then a comparison of backends -- the same test, one layer
-    /// down. docs/CAPTURE.md §3.
+    /// down. docs/graph/CAPTURE.md §3.
     fn replay<'py>(
         &self,
         py: Python<'py>,
@@ -1442,11 +1442,11 @@ impl PyCaptureTrace {
         PyTuple::new(py, out)
     }
 
-    /// Reverse-mode over this trace. docs/BACKWARD.md.
+    /// Reverse-mode over this trace. docs/training/BACKWARD.md.
     ///
     /// The forward is replayed first, because a `CaptureTrace` keeps only the
     /// *shape* of every intermediate and not the intermediate itself -- capture
-    /// drops its keepalives at `_capture_end` (docs/CAPTURE.md §6), and holding
+    /// drops its keepalives at `_capture_end` (docs/graph/CAPTURE.md §6), and holding
     /// every activation for the life of every trace would be the wrong default
     /// for the traces that are never differentiated. The cost is one extra
     /// forward per backward, and it is named here rather than hidden.
@@ -1461,7 +1461,7 @@ impl PyCaptureTrace {
         // Under `no_grad`, and for upstream's own reason rather than a
         // convenience. A backward runs *outside* the graph: upstream's engine
         // executes with grad mode off unless `create_graph=True`, so the
-        // gradients it produces are leaves. Since docs/BACKWARD4.md the door
+        // gradients it produces are leaves. Since docs/training/BACKWARD4.md the door
         // marks non-leaves, and the tape's backward is a composition of
         // ordinary `aten_dispatch` calls on tensors that require gradients --
         // so without this the returned gradients would come back with a
@@ -1476,7 +1476,7 @@ impl PyCaptureTrace {
     /// whether the tape has a rule for each.
     ///
     /// Exists so that "what stops this model" is answerable **without** running
-    /// a backward and reading the exception -- docs/BACKWARD.md's wall table is
+    /// a backward and reading the exception -- docs/training/BACKWARD.md's wall table is
     /// generated from this, not hand-kept, because hand-kept op lists in this
     /// repository have gone stale five times.
     #[pyo3(signature = (wrt_constants = None))]
@@ -1498,12 +1498,12 @@ impl PyCaptureTrace {
     /// be differentiating a different forward from the one `replay` proves
     /// equal to eager.
     /// **W10a**: refuse a replay whose burned-in constants have moved since
-    /// the trace was captured (`docs/BACKWARD5.md` §1.3, `docs/BACKWARD6.md`).
+    /// the trace was captured (`docs/training/BACKWARD5.md` §1.3, `docs/training/BACKWARD6.md`).
     ///
     /// A `CaptureTrace` holds its constants *by reference*, so without this a
     /// `backward()` called after `optimizer.step()` differentiates at the new
     /// weights and returns a plausible number with no message -- which is the
-    /// failure `docs/CAPTURE.md` §9-1 already records one other instance of,
+    /// failure `docs/graph/CAPTURE.md` §9-1 already records one other instance of,
     /// and the reason a refusal by name is worth more here than a recomputed
     /// answer would be. Recomputing is not on the table anyway: the trace has
     /// no record of how its constants were produced, because they were made
@@ -1558,7 +1558,7 @@ impl PyCaptureTrace {
                  it by reference, so replaying or differentiating it now would silently \
                  answer at the new value instead of the one the region ran on. Capture the \
                  region again after the update -- e.g. call trace.backward() before \
-                 optimizer.step(), not after (docs/BACKWARD6.md)"
+                 optimizer.step(), not after (docs/training/BACKWARD6.md)"
             )));
         }
         Ok(())
@@ -1816,7 +1816,7 @@ pub fn capture_end(py: Python<'_>, outputs: &Bound<'_, PyAny>) -> PyResult<PyCap
 
 /// Throw the eager tape away, releasing every intermediate it held.
 ///
-/// **This is W9.** `docs/BACKWARD5.md` §3 measured what is being released:
+/// **This is W9.** `docs/training/BACKWARD5.md` §3 measured what is being released:
 /// 18.9 MiB at `S=8`, 75.7 at 32, 302.6 at 128 for SmolLM2-135M, distinct
 /// storages, held for one iteration -- which §3 also established is what
 /// upstream already pays for the same program. The lifetime rule is upstream's
@@ -1854,7 +1854,7 @@ pub fn eager_tape_size() -> usize {
     })
 }
 
-/// **W11** (docs/BACKWARD8.md §4): how many bytes of tensor the eager tape is
+/// **W11** (docs/training/BACKWARD8.md §4): how many bytes of tensor the eager tape is
 /// keeping alive that nothing else would.
 ///
 /// Exists because RSS is not an instrument on this machine. The decode-loop
@@ -1863,7 +1863,7 @@ pub fn eager_tape_size() -> usize {
 /// thousand nodes; retaken with `ps -o rss=` it reported a growth that then
 /// went **negative by 599 MiB** between two consecutive steps, because eight
 /// other agents were on the machine and pages were reclaimed underneath it.
-/// `docs/BACKWARD7.md` §8 already recorded this machine corrupting a
+/// `docs/training/BACKWARD7.md` §8 already recorded this machine corrupting a
 /// measurement. A number the tape computes about itself cannot be corrupted
 /// that way, and it is the number the bound in `EAGER_MAX_NODES` is about.
 ///
@@ -1954,7 +1954,7 @@ pub fn eager_reason() -> Option<String> {
 ///
 /// **The reuse is the point.** This function builds no derivative rules. It
 /// projects the `Recorder` onto a `PyCaptureTrace` -- which is legal because
-/// `docs/BACKWARD5.md` §4 found `Recorder` already holds four of the five
+/// `docs/training/BACKWARD5.md` §4 found `Recorder` already holds four of the five
 /// things `tape::backward` reads -- pairs it with the fifth, an `Env` made out
 /// of `node_objects` **without replaying anything**, and calls
 /// `tape::backward_in`. All 60 rules, `derivative()`, `wrt_set()`,
@@ -1962,18 +1962,18 @@ pub fn eager_reason() -> Option<String> {
 /// called them.
 ///
 /// `reachable()` in particular was expected to need replacing
-/// (`docs/BACKWARD5.md` §4, last paragraph). It did not. With no trace inputs
+/// (`docs/training/BACKWARD5.md` §4, last paragraph). It did not. With no trace inputs
 /// -- an eager tape has none, everything it reads from outside is a constant --
 /// its rule "a node is needed if it reads a wanted constant or a needed node"
-/// **is** the propagated `requires_grad` flag `docs/BACKWARD4.md` installed,
+/// **is** the propagated `requires_grad` flag `docs/training/BACKWARD4.md` installed,
 /// computed from the same information one step earlier.
 ///
-/// **Wired into `Tensor.backward()` since `docs/BACKWARD9.md`.** It kept its
+/// **Wired into `Tensor.backward()` since `docs/training/BACKWARD9.md`.** It kept its
 /// name: `_ImperativeEngine.run_backward` in `bootstrap.py` is a translation
 /// onto this function and holds no derivative rule, no traversal and no
 /// lifetime rule of its own. What it adds is upstream's shape -- `.grad`
 /// accumulation, `allow_unused`, `inputs=`, and the two flags that tell
-/// `Tensor.backward()` from `torch.autograd.grad()`. `docs/BACKWARD7.md` §6
+/// `Tensor.backward()` from `torch.autograd.grad()`. `docs/training/BACKWARD7.md` §6
 /// was the list of what stood between the two.
 #[pyfunction]
 #[pyo3(name = "_eager_backward")]
@@ -2043,7 +2043,7 @@ pub fn eager_backward<'py>(
     // rather than differentiated at its new value.
     //
     // **W10a's freshness check, and what a real model did to it**
-    // (docs/BACKWARD8.md §2). `docs/BACKWARD7.md` §10 row 3 predicted that a
+    // (docs/training/BACKWARD8.md §2). `docs/training/BACKWARD7.md` §10 row 3 predicted that a
     // mid-forward buffer write would be refused here where upstream answers,
     // and named two: a KV cache and a batch-norm running statistic. Measured,
     // both, on real models:
@@ -2071,7 +2071,7 @@ pub fn eager_backward<'py>(
         return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
             "{}\n\nThere is no region to capture again: this is the eager tape, and the \
              write happened between the op that read this tensor and backward() \
-             (docs/BACKWARD8.md §2). Take the gradient before the write -- backward() \
+             (docs/training/BACKWARD8.md §2). Take the gradient before the write -- backward() \
              before optimizer.step(), not after -- or run the write under torch.no_grad() \
              on a tensor no graph depends on",
             stale.value(py).str().map(|s| s.to_string()).unwrap_or_default()
@@ -2079,7 +2079,7 @@ pub fn eager_backward<'py>(
     }
 
     // Which constants a gradient is wanted for: upstream's rule, read off the
-    // flag `docs/BACKWARD4.md` landed. `wrt_set` does the dtype half.
+    // flag `docs/training/BACKWARD4.md` landed. `wrt_set` does the dtype half.
     let selected: Vec<usize> = match wrt.filter(|value| !value.is_none()) {
         Some(value) => {
             let wanted: Vec<Bound<'py, PyAny>> = value.extract()?;
@@ -2125,7 +2125,7 @@ pub fn eager_backward<'py>(
     // whole forward because a `CaptureTrace` kept only shapes; here the values
     // are the ones the program computed, so the gradient is taken at the point
     // the forward actually ran -- which is also why a random draw is safe on
-    // this path and refused on the other (docs/CAPTURE.md §9-1).
+    // this path and refused on the other (docs/graph/CAPTURE.md §9-1).
     let env = Env {
         inputs: Vec::new(),
         consts: trace.const_objects.iter().map(|c| c.clone_ref(py)).collect(),
@@ -2191,7 +2191,7 @@ fn eager_missing(py: Python<'_>, output: &Bound<'_, PyAny>, generic: &str) -> Py
             "torch._C eager: Trying to backward through the graph a second time -- the \
              saved intermediate values have already been freed. This is upstream's \
              retain_graph=False default, and it is the whole of the lifetime rule: a \
-             backward consumes the graph it walks (docs/BACKWARD5.md §3 measured what is \
+             backward consumes the graph it walks (docs/training/BACKWARD5.md §3 measured what is \
              being released -- 302.6 MiB for SmolLM2-135M at S=128). Run the forward again, \
              or keep a reference to what you need, or pass retain_graph=True",
         );

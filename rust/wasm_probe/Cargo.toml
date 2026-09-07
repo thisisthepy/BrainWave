@@ -38,7 +38,7 @@ half = "2.7"
 # (`rand` 0.8 pulls 0.3, `rand` 0.9 pulls 0.4), so both have to be pinned.
 #
 # The fact that this block is necessary is itself the finding: see
-# docs/WASM.md §1c. `wasm32-wasip1` needs none of it.
+# docs/platform/WASM.md §1c. `wasm32-wasip1` needs none of it.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 getrandom_03 = { package = "getrandom", version = "0.3", features = ["wasm_js"] }
 getrandom_04 = { package = "getrandom", version = "0.4", features = ["wasm_js"] }
@@ -52,7 +52,7 @@ getrandom_04 = { package = "getrandom", version = "0.4", features = ["wasm_js"] 
 # -- abi3-py313 plus extension-module -- build for wasm".
 [features]
 pyo3-route = ["dep:pyo3"]
-# docs/WASM.md §7 (this session's addition): an unresolvable `extern "C"`
+# docs/platform/WASM.md §7 (this session's addition): an unresolvable `extern "C"`
 # symbol, exposed as its own pyfunction, for the aborting-stub negative
 # control against a *real* Emscripten CPython host. Off by default -- it is
 # never linkable, on purpose, so it must not be part of the artefact anyone

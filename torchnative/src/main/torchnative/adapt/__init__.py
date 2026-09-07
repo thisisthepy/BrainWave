@@ -24,13 +24,13 @@ reverting and shipping the result lives on ``torchnative.delta.Delta``, once,
 for every method. :class:`Tent` below is 40 lines because of that.
 
 **How the step is taken here, and why it is not ``loss.backward()``.**
-``Tensor.backward()`` refuses on this stack and docs/BACKWARD.md §8 says why:
+``Tensor.backward()`` refuses on this stack and docs/training/BACKWARD.md §8 says why:
 it would need a node per op and a flag that propagates, which is upstream's
 ``VariableType`` half. What exists instead is a tape over a *captured region* --
 so an adaptation step records the forward, seeds the gradient at the objective,
 walks the record backwards and hands the gradients to a real ``torch.optim``
 optimiser. The consequence a caller can see is that **an adaptation step is
-subject to every refusal capture makes** (docs/CAPTURE.md §4): no ``.item()``
+subject to every refusal capture makes** (docs/graph/CAPTURE.md §4): no ``.item()``
 inside the region, no in-place ops, no unseeded randomness. The forward still
 runs when capture refuses -- capture is an observation -- but the *step* does
 not, and says which op stopped it.
@@ -198,7 +198,7 @@ def _logits_of(outputs):
 def _tensor_inputs(args, kwargs):
     """Every tensor the traced region is a function of, in a stable order.
 
-    Capture burns in every tensor it was not handed (docs/CAPTURE.md §2), so a
+    Capture burns in every tensor it was not handed (docs/graph/CAPTURE.md §2), so a
     tensor argument that is *not* declared here becomes a constant -- and a
     constant is a gradient target. Missing one would therefore not fail loudly;
     it would put a gradient somewhere nobody asked for. Nested lists and tuples
@@ -228,8 +228,8 @@ class Adapted(torch.nn.Module):
 
     ``offline`` is the default and is *exactly* the wrapped model: ``forward``
     calls it and returns, with nothing recorded and nothing updated. That is
-    load-bearing rather than tidy -- docs/ADAPT.md §7 re-measures the prefill
-    logits sha256 through this wrapper at every length docs/SEQLEN.md records,
+    load-bearing rather than tidy -- docs/models/ADAPT.md §7 re-measures the prefill
+    logits sha256 through this wrapper at every length docs/numerics/SEQLEN.md records,
     and an adaptation API that moves a plain forward is a bug.
 
     ``online()`` opens a :class:`~torchnative.delta.Delta` over the method's
@@ -348,7 +348,7 @@ class Adapted(torch.nn.Module):
         ``mu * (w - w_global)`` on the gradient of every adapted parameter
         (Li et al. 2020, §3).  Without a hook there is nowhere to put it, and
         an aggregator that called itself FedProx while doing FedAvg's
-        arithmetic would report success -- docs/DESIGN.md §6 puts that below a
+        arithmetic would report success -- docs/design/DESIGN.md §6 puts that below a
         refusal, so :class:`torchnative.nn.federated.FedProx` refuses to
         aggregate at all unless it has installed one of these.
 
@@ -426,7 +426,7 @@ class Adapted(torch.nn.Module):
         if self._steps == 0:
             # Once, on the first step. `differentiable()` answers "what stops
             # this model" without running a backward and reading an exception
-            # (docs/BACKWARD.md §1.2), and the first step is where a model that
+            # (docs/training/BACKWARD.md §1.2), and the first step is where a model that
             # cannot be adapted at all should say so -- with the whole list,
             # rather than with whichever missing rule the walk happened to reach
             # first. Skipped afterwards because the trace shape does not change
@@ -481,7 +481,7 @@ class Adapted(torch.nn.Module):
 
         By object identity, which is what ties "the gradient of the objective
         with respect to this parameter" to "the gradient at this constant"
-        (docs/BACKWARD.md §1.2). A selected parameter that is *not* a constant
+        (docs/training/BACKWARD.md §1.2). A selected parameter that is *not* a constant
         of this trace did not participate in this forward, and that is refused
         rather than skipped -- silently adapting a subset of what was asked for
         is the failure this class is arranged against.

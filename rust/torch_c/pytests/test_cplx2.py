@@ -1,11 +1,11 @@
 """The complex ops `fnet` and `llama4`'s vision tower stop on.
 
-`docs/COMPLEX2.md` built `Repr::Complex { re, im }` and taught it twelve ops.
-`docs/BIND3.md` §6 then measured *exactly* which further ops two architectures
+`docs/kernels/COMPLEX2.md` built `Repr::Complex { re, im }` and taught it twelve ops.
+`docs/bindings/BIND3.md` §6 then measured *exactly* which further ops two architectures
 still stop on, and this file is the proof for the round that taught them:
 `aten._to_copy.default` (real -> complex), `aten.slice.Tensor`,
 `aten.constant_pad_nd.default`, `aten.view.default` / `aten._unsafe_view.default`,
-and `aten.complex.default`. docs/COMPLEX3.md.
+and `aten.complex.default`. docs/kernels/COMPLEX3.md.
 
 **Why every assertion here is about the imaginary part.**
 
@@ -13,7 +13,7 @@ Four of the five are *shape* ops, and a shape op is the easiest place in this
 representation to be wrong while looking right. Writing `slice` as "narrow
 `re`, hand back a `Dense`" gives a result with the correct shape, the correct
 element count and a plausible magnitude; so does "narrow both halves but pad
-only `re`". `docs/COMPLEX2.md` §2.3 measured what that class of mistake costs
+only `re`". `docs/kernels/COMPLEX2.md` §2.3 measured what that class of mistake costs
 -- six of ten sampled ops computing silently once the central refusal was
 nullified -- and none of those six was detectable by a shape check.
 
@@ -33,7 +33,7 @@ So:
 
 Two narrowings are asserted *as narrowings* rather than left to be found:
 upstream's `slice` and `view` return aliases of their base and these return
-copies, for the reason `view_as_complex` already copies (docs/COMPLEX2.md §6)
+copies, for the reason `view_as_complex` already copies (docs/kernels/COMPLEX2.md §6)
 -- a pair of tensors cannot alias an interleaved buffer.
 
 Nothing here needs numpy or a network. It does need the vendored shim
@@ -281,7 +281,7 @@ def _pairs_of(value):
 def test_to_copy_builds_a_complex_tensor_from_a_real_one():
     """`x.to(torch.complex64)`, element-wise against upstream on both halves.
 
-    `docs/BIND3.md` §6 item 1: this refuses with "dtype not storable by the
+    `docs/bindings/BIND3.md` §6 item 1: this refuses with "dtype not storable by the
     candle backend", it is the *first* op of every `torch.fft.fftn`
     decomposition, and nothing downstream of it was reachable.
 
@@ -331,7 +331,7 @@ def test_to_copy_widens_both_halves_and_not_just_the_real_one():
 def test_slice_keeps_the_imaginary_part_on_every_form():
     """Five slices, including a negative range and two strides.
 
-    `docs/BIND3.md` §6 measured this refusing on a genuine shim complex tensor
+    `docs/bindings/BIND3.md` §6 measured this refusing on a genuine shim complex tensor
     (an `stft` output), which is half of why `fft_fftn`'s `s=` was out of reach
     independently of `_to_copy`.
 
@@ -389,14 +389,14 @@ def test_constant_pad_nd_pads_both_halves_and_splits_a_non_zero_fill():
 
 
 def test_view_reshapes_both_halves_at_llama4s_own_shape():
-    """`docs/BIND3.md` §5's wall, and the only complex op that tower needed.
+    """`docs/bindings/BIND3.md` §5's wall, and the only complex op that tower needed.
 
     `Llama4VisionRotaryEmbedding` -> `reshape_for_broadcast` ->
     `freqs_ci.view(*shape)`, refused because `view` was not among the taught
     ops. `view_llama4` is that call's shape.
 
     The wildcard is resolved against `re.elem_count()`, which is the *complex*
-    element count: `Repr::Complex`'s shape is `re`'s shape (docs/COMPLEX2.md
+    element count: `Repr::Complex`'s shape is `re`'s shape (docs/kernels/COMPLEX2.md
     §1.2), so there is no trailing 2 to correct for. Resolving against twice
     that would put the wrong extent in the wildcard and still satisfy every
     check made on `re` alone, which is why the shape is asserted as a value
@@ -419,7 +419,7 @@ def test_view_reshapes_both_halves_at_llama4s_own_shape():
 
 
 def test_complex_constructor_and_its_two_refusals():
-    """The third row of `docs/BIND3.md` §6's table.
+    """The third row of `docs/bindings/BIND3.md` §6's table.
 
     Both refusals are transcribed from a live upstream in the same run rather
     than from the C++, and compared byte for byte, because a message that has
@@ -451,14 +451,14 @@ def test_complex_constructor_and_its_two_refusals():
 def test_the_fftn_shape_path_composes_end_to_end():
     """pad -> slice -> `_fft_c2c`, and real -> `_to_copy` -> `_fft_c2c`.
 
-    `docs/BIND3.md` §6 traced `torch.fft.fftn` upstream and got
+    `docs/bindings/BIND3.md` §6 traced `torch.fft.fftn` upstream and got
     `_to_copy(dtype=complex64)`, then `slice.Tensor` and `constant_pad_nd` when
     `s=` is given, then `_fft_c2c`. Each of those four is proven separately
     above; this runs them in sequence, because the failure a per-op test cannot
     see is a result that is individually right and does not compose -- a
     non-contiguous half that the next kernel reads through the wrong layout.
 
-    `_fft_c2c` was already correct on a complex tensor (docs/FFT.md); what is
+    `_fft_c2c` was already correct on a complex tensor (docs/kernels/FFT.md); what is
     new is that its *input* can now be built from real data.
     """
     shim, up = _both()
@@ -479,7 +479,7 @@ def test_the_fftn_shape_path_composes_end_to_end():
 def test_slice_and_view_copy_where_upstream_aliases():
     """Upstream's `slice` and `view` return views of their base; these copy.
 
-    Same narrowing as `view_as_complex` (docs/COMPLEX2.md §6) and the same
+    Same narrowing as `view_as_complex` (docs/kernels/COMPLEX2.md §6) and the same
     cause: a pair of real tensors cannot alias an interleaved buffer, and
     `view_as_complex` allocates unconditionally, so **no complex tensor in this
     shim shares storage with anything.** That makes the difference
@@ -488,7 +488,7 @@ def test_slice_and_view_copy_where_upstream_aliases():
     rather than leaving a reader to find it.
 
     If either of these ever becomes `True`, that is an *improvement* and the
-    fix is to remove the narrowing from docs/COMPLEX3.md first.
+    fix is to remove the narrowing from docs/kernels/COMPLEX3.md first.
     """
     shim, up = _both()
     if shim is None:
@@ -499,7 +499,7 @@ def test_slice_and_view_copy_where_upstream_aliases():
     )
     assert up["view_aliases_its_base"] is True
     assert shim["slice_aliases_its_base"] is False, (
-        "the shim's complex slice now aliases its base. docs/COMPLEX3.md "
+        "the shim's complex slice now aliases its base. docs/kernels/COMPLEX3.md "
         "records the copy as a narrowing; remove it there before removing it "
         "here."
     )
@@ -596,7 +596,7 @@ def test_the_five_taught_keys_are_all_still_dispatchable():
     it must stay in `_aten_implemented()`; `aten.complex.default` returns a
     complex tensor, which golden cannot read, so it must stay *out* of it and
     in the parked list. Getting this backwards is how an op silently stops
-    being compared (docs/COMPLEX2.md's note on `IMPLEMENTED_AWAITING_GOLDEN`).
+    being compared (docs/kernels/COMPLEX2.md's note on `IMPLEMENTED_AWAITING_GOLDEN`).
     """
     implemented = set(_C._aten_implemented())
     parked = set(_C._aten_implemented_awaiting_golden())

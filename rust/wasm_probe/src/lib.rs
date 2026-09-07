@@ -6,7 +6,7 @@
 //! on this target", not "candle compiles at all".
 //!
 //! It is deliberately not a `#[test]`: there is no wasm runtime on this
-//! machine (docs/WASM.md §0), so the question that can be answered here is
+//! machine (docs/platform/WASM.md §0), so the question that can be answered here is
 //! compilation, not execution. Everything below is therefore written to fail
 //! at *compile* time if an item is missing, and the bodies exist only to stop
 //! the optimiser from making the references vanish.
@@ -62,7 +62,7 @@ pub fn probe_storage() -> candle_core::Result<(Shape, usize)> {
 }
 
 /// The whole of `quant.rs`: `QTensor`, `QStorage`, `QMatMul`, `GgmlDType`.
-/// This is the block that `docs/CANDLE_DEPS.md` says sits next to the
+/// This is the block that `docs/design/CANDLE_DEPS.md` says sits next to the
 /// `cfg(not(target_arch = "wasm32"))`-gated `quantized::tokenizer` module, so
 /// it is the one most likely to disappear on this target.
 pub fn probe_quantized() -> candle_core::Result<Tensor> {
@@ -118,7 +118,7 @@ pub fn probe_errors(e: &candle_core::Error) -> bool {
 /// Layer 3, part two: a plain C entry point so the `cdylib` can be `dlopen`ed
 /// and driven from outside.
 ///
-/// It exists because of a false positive recorded in docs/WASM.md §7.1: the
+/// It exists because of a false positive recorded in docs/platform/WASM.md §7.1: the
 /// emscripten `cdylib` link exits 0 while producing a **65-byte** `.wasm`,
 /// because `--gc-sections` discards everything not reachable from an export.
 /// `#[no_mangle] pub extern "C"` is the cheapest thing that makes candle
@@ -180,7 +180,7 @@ pub mod pyo3_route {
         Ok(n)
     }
 
-    // docs/WASM.md §7.5a ran this control against a *synthetic* stub host that
+    // docs/platform/WASM.md §7.5a ran this control against a *synthetic* stub host that
     // this crate itself generated (`gen_pystubs.py`). That leaves open whether
     // a real CPython's Emscripten dynamic linker behaves the same way. This
     // repeats the control against whatever host actually loads the module --

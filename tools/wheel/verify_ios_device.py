@@ -17,7 +17,7 @@ is not caution. It is dyld:
         need 'macOS'))
 
 So "run it and see" is unavailable, on both machines this repository has. That
-left the device column of docs/WHEEL.md §7.0 at *built* -- the artefact is a
+left the device column of docs/platform/WHEEL.md §7.0 at *built* -- the artefact is a
 device Mach-O, its tag is one an installer matches -- with everything after it
 blank, and with a note saying a device is required.
 
@@ -25,7 +25,7 @@ blank, and with a note saying a device is required.
 differ in exactly one thing that matters at load time, and it is checkable here:
 
   * the **simulator** extension resolves its CPython symbols by flat
-    `-undefined dynamic_lookup` (docs/WHEEL.md §7.1). All 118 of them are marked
+    `-undefined dynamic_lookup` (docs/platform/WHEEL.md §7.1). All 118 of them are marked
     `dynamically looked up` in its symbol table; the file names no Python
     dependency at all.
   * the **device** extension has no libpython to fall back on, so it links
@@ -69,12 +69,12 @@ Specifically still open, and a device is the only way to close them:
     has to *find* `@rpath/Python.framework/Python` at load time, which depends
     on the embedding app's `LC_RPATH` and on the framework being in the bundle.
     This script reads a framework off a shared cache directory; an app resolves
-    `@rpath` against `@executable_path/Frameworks` (docs/IOS.md §10).
+    `@rpath` against `@executable_path/Frameworks` (docs/platform/IOS.md §10).
   * **code signing.** Every Mach-O in an iOS app bundle must be signed with a
     profile the device trusts. Nothing here signs anything.
   * **`import torch` completing.** The simulator needed a `_multiprocessing`
     stub and a UIKit-loaded process to get through `torch/__init__.py`
-    (docs/IOS.md §4, §5). Whether a real app satisfies those is unmeasured.
+    (docs/platform/IOS.md §4, §5). Whether a real app satisfies those is unmeasured.
   * **any kernel computing**, and any number about how fast.
 
 The ladder, and where the device wheel stands on it, is printed at the end of
@@ -431,7 +431,7 @@ def check_same_but_the_binary(device: Path, sibling: Path, findings: Findings,
     imported 2,372 vendored Python modules inside a simulator; if those files
     are the same bytes here, the device wheel's *Python* half is as verified as
     the simulator's. It is only the Mach-O half that is a separate artefact --
-    which is the point docs/WHEEL.md §7.4 makes, stated as a measurement rather
+    which is the point docs/platform/WHEEL.md §7.4 makes, stated as a measurement rather
     than as a caveat.
     """
     with zipfile.ZipFile(device) as a, zipfile.ZipFile(sibling) as b:
@@ -534,7 +534,7 @@ def ladder(link_findings: Findings, compare_findings: Findings,
           "@rpath/Python.framework/Python\n"
           "  in a real app bundle, code signing, `import torch` completing, "
           "any kernel computing,\n"
-          "  and every performance number. See docs/IOS.md §10.")
+          "  and every performance number. See docs/platform/IOS.md §10.")
     return rows
 
 
@@ -600,7 +600,7 @@ def self_test(device: Path, sibling: Path | None) -> int:
         record("an SDK with no .tbd stubs", "blind", findings, "no stub in the SDK")
 
         # 4. The simulator slice in the device wheel's place. This is the
-        #    substitution docs/WHEEL.md §7.4 says nothing else distinguishes.
+        #    substitution docs/platform/WHEEL.md §7.4 says nothing else distinguishes.
         if sibling is not None:
             with zipfile.ZipFile(sibling) as zf:
                 sim = zf.read("torch/_C.abi3.so")

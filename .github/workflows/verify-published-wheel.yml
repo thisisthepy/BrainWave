@@ -51,11 +51,11 @@ jobs:
           #     no simulator CPython at
           #     .../caches/target-python/arm64-iphonesimulator
           #
-          # docs/TARGET_PYTHON.md identified that distribution afterwards: a local
+          # docs/platform/TARGET_PYTHON.md identified that distribution afterwards: a local
           # build of CPython's own in-tree `iOS/` support at a pinned commit, with
           # no published URL. So this job builds an equivalent one itself (see the
           # `Build the arm64-iphonesimulator CPython` step below) rather than
-          # expecting it to already exist. docs/IOS_CI.md and docs/IOS_CI2.md
+          # expecting it to already exist. docs/platform/IOS_CI.md and docs/platform/IOS_CI2.md
           # record the sizing and what is, and is not, verified here.
           - os: macos-15
             label: ios-simulator-arm64
@@ -63,7 +63,7 @@ jobs:
     name: ${{ matrix.label }}
 
     # The CPython commit this project's iOS distributions were built from
-    # (docs/TARGET_PYTHON.md §1). Pinned, not "latest 3.13", because the iOS
+    # (docs/platform/TARGET_PYTHON.md §1). Pinned, not "latest 3.13", because the iOS
     # cross-build needs a same-version *host* interpreter to run its own build
     # scripts, and the wheel's ABI tag was produced against this exact source.
     env:
@@ -101,7 +101,7 @@ jobs:
           echo "version=$(xcodebuild -version | head -1 | tr ' ' '_')" >> "$GITHUB_OUTPUT"
 
       # Keyed on the pinned commit and the runner's Xcode version, per
-      # docs/TARGET_PYTHON.md's sizing: 30-60 minutes to build host-python, the
+      # docs/platform/TARGET_PYTHON.md's sizing: 30-60 minutes to build host-python, the
       # four dependencies and the iphonesimulator configuration is not a cost
       # worth paying on every run.
       - name: Cache the iOS-simulator CPython
@@ -115,7 +115,7 @@ jobs:
       # UNTESTED on a hosted runner -- see the coordinating report. Follows
       # CPython's own iOS/README.rst build procedure (fetched and read at the
       # pinned commit while writing this) plus prebuilt dependency archives from
-      # beeware/cpython-apple-source-deps, the same source docs/TARGET_PYTHON.md
+      # beeware/cpython-apple-source-deps, the same source docs/platform/TARGET_PYTHON.md
       # names as the recipe. Two independent checkouts of the same commit: one
       # built as a plain macOS host interpreter (needed to run the cross build's
       # own Python scripts), one cross-configured for the simulator.

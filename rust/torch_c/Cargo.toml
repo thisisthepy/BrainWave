@@ -28,7 +28,7 @@ pyo3 = { version = "0.29.2", features = ["extension-module", "abi3-py313"] }
 # future upstream default can never quietly link Accelerate/Metal/MKL/CUDA into
 # a device build.
 #
-# Accelerate is enabled per-target below rather than here. docs/PERF.md has the
+# Accelerate is enabled per-target below rather than here. docs/perf/PERF.md has the
 # measurement: without it a two-layer block runs 7.0x upstream, with it 0.97x,
 # and the golden suite is 2258/2258 either way -- which had to be checked rather
 # than assumed, BLAS being free to accumulate in a different order. It is
@@ -38,7 +38,7 @@ candle-core = { version = "0.11.0", default-features = false }
 # The GEMM `candle-core` calls when no BLAS feature is on -- which is every
 # non-Apple target, Android included. Named here only so `lib.rs` can reach
 # `gemm::set_threading_threshold`; the version is the one candle-core already
-# resolves, so this adds no code to the artefact (docs/PERF_ANDROID.md §4
+# resolves, so this adds no code to the artefact (docs/perf/PERF_ANDROID.md §4
 # records the before/after sizes).
 #
 # The coupling is deliberate and it is the reason to keep the version pinned
@@ -54,7 +54,7 @@ gemm = "0.19.0"
 # It is the reference implementation and not merely a convenience type. Every
 # kernel in `reduced.rs` is checked bitwise against the `half` function it
 # replaces -- over all 65536 bit patterns where that set is finite -- and the
-# numbers docs/BF16.md pinned this shim to were produced by these very
+# numbers docs/numerics/BF16.md pinned this shim to were produced by these very
 # functions, so "agrees with `half`" and "agrees with what shipped" are one
 # statement rather than two.
 half = "2.7"
@@ -65,7 +65,7 @@ half = "2.7"
 #
 # One call site: `tensor.rs::flat_storage` and the `WriteThrough` arm beside it,
 # which is what lets an in-place op write through a `float8_e4m3fn` view
-# (docs/FLOAT8C.md §3). `CpuStorage::F8E4M3(Vec<F8E4M3>)` cannot be matched
+# (docs/numerics/FLOAT8C.md §3). `CpuStorage::F8E4M3(Vec<F8E4M3>)` cannot be matched
 # without naming the type, and candle-core does not re-export it.
 #
 # Note what this dependency is *not* for: it is not a way to reach the crate's
@@ -111,7 +111,7 @@ ash = { version = "0.38", default-features = false, features = ["loaded", "std",
 # `.cargo/config.toml` rather than adding to them, which silently drops this
 # crate's `-undefined dynamic_lookup` and the host link then fails with a wall
 # of undefined `_Py*` symbols (measured -- same trap as building from the wrong
-# working directory, docs/TORCH_C.md §3). Two `--config`/config-file rustflags
+# working directory, docs/design/TORCH_C.md §3). Two `--config`/config-file rustflags
 # entries for the same target are joined, so the link wiring survives.
 #
 # Why a cfg and not a Cargo feature: a dependency entry's `features = [...]`
@@ -127,11 +127,11 @@ ash = { version = "0.38", default-features = false, features = ["loaded", "std",
 #
 # Why parity wants it: with Accelerate on the host and `gemm` on the device the
 # two ends run different BLAS, so a bit comparison between them can only restate
-# something already known (docs/DEVICE.md §5.1). Off, it is gemm against gemm,
+# something already known (docs/devices/DEVICE.md §5.1). Off, it is gemm against gemm,
 # which is the comparison that can catch a device-specific kernel fault.
 #
 # What must not happen is this going off for a *shipped* build: that is a 7x
-# model-level regression (docs/PERF.md §3) with no other symptom. `parity`
+# model-level regression (docs/perf/PERF.md §3) with no other symptom. `parity`
 # guards the other direction too -- it refuses to measure a host artefact that
 # still links Accelerate, so a cfg key that stops working is a loud failure and
 # not a quietly meaningless comparison.
@@ -141,14 +141,14 @@ candle-core = { version = "0.11.0", default-features = false, features = ["accel
 # Apple only, and a *separate* entry from the Accelerate one above on purpose.
 #
 # Metal is candle's own backend -- `Device::Metal(MetalDevice)` is already a
-# variant of the closed enum that `docs/VULKAN2.md` §5.1 found had nowhere to
+# variant of the closed enum that `docs/devices/VULKAN2.md` §5.1 found had nowhere to
 # put a Vulkan handle. So unlike Vulkan, an `mps` tensor is an **ordinary
 # `candle_core::Tensor`**: it needs no `tensor::Repr` arm, no dispatcher arm and
 # no kernel of ours. The entire difference is `PyDevice::resolve()` learning to
 # return `Device::new_metal(index)`, after which every one of this crate's
 # kernels that already goes through candle runs on the GPU because candle's own
 # op does. That asymmetry is why `mps` landed before `vulkan` this round
-# (docs/VULKAN3.md §1).
+# (docs/devices/VULKAN3.md §1).
 #
 # Why not folded into the entry above: that one is gated on
 # `not(torch_c_no_accelerate)`, which `scripts/device_android.sh parity` sets to
@@ -160,7 +160,7 @@ candle-core = { version = "0.11.0", default-features = false, features = ["accel
 # entries add up to `["accelerate", "metal"]` here and to `["metal"]` alone under
 # the parity cfg, which is what each build wants.
 #
-# Cost, measured on this checkout and recorded in docs/VULKAN3.md §2: it adds
+# Cost, measured on this checkout and recorded in docs/devices/VULKAN3.md §2: it adds
 # the `metal`/`objc2` binding crates and `candle-metal-kernels`, and the shaders
 # are compiled by candle at runtime from source it embeds, so there is no build
 # step and no `.metallib` to ship. It does not reach the Android or wasm targets
@@ -175,7 +175,7 @@ candle-core = { version = "0.11.0", default-features = false, features = ["metal
 #
 # The design argument is the *Metal* one, not the Vulkan one, and that is worth
 # stating before the wiring. `Device::Cuda(CudaDevice)` is already a variant of
-# the closed enum that `docs/VULKAN2.md` §5.1 found had nowhere to put a Vulkan
+# the closed enum that `docs/devices/VULKAN2.md` §5.1 found had nowhere to put a Vulkan
 # handle -- it sits directly beside `Device::Metal`. So a `cuda` tensor is an
 # **ordinary `candle_core::Tensor`**: no `tensor::Repr` arm, no dispatcher arm,
 # no kernel of ours. Adding a `Repr` arm would buy the Vulkan cost instead --
@@ -206,7 +206,7 @@ candle-core = { version = "0.11.0", default-features = false, features = ["metal
 # only, there being no CUDA toolkit for `aarch64-pc-windows-msvc`.
 #
 # **What this costs at build time, measured against the crates rather than
-# assumed** (docs/CUDA.md §2 has the readings and the sources):
+# assumed** (docs/devices/CUDA.md §2 has the readings and the sources):
 #
 # * `candle-core`'s `cuda` feature pins `cudarc` with
 #   `cuda-version-from-build-system` and `dynamic-linking`. The first runs
@@ -240,16 +240,16 @@ candle-core = { version = "0.11.0", default-features = false, features = ["cuda"
 # * `CudaContext::compute_capability()` -- so a GPU older than the one the
 #   kernels were compiled for is refused **by name at `resolve()` time**, before
 #   a kernel launch turns it into `CUDA_ERROR_NO_BINARY_FOR_GPU` several frames
-#   deeper. `docs/CUDA.md` §4 is the taxonomy.
+#   deeper. `docs/devices/CUDA.md` §4 is the taxonomy.
 # * `CudaContext::mem_get_info()` -- the runtime evidence that the GPU is
-#   actually holding the tensors. `docs/MPSATTN.md` §3.1 records how a
+#   actually holding the tensors. `docs/devices/MPSATTN.md` §3.1 records how a
 #   *source-scanning* proof of "it ran on the GPU" can be defeated by moving the
 #   thing it greps for one call deeper; a free-memory reading taken from the
 #   driver cannot be moved out of the way, because it is not a description of
 #   this crate's source at all.
 #
 # The requirement is spelled `0.19.8` because that is `candle-core`'s own; the
-# lock resolves `0.19.9`, and every fact in docs/CUDA.md §2 was re-checked
+# lock resolves `0.19.9`, and every fact in docs/devices/CUDA.md §2 was re-checked
 # against 0.19.9 rather than assumed to carry over.
 #
 # The feature list is candle's own, copied rather than narrowed **on purpose**:

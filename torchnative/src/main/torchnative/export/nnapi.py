@@ -3,9 +3,9 @@
 ## The question that decides the shape of this module
 
 Upstream ships a real NNAPI serialiser in the vendored tree,
-`torch/backends/_nnapi/serializer.py`. docs/DECOMP.md §12 read its `ADDER_MAP`
+`torch/backends/_nnapi/serializer.py`. docs/graph/DECOMP.md §12 read its `ADDER_MAP`
 for the *operator set*. The next question is whether the same file can be
-*driven*, or only read. The answer is the first line of docs/NPU.md, and it is
+*driven*, or only read. The answer is the first line of docs/graph/NPU.md, and it is
 neither yes nor no:
 
     `_NnapiSerializer.serialize_model(model, inputs)` needs a TorchScript IR
@@ -29,7 +29,7 @@ is `to_jit_module` and `_SIGNATURES`.
 
 ## Why `_SIGNATURES` has to exist, and what it is not
 
-docs/DECOMP.md §12.2 flagged this and left it as a caveat; here it becomes a
+docs/graph/DECOMP.md §12.2 flagged this and left it as a caveat; here it becomes a
 concrete obstacle. `ADDER_MAP` is keyed by TorchScript *node kind*
 (`aten::add`), which carries no overload, and every adder then asserts an exact
 `inputsSize()` -- `aten::add` wants three inputs, `aten::_convolution` wants
@@ -66,7 +66,7 @@ blob was run. What it claims:
   A blob that survives it is structurally a well-formed NNAPI model.
 * `verify_shapes()` is the semantic check described above.
 
-None of the three is "this ran on an NPU". docs/NPU.md says so in the same
+None of the three is "this ran on an NPU". docs/graph/NPU.md says so in the same
 words, because merging the two claims is the specific failure this project has
 paid for before.
 """
@@ -699,7 +699,7 @@ def fold_constants(trace):
 
     Folding is done by *executing* the node through `torch._C._aten_dispatch`,
     the same door capture recorded at and the same one `DecomposedTrace.replay`
-    goes back through, for the reason docs/CAPTURE.md §3 gives: what comes out
+    goes back through, for the reason docs/graph/CAPTURE.md §3 gives: what comes out
     is then upstream's own answer rather than a second implementation of the
     op that happens to agree.
 
@@ -912,7 +912,7 @@ def parse_model(model) -> dict:
 
     That is what "structurally validated" means everywhere this project uses
     the phrase for NNAPI, and it is not "executed": no NNAPI runtime exists on
-    a Mac. docs/NPU.md keeps the two claims apart.
+    a Mac. docs/graph/NPU.md keeps the two claims apart.
     """
     data = model.as_bytes() if isinstance(model, NnapiModel) else bytes(model)
     reader = _Reader(data)

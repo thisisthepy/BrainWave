@@ -7,7 +7,7 @@
 // failure this repository keeps paying for. So it gets run on the device too,
 // graded by `check.rs`, the same code that graded `ash`.
 //
-// Like the ash probe: no timings. See docs/VULKAN.md §7.
+// Like the ash probe: no timings. See docs/devices/VULKAN.md §7.
 
 #[path = "check.rs"]
 mod check;
@@ -85,7 +85,7 @@ fn run(gpu: &Gpu, wgsl: &str, a: &[f32], b: &[f32], out_len: usize, dims: [u32; 
     });
     // wgpu has no push constants without a feature, so the shape goes in a
     // uniform. It is still one shader for every shape -- which is the property
-    // that matters, see docs/VULKAN.md §3.
+    // that matters, see docs/devices/VULKAN.md §3.
     let buf_d = dev.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("dims"),
         contents: &dims.iter().flat_map(|v| v.to_ne_bytes()).collect::<Vec<u8>>(),

@@ -3,32 +3,32 @@
 # WHAT THIS JOB PROVES
 #   * that `to_edge_transform_and_lower_to_qnn` runs to completion on a real
 #     `transformers` submodule, with the real `QnnPartitioner` and the real
-#     Qualcomm SDK -- something docs/QNN.md §11 records as never having
+#     Qualcomm SDK -- something docs/devices/QNN.md §11 records as never having
 #     happened ("`lower()` has never executed ... wired, not run");
 #   * that the resulting `.pte` is a QNN program built for the named silicon:
 #     `read_artefact(...).is_qnn`, a delegate named `QnnBackend`, and
-#     `match_device(art, SOC)` (docs/QNN.md §5 step 7);
+#     `match_device(art, SOC)` (docs/devices/QNN.md §5 step 7);
 #   * what `delegated_fraction` actually is for `LlamaMLP` under
-#     `QnnPartitioner`. docs/QNN.md §11 records that number as **UNKNOWN and
+#     `QnnPartitioner`. docs/devices/QNN.md §11 records that number as **UNKNOWN and
 #     possibly poor**. Whatever it is, this job prints it.
 #
 # WHAT THIS JOB PROVES NOTHING ABOUT
 #   * **HTP execution.** Nothing here goes near a Hexagon NPU. A hosted runner
-#     has no Snapdragon in it. docs/QNN.md §6.1 lists four things that would
+#     has no Snapdragon in it. docs/devices/QNN.md §6.1 lists four things that would
 #     prove HTP execution and this job can supply exactly one of them --
 #     (b), the decoded artefact, which §6.1 itself calls "still a claim about
 #     a file". (c) the optrace/QHAS hardware counters and (d) the
 #     skeleton-removal negative control both need the physical device, and
 #     (d) is the one §6.1 says makes it evidence rather than a plan.
 #   * **numbers.** No element-wise comparison against upstream happens here.
-#     docs/QNN.md §7.2 and §11 ("No timing, anywhere").
+#     docs/devices/QNN.md §7.2 and §11 ("No timing, anywhere").
 #
 #   So a green run means "the artefact exists and is what it says it is".
-#   It does not license a single sentence about the NPU. docs/QNN.md §6.4 is
+#   It does not license a single sentence about the NPU. docs/devices/QNN.md §6.4 is
 #   the paragraph that must stay true, and `test_qnn.py`'s
 #   `test_no_claim_is_made_that_anything_ran_on_an_npu` is what keeps it true.
 #
-# The artefact this uploads is the input to docs/QNN.md §5 step 8 -- "copy
+# The artefact this uploads is the input to docs/devices/QNN.md §5 step 8 -- "copy
 # layer0_mlp.pte, qnn_executor_runner and libqnn_executorch_backend.so back to
 # the host that holds the device". Steps 9-14 are still a human with a phone.
 #
@@ -47,11 +47,11 @@ on:
         description: >-
           Qualcomm chipset to build the HTP context binary for. Must be a name
           in ExecuTorch's own QcomChipset table. The default is the device this
-          project actually has (CLAUDE.md §7, docs/QNN.md §5.1: Galaxy Tab S9
+          project actually has (CLAUDE.md §7, docs/devices/QNN.md §5.1: Galaxy Tab S9
           Ultra, ro.soc.model=SM8550, HTP v73) and NOT the SM8650 the doc's
           example line uses -- SM8650 is HTP v75, and an artefact built for v75
           is refused by v73 at backend init with the method load aborting
-          (docs/QNN.md §6.3). Read it off the device with
+          (docs/devices/QNN.md §6.3). Read it off the device with
           `adb shell getprop ro.soc.model` rather than assuming it.
         required: false
         default: "SM8550"
@@ -66,7 +66,7 @@ on:
         default: "HuggingFaceTB/SmolLM2-135M"
       submodule:
         description: >-
-          Dotted path of the submodule to lower. docs/QNN.md §11: "No whole
+          Dotted path of the submodule to lower. docs/devices/QNN.md §11: "No whole
           model, only one submodule" -- layer 0's MLP is the smallest thing
           that makes the claim real.
         required: false
@@ -84,7 +84,7 @@ permissions:
   contents: read
 
 env:
-  # docs/QNN.md §1.1, "The four numbers". Every one of these is pinned, and
+  # docs/devices/QNN.md §1.1, "The four numbers". Every one of these is pinned, and
   # pinned to the value the doc measured rather than to "latest":
   #
   #   executorch 1.4.1        the release §1.3's measurement was taken against
@@ -94,10 +94,10 @@ env:
   #                           is_linux_x86()), so this is ASSERTED here rather
   #                           than installed -- if ExecuTorch's pin has moved,
   #                           the job should say so, not silently lower against
-  #                           a different SDK than docs/QNN.md describes.
+  #                           a different SDK than docs/devices/QNN.md describes.
   #   NDK r26c                "This example is verified with NDK 26c"
   #   transformers 5.15.1     the version pinned in this project's spike-venv,
-  #                           i.e. the one every other claim in docs/QNN.md was
+  #                           i.e. the one every other claim in docs/devices/QNN.md was
   #                           measured under. Not "latest": a Llama attribute
   #                           rename upstream would change which module gets
   #                           lowered without changing this file.
@@ -111,14 +111,14 @@ env:
 
 jobs:
   # ═══════════════════════════════════════════════════════════════════════
-  # The job that carries the claim. docs/QNN.md §5 steps 4, 6 and 7.
+  # The job that carries the claim. docs/devices/QNN.md §5 steps 4, 6 and 7.
   # ═══════════════════════════════════════════════════════════════════════
   lower:
     name: lower layer0 mlp to QNN
 
     # ── The Ubuntu version, decided rather than defaulted ──────────────────
     #
-    # docs/QNN.md §1.1 records Qualcomm's verified host list: "Ubuntu 22.04 LTS
+    # docs/devices/QNN.md §1.1 records Qualcomm's verified host list: "Ubuntu 22.04 LTS
     # (x64), CentOS Stream 9, WSL with Ubuntu 22.04". So the obvious move is
     # `ubuntu-22.04`. It is NOT what this pins, for three reasons, and the
     # third is the one that decides it:
@@ -139,10 +139,10 @@ jobs:
     #
     # It is pinned to `ubuntu-24.04` and not `ubuntu-latest` so that the host
     # this measurement was taken on cannot change under it without a commit --
-    # docs/QNN.md's numbers are keyed to hosts.
+    # docs/devices/QNN.md's numbers are keyed to hosts.
     #
     # If the SDK does turn out to refuse this image, that is a real finding and
-    # docs/QNNCI.md says to record it; the `runner` input exists so it can be
+    # docs/devices/QNNCI.md says to record it; the `runner` input exists so it can be
     # re-run on another image to confirm, WITHOUT editing this file first.
     runs-on: ${{ inputs.runner || 'ubuntu-24.04' }}
 
@@ -154,7 +154,7 @@ jobs:
           python-version: ${{ env.PYTHON_VERSION }}
 
       - name: What we are standing on
-        # docs/QNN.md §1.3's whole argument is about host arch. If this is ever
+        # docs/devices/QNN.md §1.3's whole argument is about host arch. If this is ever
         # not linux/x86_64 the rest of the job is meaningless, so it refuses
         # here by name rather than producing a confusing ImportError later.
         run: |
@@ -168,7 +168,7 @@ jobs:
           if system != "linux" or machine not in ("x86_64", "amd64"):
               sys.exit(
                   f"this job requires a linux x86-64 host and got {system}/{machine}. "
-                  "docs/QNN.md §1.3: the QNN SDK's host libraries exist only under "
+                  "docs/devices/QNN.md §1.3: the QNN SDK's host libraries exist only under "
                   "lib/x86_64-linux-clang and ExecuTorch's installer gates on "
                   "is_linux_x86()."
               )
@@ -176,7 +176,7 @@ jobs:
           PY
 
       - name: Install upstream torch, executorch and transformers
-        # docs/QNN.md §5 step 4. NOTE the deviation from the doc, and the
+        # docs/devices/QNN.md §5 step 4. NOTE the deviation from the doc, and the
         # reason: the doc's step 4 sources `$QNN_SDK_ROOT/bin/envsetup.sh` from
         # a manually installed SDK at /opt/qcom/aistack. That path does not
         # exist on a hosted runner and there is no license-free way to put it
@@ -186,8 +186,8 @@ jobs:
         # taken here. It is the doc's recipe, not a different one.
         #
         # This deliberately does NOT install this project's shim. The lowering
-        # is upstream torch and upstream executorch (docs/QNN.md §2); the shim
-        # would substitute this project's torch.export, which docs/EXPORT5.md
+        # is upstream torch and upstream executorch (docs/devices/QNN.md §2); the shim
+        # would substitute this project's torch.export, which docs/graph/EXPORT5.md
         # §0 measures at 0 of 40 architectures. `tools/ci/qnn_lower.py` asserts
         # the shim is absent rather than trusting this comment.
         run: |
@@ -208,8 +208,8 @@ jobs:
         # `backends/qualcomm/scripts/download_qnn_sdk.py` (via
         # `qnn.qnn_sdk_version()`, which resolves it from `qnn_config.sh` and
         # falls back to the literal) and compared against the pin. It is not
-        # transcribed -- docs/QNN.md §1.1 is explicit that transcribing it is
-        # the mistake. A mismatch FAILS: docs/QNN.md's §1.1 numbers describe
+        # transcribed -- docs/devices/QNN.md §1.1 is explicit that transcribing it is
+        # the mistake. A mismatch FAILS: docs/devices/QNN.md's §1.1 numbers describe
         # 2.37.0.250724, and an artefact built against a different SDK is not
         # the thing this job's header claims to produce.
         run: |
@@ -219,7 +219,7 @@ jobs:
           from torchnative.export import qnn
 
           # The import below is what triggers the SDK download, and it is the
-          # single most likely place for this job to die (docs/QNNCI.md §6
+          # single most likely place for this job to die (docs/devices/QNNCI.md §6
           # item 1: the linux-x86_64 wheel may also lack PyQnnManagerAdaptor,
           # which §1.3 only measured on the macOS arm64 wheel). Letting it
           # raise bare would end the job with a traceback whose top frame is
@@ -234,7 +234,7 @@ jobs:
                   "importing executorch.backends.qualcomm failed on this "
                   "runner, so install_qnn_sdk() never ran.\n"
                   f"qnn_aot_refusal(): {qnn.qnn_aot_refusal()}\n"
-                  "docs/QNNCI.md §6 item 1 and item 2 are the two shapes this "
+                  "docs/devices/QNNCI.md §6 item 1 and item 2 are the two shapes this "
                   "takes. Do NOT weaken qnn_aot_refusal() -- it is reporting "
                   "correctly."
               )
@@ -247,7 +247,7 @@ jobs:
           if version != expected:
               sys.exit(
                   f"ExecuTorch {os.environ['EXECUTORCH_VERSION']} now pins QNN SDK "
-                  f"{version}, not the {expected} that docs/QNN.md §1.1 measured and "
+                  f"{version}, not the {expected} that docs/devices/QNN.md §1.1 measured and "
                   f"this workflow pins. That is a real change, not a flake: re-measure "
                   f"§1.1 and update EXPECTED_QNN_SDK_VERSION in the same commit."
               )
@@ -255,7 +255,7 @@ jobs:
           PY
 
       # ═══════════════════════════════════════════════════════════════════
-      # docs/QNN.md §5 step 6 (lower) and step 7 (verify), in one process.
+      # docs/devices/QNN.md §5 step 6 (lower) and step 7 (verify), in one process.
       #
       # There is no `|| true`, no `continue-on-error` and no `if: always()`
       # on this step, on purpose: it is the step whose failure must stop the
@@ -274,7 +274,7 @@ jobs:
 
       # The report is uploaded even when the run is red, and BEFORE the
       # artefact gate below. When this job fails, `delegation_report.json` is
-      # the thing somebody needs -- docs/QNN.md §11 asked for that number and a
+      # the thing somebody needs -- docs/devices/QNN.md §11 asked for that number and a
       # red run that threw it away would have answered nothing.
       - name: Upload the delegation report (always)
         if: always()
@@ -294,12 +294,12 @@ jobs:
       # difference is the whole design (see tools/ci/qnn_lower.py's docstring):
       #
       #   integrity failed -> not uploaded. The file is not what this job would
-      #     be labelling it. docs/QNN.md §6.2 row 1: it would still load, still
+      #     be labelling it. docs/devices/QNN.md §6.2 row 1: it would still load, still
       #     run and still give the right answer, on the CPU.
       #   coverage failed (delegated_fraction below §5 step 6's 0.9) -> the job
       #     is RED and the artefact IS uploaded. It is a genuine QNN program
       #     that the partitioner barely claimed, which is precisely the
-      #     measurement docs/QNN.md §11 says is missing. Deleting it would be
+      #     measurement docs/devices/QNN.md §11 says is missing. Deleting it would be
       #     deleting the answer.
       #
       # This is not `|| true` on an assertion: the assertion still fails the
@@ -315,7 +315,7 @@ jobs:
           if-no-files-found: error
 
   # ═══════════════════════════════════════════════════════════════════════
-  # The other two files docs/QNN.md §5 step 8 says to copy to the device.
+  # The other two files docs/devices/QNN.md §5 step 8 says to copy to the device.
   # ═══════════════════════════════════════════════════════════════════════
   android-runtime:
     name: build qnn_executor_runner (arm64-v8a)
@@ -326,13 +326,13 @@ jobs:
     # is that this job and `lower` answer different questions and coupling them
     # would let the smaller one suppress the larger:
     #
-    #   * `lower` produces the artefact that carries the claim. docs/QNN.md
+    #   * `lower` produces the artefact that carries the claim. docs/devices/QNN.md
     #     §11 says `lower()` has never executed; that is the gap being closed.
     #   * this job produces `qnn_executor_runner` and
     #     `libqnn_executorch_backend.so`, which are a CONVENIENCE. They are
     #     ordinary ExecuTorch build outputs, they contain nothing measured, and
     #     any Linux x86-64 host with the NDK can produce them by running
-    #     `backends/qualcomm/scripts/build.sh` (docs/QNN.md §5 step 5).
+    #     `backends/qualcomm/scripts/build.sh` (docs/devices/QNN.md §5 step 5).
     #
     # Task item 3 says these are wanted "if the build produces them". An NDK or
     # CMake breakage here must not turn a successful, verified lowering into a
@@ -350,7 +350,7 @@ jobs:
           python-version: ${{ env.PYTHON_VERSION }}
 
       - name: Install NDK r26c
-        # docs/QNN.md §1.1: "This example is verified with NDK 26c". Hosted
+        # docs/devices/QNN.md §1.1: "This example is verified with NDK 26c". Hosted
         # ubuntu runners ship an Android SDK with a *different* NDK default, so
         # the pinned one is installed explicitly rather than inherited --
         # inheriting it would mean the version this builds against changes when
@@ -361,12 +361,12 @@ jobs:
           echo "ANDROID_NDK_ROOT=$ANDROID_HOME/ndk/${ANDROID_NDK_VERSION}" >> "$GITHUB_ENV"
 
       - name: Build ExecuTorch with the QNN backend, AOT + arm64-v8a runtime
-        # docs/QNN.md §5 step 5, verbatim in intent: build.sh produces
+        # docs/devices/QNN.md §5 step 5, verbatim in intent: build.sh produces
         # build-x86/ (the AOT half) and build-android/ (qnn_executor_runner +
         # libqnn_executorch_backend.so) with -DEXECUTORCH_BUILD_QNN=ON,
         # -DANDROID_ABI=arm64-v8a, -DANDROID_PLATFORM=android-30 and
         # -DEXECUTORCH_ENABLE_EVENT_TRACER=ON. The event tracer is not
-        # optional: docs/QNN.md §6.1(c) and §5 step 12 need it for the
+        # optional: docs/devices/QNN.md §6.1(c) and §5 step 12 need it for the
         # optrace/QHAS hardware counters, which are the only per-operation
         # answer to "which unit ran this".
         #

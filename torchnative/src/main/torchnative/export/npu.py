@@ -1,7 +1,7 @@
 """The front end: a real `transformers` model with submodules swapped for a delegate.
 
 This module is deliberately small and deliberately says nothing about any
-vendor. It holds the one shape docs/QNN.md §2 and docs/INTELNPU.md both need:
+vendor. It holds the one shape docs/devices/QNN.md §2 and docs/devices/INTELNPU.md both need:
 
     front (FIXED)      real transformers, from_pretrained, generate
     back  (SWAPPABLE)  Apple -> CoreML ; Android -> ExecuTorch/QNN ; Windows -> Intel
@@ -15,7 +15,7 @@ It does not return a wrapper. That is not a convenience: `generate()` is
 of that, and every forward is a place the wrapper can be wrong. Returning the
 model means there is nothing to forward and nothing to keep in sync.
 
-`docs/QUANT2.md` §3 already framed torchnative's own `quantize_` this way, and
+`docs/graph/QUANT2.md` §3 already framed torchnative's own `quantize_` this way, and
 gave the precedent from the other side -- the archived
 `intel_npu_acceleration_library.compile(model, dtype=torch.int8)` replaces
 leaves and hands the model back too. The user never holds the compiled graph.
@@ -53,7 +53,7 @@ class DelegateRefused(RuntimeError):
     Every refusal in this layer carries the backend's name and the reason,
     because the alternative -- falling back to the eager submodule silently --
     produces a model that is correct, slower than it looks, and indistinguishable
-    from a working delegate by its output. docs/NPU2.md is the record of that
+    from a working delegate by its output. docs/graph/NPU2.md is the record of that
     exact failure costing a round twice.
     """
 
@@ -224,7 +224,7 @@ class NpuModelForCausalLM:
 
     The whole class is one static method and that is the point. The archived
     `intel_npu_acceleration_library` exposed `NPUModelForCausalLM` with the
-    same shape, and docs/QUANT2.md §3 records why this repository already
+    same shape, and docs/graph/QUANT2.md §3 records why this repository already
     agreed with it: the model is a real `transformers` instance, the source is
     not edited, the *instance* is.
 
@@ -245,7 +245,7 @@ class NpuModelForCausalLM:
     stack it has not seen yet.
 
     This class deliberately does **not** know how to produce an artefact. That
-    is offline work on another host (docs/QNN.md §2), and a `from_pretrained`
+    is offline work on another host (docs/devices/QNN.md §2), and a `from_pretrained`
     that quietly compiled something would be doing minutes of work behind a
     call that reads like a download.
     """

@@ -1,11 +1,11 @@
-"""docs/TAIL3.md -- the walls found *behind* the ones the previous round closed.
+"""docs/kernels/TAIL3.md -- the walls found *behind* the ones the previous round closed.
 
 `tools/golden/cases.py` already compares every op below against upstream
 element-wise, and this file deliberately does not repeat that. What is here is
 the part a value comparison structurally cannot hold down:
 
-  * **The matmul striding verdict.** `docs/ARCH100.md` classified
-    `MatMulUnexpectedStriding` a backend limitation and `docs/SETITEM.md`
+  * **The matmul striding verdict.** `docs/architectures/ARCH100.md` classified
+    `MatMulUnexpectedStriding` a backend limitation and `docs/bindings/SETITEM.md`
     proposed `contiguous()` as the fix. The operands are *already contiguous*,
     so `contiguous()` is a no-op there -- and a golden case that passes says
     nothing about *why*. `test_the_refused_matmul_operands_were_already_
@@ -209,7 +209,7 @@ rec("as_strided", lambda: torch.arange(10.0).as_strided((3, 3), (1, 1)))
 
 # The write that upstream propagates into the base and this shim refuses.
 # Recorded on both sides: upstream must SUCCEED here, or the refusal below is
-# gratuitous rather than a narrowing. docs/STRIDED.md 4.
+# gratuitous rather than a narrowing. docs/kernels/STRIDED.md 4.
 def _as_strided_write():
     x = torch.arange(10.0)
     y = x.as_strided((3, 3), (1, 1))
@@ -294,7 +294,7 @@ def _agree(name, atol=1e-9, rtol=1e-9):
 
 
 def test_the_refused_matmul_operands_were_already_contiguous():
-    """The layouts `docs/ARCH100.md` printed, checked as arithmetic.
+    """The layouts `docs/architectures/ARCH100.md` printed, checked as arithmetic.
 
     Each of the three sweep refusals prints its operand layout. A stride
     vector is the contiguous one exactly when it is the reversed cumulative
@@ -318,7 +318,7 @@ def test_the_refused_matmul_operands_were_already_contiguous():
         assert stride == want, (
             f"{arch}: the refused lhs was NOT contiguous after all "
             f"(stride {stride}, contiguous would be {want}). If this ever "
-            "fires, the docs/TAIL3.md verdict needs re-deriving -- a "
+            "fires, the docs/kernels/TAIL3.md verdict needs re-deriving -- a "
             "contiguous() might genuinely help for that shape."
         )
         assert len(shape) - 2 >= 3, (
@@ -396,7 +396,7 @@ def test_eye_is_the_wall_four_lines_behind_the_matmul_fold():
 def test_the_two_new_kernels_are_the_only_new_arithmetic():
     """Six ops landed; four of them are bodies that already existed.
 
-    docs/TAIL3.md reports the split, and this is the check that keeps the
+    docs/kernels/TAIL3.md reports the split, and this is the check that keeps the
     report honest. `index_add.default` shares `index_add_`'s body,
     `view_as.default` shares `aten.view.default`'s, and both `bitwise_xor`
     overloads are a third arm on an enum. Only `scatter_reduce.two` and
@@ -407,7 +407,7 @@ def test_the_two_new_kernels_are_the_only_new_arithmetic():
     assert src.count("index_add_common(py, args, kwargs,") == 2, (
         "index_add and index_add_ no longer share one body -- if that was "
         "deliberate, the negative-index rule now exists in two places and "
-        "docs/DEMAND8.md's finding has to be re-checked in both"
+        "docs/architectures/DEMAND8.md's finding has to be re-checked in both"
     )
     assert "Bitwise::Xor => x ^ y" in src and "Bitwise::Xor => x ^ rhs" in src, (
         "bitwise_xor grew its own kernel instead of an arm on Bitwise"
@@ -533,7 +533,7 @@ def test_index_add_does_not_write_through_and_still_refuses_negatives():
     got, want = _both("index_add_negative_index")
     assert "raised" in got and "raised" in want, (
         "a negative index was accepted -- that is `index_put_`'s rule "
-        "(docs/DEMAND8.md), not this op's"
+        "(docs/architectures/DEMAND8.md), not this op's"
     )
     assert got["msg"] == want["msg"] == "index out of range in self", (got, want)
     _agree("index_add_transposed_self")
@@ -604,7 +604,7 @@ def test_in_the_far_float64_tail_this_shim_is_more_accurate_than_upstream():
             f"the shim's far-tail erfinv is no longer at least as accurate as "
             f"upstream's: erfc(ours)={ours!r}, erfc(theirs)={theirs!r}, "
             f"target={target!r}. If the series was changed, re-derive "
-            "docs/TAIL3.md's accuracy table before relaxing this."
+            "docs/kernels/TAIL3.md's accuracy table before relaxing this."
         )
     assert abs(math.erfc(got["ok"][0]) - targets[0]) / targets[0] < 1e-9, (
         "the shim's own round trip has drifted"
@@ -624,7 +624,7 @@ def test_as_strided_landed_as_a_COPY_and_the_writes_are_refused_instead():
     element-wise cases; if a COPY landed, that is the silent-divergence shape
     this test exists to prevent."* A copy landed. The shape it existed to
     prevent is prevented a different way, and that difference is the whole of
-    `docs/STRIDED.md`:
+    `docs/kernels/STRIDED.md`:
 
       * The aliasing is still impossible. candle 0.11.0 still exposes no way to
         build a `Tensor` over an existing storage with arbitrary strides --
@@ -647,7 +647,7 @@ def test_as_strided_landed_as_a_COPY_and_the_writes_are_refused_instead():
     assert "raised" not in want, "upstream refused as_strided, which it should not"
     assert "raised" not in got, (
         "as_strided refuses again. If it was reverted, invert this test back "
-        "rather than deleting it -- docs/STRIDED.md §1 is the argument."
+        "rather than deleting it -- docs/kernels/STRIDED.md §1 is the argument."
     )
     assert got["ok"] == want["ok"], (got, want)
     assert got["shape"] == want["shape"], (got, want)
@@ -675,7 +675,7 @@ def test_as_strided_is_advertised_now_that_it_has_a_kernel():
     implemented = _C._aten_implemented()
     assert "aten.as_strided.default" in implemented, (
         "as_strided has a kernel and case builders but is not advertised -- "
-        "docs/STRIDED.md §1"
+        "docs/kernels/STRIDED.md §1"
     )
 
 

@@ -52,7 +52,7 @@ def test_device_is_a_label_not_a_backend():
     assert _C.device("cuda") != _C.device("cpu")
 
 
-# --- the device layer (docs/DEVICE_ABS.md) ----------------------------------
+# --- the device layer (docs/devices/DEVICE_ABS.md) ----------------------------------
 
 
 def test_device_label_is_validated_against_a_closed_vocabulary():
@@ -283,7 +283,7 @@ def test_mixed_device_gate_lets_agreeing_tensors_through():
     top-level-only scan would miss -- is the one that runs on every call.
 
     `_shim_same_device` is the *label*-level version of the comparison -- what a
-    device-carrying tensor would need (docs/DEVICE_ABS.md §3.2). It has no other
+    device-carrying tensor would need (docs/devices/DEVICE_ABS.md §3.2). It has no other
     caller today, because the gate reads candle's handles directly: building a
     label per argument cost a measured 78 ns per dispatch. It is pinned here
     because it is deliberately *not* `==`; `cpu` and `cpu:0` are unequal labels
@@ -338,23 +338,23 @@ def test_tensor_base_is_subclassable():
     assert issubclass(Tensor, _C.TensorBase)
 
 
-# --- autograd boundary (docs/AUTOGRAD.md §1) --------------------------------
+# --- autograd boundary (docs/training/AUTOGRAD.md §1) --------------------------------
 
 
 def test_the_autograd_boundary_is_where_autograd_md_says_it_is():
-    """Pin the three facts docs/AUTOGRAD.md §1 measured, so they cannot drift.
+    """Pin the three facts docs/training/AUTOGRAD.md §1 measured, so they cannot drift.
 
     There is no autograd behind this shim, and `_install_autograd_shape` in
     bootstrap.py argues at length for carrying `requires_grad` as an *inert*
     flag rather than stopping at it. That argument is only honest while the
     flag really is inert and `backward()` really does refuse -- and nothing
-    checked either, so docs/AUTOGRAD.md could have gone stale the same way
-    docs/AUDIT.md found six of eleven documents had.
+    checked either, so docs/training/AUTOGRAD.md could have gone stale the same way
+    docs/verification/AUDIT.md found six of eleven documents had.
 
     **This test was written to fail when autograd landed, and a backward has
     landed without failing it.** That is not the test missing something. It is
     that the boundary pinned here is a *different* boundary from the one
-    docs/BACKWARD.md moved, and keeping them apart is the point:
+    docs/training/BACKWARD.md moved, and keeping them apart is the point:
 
       * `CaptureTrace.backward()` differentiates a **recorded region**. It
         needs no flag on any tensor and builds nothing as ops run, because the
@@ -365,7 +365,7 @@ def test_the_autograd_boundary_is_where_autograd_md_says_it_is():
     Every line below is about the second one and every line of it still holds:
     `requires_grad` is inert, `mul` does not propagate it, and both walls
     refuse. The one thing that changed is `.grad`, which is a real slot now --
-    docs/AUTOGRAD.md §7 argued for leaving it read-only *while nothing wrote
+    docs/training/AUTOGRAD.md §7 argued for leaving it read-only *while nothing wrote
     to it*, and something does.
     `test_grad_is_a_real_slot_now_and_takes_only_a_tensor_or_none` is that
     half; the assertion here is only that it still *starts* empty.
@@ -375,7 +375,7 @@ def test_the_autograd_boundary_is_where_autograd_md_says_it_is():
     did.
 
     **Wall 3 below has been inverted once already, and the wall it named was
-    not autograd.** docs/BACKWARD2.md §1.2 measured that `_stash_obj_in_tls` is
+    not autograd.** docs/training/BACKWARD2.md §1.2 measured that `_stash_obj_in_tls` is
     a thread-local key/value store that `torch/autograd/graph.py` uses so the
     engine's *device threads* can see a `contextvars.Context` -- and that with
     it refusing, `_engine_run_backward`'s `finally:` then raised
@@ -388,7 +388,7 @@ def test_the_autograd_boundary_is_where_autograd_md_says_it_is():
     x = _C._aten_dispatch("aten.full.default", [4], 2.0)
 
     # 1. The flag round-trips, all three spellings, and `requires_grad_` chains.
-    #    The factory keyword is here since docs/BACKWARD2.md §4.1 -- it used to
+    #    The factory keyword is here since docs/training/BACKWARD2.md §4.1 -- it used to
     #    refuse while `requires_grad_` did not, which drew one boundary in two
     #    places for two spellings of one thing.
     x.requires_grad = True
@@ -402,19 +402,19 @@ def test_the_autograd_boundary_is_where_autograd_md_says_it_is():
     # has been through no backward still reports None, and that is the claim.
     assert x.grad is None
 
-    # 2. **Inverted by docs/BACKWARD4.md, not deleted.** This assertion used to
+    # 2. **Inverted by docs/training/BACKWARD4.md, not deleted.** This assertion used to
     #    read `y.requires_grad is False` with a message saying "an op propagated
     #    requires_grad -- graph construction has appeared". An op now does
     #    propagate it, and graph construction has *not* appeared: the door
     #    records which op produced a tensor and nothing else, so `grad_fn` is a
-    #    correct nullness rather than a node (docs/BACKWARD4.md §2).
+    #    correct nullness rather than a node (docs/training/BACKWARD4.md §2).
     #
     #    So the claim the test makes has to become the sharper one -- the flag
     #    propagates AND the boundary is still where it was -- because that pair
     #    is what "a nullness, not a graph" means and neither half alone says it.
     y = _C._aten_dispatch("aten.mul.Tensor", x, x)
     assert y.requires_grad is True, (
-        "an op stopped propagating requires_grad -- docs/BACKWARD4.md landed "
+        "an op stopped propagating requires_grad -- docs/training/BACKWARD4.md landed "
         "that, and upstream's invariant `grad_fn is not None => requires_grad` "
         "cannot hold without it"
     )
@@ -432,14 +432,14 @@ def test_the_autograd_boundary_is_where_autograd_md_says_it_is():
         else:
             raise AssertionError(
                 f"grad_fn.{attribute} answered -- a graph has appeared; see "
-                "docs/BACKWARD4.md §1.3 and docs/BACKWARD2.md §2.1 before "
+                "docs/training/BACKWARD4.md §1.3 and docs/training/BACKWARD2.md §2.1 before "
                 "extending this"
             )
     # A leaf is still a leaf, which is the control that keeps the two rows
     # above from passing on a `grad_fn` that is simply always non-None.
     assert x.is_leaf is True and x.grad_fn is None
 
-    # 3. **Inverted by docs/BACKWARD9.md, as the previous revision asked.** The
+    # 3. **Inverted by docs/training/BACKWARD9.md, as the previous revision asked.** The
     #    wall a `backward()` reaches used to refuse by name; it answers now, and
     #    what replaces the refusal is the stronger claim -- the engine
     #    differentiates *whatever produced this tensor* and writes the answer
@@ -475,7 +475,7 @@ def test_the_autograd_boundary_is_where_autograd_md_says_it_is():
 def test_the_thread_local_store_is_thread_local_and_not_a_module_dict():
     """The one property of `_stash_obj_in_tls` a single-threaded test cannot see.
 
-    docs/BACKWARD2.md §4.3: a module-level dict would pass every other
+    docs/training/BACKWARD2.md §4.3: a module-level dict would pass every other
     assertion in this file and be a *different* semantics -- and the reason the
     key exists upstream at all is that the engine has more than one thread. So
     the implementation is `threading.local()`, and this is what says so.
@@ -514,14 +514,14 @@ def test_the_thread_local_store_is_thread_local_and_not_a_module_dict():
 
 
 def test_the_profiler_markers_are_no_ops_and_nothing_could_observe_one():
-    """docs/LOSS.md §6. Two profiler markers gate every `torch.optim`
+    """docs/training/LOSS.md §6. Two profiler markers gate every `torch.optim`
     optimiser, and neither is arithmetic.
 
     `torch.optim` wraps `step()` and `zero_grad()` in
     `with torch.autograd.profiler.record_function(...)`, so
     `profiler._record_function_enter_new` and `_record_function_exit` are on
     the road to **SGD's `zero_grad()`**, which needs no kernels at all
-    (docs/AUTOGRAD.md §7 measured the failure and named the marker).
+    (docs/training/AUTOGRAD.md §7 measured the failure and named the marker).
 
     **A no-op is only honest while nothing can observe a record**, so that is
     the part this test pins rather than the return value. All three ways of
@@ -581,7 +581,7 @@ def test_the_profiler_markers_are_no_ops_and_nothing_could_observe_one():
                 f"{label} no longer refuses -- this build may now have a profiler "
                 f"that could observe a record_function region, at which point the "
                 f"markers in bootstrap.py's _PROFILER_MARKERS are discarding data "
-                f"rather than discarding nothing. See docs/LOSS.md §6"
+                f"rather than discarding nothing. See docs/training/LOSS.md §6"
             )
 
     # 4. `DisableTorchFunctionSubclass` is the other name on that road, and a
@@ -626,8 +626,8 @@ def test_unimplemented_op_names_itself():
     # stops being a sample. Both were plausible sample choices *because* they
     # were plausible implementation targets, which is exactly what makes them
     # bad ones. `ormqr` multiplies by a Householder product from a LAPACK
-    # factorisation; nothing in the architecture tails of docs/ARCH.md or
-    # docs/OPS4.md reaches for it, and on-device inference has no reason to.
+    # factorisation; nothing in the architecture tails of docs/architectures/ARCH.md or
+    # docs/kernels/OPS4.md reaches for it, and on-device inference has no reason to.
     try:
         _C._aten_dispatch("aten.ormqr.default")
     except NotImplementedError as e:
@@ -652,13 +652,13 @@ def test_the_two_op_lists_are_disjoint():
     # `_aten_implemented_awaiting_golden()` under-reports on purpose (it is
     # kept out of the harness's coverage count until a case builder exists).
     # An op appearing in both would make it over-report instead, which is the
-    # direction docs/TORCH_C.md §1 says the instrument must never take.
+    # direction docs/design/TORCH_C.md §1 says the instrument must never take.
     advertised = set(_C._aten_implemented())
     parked = set(_C._aten_implemented_awaiting_golden())
     assert not (advertised & parked)
 
 
-# --- overload resolution (docs/OVERLOAD.md) ---------------------------------
+# --- overload resolution (docs/bindings/OVERLOAD.md) ---------------------------------
 #
 # `torch.<op>` lives on `_C._VariableFunctions`; `torch/__init__.py` hoists it
 # onto the `torch` namespace at import. These tests reach it at the source, so
@@ -690,7 +690,7 @@ def _resolved_key(name, *args, **kwargs):
 
 def test_overload_resolution_picks_the_same_key_torch_picks():
     # Each of these was measured on real torch 2.13.0 with a TorchDispatchMode
-    # logger (docs/OVERLOAD.md §3). The two arange rows are the ones a
+    # logger (docs/bindings/OVERLOAD.md §3). The two arange rows are the ones a
     # plausible reading of the schemas gets wrong: `start_step` has a default
     # for `step`, so it would happily swallow the two-argument call.
     t = _C._aten_dispatch("aten.full.default", [2], 1.0)
@@ -720,18 +720,18 @@ def test_overload_resolution_refuses_rather_than_guessing():
 
     # An op with no table entry keeps the old refusal rather than guessing
     # `.default`. `stft` has no kernel and so no table entry either --
-    # `relu` used to be this example until docs/SPELLINGS.md §6 gave it one,
-    # `flatten` was it until docs/ARCH20.md §5 gave `cohere` a composite, and
-    # `cumprod` was it until docs/VOICE.md gave Spark-TTS BiCodec one.
+    # `relu` used to be this example until docs/bindings/SPELLINGS.md §6 gave it one,
+    # `flatten` was it until docs/architectures/ARCH20.md §5 gave `cohere` a composite, and
+    # `cumprod` was it until docs/architectures/VOICE.md gave Spark-TTS BiCodec one.
     #
     # The example keeps having to move, and that is the point rather than an
     # annoyance: it can only be a name that is *still* unreachable, so choosing
     # one is choosing a claim that gets falsified the day someone implements
-    # it. `stft` was it until docs/FFT.md, which built the transform on
+    # it. `stft` was it until docs/kernels/FFT.md, which built the transform on
     # `Repr::Complex` and gave `torch.stft` a two-overload table entry -- so
     # the example has moved to `istft`, its inverse. `istft` is a genuinely
     # different problem from `stft` rather than the same one unwritten: it is
-    # an overlap-add with a window-sum normalisation, and docs/VOICE.md §3
+    # an overlap-add with a window-sum normalisation, and docs/architectures/VOICE.md §3
     # ranks it beside `stft` for the same four speech models. Falsifying this
     # line means somebody wrote that.
     try:
@@ -754,7 +754,7 @@ def test_varargs_intlist_rule_matches_torchs_precondition():
 def test_requires_grad_is_carried_not_dropped_and_not_refused():
     """The inversion of `test_requires_grad_is_refused_not_ignored`.
 
-    That test pinned a refusal, and docs/BACKWARD2.md §4.1 removed it -- for a
+    That test pinned a refusal, and docs/training/BACKWARD2.md §4.1 removed it -- for a
     reason that is about the refusal's own argument rather than about autograd
     arriving. The refusal's ground was "returning a tensor that quietly records
     nothing would be worse than refusing", and
@@ -788,13 +788,13 @@ def test_requires_grad_is_carried_not_dropped_and_not_refused():
 
 
 def test_requires_grad_refuses_a_non_floating_tensor_at_all_three_doors():
-    """docs/BACKWARD2.md §1.4 and §4.2: the one place this shim was *more*
+    """docs/training/BACKWARD2.md §1.4 and §4.2: the one place this shim was *more*
     permissive than upstream in the whole autograd chain.
 
     `torch.ones(2, dtype=torch.int64).requires_grad_(True)` succeeded here and
     raises upstream, because only a tensor with a derivative to accumulate may
     carry the flag. `tape.rs`'s `wrt_set` had been enforcing it alone, one layer
-    down, where docs/BACKWARD.md §4.1 records having to add it after the reverse
+    down, where docs/training/BACKWARD.md §4.1 records having to add it after the reverse
     walk asked for the derivative of a token id.
 
     Upstream has **three** wordings for the one rule, and all three are
@@ -826,7 +826,7 @@ def test_requires_grad_refuses_a_non_floating_tensor_at_all_three_doors():
             else:
                 raise AssertionError(
                     f"{label} let a {dt} tensor require gradients; upstream "
-                    f"raises {message!r} (docs/BACKWARD2.md §4.2)"
+                    f"raises {message!r} (docs/training/BACKWARD2.md §4.2)"
                 )
         # ... and a floating dtype goes through every door.
         call(_C.float32)
@@ -909,7 +909,7 @@ def test_add_promotes_and_computes_in_the_promoted_dtype():
     """`float32 + float64` is `float64`, computed there rather than relabelled.
 
     This test used to assert the opposite -- that `add` refused the pair.
-    That invariant genuinely changed: docs/PROMOTE.md §3 measured the whole
+    That invariant genuinely changed: docs/numerics/PROMOTE.md §3 measured the whole
     9x9 grid against `torch.promote_types` and upstream promotes every cell,
     so the refusal was the defect and not the contract.
 
@@ -992,7 +992,7 @@ def test_mm_is_2d_only():
         raise AssertionError("candle's batched matmul must not stand in for mm")
 
 
-# --- _grouped_mm (docs/GROUPED_MM.md) ---------------------------------------
+# --- _grouped_mm (docs/kernels/GROUPED_MM.md) ---------------------------------------
 #
 # `tools/golden/cases.py` compares this op against upstream on 64 cases; what
 # these add is the part that is worth being able to check *without* upstream
@@ -1043,7 +1043,7 @@ def test_grouped_mm_reads_offsets_as_cumulative_ends_not_lengths():
     # Upstream leaves this row uninitialised and `transformers` masks it rather
     # than reading it; this shim fills it with zeros so the answer is at least
     # deterministic. Nothing in the golden suite compares it -- see
-    # docs/GROUPED_MM.md §2.3.
+    # docs/kernels/GROUPED_MM.md §2.3.
     assert out[3] == [0.0, 0.0, 0.0, 0.0], out[3]
 
 
@@ -1123,7 +1123,7 @@ def test_grouped_mm_refuses_bias_and_a_foreign_out_dtype():
 def test_grouped_mm_refuses_operands_upstreams_cpu_kernel_cannot_align():
     # candle would multiply these happily. The refusal exists because
     # upstream's CPU kernel has it -- 16 bytes is 4 float32 elements, and a
-    # contraction of 3 is not a multiple of that. docs/GROUPED_MM.md §2.2.
+    # contraction of 3 is not a multiple of that. docs/kernels/GROUPED_MM.md §2.2.
     a = _C._tensor_from_flat([1.0] * 12, [4, 3])
     b = _C._tensor_from_flat([1.0] * 24, [2, 3, 4])
     offs = _C._tensor_from_flat([1, 4], [2], dtype=_C.int32)
@@ -1166,7 +1166,7 @@ def test_grouped_mm_resolves_from_the_torch_level_name():
     key, so an aten op whose name began with `_` could not have a `torch.<op>`
     binding at all. `methods.json`'s sibling comprehension six lines below had
     always spelled the same intent correctly as `startswith("_README")`;
-    narrowing this one to match was the whole fix. docs/GROUPED_MM.md §6.1.
+    narrowing this one to match was the whole fix. docs/kernels/GROUPED_MM.md §6.1.
 
     This test asserted the broken state until the fix landed, so that it could
     not land silently. It now asserts the fixed state, and asserts the *scope*
@@ -1175,16 +1175,16 @@ def test_grouped_mm_resolves_from_the_torch_level_name():
     underscore-prefixed op is added to `overloads.json` later, that assertion
     is where it announces itself" -- and one was:
 
-    `_safe_softmax` (docs/TRIL.md §2). The leading underscore is why it went
-    missing in the first place. It reads as private, so docs/ARCH20.md §9's
+    `_safe_softmax` (docs/kernels/TRIL.md §2). The leading underscore is why it went
+    missing in the first place. It reads as private, so docs/architectures/ARCH20.md §9's
     inventory filed it under "no such public function upstream" without
     checking; `hasattr(torch, '_safe_softmax')` is `True` on 2.13.0, it fires
     `aten._safe_softmax.default` as a leaf op, and this shim has had that
-    kernel golden-compared since docs/SDPA.md. Two refusals in
+    kernel golden-compared since docs/kernels/SDPA.md. Two refusals in
     `scaled_dot_product_attention` meanwhile named it as a kernel that did not
     exist -- see `test_the_two_stale_sdpa_refusals_no_longer_claim_a_missing_kernel`.
 
-    And a third: `_log_softmax` (docs/LOSS.md), the same shape again, arriving
+    And a third: `_log_softmax` (docs/training/LOSS.md), the same shape again, arriving
     with its own trap next door. `torch.log_softmax` -- one underscore fewer --
     has parser key `aten::log_softmax.int`, which is
     `CompositeImplicitAutograd` and must **not** be in `overloads.json`; it is
@@ -1203,7 +1203,7 @@ def test_grouped_mm_resolves_from_the_torch_level_name():
     # are the underscore-prefixed keys that reach a `torch.<name>` because of
     # it. All three have kernels; none would resolve under the old predicate.
     admitted = sorted(n for n in _C._shim_overloads if n.startswith("_"))
-    # `_is_all_true` joined in docs/TAIL1.md. It is `overloads.json`-only in
+    # `_is_all_true` joined in docs/kernels/TAIL1.md. It is `overloads.json`-only in
     # the sense that matters here -- upstream has `torch._is_all_true` AND
     # `Tensor._is_all_true`, and both tables carry it -- and it is the fourth
     # underscore-prefixed key the widened predicate admits. The other seven ops
@@ -1215,7 +1215,7 @@ def test_grouped_mm_resolves_from_the_torch_level_name():
         "_is_all_true",
         "_log_softmax",
         "_safe_softmax",
-    # `_unique2` joined in docs/VOICE3.md and is the fifth. It is the first
+    # `_unique2` joined in docs/architectures/VOICE3.md and is the fifth. It is the first
     # one here that is private *upstream too* in the sense that matters: there
     # is no `torch.unique2`, and `torch.unique` reaches it through
     # `torch/functional.py::_unique_impl`, which spells `torch._unique2(...)`
@@ -1265,7 +1265,7 @@ def test_grouped_mm_resolves_from_the_torch_level_name():
 def test_the_mixtral_member_names_reach_the_kernels_that_were_already_there():
     """Seven `TensorBase` members, none of them a new operator.
 
-    docs/GROUPED_MM.md §6.4 measured what stopped Mixtral from *executing*
+    docs/kernels/GROUPED_MM.md §6.4 measured what stopped Mixtral from *executing*
     after `_grouped_mm` took it to zero missing operators, and every item was
     a name with a kernel already in `_aten_implemented()`. Five are
     `methods.json` entries (`__idiv__`, `__ge__`, `clamp_`, `masked_fill_`,
@@ -1349,7 +1349,7 @@ def test_setitem_writes_the_basic_index_through_to_the_base():
     """`x[0] = v`, and the one spelling of it that still refuses.
 
     **This test used to assert the opposite** -- it was written as the signal
-    for docs/VIEWS.md §4, asserting through a probe that a write via
+    for docs/kernels/VIEWS.md §4, asserting through a probe that a write via
     `select.int` did *not* reach the base, so that it would go red the day
     views became mutable. It did, and this is the other side of it.
 
@@ -1362,7 +1362,7 @@ def test_setitem_writes_the_basic_index_through_to_the_base():
     The refusal that is left is a slice with `step != 1`, and it is not a
     view problem in the same sense: `slice.Tensor` above step 1 reaches its
     result through `index_select`, which materialises, so there is no shared
-    buffer to write into. docs/VIEWS.md §6.4.
+    buffer to write into. docs/kernels/VIEWS.md §6.4.
     """
     # The probe the old version of this test asserted the negative of.
     x = _C._tensor_from_flat([0.0] * 5, [5])
@@ -1407,7 +1407,7 @@ def test_setitem_writes_the_basic_index_through_to_the_base():
     row[2] = 42.0
     assert f.tolist()[1][2] == 42.0, f.tolist()
 
-    # A step above 1 used to refuse by name. docs/SETITEM.md landed the
+    # A step above 1 used to refuse by name. docs/bindings/SETITEM.md landed the
     # lowering -- a stepped slice is a set of positions, handed to
     # `index_put_`, which writes through the receiver's own storage -- so this
     # is inverted rather than deleted, and asserts the write it used to forbid.
@@ -1420,7 +1420,7 @@ def test_setitem_writes_the_basic_index_through_to_the_base():
 
     # Two stepped slices at once are still refused, by name: `index_put_`
     # implements a single index group and a second one is refused rather than
-    # approximated (docs/SETITEM.md §3).
+    # approximated (docs/bindings/SETITEM.md §3).
     h = grid()
     try:
         h[0:3:2, 0:4:2] = 0.0
@@ -1434,7 +1434,7 @@ def test_setitem_writes_the_basic_index_through_to_the_base():
 def test_which_ops_share_storage_with_their_input_and_which_do_not():
     """The aliasing table, asserted op by op, in both directions.
 
-    Before docs/VIEWS.md §6 this could not have been written: no in-place op
+    Before docs/kernels/VIEWS.md §6 this could not have been written: no in-place op
     reached storage, so every one of these answers was `independent` whatever
     the op did. Making one write go through makes **all twenty-eight of them
     correctness questions at once**, which is the reason this table is a test
@@ -1529,7 +1529,7 @@ def test_the_two_aliasing_relationships_that_still_diverge_are_pinned():
     """The write-lost divergences, asserted so they cannot be forgotten.
 
     Every other view-producing op in this shim shares storage with its input
-    the way upstream does, and since docs/VIEWS.md §6 a write through any of
+    the way upstream does, and since docs/kernels/VIEWS.md §6 a write through any of
     them reaches the base. Two do not, and both are properties of candle's
     storage model rather than oversights:
 
@@ -1553,7 +1553,7 @@ def test_the_two_aliasing_relationships_that_still_diverge_are_pinned():
     _C._aten_dispatch("aten.fill_.Scalar", stepped, 0.0)
     assert stepped.tolist() == [0.0, 0.0], stepped.tolist()
     assert x.tolist() == [1.0, 2.0, 3.0, 4.0], (
-        "a step-2 slice is now a view -- update docs/VIEWS.md §6.4, the diverge "
+        "a step-2 slice is now a view -- update docs/kernels/VIEWS.md §6.4, the diverge "
         "case in slice_cases, and __setitem__'s step refusal"
     )
 
@@ -1561,7 +1561,7 @@ def test_the_two_aliasing_relationships_that_still_diverge_are_pinned():
     reinterpreted = _C._aten_dispatch("aten.view.dtype", y, _C.float32)
     _C._aten_dispatch("aten.fill_.Scalar", reinterpreted, 0.0)
     assert y.tolist() == [1, 2, 3, 4], (
-        "view.dtype is now a view -- update docs/VIEWS.md §6.4 and the diverge "
+        "view.dtype is now a view -- update docs/kernels/VIEWS.md §6.4 and the diverge "
         "case in view_dtype_cases"
     )
 
@@ -1735,7 +1735,7 @@ def test_an_expanded_destination_follows_upstream_op_by_op():
 
 
 def test_index_put_takes_a_mask_a_matrix_and_a_number():
-    """The three `index_put_` gaps docs/GROUPED_MM.md §6.4 recorded, closed.
+    """The three `index_put_` gaps docs/kernels/GROUPED_MM.md §6.4 recorded, closed.
 
     All three were the same cause: the kernel delegated to `scatter.src`,
     which wants an int32/int64 index and index/src/self all of one rank. So a
@@ -1840,7 +1840,7 @@ def test_index_put_takes_a_mask_a_matrix_and_a_number():
     # Still refused, and still by name: two index tensors. `accumulate=True`
     # used to be asserted here alongside it and is now implemented -- see
     # `test_index_put_accumulates_and_does_so_at_the_receivers_precision`
-    # and docs/VIEWS.md §7. This assertion firing is what caught the landing,
+    # and docs/kernels/VIEWS.md §7. This assertion firing is what caught the landing,
     # which is what it was for.
     for label, call in (
         ("two index tensors", lambda: _C._aten_dispatch(
@@ -1869,7 +1869,7 @@ def test_index_put_writes_into_the_receiver_and_not_into_a_copy():
 
     The third block used to assert the *limitation* that came with
     `replace_with`: a second wrapper made before the call did not see the
-    write. docs/VIEWS.md §6 removed it, and the assertion is inverted rather
+    write. docs/kernels/VIEWS.md §6 removed it, and the assertion is inverted rather
     than deleted -- `detach` shares storage upstream too, so seeing the write
     is now the agreeing answer and a regression to wrapper-swapping fails
     here.
@@ -1898,7 +1898,7 @@ def test_index_put_writes_into_the_receiver_and_not_into_a_copy():
     assert z.tolist() == [1.0, 0.0, 0.0, 0.0], z.tolist()
     assert alias.tolist() == [1.0, 0.0, 0.0, 0.0], (
         "the alias did not see the write -- index_put_ has gone back to replacing "
-        "the wrapper instead of writing through the layout (docs/VIEWS.md §6)"
+        "the wrapper instead of writing through the layout (docs/kernels/VIEWS.md §6)"
     )
     # ...and the other way round, which is the direction that fails if only
     # the receiver's own wrapper is being written.
@@ -1907,7 +1907,7 @@ def test_index_put_writes_into_the_receiver_and_not_into_a_copy():
 
 
 def test_index_put_accumulates_and_does_so_at_the_receivers_precision():
-    """`accumulate=True`, which was refused by name until docs/VIEWS.md §7.
+    """`accumulate=True`, which was refused by name until docs/kernels/VIEWS.md §7.
 
     The golden suite diffs 17 accumulate cases against upstream. This pins
     the three things a *regression* would most plausibly get wrong, by name
@@ -1923,7 +1923,7 @@ def test_index_put_accumulates_and_does_so_at_the_receivers_precision():
       * that `torch.bool` accumulates as a logical or. `*dst += *src` on a
         C++ `bool` promotes and converts back upstream, so the byte stays
         0 or 1; adding in the `i64` walk would leave a 2 in a buffer the
-        whole tag depends on (docs/BOOL.md §6.3), and reading it *as bool*
+        whole tag depends on (docs/numerics/BOOL.md §6.3), and reading it *as bool*
         cannot see that because 2 is truthy. It is read as int64 here.
     """
     def t(flat, shape, dtype=None):
@@ -1961,12 +1961,12 @@ def test_index_put_accumulates_and_does_so_at_the_receivers_precision():
     as_int = _C._aten_dispatch("aten._to_copy.default", p, dtype=_C.int64)
     assert as_int.tolist() == [1, 1, 0], (
         f"{as_int.tolist()} -- a 3 here means the bool buffer holds a byte the "
-        "bool tag's invariant forbids (docs/BOOL.md §6.3)"
+        "bool tag's invariant forbids (docs/numerics/BOOL.md §6.3)"
     )
 
 
 def test_the_bool_arithmetic_refusals_each_give_upstreams_actual_reason():
-    """docs/TAIL.md §2.2's finding, and the defect the audit found on top of it.
+    """docs/kernels/TAIL.md §2.2's finding, and the defect the audit found on top of it.
 
     `arith_tag` refuses `torch.bool` for every arithmetic overload but
     `mul.Tensor`, and every one of those refusals is correct. The *reason*
@@ -2065,7 +2065,7 @@ def test_bool_is_not_uint8():
 def test_full_gives_a_bool_tensor_for_a_bool_fill():
     # torch.full((2,), True).dtype is torch.bool. `bool` subclasses `int` in
     # Python, so before the tag existed this fell into the integer branch and
-    # produced int64 -- docs/TORCH_C.md §2 recorded it as unfixable then.
+    # produced int64 -- docs/design/TORCH_C.md §2 recorded it as unfixable then.
     t = _C._aten_dispatch("aten.full.default", [2], True)
     assert t.dtype == _C.bool
     # and it reads back as Python bools, not as 0/1
@@ -2146,7 +2146,7 @@ def test_full_reproduces_torchs_one_element_hole():
 
 
 def test_the_import_surface_is_present():
-    # docs/IMPORT_TORCH.md: `import torch` needs these before it finishes.
+    # docs/models/IMPORT_TORCH.md: `import torch` needs these before it finishes.
     assert len([n for n in dir(_C.TensorBase) if not n.startswith("__")]) > 500
     assert len(dir(_C._VariableFunctions)) > 900
     assert isinstance(_C._jit_tree_views.SourceRangeFactory, type)
@@ -2222,7 +2222,7 @@ def test_off_switches_stay_off():
     assert _C._shim_off_switches, "the off-switch list must be inspectable"
 
     # `_c10d_init` used to be on this list and is now answered -- see
-    # `ANSWERED_PROBES` in bootstrap.py and docs/DISTRIBUTED.md. The switch is
+    # `ANSWERED_PROBES` in bootstrap.py and docs/distributed/DISTRIBUTED.md. The switch is
     # inverted rather than removed: a subsystem that is built has to say so,
     # and the list must not still be claiming it is off.
     assert hasattr(_C, "_c10d_init")
@@ -2284,7 +2284,7 @@ def test_finfo_and_iinfo_report_torchs_numbers():
         raise AssertionError("torch refuses iinfo(bool); so must the shim")
 
 
-# --- TensorBase methods (docs/TENSORBASE.md) --------------------------------
+# --- TensorBase methods (docs/bindings/TENSORBASE.md) --------------------------------
 #
 # These run against the bare artefact, with no vendored tree: `TensorBase` is
 # the class the methods are installed on, so nothing here needs `torch.Tensor`
@@ -2303,7 +2303,7 @@ def test_log_softmax_names_the_kernel_its_dim_actually_selected():
 
     Upstream has two log-softmax CPU kernels and picks on whether `dim` is the
     trailing axis. Each names *itself* in the `NotImplementedError` an integral
-    input raises, and the two names differ (docs/LOSS.md §2.3):
+    input raises, and the two names differ (docs/training/LOSS.md §2.3):
 
         int64 (4,)   dim 0   ->  "log_softmax_lastdim_kernel_impl"
         int64 (2,3)  dim 1   ->  "log_softmax_lastdim_kernel_impl"
@@ -2347,7 +2347,7 @@ def test_tensor_methods_reach_the_one_door():
     assert _C._shim_methods["__mul__"] == ["aten.mul.Tensor", "aten.mul.Scalar"]
     # `item`, `to`, `float`, `__bool__` and `__getitem__` are deliberately
     # *not* in the table -- upstream's binding for each is not a plain overload
-    # set, so they are written out in `bootstrap.py` (docs/TENSORBASE.md §3).
+    # set, so they are written out in `bootstrap.py` (docs/bindings/TENSORBASE.md §3).
     # They still end at `_aten_dispatch`; they just do not resolve first.
     for python_level in ("item", "to", "float", "__bool__", "__getitem__"):
         assert python_level not in _C._shim_methods
@@ -2363,7 +2363,7 @@ def test_method_overload_resolution_picks_by_argument_type():
     assert (x * y).tolist() == [[5.0, 12.0], [21.0, 32.0]]
     # A Python scalar picks the `Scalar` overload at the *parser* level, which
     # is what this shim reproduces -- upstream's dispatcher then records
-    # `mul.Tensor` one layer down (docs/TENSORBASE.md).
+    # `mul.Tensor` one layer down (docs/bindings/TENSORBASE.md).
     assert (x * 2).tolist() == [[2.0, 4.0], [6.0, 8.0]]
     assert (x * 2.5).tolist() == [[2.5, 5.0], [7.5, 10.0]]
 
@@ -2523,7 +2523,7 @@ def test_operator_dunders_decline_rather_than_raise():
 def test_the_rng_ops_have_kernels_now():
     # This used to be `test_the_rng_ops_are_the_wall_and_they_name_themselves`,
     # asserting that both ops resolved to the right aten key and then stopped
-    # (docs/TENSORBASE.md §7, wall 6). `rng.rs` is that wall coming down: the
+    # (docs/bindings/TENSORBASE.md §7, wall 6). `rng.rs` is that wall coming down: the
     # assertion is inverted rather than deleted, so the file still records
     # that these two are the pair `from_config` needed.
     x = _t([0.0] * 6, [2, 3])
@@ -2537,7 +2537,7 @@ def test_the_rng_ops_have_kernels_now():
 def test_the_same_seed_gives_the_same_stream():
     # The point of porting torch's generator rather than using candle's: a
     # seed has to mean something. candle's CPU backend refuses `set_seed`
-    # outright (docs/RNG.md §2.1), so this test is unimplementable on top of
+    # outright (docs/numerics/RNG.md §2.1), so this test is unimplementable on top of
     # it -- not merely failing, unimplementable.
     _C._shim_manual_seed(1234)
     first = _t([0.0] * 5, [5])
@@ -2567,7 +2567,7 @@ def test_uniform_matches_torchs_stream_bit_for_bit():
 
 
 def test_normal_takes_a_different_path_at_sixteen_elements():
-    # The trap docs/RNG.md §1.3 measured and §5 item 2 asked to be cased:
+    # The trap docs/numerics/RNG.md §1.3 measured and §5 item 2 asked to be cased:
     # `normal_kernel` branches on `size >= 16 && is_contiguous()`, so one seed
     # gives two unrelated sequences either side of the boundary, and a size
     # that is not a multiple of 16 redraws its last 16 elements over values it
@@ -2636,10 +2636,10 @@ def test_rng_ops_refuse_integer_tensors():
             raise AssertionError("an integer tensor was filled")
 
 
-# --- bernoulli_ and the dropout composite over it (docs/TRAIN.md) ----------
+# --- bernoulli_ and the dropout composite over it (docs/training/TRAIN.md) ----------
 #
 # Training mode. Every architecture sweep in this repository called `.eval()`
-# until docs/TRAIN.md, and in `.eval()` `torch.dropout` short-circuits before
+# until docs/training/TRAIN.md, and in `.eval()` `torch.dropout` short-circuits before
 # the dispatcher -- so this whole family was unreachable and unmeasured while
 # the project's stated purpose (README §2/§3: federated learning, test-time
 # adaptation) is training.
@@ -2800,7 +2800,7 @@ def test_div_scalar_takes_upstreams_reduced_float_reciprocal_path():
     # `div_true_kernel`'s Half/BFloat16 branch reads the ORIGINAL scalar in
     # float and multiplies by its reciprocal; it does not narrow the divisor
     # to the tensor's dtype the way add/sub do. (It read "the way add/mul do"
-    # until docs/SCALAR.md, which is exactly the assumption that hid the same
+    # until docs/numerics/SCALAR.md, which is exactly the assumption that hid the same
     # defect in `mul` for another round -- `mul` widens too.) Only float16
     # can see it:
     # upstream answers 3.333984375 = f16(1.0f/0.3f), while narrowing first
@@ -2818,7 +2818,7 @@ def test_div_scalar_takes_upstreams_reduced_float_reciprocal_path():
         assert in_place.tolist() == [expected], (dtype, in_place.tolist())
 
 
-# --- the reduced-float scalar rule (docs/SCALAR.md) ------------------------
+# --- the reduced-float scalar rule (docs/numerics/SCALAR.md) ------------------------
 #
 # `div.Scalar` above was the first member of a family to be found, and it was
 # found the way this one was: by noticing that two implementations which should
@@ -2836,14 +2836,14 @@ def test_div_scalar_takes_upstreams_reduced_float_reciprocal_path():
 
 
 def test_mul_scalar_reads_the_scalar_at_opmath_not_narrowed():
-    # docs/SCALAR.md §2. `mul_kernel`'s reduced-float branch is
+    # docs/numerics/SCALAR.md §2. `mul_kernel`'s reduced-float branch is
     # `opmath_t b = iter.original_scalar_value<opmath_t>(2)`, so `bfloat16 * 0.3`
     # multiplies by `0.3f`, not by `bf16(0.3) == 0.30078125`. This shim
     # narrowed and answered one representable step high.
     #
     # Found because a sabotage fault failed to fail: with the narrowing in
     # place, "scale dropout's input" and "scale dropout's mask" were
-    # bit-identical here where upstream separates them (docs/TRAIN.md §5, S4).
+    # bit-identical here where upstream separates them (docs/training/TRAIN.md §5, S4).
     for dtype, want in (
         (_C.bfloat16, [0.8984375, 1.5, 2.09375]),
         (_C.float16, [0.89990234375, 1.5, 2.099609375]),
@@ -2859,7 +2859,7 @@ def test_mul_scalar_reads_the_scalar_at_opmath_not_narrowed():
 
 
 def test_mul__scalar_is_the_one_spelling_of_a_scalar_multiply_upstream_narrows():
-    # docs/SCALAR.md §2.2, and the reason `mul_` was NOT changed with `mul`.
+    # docs/numerics/SCALAR.md §2.2, and the reason `mul_` was NOT changed with `mul`.
     # Measured over 4096 values x 4 scalars x 2 dtypes:
     # `torch.ops.aten.mul_.Scalar` narrows where `mul.Scalar`, `div_.Scalar`,
     # `x * 0.3` and `x *= 0.3` all widen. Upstream disagrees with itself here;
@@ -2877,7 +2877,7 @@ def test_add_and_sub_scalar_still_narrow_and_did_not_follow_mul():
     # The half of the family that must NOT move. `add`/`sub` have no
     # reduced-float scalar branch upstream, so the operand arrives through the
     # iterator's common dtype and `bfloat16 + 0.3` really does add `0.30078125`
-    # (docs/GENERATE.md §3.2). A fix applied to "the .Scalar family" rather
+    # (docs/models/GENERATE.md §3.2). A fix applied to "the .Scalar family" rather
     # than to the measured half would break these.
     #
     # **The out-of-place keys are the ones `arith_scalar` owns**, and they are
@@ -2916,7 +2916,7 @@ def test_add_and_sub_scalar_still_narrow_and_did_not_follow_mul():
 
 
 def test_floor_division_by_a_reduced_float_scalar_is_off_by_a_whole_integer():
-    # docs/SCALAR.md §3.2. What is one ULP in `mul` is one *unit* here, because
+    # docs/numerics/SCALAR.md §3.2. What is one ULP in `mul` is one *unit* here, because
     # a floor turns a fractional error into an integer one. Both spellings are
     # asserted because they were separately implemented and disagreed:
     # `floor_divide.Scalar` computed `floor(a / b)` where `div.Scalar_mode` ran
@@ -2960,7 +2960,7 @@ def test_floor_divide_runs_upstreams_algorithm_and_not_floor_of_the_quotient():
 
 
 def test_pow_narrows_its_scalar_where_mul_widens_it():
-    # docs/SCALAR.md §3.3, the other side of the split, and the reason the rule
+    # docs/numerics/SCALAR.md §3.3, the other side of the split, and the reason the rule
     # has to be established per kernel rather than argued from `mul`:
     # `pow_tensor_scalar_kernel` converts the exponent to the dispatched
     # `scalar_t`. This shim kept the parser's `f64` and was one step out.
@@ -2972,7 +2972,7 @@ def test_pow_narrows_its_scalar_where_mul_widens_it():
 
 
 def test_the_scalar_rule_does_not_reach_ops_whose_scalar_is_only_stored():
-    # docs/SCALAR.md §1.1. `clamp`, `fill_`, `masked_fill` and
+    # docs/numerics/SCALAR.md §1.1. `clamp`, `fill_`, `masked_fill` and
     # `where.ScalarOther` cannot be got wrong this way: the scalar's only route
     # to the output is to be stored, and storing narrows it whichever road it
     # took. Asserted so that nobody "fixes" them, and with the two bfloat16
@@ -2985,7 +2985,7 @@ def test_the_scalar_rule_does_not_reach_ops_whose_scalar_is_only_stored():
     assert filled.tolist() == [0.30078125], filled.tolist()
 
 
-# --- torch.randn / torch.rand and their siblings (docs/RANDOM.md) ----------
+# --- torch.randn / torch.rand and their siblings (docs/kernels/RANDOM.md) ----------
 #
 # `randn`/`rand` are not `overloads.json` entries: there is no `aten::randn`
 # or `aten::rand` kernel in `aten.rs`, only `aten.empty.memory_format` +
@@ -3058,7 +3058,7 @@ def test_randn_carries_requires_grad_through_its_composite():
     **survive the in-place fill** -- if `normal_` returned a fresh Python object
     wrapping the same data, `torch.randn(requires_grad=True)` would silently
     come back with the flag off. Nothing could check that while the whole path
-    refused. docs/BACKWARD2.md §4.1.
+    refused. docs/training/BACKWARD2.md §4.1.
     """
     for name in ("randn", "rand"):
         made = getattr(_C._VariableFunctions, name)(2, 2, requires_grad=True)
@@ -3145,7 +3145,7 @@ def test_normal_requires_size_when_both_mean_and_std_are_plain_numbers():
 
 
 def test_grad_mode_state_round_trips():
-    # 84 calls during `from_config` (docs/FROM_CONFIG.md §2.2). The flag is
+    # 84 calls during `from_config` (docs/models/FROM_CONFIG.md §2.2). The flag is
     # real; what it would govern is not.
     assert _C.is_grad_enabled() is True
     _C._set_grad_enabled(False)
@@ -3186,7 +3186,7 @@ def test_the_dispatch_table_matches_the_two_lists():
             pass  # missing arguments -- the key itself resolved
 
 
-# --- against real upstream torch, live in the same process (docs/E2E.md) ---
+# --- against real upstream torch, live in the same process (docs/models/E2E.md) ---
 #
 # Every measurement below was a one-off until now: it lived in a probe script
 # under a `caches/` directory that is not committed and evaporates with the
@@ -3201,7 +3201,7 @@ def test_the_dispatch_table_matches_the_two_lists():
 # as a module literally named `_C`, never as `torch._C`. The two do not
 # collide in one process -- confirmed by running the model-comparison probes
 # this section is built from directly, both here and previously as throwaway
-# scripts under `caches/bw-sample-probe/`. docs/E2E.md records that check and
+# scripts under `caches/bw-sample-probe/`. docs/models/E2E.md records that check and
 # why it is not the two-process split this file's callers expected going in.
 #
 # This makes the tests below option (b) from that discussion -- live against
@@ -3210,7 +3210,7 @@ def test_the_dispatch_table_matches_the_two_lists():
 # honest cost is the same as (b) would have had: upstream `torch` has to be
 # importable. It usually is not (this file's own docstring promises no test
 # dependency on a package that has none), so every test in this section
-# no-ops rather than fails when `torch` is missing, and docs/E2E.md says so.
+# no-ops rather than fails when `torch` is missing, and docs/models/E2E.md says so.
 try:
     import torch as _upstream_torch
 except ImportError:  # pragma: no cover - most interpreters running this file
@@ -3309,7 +3309,7 @@ def _e2e_rms_norm(b, x, w, eps=1e-6):
 
 def _e2e_linear(b, x, w):
     """`nn.Linear` without bias: `x @ w.t()`, decomposed the way
-    docs/NN_SURFACE.md §5 measured upstream actually calling it."""
+    docs/bindings/NN_SURFACE.md §5 measured upstream actually calling it."""
     dims = list(x.shape)
     flat = b.op("aten.view.default", x, [-1, dims[-1]])
     out = b.op("aten.mm.default", flat, b.op("aten.t.default", w))
@@ -3349,7 +3349,7 @@ def _e2e_apply_rope(b, x, cos, sin):
 def _e2e_forward(b, w, ids, seq):
     """A 2-layer Llama-shaped decoder -- RMSNorm, RoPE, flash `sdpa`, SwiGLU
     MLP -- op-for-op the sequence transformers' `LlamaModel` produces
-    (docs/NN_SURFACE.md §5-6)."""
+    (docs/bindings/NN_SURFACE.md §5-6)."""
     H, HD, HEADS = _E2E_H, _E2E_HD, _E2E_HEADS
     idx = b.t(ids, (len(ids),), "int64")
     h = b.op("aten.embedding.default", w["embed"], idx)
@@ -3398,7 +3398,7 @@ def _e2e_flatten(x):
     return [x]
 
 
-# A token match is necessary, not sufficient: docs/ARCH.md §5.1 measured a
+# A token match is necessary, not sufficient: docs/architectures/ARCH.md §5.1 measured a
 # case (Gemma, wrong `gelu` approximation) where greedy decoding produced the
 # *same* tokens at three weight scales while the logits behind them differed
 # by 5.87e-04 -- 379x the 1.55e-06 the correct kernel gave on the same model.
@@ -3410,17 +3410,17 @@ def _e2e_flatten(x):
 #
 #   this file's own aten-level 2-layer decoder ................ up to 5.2e-06
 #     (greedy, 4 steps: ~2.3e-06; do_sample, 6 steps x 12 configs: ~5.2e-06)
-#   torch.nn-assembled 2-layer decoder (docs/NN_SURFACE.md §7) ... rel 5.8e-07
-#   aten-level 2-layer Llama (docs/SAMPLING.md §3) ................ 2.3e-09
-#   GPT-2, 2 layers (docs/GPT2.md) ................................. 4.1e-08
-#   Gemma, 2 layers (docs/ARCH.md §5) .............................. 1.55e-06
-#   BERT, 2 layers (docs/ARCH.md §5): hidden 1.43e-06, pooled ...... 9.39e-07
+#   torch.nn-assembled 2-layer decoder (docs/bindings/NN_SURFACE.md §7) ... rel 5.8e-07
+#   aten-level 2-layer Llama (docs/models/SAMPLING.md §3) ................ 2.3e-09
+#   GPT-2, 2 layers (docs/models/GPT2.md) ................................. 4.1e-08
+#   Gemma, 2 layers (docs/architectures/ARCH.md §5) .............................. 1.55e-06
+#   BERT, 2 layers (docs/architectures/ARCH.md §5): hidden 1.43e-06, pooled ...... 9.39e-07
 #   -------------------------------------------------------------------------
-#   Gemma with the wrong gelu approximation (docs/ARCH.md §5.1) .... 5.87e-04
+#   Gemma with the wrong gelu approximation (docs/architectures/ARCH.md §5.1) .... 5.87e-04
 #
 # Every normal measurement across five different architectures and two
 # measurement methods (this file's own live comparison, and the aten-level
-# transcriptions docs/ARCH.md and friends built independently) lands at or
+# transcriptions docs/architectures/ARCH.md and friends built independently) lands at or
 # below 5.2e-06. The one case known to be *wrong* lands at 5.87e-04 -- roughly
 # 113x the worst normal figure. `_E2E_LOGIT_ATOL = 1e-5` sits in that gap: the
 # golden harness's own float32 bound (tools/golden/dtypes.py
@@ -3430,16 +3430,16 @@ def _e2e_flatten(x):
 # ~2x margin above the worst normal figure measured in this file and ~59x
 # margin below the one documented wrong-math figure -- see the do_sample test
 # below for a direct check that this bound actually catches an error of that
-# size, and docs/E2E.md for how it was confirmed.
+# size, and docs/models/E2E.md for how it was confirmed.
 _E2E_LOGIT_ATOL = 1e-5
 
 
 def test_two_layer_llama_greedy_matches_upstream_token_for_token():
-    # Regression-pins the claim measured in docs/NN_SURFACE.md §7 and
-    # docs/SAMPLING.md §3's aten-level model: an aten-level 2-layer decoder,
+    # Regression-pins the claim measured in docs/bindings/NN_SURFACE.md §7 and
+    # docs/models/SAMPLING.md §3's aten-level model: an aten-level 2-layer decoder,
     # decoded greedily, produces the exact same tokens as real torch.
     if _upstream_torch is None:
-        return  # no upstream torch in this interpreter -- see docs/E2E.md
+        return  # no upstream torch in this interpreter -- see docs/models/E2E.md
     ids, steps = [7, 42, 3, 88], 4
     results = {}
     for kind in ("upstream", "shim"):
@@ -3509,7 +3509,7 @@ def _e2e_sample_step(b, logits, seq, temperature, top_k, top_p, seed, vocab):
 def _e2e_generate(kind, ids, steps, temperature, top_k, top_p, seed, reseed_each_step):
     """Returns `(tokens, raw_logits)`, where `raw_logits[step]` is the flat
     last-position logit vector *before* temperature/top-k/top-p (the same
-    quantity docs/ARCH.md §5.1 showed a token-only check cannot tell apart
+    quantity docs/architectures/ARCH.md §5.1 showed a token-only check cannot tell apart
     from a wrong kernel). Callers that only need tokens can ignore the second
     element; `test_do_sample_matches_upstream_across_configs_and_reseed_modes`
     below uses both."""
@@ -3540,7 +3540,7 @@ def _e2e_max_logit_diff(t_logits, c_logits):
 
 
 def test_do_sample_matches_upstream_across_configs_and_reseed_modes():
-    # Regression-pins docs/SAMPLING.md §3's judgment call: 15 configurations x
+    # Regression-pins docs/models/SAMPLING.md §3's judgment call: 15 configurations x
     # 6 greedy-sampled tokens = 90 tokens, all matching upstream. Nine configs
     # reseed before every draw (same starting point -> same value); six seed
     # once and let the stream run across all 6 steps, which is the stronger
@@ -3551,7 +3551,7 @@ def test_do_sample_matches_upstream_across_configs_and_reseed_modes():
     # `_E2E_LOGIT_ATOL`), so every configuration below also compares the raw
     # logits `_e2e_generate` now returns alongside the tokens.
     if _upstream_torch is None:
-        return  # no upstream torch in this interpreter -- see docs/E2E.md
+        return  # no upstream torch in this interpreter -- see docs/models/E2E.md
     ids, steps = [7, 42, 3, 88], 6
     checked = 0
     max_diff = 0.0
@@ -3581,7 +3581,7 @@ def test_do_sample_matches_upstream_across_configs_and_reseed_modes():
 
 
 def test_multinomial_matches_upstream_through_a_second_draw():
-    # docs/SAMPLING.md §2: `multinomial` takes one of two algorithms
+    # docs/models/SAMPLING.md §2: `multinomial` takes one of two algorithms
     # (Gumbel-style argmax/topk, or cumsum + binary search) depending on
     # `!replacement or n_sample == 1`, and the fast path consumes a fixed word
     # count regardless of `n_sample`/`replacement`. A single draw matching by
@@ -3589,7 +3589,7 @@ def test_multinomial_matches_upstream_through_a_second_draw():
     # reseed in between, only matches if the first draw consumed exactly the
     # same number of generator words on both sides.
     if _upstream_torch is None:
-        return  # no upstream torch in this interpreter -- see docs/E2E.md
+        return  # no upstream torch in this interpreter -- see docs/models/E2E.md
     cases = [(5, 1, False), (5, 3, True), (8, 1, True), (100, 1, False), (100, 3, True)]
     for n_cat, n_sample, replacement in cases:
         flat = [round(((i * 2654435761 + 1) % 1000) / 1000.0 + 0.01, 6) for i in range(n_cat)]
@@ -3612,7 +3612,7 @@ def test_randn_matches_upstreams_stream_bit_for_bit():
     # upstream's own `aten::randn.default` kernel does, not just that the
     # distribution looks right.
     if _upstream_torch is None:
-        return  # no upstream torch in this interpreter -- see docs/E2E.md
+        return  # no upstream torch in this interpreter -- see docs/models/E2E.md
     for seed in (0, 1, 1234):
         _upstream_torch.manual_seed(seed)
         want = _upstream_torch.randn(4, 4)
@@ -3637,7 +3637,7 @@ def test_rand_matches_upstreams_stream_bit_for_bit():
         assert got.tolist() == want.tolist(), seed
 
 
-# --- randint / randperm (docs/RANDINT.md) ----------------------------------
+# --- randint / randperm (docs/kernels/RANDINT.md) ----------------------------------
 #
 # These sat wrong for as long as they did because `randn` and `rand` above
 # were right. A seeded run agreed with upstream on floats and disagreed on
@@ -3650,7 +3650,7 @@ _RANDINT_DTYPES_UP = ("int64", "int32", "int16", "uint8", "bool",
 
 #: (low, high). The widths straddle 2^28 on purpose: that, not 2^32, is where
 #: upstream's public build switches from `random()` to `random64()`
-#: (docs/RANDINT.md §1.1 -- the 2^32 arm is `#ifdef FBCODE_CAFFE2`).
+#: (docs/kernels/RANDINT.md §1.1 -- the 2^32 arm is `#ifdef FBCODE_CAFFE2`).
 _RANDINT_RANGES = (
     (0, 2), (0, 10), (-5, 5), (3, 4), (0, 100), (0, 256), (0, 2048),
     (0, 2**24), (0, 2**28 - 1), (0, 2**28), (0, 2**28 + 1),
@@ -3825,7 +3825,7 @@ def test_randperm_dtypes_match_upstream_including_the_bfloat16_defect():
     returns 279 distinct values out of 300 rather than refusing. This shim
     reproduces that. Returning a real permutation there would read like the
     better answer and would disagree with torch, which is the direction
-    docs/TORCH_C.md §1 refuses.
+    docs/design/TORCH_C.md §1 refuses.
     """
     if _upstream_torch is None:
         return
@@ -4000,7 +4000,7 @@ def test_normal_matches_upstreams_stream_bit_for_bit_across_overloads():
         # Broadcasting mean and std against each other, not just matching
         # shapes -- the standard-normal draw has to be sized at the
         # *broadcast* shape, not either operand's own shape (measured against
-        # upstream 2.13.0; see docs/RANDOM.md).
+        # upstream 2.13.0; see docs/kernels/RANDOM.md).
         bflat_mean, bflat_std = [0.0, 0.0, 0.0], [1.0, 1.0, 1.0, 1.0]
         t_bmean = _upstream_torch.tensor(bflat_mean).reshape(3, 1)
         t_bstd = _upstream_torch.tensor(bflat_std).reshape(1, 4)
@@ -4014,9 +4014,9 @@ def test_normal_matches_upstreams_stream_bit_for_bit_across_overloads():
 
 
 # --- checkpoint round trip: torch.load / safetensors read what upstream
-# wrote, and the `filled` guard refuses to fabricate zeros (docs/CKPT.md) ----
+# wrote, and the `filled` guard refuses to fabricate zeros (docs/models/CKPT.md) ----
 #
-# docs/CKPT.md measured this by hand under /Volumes/macMini/caches/ckpt-probe/
+# docs/models/CKPT.md measured this by hand under /Volumes/macMini/caches/ckpt-probe/
 # (not committed, evaporates with the worktree) and said so itself: "이 중
 # 아무것도 회귀로부터 보호되지 않는다." This section pins those measurements.
 #
@@ -4031,7 +4031,7 @@ def test_normal_matches_upstreams_stream_bit_for_bit_across_overloads():
 # shim's native library a second time from a second path in a process that
 # already loaded it once as standalone `_C`, which nothing here has measured
 # as safe. So this uses a *second interpreter*, exactly the two-script recipe
-# docs/CKPT.md §7 already validated (`make_ckpt.py` then `verify.py`): a
+# docs/models/CKPT.md §7 already validated (`make_ckpt.py` then `verify.py`): a
 # subprocess with `torchnative/src/main` on `PYTHONPATH` gets the vendored
 # `torch` (shim-backed); this process keeps plain upstream `torch`
 # (`_upstream_torch` above, already guarded for its absence).
@@ -4041,7 +4041,7 @@ def test_normal_matches_upstreams_stream_bit_for_bit_across_overloads():
 # than the one `pytests/run.sh` runs for the standalone `_C` every other test
 # in this file uses. So the guard below checks for that file too, not just
 # `_upstream_torch is None`, and skips the same way (silently, no pytest.skip
-# -- see docs/E2E.md's reasoning, which applies here unchanged) when it is
+# -- see docs/models/E2E.md's reasoning, which applies here unchanged) when it is
 # missing.
 import functools
 import json
@@ -4165,12 +4165,12 @@ except NotImplementedError as e:
     result["legacy_refused"] = True
     result["legacy_error"] = str(e)
 
-# safetensors' *default* backend. docs/CKPT.md §3.1 recorded this refusing --
+# safetensors' *default* backend. docs/models/CKPT.md §3.1 recorded this refusing --
 # it goes through `UntypedStorage.from_file`, which did not exist -- and
-# docs/CKPT2.md §2 is the round that implemented it. What is recorded now is
+# docs/models/CKPT2.md §2 is the round that implemented it. What is recorded now is
 # not "it works" but "it agrees": a third reader of the same file, reaching the
 # bytes by a third route (whole-file storage, sliced, `asarray`, `view.dtype`),
-# has to land on the same numbers as the two docs/CKPT.md §1 already compared.
+# has to land on the same numbers as the two docs/models/CKPT.md §1 already compared.
 try:
     sd_mm = load_file(os.path.join(d, "tiny.safetensors"), backend="mmap")
     result["mmap_backend"] = "OK"
@@ -4287,7 +4287,7 @@ def _ckpt_fixture():
     keys = {k: [list(v.shape), str(v.dtype)] for k, v in sd.items()}
 
     # The 14-case "hard" checkpoint: dtypes and views a real checkpoint has
-    # that Tiny above does not (docs/CKPT.md §5-6).
+    # that Tiny above does not (docs/models/CKPT.md §5-6).
     hard = {}
     hard["w_f32"] = torch.tensor(_ckpt_det(24, 101), dtype=torch.float32).reshape(4, 6)
     hard["w_f16"] = hard["w_f32"].half()
@@ -4323,7 +4323,7 @@ def _ckpt_fixture():
     env = dict(os.environ)
     env["PYTHONPATH"] = _CKPT_VENDOR_DIR
     # Not a workaround -- upstream ships this switch for builds without
-    # libtorch_global_deps, which is exactly this one (docs/CKPT.md §7,
+    # libtorch_global_deps, which is exactly this one (docs/models/CKPT.md §7,
     # VENDOR.md:181).
     env["TORCH_USE_RTLD_GLOBAL"] = "1"
     proc = subprocess.run(
@@ -4346,13 +4346,13 @@ def _ckpt_fixture():
 
 
 def test_ckpt_torch_load_zip_round_trip_matches_upstream_within_measured_tolerance():
-    # docs/CKPT.md §1: torch.load (zip, both weights_only=True and False)
+    # docs/models/CKPT.md §1: torch.load (zip, both weights_only=True and False)
     # measured 2.98e-08 today, inside the "normal float32 rounding" range
     # (2.3e-09~5.2e-06) that table itself states -- the same range
     # `_E2E_LOGIT_ATOL` above is grounded in, so this reuses that constant
     # rather than inventing a second one for the same evidence.
     if not _ckpt_shim_available():
-        return  # no upstream torch, or vendor shim not installed -- see docs/CKPT.md
+        return  # no upstream torch, or vendor shim not installed -- see docs/models/CKPT.md
     r = _ckpt_fixture()
     assert r["keys_match"]
     assert r["shapes_dtypes_match"]
@@ -4364,10 +4364,10 @@ def test_ckpt_torch_load_zip_round_trip_matches_upstream_within_measured_toleran
 
 
 def test_ckpt_safetensors_two_readers_agree_with_torch_load_bit_for_bit():
-    # docs/CKPT.md §1, §3.1: both safetensors backends load correctly, and
+    # docs/models/CKPT.md §1, §3.1: both safetensors backends load correctly, and
     # agree with torch.load's reading of the *same weights* to exactly 0.0 --
     # not an approximation, because both go through the shared `from_le_bytes`
-    # (docs/CKPT.md §6) rather than two independent dtype/bool paths.
+    # (docs/models/CKPT.md §6) rather than two independent dtype/bool paths.
     if not _ckpt_shim_available():
         return
     r = _ckpt_fixture()
@@ -4383,14 +4383,14 @@ def test_ckpt_safetensors_two_readers_agree_with_torch_load_bit_for_bit():
 def test_ckpt_legacy_format_is_refused_by_name_and_the_mmap_backend_agrees():
     """The two halves of this used to be one claim, and are now opposites.
 
-    docs/CKPT.md §3.3 listed legacy `torch.load` and safetensors' default mmap
+    docs/models/CKPT.md §3.3 listed legacy `torch.load` and safetensors' default mmap
     backend together, as the two paths that refused. They were never the same
-    kind of thing, and docs/CKPT2.md §2 separated them:
+    kind of thing, and docs/models/CKPT2.md §2 separated them:
 
       * **legacy stays refused, and must.** Its container fills the storage
         *after* `set_`, and this shim's `set_` copies, so an implementation
         that did not refuse would return a state dict of `0.0` with no error
-        (docs/CKPT.md §4). The refusal is the `filled` guard firing through
+        (docs/models/CKPT.md §4). The refusal is the `filled` guard firing through
         `_rebuild_tensor` -> `set_`, so this also checks the guard is what is
         doing it, by message.
       * **mmap is implemented, so the assertion becomes agreement.** It reads
@@ -4409,13 +4409,13 @@ def test_ckpt_legacy_format_is_refused_by_name_and_the_mmap_backend_agrees():
 
 
 def test_ckpt_filled_guard_refuses_set_on_unfilled_storage_then_gathers_strided_views():
-    # docs/CKPT.md §4: the single most important safety property in this
+    # docs/models/CKPT.md §4: the single most important safety property in this
     # work. Without it, `torch.load` of a legacy-format checkpoint succeeds,
     # `load_state_dict` reports "All keys matched successfully", and every
-    # loaded weight is silently 0.0 -- no exception anywhere (docs/CKPT.md §4
+    # loaded weight is silently 0.0 -- no exception anywhere (docs/models/CKPT.md §4
     # reproduces that exact failure). `set_` on a storage that was never
     # filled must refuse by name; once filled, `set_` must gather strided
-    # views correctly (docs/CKPT.md §5: contiguous, transposed, and a nonzero
+    # views correctly (docs/models/CKPT.md §5: contiguous, transposed, and a nonzero
     # storage_offset), and must still refuse bounds violations and negative
     # strides rather than guess.
     if not _ckpt_shim_available():
@@ -4433,9 +4433,9 @@ def test_ckpt_filled_guard_refuses_set_on_unfilled_storage_then_gathers_strided_
 
 
 def test_ckpt_fourteen_hard_dtypes_and_views_round_trip_bit_exact():
-    # docs/CKPT.md §5: f16/bf16/f64/i64/i32/bool/scalar/empty/rank-3, tied
+    # docs/models/CKPT.md §5: f16/bf16/f64/i64/i32/bool/scalar/empty/rank-3, tied
     # weights, a transposed view, and a nonzero storage_offset slice -- all
-    # loaded from a checkpoint upstream wrote. docs/CKPT.md's own bar for
+    # loaded from a checkpoint upstream wrote. docs/models/CKPT.md's own bar for
     # these is bit-exact ("키마다 비트 일치"), not a tolerance: float16 and
     # bfloat16 round-trip exactly through float32, so a nonzero diff here is
     # a real regression, not rounding.
@@ -4452,13 +4452,13 @@ def test_ckpt_fourteen_hard_dtypes_and_views_round_trip_bit_exact():
         assert got["dtype_ok"], (key, "dtype mismatch")
         assert got["shape_ok"], (key, "shape mismatch")
         assert got["worst"] == 0.0, (key, got["worst"])
-    # Weight tying is preserved in value (not identity -- docs/CKPT.md §5's
+    # Weight tying is preserved in value (not identity -- docs/models/CKPT.md §5's
     # one recorded gap, which this does not re-litigate).
     assert r["tied_equal"]
 
 
 # ---------------------------------------------------------------------------
-# The device road, end to end through the vendored tree (docs/DEVICE_ABS.md §5)
+# The device road, end to end through the vendored tree (docs/devices/DEVICE_ABS.md §5)
 # ---------------------------------------------------------------------------
 #
 # Everything above tests `_C` in isolation, which is where the pieces live but
@@ -4477,7 +4477,7 @@ out = {}
 # Two Linears and no activation on purpose: `nn.ReLU`'s forward goes through
 # `torch.relu`, which has no overload-table entry, and this test is about the
 # device road rather than about that hole. `nn.Linear` forward is the one
-# docs/DEVICE.md measured as bit-identical to upstream.
+# docs/devices/DEVICE.md measured as bit-identical to upstream.
 m = nn.Sequential(nn.Linear(4, 8), nn.Linear(8, 2))
 before = [id(p) for p in m.parameters()]
 
@@ -4643,13 +4643,13 @@ def test_device_road_through_the_vendored_tree():
     # backend this build does not link, `meta` is a device that needs no
     # backend at all. `t.to("meta")` returns a tensor here now, and the
     # measurement that it is the *right* tensor lives in
-    # `test_meta_tensors_carry_shape_and_dtype_and_no_data`. docs/META.md.
+    # `test_meta_tensors_carry_shape_and_dtype_and_no_data`. docs/devices/META.md.
 
 
-# --- the meta device (docs/META.md) -----------------------------------------
+# --- the meta device (docs/devices/META.md) -----------------------------------------
 #
 # `meta` is the second device this build has, and the first one that needed no
-# backend. That is what it is *for* here: every claim docs/DEVICE_ABS.md had to
+# backend. That is what it is *for* here: every claim docs/devices/DEVICE_ABS.md had to
 # argue about "when there are two devices" is testable now, and the tests below
 # are that argument turned into assertions.
 
@@ -4658,7 +4658,7 @@ def test_meta_tensors_carry_shape_and_dtype_and_no_data():
     """The whole of what a meta tensor is, and the whole of what it is not.
 
     Every expected value here was measured on upstream torch 2.13.0 first
-    (docs/META.md §2) -- including the two *different* refusals, which are not
+    (docs/devices/META.md §2) -- including the two *different* refusals, which are not
     tidied into one: `.tolist()` is
     `NotImplementedError: Cannot copy out of meta tensor; no data!` and
     `.item()` is `RuntimeError: Tensor.item() cannot be called on meta
@@ -4703,7 +4703,7 @@ def test_meta_drops_the_device_index_where_cpu_does_too():
     `torch.zeros(2, device="meta:7").device` is `device(type='meta')`, exactly
     as `device="cpu:3"` reports plain `cpu`. That is why `Repr::Meta` stores no
     label -- there is only one meta device, so the label is a constant, and
-    `PyDevice::from_candle`'s hardcoded index (docs/DEVICE_ABS.md §3.2) is not
+    `PyDevice::from_candle`'s hardcoded index (docs/devices/DEVICE_ABS.md §3.2) is not
     the thing that answers for it.
 
     The *label* `meta:7` still exists and is still unequal to bare `meta`;
@@ -4720,12 +4720,12 @@ def test_meta_drops_the_device_index_where_cpu_does_too():
 def test_the_gate_refuses_a_mixed_device_op_and_finds_it_in_a_sequence():
     """**The half of `check_devices_agree` that had never run.**
 
-    docs/DEVICE_ABS.md §10 recorded it as untested and unreachable: with `cpu`
+    docs/devices/DEVICE_ABS.md §10 recorded it as untested and unreachable: with `cpu`
     the only resolvable label, an input that disagreed could not be built. It
     can now, and running it found a real hole -- the keyword loop did not
     descend into sequences, and every torch-level call arrives with its
     arguments bound by *name*, so `cat([cpu, meta])` went straight past the
-    gate. docs/META.md §5.
+    gate. docs/devices/META.md §5.
 
     Both argument shapes are pinned here for that reason: a plain tensor
     argument and a `Tensor[]`, each positionally *and* by keyword.
@@ -4778,7 +4778,7 @@ def test_meta_transfers_go_one_way_only():
     This is the property `meta` exists for, and the one a shim could most
     easily get wrong in the expensive direction: materialising zeros for
     `meta.to("cpu")` would turn "these weights were never loaded" into "these
-    weights are zero", which is the failure `docs/CKPT.md`'s `filled` guard
+    weights are zero", which is the failure `docs/models/CKPT.md`'s `filled` guard
     exists to stop one layer down.
     """
     d = _C._aten_dispatch
@@ -4791,7 +4791,7 @@ def test_meta_transfers_go_one_way_only():
     assert dense.tolist() == [1.0, 1.0]  # the source is untouched
 
     # dtype changes stay on meta, including when `device=` is absent -- absent
-    # means "stay where you are", not "go to the CPU" (docs/DEVICE_ABS.md §5.2,
+    # means "stay where you are", not "go to the CPU" (docs/devices/DEVICE_ABS.md §5.2,
     # observable for the first time now that there are two devices).
     cast = d("aten._to_copy.default", moved, _C.float64)
     assert cast.is_meta is True and cast.dtype == _C.float64
@@ -5015,7 +5015,7 @@ def test_meta_reciprocal_floats_an_integral_input():
     assert chain.dtype == _C.float32, chain.dtype
 
 
-# --- the elementwise meta family (docs/META.md §7.1) -------------------------
+# --- the elementwise meta family (docs/devices/META.md §7.1) -------------------------
 #
 # Every test below checks **shape and dtype separately and explicitly**. That
 # is not belt-and-braces: a meta kernel's entire output is those two fields, so
@@ -5102,10 +5102,10 @@ def test_meta_comparisons_answer_bool_whatever_went_in():
 
     # And the meta kernel's dtype rule is the dense kernel's, in BOTH
     # directions -- it must promote exactly the pairs the dense kernel
-    # promotes and refuse exactly the ones it refuses (docs/E2E_REAL.md §6.1).
+    # promotes and refuse exactly the ones it refuses (docs/models/E2E_REAL.md §6.1).
     #
     # `float32 x int64` used to be the refusing example here. It promotes now
-    # (docs/PROMOTE.md §4), so it has become the *promoting* example and the
+    # (docs/numerics/PROMOTE.md §4), so it has become the *promoting* example and the
     # refusal is checked against a pair that genuinely has no promotion.
     assert d("aten.gt.Tensor", _meta_empty([2], _C.float32),
              _meta_empty([2], _C.int64)).dtype == _C.bool
@@ -5162,7 +5162,7 @@ def test_meta_elementwise_arithmetic_broadcasts_and_promotes_like_the_dense_kern
                 assert tuple(out.shape) == shape, (op, dtype, lhs, rhs, tuple(out.shape))
                 assert out.dtype == want, (op, dtype, lhs, rhs, out.dtype)
 
-    # `mul.Tensor` and -- since docs/KERNELS26.md §23 -- `div.Tensor` promote a
+    # `mul.Tensor` and -- since docs/kernels/KERNELS26.md §23 -- `div.Tensor` promote a
     # mixed pair; `add` and `sub` still refuse it. Both halves, so that a meta
     # kernel which promoted everything and one which refused everything both
     # fail.
@@ -5187,7 +5187,7 @@ def test_meta_elementwise_arithmetic_broadcasts_and_promotes_like_the_dense_kern
     assert d("aten.mul.Tensor", _meta_empty([2], _C.int64),
              _meta_empty([2], _C.int32)).dtype == _C.int64
     # `add` and `sub` promote too now -- all four members share one rule
-    # (docs/PROMOTE.md §4), where they used to be split two and two. The meta
+    # (docs/numerics/PROMOTE.md §4), where they used to be split two and two. The meta
     # path must have moved with the dense one, so this asserts the promotion
     # rather than the refusal it used to assert.
     for op in ("aten.add.Tensor", "aten.sub.Tensor"):
@@ -5213,7 +5213,7 @@ def test_meta_elementwise_arithmetic_broadcasts_and_promotes_like_the_dense_kern
 
     # `sub` refuses a `bool` operand whatever it would promote to, because
     # upstream does -- the check is on the operand, not on the promoted type,
-    # and the meta path has to make it in the same order (docs/PROMOTE.md §4).
+    # and the meta path has to make it in the same order (docs/numerics/PROMOTE.md §4).
     try:
         d("aten.sub.Tensor", _meta_empty([2], _C.bool), _meta_empty([2], _C.float32))
     except NotImplementedError as e:
@@ -5302,7 +5302,7 @@ def test_meta_where_broadcasts_three_operands_and_takes_dtype_from_the_values():
 
     # And the value operands promote, as they do on the dense path -- from the
     # two value operands only, with the condition's dtype taking no part
-    # (docs/PROMOTE.md §4).
+    # (docs/numerics/PROMOTE.md §4).
     assert d("aten.where.self", _meta_empty([2], _C.bool),
              _meta_empty([2], _C.float32), _meta_empty([2], _C.int64)).dtype == _C.float32
     assert d("aten.where.self", _meta_empty([2], _C.bool),
@@ -5656,21 +5656,21 @@ def test_ops_without_a_meta_kernel_name_themselves():
     gidx = d("aten.empty.memory_format", [2, 1], _C.int64, device=meta)
 
     # `add.Tensor` used to head this list and is now implemented
-    # (docs/META.md §7.1). It was replaced rather than the test deleted: the
+    # (docs/devices/META.md §7.1). It was replaced rather than the test deleted: the
     # boundary moved, it did not disappear, and the reductions, the
     # contractions and the remaining views are still behind it.
     #
-    # `sum.default` and `view.default` left it the same way in docs/VOICE4.md
+    # `sum.default` and `view.default` left it the same way in docs/architectures/VOICE4.md
     # §4 -- voicestudio's BigVGAN normalises each of its 218 resampling filters
     # with `(taps / taps.sum()).view(1, 1, k)` inside `__init__`, which
     # `from_pretrained` runs on meta. They were two *members* of the two
-    # families named above, not the families -- and docs/METAFAM.md closed
+    # families named above, not the families -- and docs/kernels/METAFAM.md closed
     # the rest of the members named here: `reshape`, `slice.Tensor`,
     # `sum.dim_IntList`, `mean.dim`, `mean.default`, `cumsum.default`,
     # `any.default`, `amax.default`, `t.default`, `transpose.int`,
     # `permute.default`, `unsqueeze.default`, `squeeze.dim` and
     # `squeeze.default` moved to the answering half below. The boundary moved
-    # again rather than the test being deleted, and docs/METAEMB.md moved it a
+    # again rather than the test being deleted, and docs/kernels/METAEMB.md moved it a
     # third time: `embedding`, `gather`, `max.dim`, `argmax`, `topk`, `sort`,
     # the contraction family, `native_layer_norm`, `cat`, `split`,
     # `convolution`, SDPA, the activations, `repeat` and the integer half of
@@ -5719,7 +5719,7 @@ def test_ops_without_a_meta_kernel_name_themselves():
         ("aten.tril.default", (a, 0)),
         ("aten.sum.default", (a,)),
         ("aten.view.default", (a, [3, 2])),
-        # docs/METAFAM.md -- the rest of the two families.
+        # docs/kernels/METAFAM.md -- the rest of the two families.
         ("aten.sum.dim_IntList", (a, [1])),
         ("aten.mean.dim", (a, [1])),
         ("aten.mean.default", (a,)),
@@ -5734,11 +5734,11 @@ def test_ops_without_a_meta_kernel_name_themselves():
         ("aten.squeeze.dim", (a, 0)),
         ("aten.squeeze.default", (a,)),
         ("aten.slice.Tensor", (a, 0, 0, 1)),
-        # docs/EXPORT5.md -- export needs this one on meta, and it landed on a
+        # docs/graph/EXPORT5.md -- export needs this one on meta, and it landed on a
         # branch parallel to METAEMB's, which is why the refusing list above
         # still named it after the merge.
         ("aten.zeros_like.default", (a,)),
-        # docs/METAEMB.md -- the measured wall and what stood behind it.
+        # docs/kernels/METAEMB.md -- the measured wall and what stood behind it.
         ("aten.embedding.default", (w, idx)),
         ("aten.gather.default", (a, 1, gidx)),
         ("aten.mm.default", (a, at)),
@@ -5757,7 +5757,7 @@ def test_ops_without_a_meta_kernel_name_themselves():
 
     # The multi-output ones are checked separately: they answer a pair or a
     # triple, so `out.is_meta` above would not typecheck -- and the INDEX
-    # dtype is the whole point of docs/METAEMB.md §3.1, so it is read here
+    # dtype is the whole point of docs/kernels/METAEMB.md §3.1, so it is read here
     # rather than only in test_metaemb.py.
     for op, args, count in (
         ("aten.max.dim", (a, 0), 2),
@@ -5776,7 +5776,7 @@ def test_ops_without_a_meta_kernel_name_themselves():
     # `_aten_implemented()` is untouched by any of this: it means "has a kernel
     # *and* tools/golden/cases.py compares it against upstream", and a meta
     # tensor has no values to compare. Meta support is a property of ops
-    # already on that list. docs/META.md §7.
+    # already on that list. docs/devices/META.md §7.
     assert "aten.add.Tensor" in _C._aten_implemented()
 
 
@@ -5914,14 +5914,14 @@ def _meta_road_fixture():
 def test_meta_road_through_the_vendored_tree():
     """`with torch.device("meta")` end to end, and the reason it had to be.
 
-    docs/DEVICE_ABS.md §7.2 refused to build the mode stack on its own, because
+    docs/devices/DEVICE_ABS.md §7.2 refused to build the mode stack on its own, because
     a stack nothing consults makes `with torch.device("meta"): torch.zeros(2)`
     return a **CPU** tensor with the block appearing to work. Every assertion
     below is the other half of that: the stack exists *and* the factories
     consult it.
 
     Each expected value was measured on upstream torch 2.13.0 first
-    (docs/META.md §2/§8), including the ones that are easy to guess wrong --
+    (docs/devices/META.md §2/§8), including the ones that are easy to guess wrong --
     `__enter__` returns the device rather than the mode, and an explicit
     `device=` beats the context.
     """
@@ -5963,7 +5963,7 @@ def test_meta_road_through_the_vendored_tree():
     assert r["empty_state_dict"]["0.weight"] == ["meta", [8, 4]]
 
     # ... then the real weights arrive and it computes. The number is upstream's
-    # -- the same script on torch 2.13.0 gives [[32.0, 32.0]] (docs/META.md §8).
+    # -- the same script on torch 2.13.0 gives [[32.0, 32.0]] (docs/devices/META.md §8).
     assert r["after_load_device"] == "cpu", r["after_load_device"]
     assert r["after_load_forward"] == [[32.0, 32.0]], r["after_load_forward"]
 
@@ -5976,7 +5976,7 @@ def test_meta_road_through_the_vendored_tree():
     assert "at least two devices" in r["mixed_add"], r["mixed_add"]
 
 
-# --- the capture layer (docs/CAPTURE.md) ------------------------------------
+# --- the capture layer (docs/graph/CAPTURE.md) ------------------------------------
 #
 # DESIGN.md §11.1 named the reason this exists: an NPU is not an eager device,
 # it is an executor that takes a whole graph. The single door is what makes
@@ -6018,14 +6018,14 @@ def test_capture_is_off_until_it_is_asked_for():
 
 
 def test_capture_takes_the_functional_dropout_and_only_inside_a_region():
-    """docs/LOSS.md §7. `.train()` dropout is recordable now, and the eager
+    """docs/training/LOSS.md §7. `.train()` dropout is recordable now, and the eager
     path is unchanged outside a capture region.
 
     Before this, `torch.dropout(x, 0.5, True)` decomposed onto `bernoulli_`,
     which writes in place, and capture refuses mutation so a trace stays
     single-assignment. So no `.train()` forward with real dropout could be
-    recorded at all -- `gpt2`, `bert`, `opt` and `gpt_bigcode`, docs/TRAIN.md's
-    own four, and docs/AUTOGRAD.md §6.5's second reason to want this op.
+    recorded at all -- `gpt2`, `bert`, `opt` and `gpt_bigcode`, docs/training/TRAIN.md's
+    own four, and docs/training/AUTOGRAD.md §6.5's second reason to want this op.
 
     Three things are asserted and each catches a different regression:
 
@@ -6073,7 +6073,7 @@ def test_capture_takes_the_functional_dropout_and_only_inside_a_region():
     #    `1/(1-p)` -- and they agree bit for bit anyway, in every dtype,
     #    because **both end up multiplying by a value narrowed to the input's
     #    dtype**: the eager one stores its scale into a mask of that dtype, and
-    #    the functional one narrows the scalar (docs/LOSS.md §7). Measured
+    #    the functional one narrows the scalar (docs/training/LOSS.md §7). Measured
     #    upstream: 0 of 25872 survivors differ, over 4 dtypes x 6 values of p.
     #
     #    That coincidence is what makes the substitution in `_dropout_impl`
@@ -6096,7 +6096,7 @@ def test_capture_takes_the_functional_dropout_and_only_inside_a_region():
             f"disagree, so entering a capture region changes the numbers.\n"
             f"  eager      {eager}\n  native_dropout {functional}\n"
             f"The usual cause is native_dropout's scale no longer being narrowed "
-            f"to the input's dtype before it multiplies -- see docs/LOSS.md §7"
+            f"to the input's dtype before it multiplies -- see docs/training/LOSS.md §7"
         )
 
 
@@ -6276,7 +6276,7 @@ def test_capture_guard_refuses_a_different_shape():
     The record holds concrete shapes -- every intermediate shape in it was
     computed from the shapes that came in. Replaying with a different one does
     not merely risk a wrong answer, it makes every recorded output shape a lie.
-    Dynamic shapes are out of scope here (docs/CAPTURE.md §4), and this is what
+    Dynamic shapes are out of scope here (docs/graph/CAPTURE.md §4), and this is what
     "out of scope" has to mean: refused by name, not attempted.
     """
     trace = _one_op_trace()
@@ -6388,7 +6388,7 @@ def test_capture_refuses_reading_a_tensor_value_onto_the_host():
 def test_capture_refuses_in_place_ops():
     """Mutation is what makes aliasing observable, so refusing it removes both.
 
-    In-place aliasing is out of scope (docs/CAPTURE.md §4). Rather than model
+    In-place aliasing is out of scope (docs/graph/CAPTURE.md §4). Rather than model
     it, capture refuses every mutating overload -- and with no mutation in the
     segment, whether two recorded values share storage cannot be observed. The
     trace is single-assignment by construction rather than by hope.
@@ -6409,10 +6409,10 @@ def test_capture_refuses_in_place_ops():
 
 
 def test_capture_refuses_the_new_inplace_spellings_by_dispatch_key():
-    """docs/SPELLINGS.md §9's six real gaps, at the raw `_aten_dispatch` level.
+    """docs/bindings/SPELLINGS.md §9's six real gaps, at the raw `_aten_dispatch` level.
 
     `capture.rs`'s `is_mutating` keys off the op name ending in `_` (before
-    the last `.`), not off which Python door reached it (docs/CAPTURE.md), so
+    the last `.`), not off which Python door reached it (docs/graph/CAPTURE.md), so
     opening `torch.<name>`/`Tensor.<name>` doors onto these kernels needed no
     `capture.rs` change. This is the raw-dispatch half of the measurement
     that confirms that rather than assumes it -- `masked_fill.Scalar` is the
@@ -6456,7 +6456,7 @@ def test_capture_refuses_ops_that_draw_random_numbers():
     Not a claim that the graph is invalid -- it is a claim that this layer has
     no story yet for seeding a delegate, and a trace whose replay differs from
     eager for a legitimate reason would hide one that differs for a bad one.
-    docs/CAPTURE.md §4.
+    docs/graph/CAPTURE.md §4.
     """
     d = _C._aten_dispatch
     probs = _C._tensor_new_from_data([0.25, 0.75])
@@ -6560,7 +6560,7 @@ def test_capture_abandon_leaves_nothing_behind():
 
 
 def test_capture_graph_is_shaped_like_an_exported_program():
-    """docs/CAPTURE.md §5: is this structure one that can become Edge dialect?
+    """docs/graph/CAPTURE.md §5: is this structure one that can become Edge dialect?
 
     The judgement is recorded as a test rather than only as prose, because the
     answer is a claim about *this* data structure and it is cheap to pin. FX's
@@ -6737,14 +6737,14 @@ def test_capture_road_through_the_vendored_tree():
     assert r["active_after"] is False
 
 
-# --- torch.distributed at world_size 1 (docs/DISTRIBUTED.md) -----------------
+# --- torch.distributed at world_size 1 (docs/distributed/DISTRIBUTED.md) -----------------
 #
 # `torch.distributed` was off, because `_c10d_init` was one of the names the
 # surface deliberately omits (bootstrap.py's "Deliberate omissions"). Turning it
 # on is not a one-line switch: `torch/distributed/__init__.py` reaches straight
 # into `torch._C._distributed_c10d` and what it needs there is *structure* --
 # real enums iterated with `__members__`, nested types, subclassable bases --
-# not names. docs/SURFACE_HONESTY.md §2.4 measured that a catch-all answering
+# not names. docs/design/SURFACE_HONESTY.md §2.4 measured that a catch-all answering
 # every question still could not finish `import torch`.
 #
 # The tests below are grouped by what they hold down:
@@ -6884,7 +6884,7 @@ _DEFAULT_DTYPE_NO_STORAGE = (
 def test_set_default_dtype_moves_every_rule_that_reads_the_default():
     """A setter that leaves `torch.ones(3).dtype` alone is worse than a refusal.
 
-    docs/DISTRIBUTED.md §3.4 refused `set_default_dtype` by name because the
+    docs/distributed/DISTRIBUTED.md §3.4 refused `set_default_dtype` by name because the
     value lived in a Rust `const` and a setter cannot reach one. `transformers`
     ends the argument: `modeling_utils.py:239` (`local_torch_dtype`, entered
     from `from_pretrained` at line 4304) calls `torch.set_default_dtype(dtype)`
@@ -7000,7 +7000,7 @@ def test_reduce_op_is_a_real_enum_that_can_be_walked():
     """`distributed_c10d.py:560` runs `reduce_op = _reduce_op()` at module scope,
     whose `__init__` iterates `ReduceOp.RedOpType.__members__.items()`.
 
-    docs/SURFACE_HONESTY.md §2.4 stopped exactly here: a placeholder that
+    docs/design/SURFACE_HONESTY.md §2.4 stopped exactly here: a placeholder that
     answers every attribute still has no `__members__` to walk.
     """
     c10d = _C._distributed_c10d
@@ -7100,7 +7100,7 @@ def test_the_store_is_a_real_key_value_store():
 
 def test_the_store_refuses_to_wait_for_a_rank_that_cannot_exist():
     """A silent no-op `wait` is the failure mode this repository named in
-    docs/CKPT.md: it looks like it worked. At world_size 1 nobody else can ever
+    docs/models/CKPT.md: it looks like it worked. At world_size 1 nobody else can ever
     set the key, so waiting is not "not yet", it is "never".
     """
     s = _C._distributed_c10d.HashStore()
@@ -7127,7 +7127,7 @@ def test_transports_that_need_a_peer_refuse_by_name():
         raise AssertionError("TCPStore pretended to connect")
 
 
-# --- the road through the vendored tree (docs/DISTRIBUTED.md) ---------------
+# --- the road through the vendored tree (docs/distributed/DISTRIBUTED.md) ---------------
 #
 # Everything above drives `_C` directly. What this section holds down is the
 # thing the work was for: that the *tree* gets somewhere it could not get
@@ -7156,7 +7156,7 @@ out["is_available"] = dist.is_available()
 out["has_Store"] = hasattr(dist, "Store")
 # The wire backends must stay *absent*, so the tree's own availability flags
 # come out False and it refuses by name rather than reaching for a hollow
-# object. docs/SURFACE_HONESTY.md 2.4's regression lives here.
+# object. docs/design/SURFACE_HONESTY.md 2.4's regression lives here.
 out["gloo_available"] = c10d._GLOO_AVAILABLE
 out["nccl_available"] = c10d._NCCL_AVAILABLE
 out["mpi_available"] = c10d._MPI_AVAILABLE
@@ -7292,7 +7292,7 @@ def _dist_road_fixture():
 def test_distributed_is_on_and_the_wire_backends_are_still_off():
     """Both halves of the switch, because only having one is the bug.
 
-    docs/SURFACE_HONESTY.md §2.4 turned `_c10d_init` on once before and
+    docs/design/SURFACE_HONESTY.md §2.4 turned `_c10d_init` on once before and
     `import torch` stopped. It gets on the road now -- and the second half
     matters just as much: `ProcessGroupGloo` and its siblings must stay
     *absent*, or `distributed_c10d.py:220` sets `_GLOO_AVAILABLE = True` and
@@ -7367,7 +7367,7 @@ def test_world_size_one_collectives_agree_with_upstream_gloo():
 
 
 def test_what_needs_a_peer_refuses_by_name():
-    """DESIGN.md §6, and the specific accident docs/CKPT.md recorded.
+    """DESIGN.md §6, and the specific accident docs/models/CKPT.md recorded.
 
     `send`/`recv` cannot be made true by any amount of local work, and a
     `recv` that quietly did nothing would leave the caller reading an unwritten
@@ -7388,9 +7388,9 @@ def test_what_needs_a_peer_refuses_by_name():
     assert r["store_wait"] == "REFUSED", r["store_wait"]
 
 
-# --- printing a tensor (docs/E2E_REAL.md) -----------------------------------
+# --- printing a tensor (docs/models/E2E_REAL.md) -----------------------------------
 #
-# `print(tensor)` was the one thing docs/WHEEL.md §5 recorded the built wheel
+# `print(tensor)` was the one thing docs/platform/WHEEL.md §5 recorded the built wheel
 # could not do, and it was not a packaging fault: `torch/_tensor_str.py` walks
 # a surface this shim had holes in. The spec for closing it is not a guess --
 # it is a `TorchDispatchMode` logger placed *inside* `_str`'s
@@ -7516,7 +7516,7 @@ def test_the_alternative_representations_have_no_constructors():
     those ways refuses by name. If any of them ever lands, this test fails,
     and the predicate that quietly said `False` becomes a lie that something
     noticed. That is the difference between an invariant and an assumption --
-    the `is_mutable` accident in docs/DISTRIBUTED.md §8.1 is what an unguarded
+    the `is_mutable` accident in docs/distributed/DISTRIBUTED.md §8.1 is what an unguarded
     one looks like.
 
     **The sixth is no longer in that group.** `Repr::Quantized` landed, so
@@ -7727,7 +7727,7 @@ def test_cat_skips_a_tensor_of_shape_zero_and_only_that_shape():
     step and then `torch.cat([self.keys, key_states], dim=-2)`
     (`cache_utils.py:144`), so the very first attention layer of every model
     concatenates a 1-D empty against a 4-D tensor. This shim raised
-    `IndexError` there and the forward pass stopped -- docs/E2E_REAL.md.
+    `IndexError` there and the forward pass stopped -- docs/models/E2E_REAL.md.
 
     The four assertions below are the rule's *edges*, measured on 2.13.0,
     because "skip empty tensors" is the plausible over-generalisation and it
@@ -7765,7 +7765,7 @@ def test_cat_skips_a_tensor_of_shape_zero_and_only_that_shape():
 
 
 def test_autocast_is_off_and_cannot_be_turned_on():
-    """`torch._C.is_autocast_enabled` -- the wall docs/DISTRIBUTED.md §7 named.
+    """`torch._C.is_autocast_enabled` -- the wall docs/distributed/DISTRIBUTED.md §7 named.
 
     `transformers/utils/generic.py:250` opens `maybe_autocast` with
     `if torch.is_autocast_enabled(device_type) or enabled:`, and
@@ -7821,7 +7821,7 @@ def test_a_real_transformers_llama_forward_matches_upstream():
     transcribes op by op** (`_e2e_build`/`_e2e_forward`). That proves the
     kernels and proves nothing about the tree: a transcription can agree with
     upstream while `transformers`' own `LlamaForCausalLM` cannot run at all,
-    and until this round it could not -- docs/DISTRIBUTED.md §8 item 1 lists
+    and until this round it could not -- docs/distributed/DISTRIBUTED.md §8 item 1 lists
     the forward pass as untried.
 
     This one builds the real thing on both sides:
@@ -7833,7 +7833,7 @@ def test_a_real_transformers_llama_forward_matches_upstream():
     `transformers` rather than from this file.
 
     Tokens *and* logits, for the reason the comment above
-    `_E2E_LOGIT_ATOL` gives: docs/ARCH.md §5.1 measured a real bug that
+    `_E2E_LOGIT_ATOL` gives: docs/architectures/ARCH.md §5.1 measured a real bug that
     produced identical greedy tokens with logits 379x further apart than the
     correct kernel's.
 
@@ -7843,7 +7843,7 @@ def test_a_real_transformers_llama_forward_matches_upstream():
     compares. This model is 16-wide with a 32-token vocabulary and its logits
     sit around 0.05, so 1e-5 is roughly 20% of a logit: the assertion could
     not fail. Measured, by scaling `aten.silu.default`'s output on the shim
-    side only and re-running this comparison (docs/E2E_REAL.md):
+    side only and re-running this comparison (docs/models/E2E_REAL.md):
 
         clean                        2.24e-08
         silu x 1.0001 (0.01% high)   1.42e-07    under 1e-5 -- not caught
@@ -8012,9 +8012,9 @@ def _forward_road_fixture():
     return json.loads(proc.stdout)
 
 
-# --- the training sweep, as a standing check (docs/TRAIN.md §5) -------------
+# --- the training sweep, as a standing check (docs/training/TRAIN.md §5) -------------
 #
-# `docs/ARCH20.md`'s twenty and `docs/KERNELS26.md`'s twenty-six are run from
+# `docs/architectures/ARCH20.md`'s twenty and `docs/kernels/KERNELS26.md`'s twenty-six are run from
 # a script outside the repo, and both call `.eval()`. Nothing in the suite
 # noticed that a whole mode was unexercised, and nothing would notice it
 # regressing. This is that sweep in miniature, on the four ARCH20
@@ -8182,9 +8182,9 @@ _TRAIN_SWEEP_ATOL = 1e-5
 
 
 def test_train_mode_forwards_the_four_architectures_eval_mode_hid():
-    """docs/TRAIN.md's sweep, in the suite.
+    """docs/training/TRAIN.md's sweep, in the suite.
 
-    Before docs/TRAIN.md these four raised `aten.dropout.default` and then
+    Before docs/training/TRAIN.md these four raised `aten.dropout.default` and then
     `scaled_dot_product_attention(dropout_p != 0)`. Nothing in this file would
     have noticed either, because every model check in it calls `.eval()`.
     """
@@ -8238,9 +8238,9 @@ def test_min_and_max_refuse_an_empty_reduction_the_same_way():
             raise AssertionError(f"{op} on an empty tensor must raise")
 
 
-# --- grouped-query attention and greedy generate (docs/GENERATE.md) ---------
+# --- grouped-query attention and greedy generate (docs/models/GENERATE.md) ---------
 #
-# docs/CKPT2.md §7.1 and §8 left three kernels between this shim and a real
+# docs/models/CKPT2.md §7.1 and §8 left three kernels between this shim and a real
 # pretrained model actually producing text. All three are exercised here, on
 # a model `transformers` builds rather than one this file transcribes:
 #
@@ -8253,9 +8253,9 @@ def test_min_and_max_refuse_an_empty_reduction_the_same_way():
 # `num_key_value_heads=2` against `num_attention_heads=4` -- and that one
 # field is what routes the forward through (1). `_LLAMA_CFG` has them equal,
 # which is why every Llama comparison before this round missed the whole
-# grouped path (docs/CKPT2.md §7.1 says so explicitly).
+# grouped path (docs/models/CKPT2.md §7.1 says so explicitly).
 #
-# **Tokens are checked AND logits are checked.** docs/ARCH.md §5.1 is the
+# **Tokens are checked AND logits are checked.** docs/architectures/ARCH.md §5.1 is the
 # reason: a wrong `gelu` approximation once produced identical greedy tokens
 # with logits 379x further apart than the correct kernel's. A token-only
 # assertion would have passed it. The bound is the same `_REAL_LLAMA_ATOL`
@@ -8339,8 +8339,8 @@ else:
     out["argmax"] = [int(x) for x in logits[0].argmax(-1).tolist()]
 
 # Deliberately a SECOND try block: `generate` is behind a different set of
-# kernels than the forward (docs/CKPT2.md §8 item 2), and one failing must
-# not hide the other's result. docs/CKPT2.md §3 used the same shape of probe
+# kernels than the forward (docs/models/CKPT2.md §8 item 2), and one failing must
+# not hide the other's result. docs/models/CKPT2.md §3 used the same shape of probe
 # for the four checkpoint paths and it is why that round could report which
 # wall each path stopped at.
 try:
@@ -8410,7 +8410,7 @@ def test_grouped_query_attention_forward_matches_upstream_on_both_paths():
     to still bite: repeating the KV heads by tiling (`repeat`) instead of
     `repeat_interleave` -- the plausible wrong spelling, which gives query
     head `i` the KV head `i % n` instead of `i // n` -- moves these logits by
-    far more than 5e-7. That measurement is in docs/GENERATE.md; the golden
+    far more than 5e-7. That measurement is in docs/models/GENERATE.md; the golden
     harness pins the same distinction at the kernel.
     """
     if not _ckpt_shim_available() or _upstream_transformers is None:
@@ -8434,12 +8434,12 @@ def test_grouped_query_attention_forward_matches_upstream_on_both_paths():
 
 
 def test_greedy_generate_matches_upstream_token_for_token():
-    """`generate()`, which is the thing docs/CKPT2.md §8 item 2 left open.
+    """`generate()`, which is the thing docs/models/CKPT2.md §8 item 2 left open.
 
     `do_sample=False` on purpose: greedy decoding has no RNG in it, so a
     token mismatch is a kernel disagreement and nothing else. With sampling
     the two sides would have to share a random stream to be comparable at
-    all, and docs/SAMPLING.md already covers that surface separately.
+    all, and docs/models/SAMPLING.md already covers that surface separately.
 
     The wall this opens is neither of the attention ones. Before reaching any
     layer, `_prepare_attention_mask_for_generation` computes
@@ -8452,7 +8452,7 @@ def test_greedy_generate_matches_upstream_token_for_token():
 
     **Tokens alone would not be enough and are not what is asserted.** The
     forward test above pins the logits; this one pins the sequence those
-    logits decode to, on both attention implementations. docs/ARCH.md §5.1 is
+    logits decode to, on both attention implementations. docs/architectures/ARCH.md §5.1 is
     the case that makes the distinction non-theoretical.
     """
     if not _ckpt_shim_available() or _upstream_transformers is None:
@@ -8480,7 +8480,7 @@ def test_greedy_generate_matches_upstream_token_for_token():
 # Which attention implementations reach the end of `generate()`.
 #
 # `eager` joined `sdpa` here when `aten.index.Tensor` learned multi-tensor
-# advanced indexing (docs/BF16.md §5). The wall it used to be behind was
+# advanced indexing (docs/numerics/BF16.md §5). The wall it used to be behind was
 # reached from the eager mask builder, not from any attention kernel, which
 # is why the *forward* had always worked on both while `generate` worked on
 # only one. `test_eager_generate_stops_at_index_tensor_and_says_so` used to
@@ -8575,10 +8575,10 @@ def test_the_two_grouped_attention_walls_are_refused_by_name_not_by_shape():
             raise AssertionError(f"h_q={h_q} h_kv={h_kv} must be refused")
 
 
-# --- the decomposition pass (docs/DECOMP.md) ---------------------------------
+# --- the decomposition pass (docs/graph/DECOMP.md) ---------------------------------
 #
 # `_capture_end` records ATen; ExecuTorch's Edge dialect is defined over Core
-# ATen. docs/CAPTURE.md §5 measured that gap and found it is already open in
+# ATen. docs/graph/CAPTURE.md §5 measured that gap and found it is already open in
 # the smallest example there. `torchnative.export.decompose` closes it by
 # running upstream's own decomposition rules -- which means the tests need the
 # vendored tree, the same subprocess shape the capture road above uses.
@@ -8636,7 +8636,7 @@ out["table_size"] = len(decomposition_table())
 #
 # Written with `torch.ops.aten.*` spellings rather than `torch.stack` /
 # `torch.split` because neither has an entry in the shim's `torch.<fn>`
-# overload table yet (docs/DECOMP.md §4). The recorded region is identical
+# overload table yet (docs/graph/DECOMP.md §4). The recorded region is identical
 # either way -- capture records at the dispatcher, and both spellings arrive
 # there -- so this costs the test nothing and keeps it about decomposition.
 def program(x, w):
@@ -8693,7 +8693,7 @@ else:
 d = torch._C._aten_dispatch
 
 
-# -- the op docs/CAPTURE.md §5 named ------------------------------------------
+# -- the op docs/graph/CAPTURE.md §5 named ------------------------------------------
 #
 # `aten.t.default` takes two rounds: its own rule emits `aten.transpose.int`,
 # whose rule emits `aten.permute.default`, which is Core ATen. Both rounds were
@@ -8724,7 +8724,7 @@ out["transpose_kwargs"] = sorted(_tr_trace.nodes[0]["kwargs"])
 out["transpose_ops_after"] = decompose(_tr_trace).ops
 
 # Arithmetic, not data movement: `matmul` reaches `mm`, and `isin` reaches
-# three ops that actually compute. §5 of docs/DECOMP.md is about whether the
+# three ops that actually compute. §5 of docs/graph/DECOMP.md is about whether the
 # answer survives, so these are replayed against eager below.
 _mm_a, _mm_b = torch.ones(3, 4) * 0.5, torch.ones(4, 5) * 0.25
 torch._C._capture_begin([_mm_a, _mm_b])
@@ -8761,8 +8761,8 @@ except NotImplementedError as error:
 else:
     out["cia_backend_key"] = "ANSWERED"
 
-# The whole of docs/CAPTURE.md §5's example, end to end. Upstream's answer
-# for the same module (quoted in docs/DECOMP.md §7) is
+# The whole of docs/graph/CAPTURE.md §5's example, end to end. Upstream's answer
+# for the same module (quoted in docs/graph/DECOMP.md §7) is
 #   aten.permute.default, aten.addmm.default, aten.relu.default,
 #   aten.permute.default, aten.addmm.default
 # and that is what this has to produce, op for op.
@@ -8791,7 +8791,7 @@ for _scale in (1.0, 0.5, -2.0, 7.25):
         _model(_z).reshape(-1).tolist(),
     ])
 
-# `OpOverload.tags`, which used to be `[]` for everything (docs/DECOMP.md §2).
+# `OpOverload.tags`, which used to be `[]` for everything (docs/graph/DECOMP.md §2).
 out["tags_addmm"] = [t.name for t in torch.ops.aten.addmm.default.tags]
 out["tags_dropout"] = sorted(t.name for t in torch.ops.aten.dropout.default.tags)
 out["unknown_tags"] = torch._C._shim_unknown_tags()
@@ -8835,7 +8835,7 @@ def refusal(tensor, call):
 # No rule at all -- not in the reachable table and not upstream's either.
 # `aten.transpose.int` used to stand here, and it does not any more: its rule
 # was always in the tree, keyed on an overload that did not exist
-# (docs/DECOMP.md §3). `aten.reshape.default` is the honest replacement --
+# (docs/graph/DECOMP.md §3). `aten.reshape.default` is the honest replacement --
 # upstream has no Python rule for it at all, so it is the wall itself rather
 # than a wall this build put up.
 out["refuse_no_rule"] = refusal(
@@ -8856,7 +8856,7 @@ out["refuse_unrunnable"] = refusal(
 # The cause is `TensorBase.dtype` returning a fresh object per read, so
 # `a.dtype is b.dtype` was false and upstream's `get_higher_dtype` fell past
 # its `if a is b: return a` guard into the `ordered_datatypes` table
-# (docs/BIND.md §9). Fixed, so `baddbmm` lowers -- recorded below as its own
+# (docs/bindings/BIND.md §9). Fixed, so `baddbmm` lowers -- recorded below as its own
 # case, the way `sum.default` was when the kernel bug it caught was fixed.
 def verdict(inputs, call):
     torch._C._capture_begin(list(inputs))
@@ -8994,7 +8994,7 @@ def test_decompose_reads_core_aten_out_of_the_vendored_tree():
     r = _decomp_road_fixture()
     assert r["n_core"] == 193, r["n_core"]
     assert r["addmm_is_core"] is True
-    # The op docs/CAPTURE.md §5 named: the smallest model already emits one
+    # The op docs/graph/CAPTURE.md §5 named: the smallest model already emits one
     # that Edge will not take.
     assert r["t_is_core"] is False
     if r["yaml_diff"] is not None:
@@ -9010,7 +9010,7 @@ def test_decompose_gets_the_full_upstream_table_now():
     and this `_C` has no C++ dispatcher. The shim answers that query now, out of
     `native_functions.yaml` -- 743 aten names against upstream's 744, the one
     difference being a TorchScript builtin the file does not carry
-    (docs/DECOMP.md §3).
+    (docs/graph/DECOMP.md §3).
 
     Backend keys are *not* answered, and that is asserted here rather than
     left as a comment: the same file lists which ops upstream's C++ registers
@@ -9060,13 +9060,13 @@ def test_a_packet_reports_the_overloads_the_file_declares():
     if not os.path.isfile(_CKPT_VENDOR_SHIM):
         return
     r = _decomp_road_fixture()
-    # `transpose` is the one docs/DECOMP.md §3 measured: upstream's packet has
+    # `transpose` is the one docs/graph/DECOMP.md §3 measured: upstream's packet has
     # exactly one overload and it is *not* `default`, which is what made
     # `["default"]` a wrong answer rather than a lossy one.
     assert r["overloads_transpose"] == ["int"], r["overloads_transpose"]
     assert r["overloads_rsub"] == ["Tensor", "Scalar"], r["overloads_rsub"]
     assert r["overloads_relu"] == ["default"], r["overloads_relu"]
-    # 1005 until docs/ARCH20.md added a `zeros_like` entry to
+    # 1005 until docs/architectures/ARCH20.md added a `zeros_like` entry to
     # `overloads.json`. It moved for exactly the reason `floor_divide.Scalar_out`
     # moved it before (see `test_schema_text_survives_the_round_trip...`): the
     # table now carries `aten::zeros_like.out`, which the yaml does not declare,
@@ -9085,7 +9085,7 @@ def test_a_packet_reports_the_overloads_the_file_declares():
     # here: `aten::detach` has no `.out` variant, so there is no undeclared
     # overload for a packet to reach.
     #
-    # 1008 with `flip` (docs/KERNELS26.md §18), for the fourth time by the same
+    # 1008 with `flip` (docs/kernels/KERNELS26.md §18), for the fourth time by the same
     # mechanism: `overloads.json` carries `aten::flip.out`, and grepping the
     # yaml confirms it declares `flip` and not `flip.out`, so
     # `register_decomposition(aten.flip)` has a schema to resolve and reaches
@@ -9098,7 +9098,7 @@ def test_a_packet_reports_the_overloads_the_file_declares():
     # `all.all_out` itself (checked in the file), so those packets could
     # already resolve every overload this shim lists for them.
     #
-    # 1009 with docs/EXPORT4.md's `empty_strided`, for the FIFTH time by the
+    # 1009 with docs/graph/EXPORT4.md's `empty_strided`, for the FIFTH time by the
     # same mechanism as `zeros_like`, `ones_like` and `flip` above:
     # `overloads.json` carries `aten::empty_strided.out`, and
     # `native_functions.yaml` declares `empty_strided` while producing
@@ -9115,7 +9115,7 @@ def test_a_packet_reports_the_overloads_the_file_declares():
 def test_core_ops_and_op_tags_agree():
     """`OpOverload.tags` answered `[]` for every op, and two things read it.
 
-    docs/DECOMP.md §2 measured the first: `torch.Tag.core in op.tags` was False
+    docs/graph/DECOMP.md §2 measured the first: `torch.Tag.core in op.tags` was False
     for all 120 implemented ops, so a Core ATen classifier built the obvious
     way answers "nothing is core" and refuses whole programs. `core_ops()`
     routed around it by reading `native_functions.yaml` itself, which was right
@@ -9149,22 +9149,22 @@ def test_core_ops_and_op_tags_agree():
     # silently; this is the count of that happening.
     assert r["unknown_tags"] == [], r["unknown_tags"]
     assert r["tag_core_vs_file"] == [], r["tag_core_vs_file"]
-    # 77 until `aten.ge.Tensor` got a kernel (docs/VIEWS.md §1). This counts
+    # 77 until `aten.ge.Tensor` got a kernel (docs/kernels/VIEWS.md §1). This counts
     # *implemented* ops that upstream tags `core`, so it moves whenever a
     # core-tagged op is implemented -- and `ge.Tensor` is core upstream
     # exactly as its `le`/`lt`/`gt` siblings already counted here are.
-    # 78 until docs/ARCH20.md, which implemented four more ops that upstream
+    # 78 until docs/architectures/ARCH20.md, which implemented four more ops that upstream
     # tags `core`: `clamp.default`, `constant_pad_nd.default`, `expm1.default`
     # and `log.default`. The seven in-place kernels the same round added
     # (`sub_`, `mul_`, `neg_`, `exp_` and the `Scalar` overloads) are NOT core
     # upstream and do not appear here -- checked, not assumed, which is what
     # makes 82 the right number rather than 85.
-    # 83 with `aten.amax.default` (docs/SEQLEN.md §7). Read off
+    # 83 with `aten.amax.default` (docs/numerics/SEQLEN.md §7). Read off
     # `torch.ops.aten.amax.default.tags` -- `['core', 'pt2_compliant_tag',
     # 'reduction']` -- rather than inferred from its neighbours, because
     # `max.dim` sitting next to it in this shim is *not* core.
     #
-    # 84 with docs/TRIL.md, and the *one* is the point: that round put five new
+    # 84 with docs/kernels/TRIL.md, and the *one* is the point: that round put five new
     # keys into `_aten_implemented()` and only `min.dim` is core. Every one was
     # read off its own `.tags` rather than inferred from a sibling, which is
     # what stops this from being 88:
@@ -9179,7 +9179,7 @@ def test_core_ops_and_op_tags_agree():
     # implemented by the same function -- is not. There is no rule to derive
     # that from; it is upstream's table and it has to be read.
     #
-    # 85 with docs/KERNELS26.md's `sqrt`, read off
+    # 85 with docs/kernels/KERNELS26.md's `sqrt`, read off
     # `torch.ops.aten.sqrt.default.tags` -- `['core', 'pointwise',
     # 'pt2_compliant_tag']` -- and not inferred from `rsqrt`, which happens to
     # carry the same three. This number moves once per core-tagged kernel that
@@ -9200,7 +9200,7 @@ def test_core_ops_and_op_tags_agree():
     # own `.tags` rather than copied from `div.Tensor` beside them, which
     # happens to carry the same three. +2 for the same reason `remainder` was
     # +2: this counts overloads.
-    # 91 with `sigmoid.default` (docs/KERNELS26.md §17), which is
+    # 91 with `sigmoid.default` (docs/kernels/KERNELS26.md §17), which is
     # `['core', 'pointwise', 'pt2_compliant_tag']`. **+1 across five new
     # kernels**, and the four that do not appear are the check that these are
     # read one at a time rather than assumed from the round:
@@ -9220,14 +9220,14 @@ def test_core_ops_and_op_tags_agree():
     # `.tags` and not inferred from `sigmoid` beside it, which carries a
     # different set.
     #
-    # 93 with `native_group_norm.default` (docs/KERNELS26.md §19),
+    # 93 with `native_group_norm.default` (docs/kernels/KERNELS26.md §19),
     # `['core', 'pt2_compliant_tag']` -- the same pair `native_layer_norm`
     # beside it carries, read off its own `.tags` anyway. It adds one and not
     # two: `aten::group_norm` is `CompositeImplicitAutograd` and is installed
     # in `bootstrap.py` rather than being an implemented op, so it is not in
     # `_aten_implemented()` and cannot be counted here.
     #
-    # 94 with `erf.default` (docs/KERNELS26.md §22),
+    # 94 with `erf.default` (docs/kernels/KERNELS26.md §22),
     # `['core', 'pointwise', 'pt2_compliant_tag']`. `upsample_bilinear2d`,
     # landed in §20 between these two numbers, moved NOTHING here: its tags
     # are `['pt2_compliant_tag']` only. Both read off their own `.tags`.
@@ -9244,7 +9244,7 @@ def test_core_ops_and_op_tags_agree():
     # 98 with `log2.default` and `leaky_relu.default`, both
     # `['core', 'pointwise', 'pt2_compliant_tag']`. +2, one per overload.
     #
-    # 99 with `_log_softmax.default` (docs/LOSS.md), whose tags are
+    # 99 with `_log_softmax.default` (docs/training/LOSS.md), whose tags are
     # `['core', 'pt2_compliant_tag']` -- read off its own entry and not copied
     # from `_softmax.default` beside it, which happens to carry the same pair.
     # The other kernel that round landed, `nll_loss_forward.default`, is
@@ -9252,14 +9252,14 @@ def test_core_ops_and_op_tags_agree():
     # mean a loss kernel had been assumed core because the softmax next to it
     # is; upstream's Core ATen set has no loss op in it.
     #
-    # 100 with `native_dropout.default` (docs/LOSS.md §7), whose tags are
+    # 100 with `native_dropout.default` (docs/training/LOSS.md §7), whose tags are
     # `['core', 'nondeterministic_seeded', 'pt2_compliant_tag']`. The middle
     # one is the interesting entry and it is read off this op rather than
     # inherited: `bernoulli_.float` -- the primitive it draws through, already
     # implemented -- is **not** in this count, because it is not core. Two ops
     # in the same family, one core and one not, is upstream's table again.
     #
-    # 101 with `full_like.default` (docs/DEMAND1.md §2), whose tags are
+    # 101 with `full_like.default` (docs/architectures/DEMAND1.md §2), whose tags are
     # `['core', 'pt2_compliant_tag']` -- the same pair `full.default` already
     # counted here carries, read off `full_like`'s own entry rather than
     # inherited from it. **+1 across three new kernels**, and the two that do
@@ -9277,9 +9277,9 @@ def test_core_ops_and_op_tags_agree():
     # vision-CNN primitive there is, and upstream still does not tag it core,
     # because Core ATen's batch-norm member is `_native_batch_norm_legit`, the
     # functionalised spelling that carries the alias annotations this one is
-    # measured not to have (docs/DEMAND1.md §1.1).
+    # measured not to have (docs/architectures/DEMAND1.md §1.1).
     #
-    # 102 with `squeeze.dims` (docs/DEMAND.md §0.1 rank 2), whose tags are
+    # 102 with `squeeze.dims` (docs/architectures/DEMAND.md §0.1 rank 2), whose tags are
     # `['core', 'pt2_compliant_tag']` -- the same pair `squeeze.dim`, already
     # counted here from before this round, carries. `squeeze.default`, landed
     # in the same round, is **not** core (`['pt2_compliant_tag']` only) and
@@ -9291,7 +9291,7 @@ def test_core_ops_and_op_tags_agree():
     # (`['pt2_compliant_tag', 'reduction']` and `['pt2_compliant_tag']`) and
     # add nothing either.
     #
-    # 102 with docs/RANDINT.md's `randperm`. **+1 across two list changes**,
+    # 102 with docs/kernels/RANDINT.md's `randperm`. **+1 across two list changes**,
     # and which one moved it is the check. `aten.randint.default` also changed
     # lists in the same round -- promoted out of `IMPLEMENTED_AWAITING_GOLDEN`
     # once it had a case builder -- and contributes nothing here, correctly:
@@ -9311,9 +9311,9 @@ def test_core_ops_and_op_tags_agree():
     # Both rounds landed together, so both increments apply: +1 for
     # `squeeze.dims` and +1 for `randperm.default`.
     #
-    # 106 with `nonzero.default` (docs/NONZERO.md).
+    # 106 with `nonzero.default` (docs/kernels/NONZERO.md).
     #
-    # 107 with docs/DEMAND8.md's four, and the *one* is the point again: only
+    # 107 with docs/architectures/DEMAND8.md's four, and the *one* is the point again: only
     # `floor.default` is `core` upstream. Each was read off its own `.tags`
     # rather than inferred -- `floor_.default` is `inplace`/`pointwise`,
     # `index_add_.default` is `inplace`, and `upsample_bicubic2d.default`
@@ -9321,7 +9321,7 @@ def test_core_ops_and_op_tags_agree():
     # shim is not core either). Getting 110 here would mean the tags were
     # guessed from the neighbours.
     #
-    # 108 with docs/PRIMS.md's round, and **+1 across fifteen new keys** --
+    # 108 with docs/kernels/PRIMS.md's round, and **+1 across fifteen new keys** --
     # which is the largest gap this counter has had between "kernels added"
     # and "core kernels added", so it is worth writing out:
     #
@@ -9337,13 +9337,13 @@ def test_core_ops_and_op_tags_agree():
     # declares `aten::` entries only. `prims` schemas come from
     # `Library.define()` in `torch/_prims/__init__.py` and carry
     # `pt2_compliant_tag` upstream, which this tree does not yet see --
-    # docs/PRIMS.md §5 has that gap and `verify_schemas.py` counts it (13
+    # docs/kernels/PRIMS.md §5 has that gap and `verify_schemas.py` counts it (13
     # `FAIL tags` rows). None of them is `core` upstream either, so the number
     # here would be 108 even with the gap closed; the reason it is 108 today
     # is weaker than the reason it should be, and that distinction is what
     # §5 records.
     #
-    # 110 with docs/FIXES.md's `torch.fmod`: `overloads.json` had no row for
+    # 110 with docs/kernels/FIXES.md's `torch.fmod`: `overloads.json` had no row for
     # `fmod` at all, so neither overload reached a kernel before this.
     # `aten.fmod.Tensor` and `aten.fmod.Scalar` both landed kernels and both
     # are `core` upstream -- `torch.ops.aten.fmod.Tensor.tags` is
@@ -9352,7 +9352,7 @@ def test_core_ops_and_op_tags_agree():
     # unlike every prior entry in this list, because both overloads landed
     # together.
     #
-    # 112 with docs/INDEXSEL.md's eleven new keys, of which only two are core
+    # 112 with docs/kernels/INDEXSEL.md's eleven new keys, of which only two are core
     # upstream, each read off its own `.tags` rather than inferred from a
     # sibling in the same round:
     #
@@ -9372,15 +9372,15 @@ def test_core_ops_and_op_tags_agree():
     # -- upstream's own composite spelling of what this shim's kernel does --
     # not being core either, are both upstream's table and not derivable.
     # `aten.reshape_as.default` is not in this list at all: it has no
-    # `torch.ops.aten` entry to read tags off (docs/INDEXSEL.md), so it is not
+    # `torch.ops.aten` entry to read tags off (docs/kernels/INDEXSEL.md), so it is not
     # in `_aten_implemented()` and cannot be counted here.
     # 113. The op tables have grown across several concurrent rounds --
-    # docs/INDEXSEL.md, docs/TAIL1.md, docs/VOICE.md, docs/FIXES.md -- and each
+    # docs/kernels/INDEXSEL.md, docs/kernels/TAIL1.md, docs/architectures/VOICE.md, docs/kernels/FIXES.md -- and each
     # read its own additions' `.tags` rather than inferring them from a sibling
     # landing the same day. This number is their sum, re-measured on the merged
     # tree rather than carried from any one branch, because each branch's count
     # was correct only against its own base.
-    # 117 -> 122 with docs/PAD.md's six padding kernels, and **the delta is
+    # 117 -> 122 with docs/kernels/PAD.md's six padding kernels, and **the delta is
     # five, not six**, which is the whole reason this number is pinned:
     #
     #     reflection_pad1d   ['core', 'pt2_compliant_tag']   <- counted
@@ -9399,7 +9399,7 @@ def test_core_ops_and_op_tags_agree():
     # day it was written, which is exactly the failure mode `min.dim` vs
     # `max.dim` above already recorded once.
     #
-    # 125 -> 127 with docs/FFT.md's five new keys, and **the delta is two, not
+    # 125 -> 127 with docs/kernels/FFT.md's five new keys, and **the delta is two, not
     # five**, for the same reason:
     #
     #     _fft_r2c.default   ['core', 'pt2_compliant_tag']   <- counted
@@ -9414,7 +9414,7 @@ def test_core_ops_and_op_tags_agree():
     # read off its own `.tags`; inferring from the round would have written
     # 130.
     #
-    # 130 -> 131 with docs/TAIL4.md's eight new keys, and **the delta is one,
+    # 130 -> 131 with docs/kernels/TAIL4.md's eight new keys, and **the delta is one,
     # not eight**, for the third time and the same reason. Each was read off
     # its own `.tags`:
     #
@@ -9440,18 +9440,18 @@ def test_core_ops_and_op_tags_agree():
     # (three nemotron ASR encoders and `cpmant` all stop one line behind it).
     # It IS core -- read off its own `.tags`, like the eight above -- and it is
     # the round's ninth key and second core one.
-    # 132 -> 133 with docs/STRIDED.md's one new key, `as_strided.default`, and
+    # 132 -> 133 with docs/kernels/STRIDED.md's one new key, `as_strided.default`, and
     # the delta is one because the round added exactly one key:
     #
     #     as_strided.default   ['core', 'pt2_compliant_tag']   <- counted
     #
     # It is core, read off its own `.tags` like every entry above, and
-    # `docs/TAIL3.md` §7 had already recorded that it is -- that section named
+    # `docs/kernels/TAIL3.md` §7 had already recorded that it is -- that section named
     # it as the one core op deliberately absent from this shim. So this
     # increment is that absence ending, and if it ever goes back to 132 the
     # thing to check is whether `as_strided` was reverted rather than whether
     # upstream retagged something.
-    # 133 -> 134 with docs/EXPORT4.md's one new key, `empty_strided.default`,
+    # 133 -> 134 with docs/graph/EXPORT4.md's one new key, `empty_strided.default`,
     # and the delta is one because the round added exactly one aten key:
     #
     #     empty_strided.default   ['core', 'pt2_compliant_tag']   <- counted
@@ -9465,7 +9465,7 @@ def test_core_ops_and_op_tags_agree():
 
 
 def test_decompose_lowers_the_op_capture_md_named():
-    """`aten.t.default` -- the op the smallest model in docs/CAPTURE.md emits.
+    """`aten.t.default` -- the op the smallest model in docs/graph/CAPTURE.md emits.
 
     Two rounds, and upstream's own answer for the same model:
     `t` -> `transpose.int` -> `permute`, which is Core ATen. Both rules are
@@ -9501,11 +9501,11 @@ def test_decompose_lowers_the_op_capture_md_named():
 
 
 def test_the_smallest_model_lowers_the_way_upstream_lowers_it():
-    """docs/CAPTURE.md §5's example, whole, against upstream's own answer.
+    """docs/graph/CAPTURE.md §5's example, whole, against upstream's own answer.
 
     That section chose `nn.Sequential(Linear, ReLU, Linear)` because it is the
     smallest thing anyone would export and it already emits `aten.t.default`,
-    which Edge will not take. docs/DECOMP.md §7 then asked upstream what it
+    which Edge will not take. docs/graph/DECOMP.md §7 then asked upstream what it
     does with the same module:
 
         ep.run_decompositions(core_aten_decompositions())
@@ -9559,7 +9559,7 @@ def test_the_newly_opened_decompositions_still_agree_with_eager():
     `matmul`->`mm` and `isin`->`view`+`eq`+`any` are the first newly-reachable
     rules that compute. They agree exactly too, and that is measured here
     rather than assumed -- if a future rule does diverge, the reply is to
-    record how far (docs/DEVICE.md §5), not to widen a comparison.
+    record how far (docs/devices/DEVICE.md §5), not to widen a comparison.
     """
     if not os.path.isfile(_CKPT_VENDOR_SHIM):
         return
@@ -9611,7 +9611,7 @@ def test_decomposed_replay_matches_eager_bit_for_bit():
     four inputs of which three the trace never saw, the lowered graph, the
     captured graph and eager all produce **identical** lists. If that ever
     stops being true the honest response is to record the size of the
-    difference here (docs/DEVICE.md §5 prefers a named exception to a
+    difference here (docs/devices/DEVICE.md §5 prefers a named exception to a
     tolerance), not to widen the comparison.
     """
     if not os.path.isfile(_CKPT_VENDOR_SHIM):
@@ -9639,7 +9639,7 @@ def test_decompose_refuses_by_name_what_it_cannot_lower():
     asserted here as a fact rather than papered over with an invented one.
     Its last example was `aten.baddbmm.default`, whose decomposition promoted
     float32 to float64; the cause was `TensorBase.dtype` handing back a fresh
-    object per read (docs/BIND.md §9), it is fixed, and `baddbmm` now lowers
+    object per read (docs/bindings/BIND.md §9), it is fixed, and `baddbmm` now lowers
     (`test_decompose_lowers_baddbmm_default_now_that_the_dtype_is_a_singleton`).
     That is the same thing that happened to `aten.sum.default` one round
     earlier, and to `aten.t.default` before it.
@@ -9651,7 +9651,7 @@ def test_decompose_refuses_by_name_what_it_cannot_lower():
     control**: with the comparison forced to disagree, the same probe reports
     `DISAGREES`. Without that control, "no op disagrees" would pass equally
     well if the check had stopped running, which is the failure mode
-    docs/DECOMP.md §7.2 now records.
+    docs/graph/DECOMP.md §7.2 now records.
     """
     if not os.path.isfile(_CKPT_VENDOR_SHIM):
         return
@@ -9659,7 +9659,7 @@ def test_decompose_refuses_by_name_what_it_cannot_lower():
 
     # 1. Nothing has a rule for it -- upstream included. `aten.transpose.int`
     #    used to be this example and it lowers now: its rule existed all along
-    #    and the packet collapse hid it (docs/DECOMP.md §3). The replacement is
+    #    and the packet collapse hid it (docs/graph/DECOMP.md §3). The replacement is
     #    an op upstream really has no Python rule for.
     assert r["refuse_no_rule"] != "ACCEPTED"
     assert "aten.reshape.default" in r["refuse_no_rule"], r["refuse_no_rule"]
@@ -9669,7 +9669,7 @@ def test_decompose_refuses_by_name_what_it_cannot_lower():
     #    refusal carries the underlying reason, so the gap is findable.
     #
     #    **The reason moved when `full_like` landed, and it moved inward.**
-    #    Until docs/DEMAND1.md this read `"torch.full_like" in ...`, because
+    #    Until docs/architectures/DEMAND1.md this read `"torch.full_like" in ...`, because
     #    `zeros_like`'s decomposition reached a name with no table entry at all
     #    and got the overload-resolution refusal. `aten.full_like.default` has
     #    a kernel now, so the decomposition gets one argument further and stops
@@ -9739,7 +9739,7 @@ def test_decompose_lowers_baddbmm_default_now_that_the_dtype_is_a_singleton():
     each other, both fell past that guard, and the pair came out **float64**.
     The decomposition then produced a float64 result where the recording had
     float32, `decompose` caught the divergence, and refused -- correctly, on a
-    real bug. docs/BIND.md §9 has the diagnosis; docs/DECOMP.md §7.2 had
+    real bug. docs/bindings/BIND.md §9 has the diagnosis; docs/graph/DECOMP.md §7.2 had
     carried it as "cause unknown" until then.
 
     `dtype` is interned now, so the rule and the recording agree and the trace
@@ -9825,12 +9825,12 @@ def test_capture_trace_hands_out_the_constants_it_burned_in():
     assert list(held.shape) == trace.constants[0]["shape"]
 
 
-# --- `from_pretrained` with real weights (docs/CKPT2.md) ---------------------
+# --- `from_pretrained` with real weights (docs/models/CKPT2.md) ---------------------
 #
-# docs/E2E_REAL.md §6.2 left `from_pretrained` stopped at
+# docs/models/E2E_REAL.md §6.2 left `from_pretrained` stopped at
 # `torch.UntypedStorage.from_file`: the model was built, the weights were not
 # read. These tests are the other side of that line. They are deliberately not
-# "did it load" tests -- docs/CKPT.md §4 measured a load path that reported
+# "did it load" tests -- docs/models/CKPT.md §4 measured a load path that reported
 # `<All keys matched successfully>` with every weight at `0.0` and no exception
 # anywhere, so "it loaded" is exactly the claim that failure makes.
 #
@@ -9902,7 +9902,7 @@ probe("step_2", lambda: len(torch.UntypedStorage.from_file(PAYLOAD, False, n)[::
 probe("shared_true", lambda: torch.UntypedStorage.from_file(PAYLOAD, True, n).nbytes())
 out["from_file"] = ff
 
-# --- `torch.load(mmap=True)` must agree with `mmap=False`, which docs/CKPT.md
+# --- `torch.load(mmap=True)` must agree with `mmap=False`, which docs/models/CKPT.md
 # --- already proved correct. This is the cross-check that an offset error
 # --- cannot survive: the two readers reach the payload by different routes.
 try:
@@ -9949,7 +9949,7 @@ load("st_nommap", ST, disable_mmap=True)
 load("bin_mmap", BIN)
 load("bin_nommap", BIN, disable_mmap=True)
 
-# The three checkpoint *shapes* docs/E2E_REAL.md §6.2 listed as unmeasured,
+# The three checkpoint *shapes* docs/models/E2E_REAL.md §6.2 listed as unmeasured,
 # plus bfloat16, which is what real checkpoints are actually stored in.
 for tag, sub in (("tied", "tied"), ("shard", "shard"), ("bf16", "bf16"),
                  ("meta", "meta"), ("rope3", "rope3")):
@@ -9995,7 +9995,7 @@ _FROM_FILE_PAYLOAD = bytes(range(256)) * 4
 def _from_pretrained_fixture():
     """Write real checkpoints with upstream torch; read them with the shim.
 
-    Two interpreters for docs/CKPT.md §8.2's reason -- `from_pretrained` lives
+    Two interpreters for docs/models/CKPT.md §8.2's reason -- `from_pretrained` lives
     in pure-Python `transformers` on top of pure-Python `torch`, so the shim
     has to be `torch` by name, and a process has only one of those.
 
@@ -10045,7 +10045,7 @@ def _from_pretrained_fixture():
         },
     }
 
-    # --- the checkpoint shapes docs/E2E_REAL.md §6.2 left unmeasured ---------
+    # --- the checkpoint shapes docs/models/E2E_REAL.md §6.2 left unmeasured ---------
     #
     # Each is a *container* property, not a numeric one, and each has its own
     # way of going quietly wrong:
@@ -10068,7 +10068,7 @@ def _from_pretrained_fixture():
     #          `_compute_llama3_parameters` runs on meta tensors, and its
     #          first line is `torch.where(wavelen > low_freq_wavelen, ...)`.
     #          Published 0.0.5a0 stopped there with "no meta kernel for
-    #          aten.gt.Scalar" (docs/META.md §7). The plain case cannot see
+    #          aten.gt.Scalar" (docs/devices/META.md §7). The plain case cannot see
     #          this: with no `rope_scaling` the default rope init does no
     #          comparisons at all, which is why every other row here passed
     #          while the flagship model did not load.
@@ -10199,7 +10199,7 @@ def _worst_state_dict_drift(expected, got):
 def test_from_file_answers_what_upstream_answers_for_a_private_mapping():
     """`from_file(shared=False)` is a private mapping, and this shim copies.
 
-    docs/CKPT2.md §2 has the measurement that makes copying the right answer
+    docs/models/CKPT2.md §2 has the measurement that makes copying the right answer
     rather than a shortcut: upstream's default is `MAP_PRIVATE`, writes through
     such a mapping never reach the file and are invisible to a second mapping,
     so a read of the same bytes is observationally the same object. What is
@@ -10219,7 +10219,7 @@ def test_from_file_answers_what_upstream_answers_for_a_private_mapping():
     assert ff["missing"].startswith("RuntimeError"), ff["missing"]
     assert ff["step_2"].startswith("RuntimeError"), ff["step_2"]
     # `shared=True` is the one thing here that cannot be copied: it means
-    # writes go back to the file. docs/CKPT2.md §2.1. Refused, by name.
+    # writes go back to the file. docs/models/CKPT2.md §2.1. Refused, by name.
     assert isinstance(ff["shared_true"], str) and "shared" in ff["shared_true"], (
         ff["shared_true"])
 
@@ -10227,7 +10227,7 @@ def test_from_file_answers_what_upstream_answers_for_a_private_mapping():
 def test_mmap_and_read_paths_of_torch_load_agree_on_every_tensor():
     """Two routes to the same bytes, and they have to meet.
 
-    `mmap=False` goes through `zipfile.read`, which docs/CKPT.md validated.
+    `mmap=False` goes through `zipfile.read`, which docs/models/CKPT.md validated.
     `mmap=True` goes through `from_file` plus `get_record_offset` -- byte
     arithmetic over the archive's local file headers. An offset that is wrong
     by a header does not raise: it silently returns the neighbouring tensor.
@@ -10246,7 +10246,7 @@ def test_from_pretrained_loads_the_real_weights_bit_for_bit_on_all_four_paths():
 
     Four routes reach the checkpoint and all four are asserted, because they
     are genuinely different code: safetensors' mmap backend and its byte
-    backend, and `torch.load` with mmap on and off. docs/E2E_REAL.md §6.2 had
+    backend, and `torch.load` with mmap on and off. docs/models/E2E_REAL.md §6.2 had
     three of the four stopped at the same name.
     """
     if not _ckpt_shim_available() or _upstream_transformers is None:
@@ -10289,7 +10289,7 @@ def test_the_llama3_rope_checkpoint_loads_and_generates_like_upstream():
     headline example loads. `from_pretrained` builds the module tree under
     `init_empty_weights`, so `_compute_llama3_parameters` runs on the meta
     device, and its first line is a comparison
-    (`transformers/modeling_rope_utils.py:655`). docs/META.md §7.
+    (`transformers/modeling_rope_utils.py:655`). docs/devices/META.md §7.
 
     `meta-llama/Llama-3.2-1B` itself is gated on the Hub and is not in this
     machine's cache, so the checkpoint here is built by upstream torch with
@@ -10320,8 +10320,8 @@ def test_the_llama3_rope_checkpoint_loads_and_generates_like_upstream():
 def test_the_four_hard_checkpoint_shapes_load_with_the_right_weights():
     """Shared tensors, shards, bfloat16, and a `_metadata` state dict.
 
-    docs/E2E_REAL.md §6.2 named the first, second and fourth of these as
-    unmeasured; docs/CKPT2.md §6 is the measurement. The bar is the same as the
+    docs/models/E2E_REAL.md §6.2 named the first, second and fourth of these as
+    unmeasured; docs/models/CKPT2.md §6 is the measurement. The bar is the same as the
     plain case -- every parameter bit-for-bit against upstream's -- because
     every one of these fails *quietly*: a reader that ignores safetensors'
     shared-tensor header loses `lm_head` and initialises it fresh, and a reader
@@ -10360,7 +10360,7 @@ def test_an_unloaded_model_is_far_from_the_truth_logits():
 
     If a model that never read the checkpoint landed within `_REAL_LLAMA_ATOL`
     of the truth, then those tests would pass whether or not any weight was
-    ever read, and docs/CKPT.md §4's failure -- a full state dict of `0.0` --
+    ever read, and docs/models/CKPT.md §4's failure -- a full state dict of `0.0` --
     would sail through. The threshold is deliberately coarse: what is being
     established is that loading moves the answer at all.
     """
@@ -10374,12 +10374,12 @@ def test_an_unloaded_model_is_far_from_the_truth_logits():
 
 
 # ---------------------------------------------------------------------------
-# Schema text (docs/SCHEMA.md)
+# Schema text (docs/bindings/SCHEMA.md)
 # ---------------------------------------------------------------------------
 #
 # `_get_schema` used to answer every aten op with `_Schema(qualname, overload)`
 # -- no arguments, no returns. Every predicate reading it was therefore a
-# constant. docs/DISTRIBUTED.md §8.1 caught `is_mutable`, which had just been
+# constant. docs/distributed/DISTRIBUTED.md §8.1 caught `is_mutable`, which had just been
 # fixed from always-true to always-*false* and was still wrong for the seven
 # in-place ops among the implemented set. It is not one predicate: 66 sites in
 # the vendored tree read `._schema.arguments`, 38 read `.returns`, 18 read
@@ -10505,7 +10505,7 @@ def _schema_road_fixture():
 #: the same overloads (`verify_schemas.py` re-derives this against real torch;
 #: it is written out here so the check needs no upstream install).
 #:
-#: docs/DISTRIBUTED.md §8.1 named seven -- `add_ copy_ fill_ normal_ relu_
+#: docs/distributed/DISTRIBUTED.md §8.1 named seven -- `add_ copy_ fill_ normal_ relu_
 #: uniform_ zero_ ` -- against the 97 ops implemented when it was written. The
 #: set is 117 now and five more of them mutate, which is the other half of that
 #: section's point: the wrong direction was "does not mutate", so growing the
@@ -10517,7 +10517,7 @@ def _schema_road_fixture():
 #: `fill_.Scalar` -- which differ only by overload -- for free, hiding whether
 #: the overload was resolved at all.
 _EXPECTED_MUTABLE = (
-    # docs/INPLACE.md: fourteen of docs/SPELLINGS.md §9's fifteen in-place
+    # docs/kernels/INPLACE.md: fourteen of docs/bindings/SPELLINGS.md §9's fifteen in-place
     # names that had no kernel. `report["ops"]` (the road script above) is
     # keyed off `torch._C._aten_implemented()`, not off the tables, so the
     # fifteenth -- `detach_`, refused by name in `aten.rs`
@@ -10532,7 +10532,7 @@ _EXPECTED_MUTABLE = (
     "aten.abs_.default",
     "aten.add_.Scalar",
     "aten.add_.Tensor",
-    # docs/TRAIN.md: `bernoulli_` and `div_.Scalar` are the two kernels
+    # docs/training/TRAIN.md: `bernoulli_` and `div_.Scalar` are the two kernels
     # training mode needed, and both are `Tensor(a!) self` -- so this list
     # growing by exactly two is the check that the new schemas were parsed
     # rather than placeholdered.
@@ -10549,7 +10549,7 @@ _EXPECTED_MUTABLE = (
     "aten.expm1_.default",
     "aten.fill_.Scalar",
     "aten.fill_.Tensor",
-    # docs/DEMAND8.md §2: `floor_` and `index_add_` are this round's two
+    # docs/architectures/DEMAND8.md §2: `floor_` and `index_add_` are this round's two
     # mutating additions, and both are `Tensor(a!) self` upstream. Two, not
     # four: `floor.default` and `upsample_bicubic2d.default` landed in the
     # same round and are out-of-place, so they must NOT appear here -- which
@@ -10557,7 +10557,7 @@ _EXPECTED_MUTABLE = (
     # restatement of "what changed".
     "aten.floor_.default",
     "aten.index_add_.default",
-    # docs/TAIL4.md: `index_copy_.default`, `round_.default`,
+    # docs/kernels/TAIL4.md: `index_copy_.default`, `round_.default`,
     # `round_.decimals` and `t_.default` are that round's four mutating
     # additions. **Four, not eight**, and which four is the check: the round
     # also landed `index_copy.default`, `round.default`, `round.decimals` and
@@ -10580,7 +10580,7 @@ _EXPECTED_MUTABLE = (
     "aten.round_.decimals",
     "aten.round_.default",
     "aten.rsqrt_.default",
-    # docs/SCATTER.md: `scatter_.src` and `scatter_.value` are this round's
+    # docs/kernels/SCATTER.md: `scatter_.src` and `scatter_.value` are this round's
     # two mutating additions, both `Tensor(a!) self`. Two, not six: the round
     # also landed `scatter.value`, `masked_scatter`, `bucketize` (x2) and
     # `prod` (x2), every one of which is out-of-place and must NOT appear
@@ -10601,8 +10601,8 @@ _EXPECTED_MUTABLE = (
     "aten.zero_.default",
 )
 
-#: The seven docs/DISTRIBUTED.md §8.1 named, as the judgement it set.
-#: docs/ARCH20.md §8 added `sub_`, `mul_`, `neg_` and `exp_` to the *set* above;
+#: The seven docs/distributed/DISTRIBUTED.md §8.1 named, as the judgement it set.
+#: docs/architectures/ARCH20.md §8 added `sub_`, `mul_`, `neg_` and `exp_` to the *set* above;
 #: this tuple stays the seven §8.1 named, because it is a record of that
 #: judgement rather than a second copy of the implemented list.
 _SECTION_8_1_MUTABLE = ("add_", "copy_", "fill_", "normal_", "relu_", "uniform_",
@@ -10658,7 +10658,7 @@ def test_every_implemented_op_has_schema_text():
     for key, entry in sorted(report["ops"].items()):
         assert entry["text"] != f"{key}(...) -> ...", key
         # The namespace the key carries, not a literal `aten::`. The thirteen
-        # `prims.*` kernels (docs/PRIMS.md) are in `_aten_implemented()` and
+        # `prims.*` kernels (docs/kernels/PRIMS.md) are in `_aten_implemented()` and
         # their schema text is `prims::...`; asserting `aten::` here would
         # force the next namespace to be dropped from the coverage check
         # rather than checked.
@@ -10669,7 +10669,7 @@ def test_every_implemented_op_has_schema_text():
 
 
 def test_the_seven_in_place_ops_say_that_they_mutate():
-    """docs/DISTRIBUTED.md §8.1's judgement, in one assertion.
+    """docs/distributed/DISTRIBUTED.md §8.1's judgement, in one assertion.
 
     `add_.Tensor` is `aten::add_.Tensor(Tensor(a!) self, ...)` -- the `!` on
     `self`'s alias annotation is the whole content of `is_mutable`, and it can
@@ -10734,10 +10734,10 @@ def test_schema_text_survives_the_round_trip_through_the_transcribed_tables():
     which exercise a normalisation rule -- if the re-printer drops one, those
     seven stop matching. This needs no upstream torch.
 
-    173 until docs/DECOMP.md's `transpose`/`permute`/`sub` entries arrived;
+    173 until docs/graph/DECOMP.md's `transpose`/`permute`/`sub` entries arrived;
     three of those five schema strings were already reachable through
     `methods.json`, so the union grew by `aten::permute` and `aten::sub.out`.
-    175 until docs/GROUPED_MM.md added `aten::_grouped_mm` and, with it, the
+    175 until docs/kernels/GROUPED_MM.md added `aten::_grouped_mm` and, with it, the
     `floor_divide`/`cumsum`/`histc` entries Mixtral's Python surface needs --
     seven more schema strings. One of the seven is a *fifth* table-only entry:
     `floor_divide.Scalar_out` is torchgen-generated and the yaml does not
@@ -10747,7 +10747,7 @@ def test_schema_text_survives_the_round_trip_through_the_transcribed_tables():
     resolve, `register_decomposition(aten.floor_divide)` now reaches it.
 
     183 until the seven `TensorBase` members Mixtral needs went into
-    `methods.json` (docs/GROUPED_MM.md §6.4): `div_` with its four overloads,
+    `methods.json` (docs/kernels/GROUPED_MM.md §6.4): `div_` with its four overloads,
     `ge` with two, `masked_fill_` with two and `clamp_` with two -- ten new
     schema strings, all of them declared in the yaml, so `from_tables` is
     unchanged at five. `__idiv__` and `__ge__` add none: they are second
@@ -10776,7 +10776,7 @@ def test_schema_text_survives_the_round_trip_through_the_transcribed_tables():
             shadowed.append((qualname, overload, got["from"]))
     assert mismatched == [], mismatched[:5]
     assert shadowed == [], shadowed[:5]
-    # 193 until docs/ARCH20.md, which added 22 distinct `(qualname, overload)`
+    # 193 until docs/architectures/ARCH20.md, which added 22 distinct `(qualname, overload)`
     # pairs across the two tables: the six spellings whose kernels already
     # existed (`exp`, `stack`, `zeros_like`, plus their `.out` siblings), the
     # three new kernels (`log`, `expm1`, `constant_pad_nd`), `clamp`, and the
@@ -10784,8 +10784,8 @@ def test_schema_text_survives_the_round_trip_through_the_transcribed_tables():
     # they are second spellings of `add_`/`sub_`/`mul_`, and this counts
     # distinct schema identities, not table keys.
     #
-    # 217 until docs/SPELLINGS.md's 22-name `overloads.json` batch (this
-    # round's fix for docs/ARCH20.md §9's inventory of kernels with no
+    # 217 until docs/bindings/SPELLINGS.md's 22-name `overloads.json` batch (this
+    # round's fix for docs/architectures/ARCH20.md §9's inventory of kernels with no
     # `torch.<name>`). +2, not +22: every schema this round put in
     # `overloads.json` was already a distinct identity somewhere in
     # `methods.json` -- `abs`, `cos`, `sin`, `reciprocal`, `clone`, `clamp`
@@ -10797,7 +10797,7 @@ def test_schema_text_survives_the_round_trip_through_the_transcribed_tables():
     # `scalar_tensor` and `convolution` are new identities: neither has a
     # `Tensor` receiver, so neither was ever a candidate for `methods.json`.
     #
-    # 220 with docs/TRIL.md's `amax`, `tril` and `triu`. **+3, not +6**, and
+    # 220 with docs/kernels/TRIL.md's `amax`, `tril` and `triu`. **+3, not +6**, and
     # that is the check rather than an aside: each of the three went into
     # *both* tables in the same change, and this counts distinct
     # `(qualname, overload)` pairs rather than table keys -- so a `torch.<name>`
@@ -10809,7 +10809,7 @@ def test_schema_text_survives_the_round_trip_through_the_transcribed_tables():
     # `torch._safe_softmax` and no `Tensor._safe_softmax`, so it adds one
     # identity rather than two.
     #
-    # 223 with docs/KERNELS26.md's `sqrt`. **+2, not +3**, for the same reason
+    # 223 with docs/kernels/KERNELS26.md's `sqrt`. **+2, not +3**, for the same reason
     # `amax`/`tril`/`triu` were +3 rather than +6: `sqrt` went into both
     # tables, and `overloads.json`'s `aten::sqrt|default` and
     # `methods.json`'s are one identity. The second is `aten::sqrt|out`, which
@@ -10840,7 +10840,7 @@ def test_schema_text_survives_the_round_trip_through_the_transcribed_tables():
     # Getting +3 here would mean the two tables had transcribed `detach`
     # differently.
     #
-    # 232 with `clamp_min` (docs/KERNELS26.md §15). **+2, not +4**: it went
+    # 232 with `clamp_min` (docs/kernels/KERNELS26.md §15). **+2, not +4**: it went
     # into both tables in the same change, with the same two schemas
     # (`clamp_min|default` and `clamp_min|Tensor`), so `torch.clamp_min` and
     # `Tensor.clamp_min` are one identity per overload -- the `amax`/`tril`
@@ -10848,20 +10848,20 @@ def test_schema_text_survives_the_round_trip_through_the_transcribed_tables():
     # listed so the tensor-floor spelling refuses by the name of the overload
     # it needed, exactly as `clamp.Tensor` does beside it.
     #
-    # 238 with `all` (docs/KERNELS26.md §16). **+6**, which is `any`'s exact
+    # 238 with `all` (docs/kernels/KERNELS26.md §16). **+6**, which is `any`'s exact
     # inventory one op over: three kernels (`all`, `all.dims`, `all.dim`) and
     # three `.out` siblings (`all_out`, `dims_out`, `out`) carried with no
     # kernel so that `torch.all(x, out=y)` refuses by the right name. Both
     # tables list the three non-`out` schemas, and they are one identity each
     # -- the `amax`/`clamp_min` shape again.
     #
-    # 240 with `sigmoid` (docs/KERNELS26.md §17). **+2**: `aten::sigmoid` and
+    # 240 with `sigmoid` (docs/kernels/KERNELS26.md §17). **+2**: `aten::sigmoid` and
     # `aten::sigmoid.out`, the second carried in `overloads.json` with no
     # kernel so that `torch.sigmoid(x, out=y)` refuses by the right name --
     # `sqrt`'s shape exactly. `methods.json`'s `sigmoid` adds none; it names
     # the same default schema.
     #
-    # 242 with `flip` (docs/KERNELS26.md §18). **+2**: `aten::flip` and
+    # 242 with `flip` (docs/kernels/KERNELS26.md §18). **+2**: `aten::flip` and
     # `aten::flip.out`. The second is the **eighth** table-only entry -- the
     # yaml declares `flip` and not `flip.out` -- which is why `from_tables`
     # below grows by one and the decomposition registry moves by one, the
@@ -10869,7 +10869,7 @@ def test_schema_text_survives_the_round_trip_through_the_transcribed_tables():
     # `methods.json`'s `flip` adds no identity; it names the same default
     # schema `torch.flip` does.
     #
-    # 244 with `erf` (docs/KERNELS26.md §22). **+2**: `aten::erf` and
+    # 244 with `erf` (docs/kernels/KERNELS26.md §22). **+2**: `aten::erf` and
     # `aten::erf.out`, the second with no kernel so `torch.erf(x, out=y)`
     # refuses by the right name -- `sqrt`/`sigmoid`'s shape. `methods.json`'s
     # `erf` adds none.
@@ -10893,7 +10893,7 @@ def test_schema_text_survives_the_round_trip_through_the_transcribed_tables():
     # is in neither table. Getting +4 here would have meant `leaky_relu` had
     # been given a table entry that invents a surface upstream does not have.
     #
-    # 250 with `bernoulli_` (docs/TRAIN.md). **+2**, and both come from
+    # 250 with `bernoulli_` (docs/training/TRAIN.md). **+2**, and both come from
     # `methods.json` alone: `aten::bernoulli_.Tensor` and
     # `aten::bernoulli_.float`. There is no `overloads.json` half -- upstream
     # has no `torch.bernoulli_`, only `Tensor.bernoulli_` (`hasattr(torch,
@@ -10905,7 +10905,7 @@ def test_schema_text_survives_the_round_trip_through_the_transcribed_tables():
     # here would mean `dropout` had been given a table entry, which would
     # invent a `CompositeImplicitAutograd` kernel upstream does not have.
     #
-    # 251 with `_log_softmax` (docs/LOSS.md). **+1**, the `_safe_softmax`
+    # 251 with `_log_softmax` (docs/training/LOSS.md). **+1**, the `_safe_softmax`
     # shape: `overloads.json`-only, because upstream has `torch._log_softmax`
     # and no `Tensor._log_softmax`. Getting +2 would mean the *public*
     # `log_softmax` had been given a table entry as well -- and it must not
@@ -10914,7 +10914,7 @@ def test_schema_text_survives_the_round_trip_through_the_transcribed_tables():
     # installed, on opposite sides of this boundary; only the private one is
     # counted here.
     #
-    # 268 with docs/INPLACE.md: fourteen in-place ops that had a kernel for
+    # 268 with docs/kernels/INPLACE.md: fourteen in-place ops that had a kernel for
     # their out-of-place twin and no kernel of their own (`abs_`, `ceil_`,
     # `cos_`, `erf_`, `expm1_`, `log2_`, `log_`, `reciprocal_`, `rsqrt_`,
     # `sigmoid_`, `sin_`, `sqrt_`, `tanh_` -- one schema each, +13 -- and
@@ -10932,7 +10932,7 @@ def test_schema_text_survives_the_round_trip_through_the_transcribed_tables():
     # is unchanged), because these are ordinary leaf ops upstream ships, not
     # a torchgen-only `.out` variant.
     #
-    # 254 with docs/DEMAND1.md's `full_like` and `new_zeros`. **+3, and the
+    # 254 with docs/architectures/DEMAND1.md's `full_like` and `new_zeros`. **+3, and the
     # split is the check**: `full_like` is `overloads.json`-only and
     # contributes two (`aten::full_like|default` and `aten::full_like|out`,
     # the `.out` carried with no kernel behind it so that
@@ -10955,7 +10955,7 @@ def test_schema_text_survives_the_round_trip_through_the_transcribed_tables():
     # Both landed in the same round pair: 251 + 17 (INPLACE.md) + 3
     # (DEMAND1.md) = 271.
     #
-    # 275 with docs/DEMAND.md §0.1 ranks 3 and 4: `linalg_vector_norm` and
+    # 275 with docs/architectures/DEMAND.md §0.1 ranks 3 and 4: `linalg_vector_norm` and
     # `linspace` each got a fresh `overloads.json` entry, `default` and
     # `out`, both declared in the yaml (checked -- `aten::linspace.out` and
     # `aten::linalg_vector_norm.out` are ordinary `- func:` lines, not a
@@ -10968,7 +10968,7 @@ def test_schema_text_survives_the_round_trip_through_the_transcribed_tables():
     # `default` and `dims` was missing, which is a different table
     # (`_aten_implemented()`) from the one this test counts.
     #
-    # 275 with docs/RANDINT.md's `randperm`. **+4, and all four from one
+    # 275 with docs/kernels/RANDINT.md's `randperm`. **+4, and all four from one
     # table**, which is the check that this is a genuinely new name rather
     # than a second door onto an old one: upstream has no `Tensor.randperm`
     # (`hasattr(torch.Tensor, "randperm")` is False on 2.13.0), so
@@ -10982,14 +10982,14 @@ def test_schema_text_survives_the_round_trip_through_the_transcribed_tables():
     #
     # Both rounds landed together, so both increments apply: +1 for
     # `squeeze.dims` and +1 for `randperm.default`.
-    # 287 with docs/DEMAND5.md's four: `adaptive_avg_pool2d` and `roll` bring
+    # 287 with docs/architectures/DEMAND5.md's four: `adaptive_avg_pool2d` and `roll` bring
     # `default` and `out` each, `greater` brings `Scalar` and `Tensor`, and
     # `where.ScalarSelf` brings none -- it was already declared in
     # `overloads.json` and only lacked a dispatch arm, which is a different
     # table from the one this counts. That asymmetry is the check: +4 rather
     # than +5 or +8 is what says `where.ScalarSelf` was the unbound-member
     # shape and the other three were genuinely new names.
-    # 291 with docs/DEMAND8.md's names. **+4, and the arithmetic is the
+    # 291 with docs/architectures/DEMAND8.md's names. **+4, and the arithmetic is the
     # check**: `floor` brings two identities (`default` and `.out`, both
     # declared in `overloads.json` the way `ceil`'s are, only one of which has
     # a kernel), `floor_` brings one, and `index_add_` brings one. The round's
@@ -10999,7 +10999,7 @@ def test_schema_text_survives_the_round_trip_through_the_transcribed_tables():
     # Getting +5 here would mean a `_nn` name had been given a table entry
     # upstream does not have.
     #
-    # 293 with the two names `rwkv` needed (docs/PRIMS.md §6). **+2, one per
+    # 293 with the two names `rwkv` needed (docs/kernels/PRIMS.md §6). **+2, one per
     # op, and the two arrive from different tables**: `new_empty` is
     # `methods.json`-only, because upstream has no `torch.new_empty` at all --
     # it is a receiver method like `new_zeros` beside it -- and `maximum` goes into
@@ -11021,7 +11021,7 @@ def test_schema_text_survives_the_round_trip_through_the_transcribed_tables():
     # would be inventing a surface, which is why `reach.py` reaches them
     # through `torch.ops.prims.<op>.<overload>` instead.
     #
-    # 295 with docs/FIXES.md's backlog. **+2, not +5**: `floor_divide.default`
+    # 295 with docs/kernels/FIXES.md's backlog. **+2, not +5**: `floor_divide.default`
     # and `floor_divide.Scalar` went into `methods.json` so `Tensor.floor_divide`
     # reaches the kernel `torch.floor_divide` already had -- both schemas were
     # already declared identities through `overloads.json`, so a second door
@@ -11038,7 +11038,7 @@ def test_schema_text_survives_the_round_trip_through_the_transcribed_tables():
     # is not asserted anywhere, so adding it here would be inventing a check
     # rather than recording one.
     #
-    # 306 with docs/INDEXSEL.md's eleven new `(qualname, overload)` pairs,
+    # 306 with docs/kernels/INDEXSEL.md's eleven new `(qualname, overload)` pairs,
     # each appearing in only one of the two tables except `argsort`, whose
     # `.default` and `.stable` overloads are declared in both `methods.json`
     # (the bound-method spelling, `x.argsort(...)`) and `overloads.json` (the
@@ -11052,13 +11052,13 @@ def test_schema_text_survives_the_round_trip_through_the_transcribed_tables():
     #     diff.default, chunk.default                              -- 11
     #
     # `reshape_as.default` is in this list even though it names no genuine
-    # `torch.ops.aten` entry (docs/INDEXSEL.md §2): this fixture parses
+    # `torch.ops.aten` entry (docs/kernels/INDEXSEL.md §2): this fixture parses
     # schema *text*, transcribed or invented, and does not check the op
     # exists upstream -- that is `verify_schemas.py`'s job, not this one's.
     # 310 on the merged tree. Same reason as `tag_core_count` above: four
     # rounds added schema identities in parallel and no branch could see the
     # others' totals, so this is measured here rather than summed from reports.
-    # 327 with docs/COMPLEX2.md's five. **+5, not +10**, and which table each
+    # 327 with docs/kernels/COMPLEX2.md's five. **+5, not +10**, and which table each
     # came from is the check: all five are `overloads.json`-only, because
     # upstream has no `Tensor.view_as_complex`/`Tensor.polar` bound method at
     # all, and `Tensor.real`/`Tensor.imag` are *properties* rather than
@@ -11071,13 +11071,13 @@ def test_schema_text_survives_the_round_trip_through_the_transcribed_tables():
     # `polar`'s five TorchScript numeric overloads (`polar.int`,
     # `polar.float`, ...) are deliberately not in the table -- see
     # `overloads.json`'s own note -- so `polar` adds one identity, not six.
-    # 328 on the merged tree. docs/COMPLEX2.md took it to 327 with five
-    # `overloads.json` entries and docs/PAD.md added `rms_norm`; the six pad
+    # 328 on the merged tree. docs/kernels/COMPLEX2.md took it to 327 with five
+    # `overloads.json` entries and docs/kernels/PAD.md added `rms_norm`; the six pad
     # kernels contribute **zero**, because upstream has no `torch.<name>`
     # spelling for them -- a row would invent a door upstream lacks. Measured
     # here rather than summed from either report, since each branch's count
     # was correct only against its own base.
-    # 339 with docs/FFT.md's `stft`. **+2, not +5**, and which of the five new
+    # 339 with docs/kernels/FFT.md's `stft`. **+2, not +5**, and which of the five new
     # kernels contribute is the check: `overloads.json` gains the two real
     # `aten::stft` overloads (`center` and `default`) because upstream really
     # does have `torch.stft`, and `Tensor.stft` names the same two schemas so
@@ -11088,7 +11088,7 @@ def test_schema_text_survives_the_round_trip_through_the_transcribed_tables():
     # a `_VariableFunctions` member, so a row for any of them would invent a
     # door upstream lacks (the same reasoning the six pad kernels record
     # above).
-    # 353 with docs/RNN.md's `lstm`. **+2**, and which table they come from is
+    # 353 with docs/kernels/RNN.md's `lstm`. **+2**, and which table they come from is
     # the check: both are `overloads.json`-only. `_VF.lstm` is what
     # `nn.LSTM.forward` calls and `torch.lstm` is a real `_VariableFunctions`
     # member, while `Tensor.lstm` does not exist on 2.13.0 -- so neither
@@ -11100,13 +11100,13 @@ def test_schema_text_survives_the_round_trip_through_the_transcribed_tables():
     # `aten.upsample_linear1d.default` is `torch._C._nn`-only (a row would
     # invent a `torch.upsample_linear1d` upstream lacks -- the six pad kernels'
     # reasoning above), and `torch.conv1d` was already spelled, as a
-    # bootstrap.py composite over `aten::convolution`, since docs/ARCH20.md.
+    # bootstrap.py composite over `aten::convolution`, since docs/architectures/ARCH20.md.
     # 362 on the merged tree. Four rounds added table rows in parallel --
-    # docs/BIND3.md, docs/RNN.md, docs/VMAP.md and docs/TAIL4.md -- and each
+    # docs/bindings/BIND3.md, docs/kernels/RNN.md, docs/kernels/VMAP.md and docs/kernels/TAIL4.md -- and each
     # branch's figure was right against its own base and wrong once merged.
     # Measured where the branches meet, which is the only place the total
     # exists.
-    # 363 with docs/COMPLEX3.md's `complex`. **+1**, and which table it comes
+    # 363 with docs/kernels/COMPLEX3.md's `complex`. **+1**, and which table it comes
     # from is the check: `overloads.json`-only, because upstream has
     # `torch.complex` and **no** `Tensor.complex` (measured on 2.13.0:
     # `hasattr(torch.Tensor, "complex")` is False), so `aten::complex|default`
@@ -11117,7 +11117,7 @@ def test_schema_text_survives_the_round_trip_through_the_transcribed_tables():
     # ops contribute **zero**: `_to_copy`, `slice`, `constant_pad_nd` and
     # `view` were all already in the tables, and what this round gave them is a
     # complex arm on an existing kernel, not a new spelling.
-    # 364 with docs/LAST7.md's `unfold`. **+1**, and which table it comes from
+    # 364 with docs/kernels/LAST7.md's `unfold`. **+1**, and which table it comes from
     # is the check, mirrored from the `complex` note above: `methods.json`-only,
     # because upstream has `Tensor.unfold` and **no** `torch.unfold` (measured
     # on 2.13.0: `hasattr(torch, "unfold")` is False), so `aten::unfold|default`
@@ -11127,7 +11127,7 @@ def test_schema_text_survives_the_round_trip_through_the_transcribed_tables():
     # The round's other landed change contributes **zero**:
     # `aten::convolution` was already in the tables and what LAST7 gave it is a
     # padding lowering inside the existing kernel, not a new spelling.
-    # 366 with docs/EXPORT4.md's `empty_strided`. **+2**, and the two are the
+    # 366 with docs/graph/EXPORT4.md's `empty_strided`. **+2**, and the two are the
     # check: `overloads.json` gained `aten::empty_strided` and
     # `aten::empty_strided.out`, and NEITHER was already an identity in
     # `methods.json` -- upstream has `torch.empty_strided` and no
@@ -11140,7 +11140,7 @@ def test_schema_text_survives_the_round_trip_through_the_transcribed_tables():
         k for k in keys
         if report["table"][f"{k[0]}|{k[1]}"]["from"] == "tables"
     )
-    # `zeros_like.out` is the sixth table-only entry (docs/ARCH20.md): like the
+    # `zeros_like.out` is the sixth table-only entry (docs/architectures/ARCH20.md): like the
     # five before it, torchgen generates it and the yaml does not declare it.
     # Every other schema this round added IS declared in the yaml, so the list
     # grew by one rather than by twenty-two -- which is the check that the new
@@ -11157,7 +11157,7 @@ def test_schema_text_survives_the_round_trip_through_the_transcribed_tables():
     # `.out` schema this round added -- so those five are answered by the file
     # and only `flip.out` is not.
     #
-    # `full_like.out` is the ninth (docs/DEMAND1.md §2), and it completes the
+    # `full_like.out` is the ninth (docs/architectures/DEMAND1.md §2), and it completes the
     # `*_like.out` set: `zeros_like.out`, `ones_like.out`, `empty_like.out` and
     # now `full_like.out` are all torchgen-generated and none of the four is
     # declared in the yaml. The check that this is that mechanism and not a
@@ -11166,7 +11166,7 @@ def test_schema_text_survives_the_round_trip_through_the_transcribed_tables():
     # not appear here. Two table entries in one round, one generated and one
     # declared, landing on opposite sides of this list is what the list is for.
     #
-    # `empty_strided.out` is the tenth (docs/EXPORT4.md §4), same mechanism
+    # `empty_strided.out` is the tenth (docs/graph/EXPORT4.md §4), same mechanism
     # again: the yaml declares `empty_strided` as a `- func:` and produces
     # `empty_strided.out` only through `autogen:` (line 2450), so the `.out`
     # half is generated-not-declared and lands here while `empty_strided`
@@ -11367,7 +11367,7 @@ def test_the_bare_shim_says_why_it_has_no_schema_table():
 #
 # It is not invisible in a model, because the error does not cancel. A biased
 # narrowing pushes every rounded element the same way, so 30 residual layers
-# accumulate it instead of averaging it out. docs/BF16.md measures exactly
+# accumulate it instead of averaging it out. docs/numerics/BF16.md measures exactly
 # that: the shim's `add` truncated, the divergence reached an O(1) logit
 # difference, and SmolLM2-135M produced different text from upstream on the
 # **default** dtype path.
@@ -11434,7 +11434,7 @@ def test_reduced_float_arithmetic_narrows_exactly_like_upstream():
     be a check that cannot fail.
     """
     if _upstream_torch is None:
-        return  # no upstream torch in this interpreter -- see docs/E2E.md
+        return  # no upstream torch in this interpreter -- see docs/models/E2E.md
     for dtype in _REDUCED_FLOATS:
         shim = _reduced_float_cases(_E2EBackend("shim"), dtype)
         upstream = _reduced_float_cases(_E2EBackend("upstream"), dtype)
@@ -11470,7 +11470,7 @@ def test_reduced_float_narrowing_is_round_to_nearest_even_not_truncation():
 
     Each pair below is exactly halfway between two representable bfloat16
     values, which is where round-to-nearest-even and truncation disagree by
-    construction. `truncated` is what this shim returned before docs/BF16.md
+    construction. `truncated` is what this shim returned before docs/numerics/BF16.md
     -- it is asserted *against*, so that a regression to the old behaviour
     fails here with the rule named rather than as a drift somewhere in a
     model.
@@ -11517,18 +11517,18 @@ def test_reduced_float_narrowing_is_round_to_nearest_even_not_truncation():
             assert got == sums(_E2EBackend("upstream"), reps), reps
 
 
-# --- the fused reduced-float kernels (docs/DTYPE.md) ------------------------
+# --- the fused reduced-float kernels (docs/numerics/DTYPE.md) ------------------------
 #
 # `rust/torch_c/src/reduced.rs` replaced two things the ops above used to do
 # through candle: the `{float16,bfloat16} <-> float32` conversions, and the
 # three-pass shape of widen / compute / narrow. Both are claimed to compute the
 # *same function* as before, only faster, and that claim is what the tests
-# below are for -- the speed is measured elsewhere, in docs/DTYPE.md.
+# below are for -- the speed is measured elsewhere, in docs/numerics/DTYPE.md.
 #
 # The interesting failure is not "wrong everywhere". A vectorised kernel that
 # handles eight elements per iteration with a scalar tail has three regions and
 # two boundaries, and a fault in the tail is invisible at any length that is a
-# multiple of eight. docs/BF16.md §2.3 records this repository losing a whole
+# multiple of eight. docs/numerics/BF16.md §2.3 records this repository losing a whole
 # class of defect to exactly that -- the wrong rounding rule lived on a path no
 # case in the golden harness was long enough to reach. So the lengths here
 # straddle the vector width deliberately rather than being round.
@@ -11704,17 +11704,17 @@ def test_reduced_float_conversion_carries_the_values_no_shift_would():
 # with an online softmax, and for `bfloat16`/`float16` inputs every step of it
 # happens in portable code -- upstream reaches its own kernel rather than a
 # BLAS. `rust/torch_c/src/flash.rs` reproduces that arrangement, and
-# docs/SDPA.md is the measurement. These tests assert the consequence: **exact**
+# docs/kernels/SDPA.md is the measurement. These tests assert the consequence: **exact**
 # agreement, with no tolerance.
 #
-# A tolerance here would not be a check. docs/SDPA.md §3 has the numbers: the
+# A tolerance here would not be a check. docs/kernels/SDPA.md §3 has the numbers: the
 # formulation this replaced sat inside `tools/golden/dtypes.py`'s bfloat16
 # tolerance (6e-2) on every element while disagreeing with upstream on 32% of
 # them, and the golden harness passed it for months. One bfloat16 ulp is
 # 1/256 of the value; the tolerance is fifteen times that.
 #
 # **That formulation is still the default, so these tests turn the kernel on.**
-# It costs 20x (docs/SDPA.md §12), so `sdpa` reaches it only when asked. Every
+# It costs 20x (docs/kernels/SDPA.md §12), so `sdpa` reaches it only when asked. Every
 # test below therefore runs inside `_sdpa_reference()`, which flips
 # `_C._shim_sdpa_reference` and flips it back -- the switch is process-global,
 # and leaking it would make the six hundred cases that follow this section slow
@@ -11815,7 +11815,7 @@ def test_amax_at_a_real_score_row_width_agrees_with_upstream_exactly():
     it, so `==` is the right comparison and a tolerance would be hiding
     something.
 
-    docs/SEQLEN.md §7 is why this shape and not another: `[1, 9, S, S]` with
+    docs/numerics/SEQLEN.md §7 is why this shape and not another: `[1, 9, S, S]` with
     `S=512` is what a SmolLM2-135M prefill hands its softmax, and it is the
     shape at which candle's index-tracking reduction measured 56x upstream.
     """
@@ -11845,10 +11845,10 @@ def test_amax_propagates_nan_where_candles_own_reduction_drops_it():
     """The divergence this kernel exists to *not* inherit.
 
     `aten.max.default` answered `3.0` for `max([3, nan, 1])` before
-    docs/E2E_REAL.md, because candle's reduction compares with `x < y` and
+    docs/models/E2E_REAL.md, because candle's reduction compares with `x < y` and
     every comparison against a NaN is false, so a NaN that is not the first
     element is skipped. `max.other` had the same hole in its second operand
-    (docs/SPELLINGS.md). Two ops, one predicate, so the third op to use that
+    (docs/bindings/SPELLINGS.md). Two ops, one predicate, so the third op to use that
     predicate would have had it too.
 
     `amax` does not use it. This checks the NaN survives from a position past
@@ -11866,7 +11866,7 @@ def test_amax_propagates_nan_where_candles_own_reduction_drops_it():
     # This used to assert that `aten.max.dim` on the same data still answered a
     # *number*, as the live proof that candle's predicate had not changed. It
     # answers NaN now, and the assertion did its job: it failed the moment
-    # docs/TRIL.md §3 fixed `max.dim`, which is exactly the notification it was
+    # docs/kernels/TRIL.md §3 fixed `max.dim`, which is exactly the notification it was
     # written to give.
     #
     # **The question that failure asks -- "is amax's own NaN pass now
@@ -11884,7 +11884,7 @@ def test_amax_propagates_nan_where_candles_own_reduction_drops_it():
     pair = _C._aten_dispatch("aten.max.dim", t, 1, False)
     values, indices = pair[0].tolist()[0], pair[1].tolist()[0]
     assert math.isnan(values), (
-        f"aten.max.dim dropped a NaN again -- docs/TRIL.md §3 fixed this; got {values}"
+        f"aten.max.dim dropped a NaN again -- docs/kernels/TRIL.md §3 fixed this; got {values}"
     )
     assert indices == 17, (
         f"aten.max.dim must report the index of the first NaN, not of the "
@@ -11918,11 +11918,11 @@ def test_amax_now_has_both_python_spellings_and_they_reach_the_kernel():
 
     **This test previously asserted the opposite**, by name:
     `test_amax_has_no_python_spelling_yet_and_says_so_by_name`. The kernel
-    landed in docs/SEQLEN.md §7 and the two Python names did not, so that round
+    landed in docs/numerics/SEQLEN.md §7 and the two Python names did not, so that round
     wrote down the absence as an executable claim -- "when the table entry
     lands, this test fails, which is the notification wanted". It did fail, on
     the first run after the entries went into `src/overloads.json` and
-    `src/methods.json` (docs/TRIL.md §2), and this is the update it asked for.
+    `src/methods.json` (docs/kernels/TRIL.md §2), and this is the update it asked for.
 
     That mechanism is the whole reason the gap did not go another round
     unnoticed. The golden harness dispatches by key and is structurally blind
@@ -11944,7 +11944,7 @@ def test_amax_now_has_both_python_spellings_and_they_reach_the_kernel():
         answer = got[label]
         assert answer == [5.0, 9.0], (
             f"{label} did not reach the kernel: {answer!r} -- the entries are in "
-            f"overloads.json / methods.json, see docs/TRIL.md §2"
+            f"overloads.json / methods.json, see docs/kernels/TRIL.md §2"
         )
     # The arguments the entry has to carry, not just the two-positional form:
     # `keepdim`, a negative `dim`, the schema's `dim=[]` default (which reduces
@@ -12006,11 +12006,11 @@ def test_sdpa_reduced_float_matches_upstream_to_the_last_bit():
     The logsumexp half is checked as carefully as the output half and is not
     redundant: it comes back in `float32` even for a `bfloat16` call, so it is
     the only place a one-ulp disagreement in the row sum is *visible* --
-    narrowing the output to bfloat16 hides it. The defect docs/SDPA.md §4.4
+    narrowing the output to bfloat16 hides it. The defect docs/kernels/SDPA.md §4.4
     describes showed up in exactly that asymmetry and nowhere else.
     """
     if _upstream_torch is None:
-        return  # no upstream torch in this interpreter -- see docs/E2E.md
+        return  # no upstream torch in this interpreter -- see docs/models/E2E.md
     shim, upstream = _E2EBackend("shim"), _E2EBackend("upstream")
     for dtype in _REDUCED_FLOATS:
         for shape in _SDPA_SHAPES:
@@ -12042,7 +12042,7 @@ def test_sdpa_mask_body_strides_by_the_mask_dtype_not_the_accumulator():
     remainder is one C statement, hence fused, where the body is not.
 
     Reading that stride as four is a difference of two columns out of seventy.
-    It moved **one element in 226136** (docs/SDPA.md §4.4), in the logsumexp
+    It moved **one element in 226136** (docs/kernels/SDPA.md §4.4), in the logsumexp
     and not the output, because the shift cancels between the row maximum and
     the log of the row sum. Nothing shaped like a tolerance can see it, and
     the general test above only sees it because it uses none.
@@ -12070,7 +12070,7 @@ def test_sdpa_wide_float_is_close_but_not_promised_exact():
 
     For `float32` upstream hands both matrix products to the platform BLAS
     (Accelerate here), whose summation order is not portable, so this kernel
-    is *not* bit-identical there and docs/SDPA.md §5 says so. The bound below
+    is *not* bit-identical there and docs/kernels/SDPA.md §5 says so. The bound below
     is the measured worst case over the same shapes, not a guess; asserting a
     bound rather than equality is what keeps the two claims apart.
     """
@@ -12123,7 +12123,7 @@ def test_sdpa_reference_switch_is_off_by_default_and_restores():
     assert resting is asked_by_env, (
         f"the reference kernel is {'on' if resting else 'off'} at rest with "
         f"BW_SDPA_REFERENCE={os.environ.get('BW_SDPA_REFERENCE')!r}; it costs 20x "
-        "(docs/SDPA.md §12) and must be reached only when asked for"
+        "(docs/kernels/SDPA.md §12) and must be reached only when asked for"
     )
 
     shim = _E2EBackend("shim")
@@ -12151,13 +12151,13 @@ def test_sdpa_reference_switch_is_off_by_default_and_restores():
     )
 
 
-# --- block quantisation (docs/QUANT2.md) ------------------------------------
+# --- block quantisation (docs/graph/QUANT2.md) ------------------------------------
 #
 # **The section that had to build its own judge.** Everything above decides by
 # bit equality against upstream, and quantisation cannot be decided that way:
 # it is lossy on purpose, so "differs from upstream" is its normal state and a
 # tolerance loose enough to accept a correct Q4K weight is loose enough to
-# accept a broken one. docs/QUANT2.md §2 is the argument; these are the checks.
+# accept a broken one. docs/graph/QUANT2.md §2 is the argument; these are the checks.
 #
 # The axis has three layers and only the third has a tolerance in it:
 #
@@ -12197,7 +12197,7 @@ def _lcg(seed):
 
 def _gauss_flat(n, seed=_QUANT_SEED):
     """Box-Muller over the LCG. Gaussian rather than uniform because it is the
-    input quantisation is *worst* at -- docs/QUANT.md §7 measured 7.5% relative
+    input quantisation is *worst* at -- docs/graph/QUANT.md §7 measured 7.5% relative
     RMS on random Gaussian weights and called it an upper bound for that
     reason."""
     nxt = _lcg(seed)
@@ -12685,7 +12685,7 @@ def test_element_size_refuses_rather_than_guessing_on_a_quantised_tensor():
 
 
 def test_is_quantized_is_no_longer_a_constant():
-    """docs/QUANT2.md §4, and the reason the six predicates were a `match`.
+    """docs/graph/QUANT2.md §4, and the reason the six predicates were a `match`.
 
     tensor.rs wrote `is_nested`/`is_sparse`/`is_quantized`/`_is_zerotensor`/
     `is_neg`/`layout` as an exhaustive match over `Repr` so that a third arm
@@ -12724,7 +12724,7 @@ def test_a_format_that_cannot_hold_a_shape_refuses_at_the_door_by_name():
     A GGML block must be filled, so a format with a 256-element block cannot
     store a weight whose last dimension is 576 -- and 576 is SmolLM2-135M's
     hidden size, not an exotic number. Every k-quant is therefore unavailable
-    for that model and the 32-element formats are not (docs/QUANT2.md §5.2).
+    for that model and the 32-element formats are not (docs/graph/QUANT2.md §5.2).
 
     Refused in `quant.rs` rather than left to candle, so the message names the
     format and the multiple it wanted; `torchnative.quant` groups its skips by
@@ -12793,9 +12793,9 @@ def test_a_quantised_activation_is_refused_and_a_reduced_float_one_too():
     """Two refusals that would otherwise be silent widenings.
 
     `QMatMul::forward` takes `f32` or `f16` and this shim's reduced-precision
-    path is `bfloat16` (docs/DTYPE.md §6.2), so a `bfloat16` activation has to
+    path is `bfloat16` (docs/numerics/DTYPE.md §6.2), so a `bfloat16` activation has to
     be widened by somebody. Doing it inside `_quantized_linear` would hide the
-    conversion cost from whoever is measuring -- the exact mistake docs/DTYPE.md
+    conversion cost from whoever is measuring -- the exact mistake docs/numerics/DTYPE.md
     §2 spent a document unpicking -- so it refuses and says why.
 
     And the weight argument must be quantised: handing `_quantized_linear` a
@@ -12829,7 +12829,7 @@ def test_a_quantised_activation_is_refused_and_a_reduced_float_one_too():
         raise AssertionError("a mismatched activation was accepted")
 
 
-# --- docs/ARCH20.md: names that had kernels and no way in --------------------
+# --- docs/architectures/ARCH20.md: names that had kernels and no way in --------------------
 #
 # Every one of these is a *reachability* check, and that is deliberate: the
 # golden harness already compares the kernels against upstream, and it did so
@@ -12847,8 +12847,8 @@ def _arch20_tensor(flat, shape=None, dtype=None):
 def test_the_in_place_arithmetic_members_are_bound():
     """`add_`, `sub_`, `mul_`, `neg_`, `exp_`, `relu_` and the three `__i*__`.
 
-    `aten.add_.Tensor` had had a kernel since docs/TAIL.md and
-    `aten.relu_.default` since docs/KERNELS.md; neither was reachable from
+    `aten.add_.Tensor` had had a kernel since docs/kernels/TAIL.md and
+    `aten.relu_.default` since docs/kernels/KERNELS.md; neither was reachable from
     Python. The value assertions are deliberately weak -- the golden harness
     owns correctness -- and the *binding* is what is asserted."""
     x = _arch20_tensor([1.0, 2.0, 3.0])
@@ -12876,14 +12876,14 @@ def test_the_in_place_arithmetic_members_are_bound():
     assert c.tolist() == [8.0, 12.0]
 
     # The scalar overloads, which need their own kernels because the parser
-    # binds a `Scalar` signature (docs/ARCH20.md §8.4).
+    # binds a `Scalar` signature (docs/architectures/ARCH20.md §8.4).
     assert _arch20_tensor([1.0, 2.0]).add_(1.0).tolist() == [2.0, 3.0]
     assert _arch20_tensor([1.0, 2.0]).sub_(1.0).tolist() == [0.0, 1.0]
     assert _arch20_tensor([1.0, 2.0]).mul_(3.0).tolist() == [3.0, 6.0]
 
 
 def test_the_in_place_members_write_through_to_the_base():
-    """The half a return-value assertion cannot reach (docs/VIEWS.md §6).
+    """The half a return-value assertion cannot reach (docs/kernels/VIEWS.md §6).
 
     Every in-place op returns `self`, so `t.add_(1); assert t == expected`
     passes against a kernel that computed into a fresh buffer and handed it
@@ -12903,7 +12903,7 @@ def test_the_in_place_members_write_through_to_the_base():
 
 
 def test_the_in_place_ops_refuse_a_cast_upstream_refuses(): 
-    """`inplace_cast_check` -- docs/ARCH20.md §8.3.
+    """`inplace_cast_check` -- docs/architectures/ARCH20.md §8.3.
 
     This shim used to *compute* a truncated answer for the first of these,
     which is the silent-divergence direction. Upstream raises for all four."""
@@ -12932,7 +12932,7 @@ def test_the_in_place_ops_refuse_a_cast_upstream_refuses():
 
 def test_the_spellings_whose_kernels_already_existed_now_resolve():
     """Six names that dispatched to implemented, golden-compared kernels and
-    refused at the Python surface (docs/ARCH20.md §0.3)."""
+    refused at the Python surface (docs/architectures/ARCH20.md §0.3)."""
     vf = _C._VariableFunctions
     a = _arch20_tensor([1.0, 2.0])
     assert vf.stack([a, a]).shape == (2, 2)
@@ -12965,7 +12965,7 @@ def test_the_three_composites_that_opened_persimmon_and_cohere():
     ]
     assert vf.repeat_interleave(m, 2).shape == (12,)
     # The tensor-`repeats` overload used to be refused by name here. It landed
-    # in docs/REPEAT.md, so this is that assertion **inverted** rather than
+    # in docs/kernels/REPEAT.md, so this is that assertion **inverted** rather than
     # dropped -- and it is inverted onto a NON-UNIFORM `repeats`, because
     # `[2, 2, 2]` is precisely the vector the scalar overload two lines above
     # would also answer correctly.
@@ -12986,7 +12986,7 @@ def test_the_three_composites_that_opened_persimmon_and_cohere():
 
 
 def test_a_list_index_lifts_into_an_index_tensor():
-    """`falcon`'s `fused_qkv[..., [-2], :]` (docs/ARCH20.md §7)."""
+    """`falcon`'s `fused_qkv[..., [-2], :]` (docs/architectures/ARCH20.md §7)."""
     x = _arch20_tensor([float(v) for v in range(24)], (2, 3, 4))
     assert x[..., [-2], :].shape == (2, 1, 4)
     assert x[..., [-2], :].tolist() == [[[4.0, 5.0, 6.0, 7.0]], [[16.0, 17.0, 18.0, 19.0]]]
@@ -13006,7 +13006,7 @@ def test_a_list_index_lifts_into_an_index_tensor():
 
 
 def test_the_determinism_flags_are_state_cells_with_upstreams_defaults():
-    """`bert`'s wall: `F.pad` reads this on every call (docs/ARCH20.md §2)."""
+    """`bert`'s wall: `F.pad` reads this on every call (docs/architectures/ARCH20.md §2)."""
     assert _C._get_deterministic_algorithms() is False
     assert _C._get_deterministic_algorithms_warn_only() is False
     # The one that defaults True -- a blanket "determinism starts off" would
@@ -13037,7 +13037,7 @@ def test_pad_is_wired_for_constant_mode_and_refuses_the_other_three():
     assert _C._aten_dispatch("aten.constant_pad_nd.default", grid, [-1, 2]).tolist() == [
         [1.0, 2.0, 0.0, 0.0], [4.0, 5.0, 0.0, 0.0]
     ]
-    # docs/PAD.md §5's patch, landed in docs/BIND2.md item 3: reflect and
+    # docs/kernels/PAD.md §5's patch, landed in docs/bindings/BIND2.md item 3: reflect and
     # replicate are wired now, through the same `n = len(pad) // 2` kernel
     # selection the constant-mode assertions above exercise for
     # `constant_pad_nd`. `_arch20_tensor([1.0, 2.0])` is rank 1, which neither
@@ -13047,7 +13047,7 @@ def test_pad_is_wired_for_constant_mode_and_refuses_the_other_three():
     assert _C._nn.pad(strip, (1, 1), "reflect", 0).tolist() == [[2.0, 1.0, 2.0, 3.0, 4.0, 3.0]]
     assert _C._nn.pad(strip, (1, 1), "replicate", 0).tolist() == [[1.0, 1.0, 2.0, 3.0, 4.0, 4.0]]
     # Only circular remains unimplemented (a new_empty/slice/copy_ composite
-    # upstream, docs/PAD.md §3) -- refused by name, not approximated.
+    # upstream, docs/kernels/PAD.md §3) -- refused by name, not approximated.
     try:
         _C._nn.pad(_arch20_tensor([1.0, 2.0]), (1, 1), "circular", 0)
     except NotImplementedError as e:
@@ -13090,7 +13090,7 @@ def test_autograd_function_apply_runs_the_forward():
 
 
 def test_clamp_out_of_place_promotes_where_clamp_underscore_refuses():
-    """The dtype rule that is NOT shared between the two (docs/ARCH20.md §4)."""
+    """The dtype rule that is NOT shared between the two (docs/architectures/ARCH20.md §4)."""
     promoted = _arch20_tensor([1, 5, 10], dtype=_C.int32).clamp(max=2.0)
     assert promoted.dtype == _C.float32, promoted.dtype
     assert promoted.tolist() == [1.0, 2.0, 2.0]
@@ -13108,7 +13108,7 @@ def test_clamp_out_of_place_promotes_where_clamp_underscore_refuses():
 
 
 def test_legacy_typed_tensor_constructors_read_a_sequence_as_data():
-    """`torch.IntTensor` and its nine siblings (docs/KERNELS26.md §24).
+    """`torch.IntTensor` and its nine siblings (docs/kernels/KERNELS26.md §24).
 
     `vits` needs them: `modeling_vits.py:349` builds
     `torch.IntTensor([self.hidden_size])` and then subscripts it. Until §24
@@ -13119,7 +13119,7 @@ def test_legacy_typed_tensor_constructors_read_a_sequence_as_data():
     constructor -- `torch.IntTensor([32])` produces a `lift_fresh` and nothing
     that names the class -- so `compare.py` has no dispatch key to hang a case
     on, and the sabotage run confirmed it: making the data form read its
-    sequence as a *shape* left all 6374 golden cases green (docs/KERNELS26.md
+    sequence as a *shape* left all 6374 golden cases green (docs/kernels/KERNELS26.md
     §25, fault S17). This test is the only thing that fails on it.
 
     The ambiguity is the whole point. `[2, 3]` looks exactly like a size list:
@@ -13275,7 +13275,7 @@ def test_tensor_type_answers_a_name_a_dtype_and_a_legacy_class():
 
 
 def test_a_numpy_scalar_binds_where_a_python_number_would():
-    """`vits`' last wall but one (docs/KERNELS26.md §24).
+    """`vits`' last wall but one (docs/kernels/KERNELS26.md §24).
 
     `modeling_vits.py:1379` is
     `predicted_lengths * np.prod(self.config.upsample_rates)`, and
@@ -13315,7 +13315,7 @@ def test_a_numpy_scalar_binds_where_a_python_number_would():
 
 
 def test_group_norm_statistics_are_per_sample_group_and_rstd_is_a_reciprocal():
-    """`sew_d`'s wall (docs/KERNELS26.md §19), and the two results nothing reads.
+    """`sew_d`'s wall (docs/kernels/KERNELS26.md §19), and the two results nothing reads.
 
     `torch.group_norm` returns `result[0]`. The `mean` and `rstd` beside it are
     what backward would need and there is no backward here, so a wrong shape, a
@@ -13391,14 +13391,14 @@ def test_group_norm_statistics_are_per_sample_group_and_rstd_is_a_reciprocal():
 
 
 def test_flip_copies_refuses_a_repeated_dim_and_reads_its_own_keyword():
-    """`vits`' wall after `clamp_min` (docs/KERNELS26.md §18).
+    """`vits`' wall after `clamp_min` (docs/kernels/KERNELS26.md §18).
 
     Three things golden's dispatch-key cases cannot see, all of them here:
 
     **It copies.** Upstream's `flip` is not a view (`data_ptr` differs), which
     matters because a negative-stride view is precisely what candle's `Layout`
     cannot express -- so an op that had to alias would have been another
-    docs/VIEWS.md §6.4 divergence. It does not, so writing into the result must
+    docs/kernels/VIEWS.md §6.4 divergence. It does not, so writing into the result must
     leave the base alone.
 
     **A repeated dim is refused.** Flipping one axis twice is the identity, so
@@ -13443,7 +13443,7 @@ def test_flip_copies_refuses_a_repeated_dim_and_reads_its_own_keyword():
 
 
 def test_all_and_any_disagree_on_empty_and_agree_on_uint8():
-    """`sam3_video`'s wall (docs/KERNELS26.md §16), and the two rules that
+    """`sam3_video`'s wall (docs/kernels/KERNELS26.md §16), and the two rules that
     separate a real `all` from `any` with the comparison flipped.
 
     **Empty.** `any` over nothing is False and `all` over nothing is True.
@@ -13493,7 +13493,7 @@ def test_all_and_any_disagree_on_empty_and_agree_on_uint8():
 
 
 def test_clamp_min_names_its_own_kernel_in_the_bool_refusal():
-    """`vits`' wall (docs/KERNELS26.md §15), and the one thing `clamp_min` does
+    """`vits`' wall (docs/kernels/KERNELS26.md §15), and the one thing `clamp_min` does
     NOT share with `clamp`.
 
     Every dtype row of the two ops agrees -- that is why the kernel calls
@@ -13547,7 +13547,7 @@ def test_clamp_min_names_its_own_kernel_in_the_bool_refusal():
 
 
 def test_expm1_is_not_exp_minus_one():
-    """The one case that separates the two (docs/ARCH20.md §4).
+    """The one case that separates the two (docs/architectures/ARCH20.md §4).
 
     Upstream float64 `expm1(1e-8)` is `1.0000000050000001e-08`;
     `exp(1e-8) - 1` is `9.99999993922529e-09`, wrong from the ninth digit. A
@@ -13560,7 +13560,7 @@ def test_expm1_is_not_exp_minus_one():
 
 
 def test_pow_promotes_and_refuses_where_upstream_does():
-    """`bloom`'s `torch.pow(float32_base, int32_powers)` (docs/ARCH20.md §6)."""
+    """`bloom`'s `torch.pow(float32_base, int32_powers)` (docs/architectures/ARCH20.md §6)."""
     base = _arch20_tensor([2.0, 3.0])
     powers = _arch20_tensor([2, 3], dtype=_C.int32)
     out = _C._aten_dispatch("aten.pow.Tensor_Tensor", base, powers)
@@ -13593,16 +13593,16 @@ def test_pow_promotes_and_refuses_where_upstream_does():
 
 
 # ---------------------------------------------------------------------------
-# The spelling road (docs/SPELLINGS.md, docs/ARCH20.md §9's 25-name inventory)
+# The spelling road (docs/bindings/SPELLINGS.md, docs/architectures/ARCH20.md §9's 25-name inventory)
 # ---------------------------------------------------------------------------
 #
 # Every case above this reaches its kernel one of two ways: `_C._aten_dispatch`
 # directly, or (in the e2e sections) a caller several layers removed from the
-# table this round edited. Neither proves the thing docs/ARCH20.md §9 found
+# table this round edited. Neither proves the thing docs/architectures/ARCH20.md §9 found
 # missing for 22 names: that `torch.<name>(...)` -- the literal spelling a
 # model's Python source writes -- resolves through `overloads.json` /
 # `methods.json` to the *same* kernel. `tools/golden/cases.py` cannot prove
-# this either (docs/SPELLINGS.md): its `c_module` is the bare `_C` extension,
+# this either (docs/bindings/SPELLINGS.md): its `c_module` is the bare `_C` extension,
 # loaded standalone, with no `overloads.json`/`methods.json` resolver
 # installed on it at all -- so a golden case for e.g. `aten.abs.default` was
 # passing for as long as that kernel existed, regardless of whether
@@ -13619,7 +13619,7 @@ def test_pow_promotes_and_refuses_where_upstream_does():
 # still runs on an interpreter with no torch installed at all, matching this
 # file's own docstring promise.
 #
-# The 3 names docs/ARCH20.md §9 listed that do NOT get an entry here --
+# The 3 names docs/architectures/ARCH20.md §9 listed that do NOT get an entry here --
 # `gelu`, `silu`, `softplus` -- are deliberately absent from this road too:
 # measured (`hasattr(torch, "gelu")` on real torch 2.13.0) there never was a
 # bare `torch.gelu` upstream, only `torch.nn.functional.gelu` /
@@ -13716,8 +13716,8 @@ rec("max_dim_member", _max_dim_member)
 rec("min_whole_fn", lambda: torch.min(x).item())
 rec("min_whole_member", lambda: x.min().item())
 # `min.other` and `min.dim` were recorded here as *refusals* while their
-# spelling-table entries existed with no kernel behind them (docs/SPELLINGS.md
-# §7.2, deliberately, so the refusal would name the right op). docs/TRIL.md §3
+# spelling-table entries existed with no kernel behind them (docs/bindings/SPELLINGS.md
+# §7.2, deliberately, so the refusal would name the right op). docs/kernels/TRIL.md §3
 # implemented both; these now compute, and this is where that shows.
 rec("min_other_fn", lambda: torch.min(x, y).tolist())
 rec("min_other_member", lambda: x.min(y).tolist())
@@ -13730,7 +13730,7 @@ def _min_dim_member():
     return [vals.tolist(), idx.tolist()]
 rec("min_dim_member", _min_dim_member)
 
-# --- tril / triu / amax / softmax: docs/TRIL.md's four new names -----------
+# --- tril / triu / amax / softmax: docs/kernels/TRIL.md's four new names -----------
 tri = torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0], [7.0, 8.0, 9.0]])
 rec("tril_fn", lambda: torch.tril(tri).tolist())
 rec("tril_member", lambda: tri.tril().tolist())
@@ -13797,7 +13797,7 @@ def _convolution_matches_raw_dispatch():
 rec("convolution_fn_matches_raw", _convolution_matches_raw_dispatch)
 
 # --- spelling reaches the same kernel `_aten_dispatch` does, directly -----
-# (the "reaches the right kernel" half of docs/SPELLINGS.md's split, for a
+# (the "reaches the right kernel" half of docs/bindings/SPELLINGS.md's split, for a
 # sample of the 22 rather than all of them -- a resolver bug that picked a
 # *different but coincidentally value-compatible* kernel would not be caught
 # by the value checks above alone.)
@@ -13807,9 +13807,9 @@ rec("max_other_matches_raw", lambda: torch.max(x, y).tolist() == torch._C._aten_
 rec("reshape_matches_raw", lambda: torch.reshape(x, (2, 2)).tolist() == torch._C._aten_dispatch("aten.reshape.default", x, [2, 2]).tolist())
 rec("bitwise_and_matches_raw", lambda: torch.bitwise_and(bi, bj).tolist() == torch._C._aten_dispatch("aten.bitwise_and.Tensor", bi, bj).tolist())
 
-# docs/DEMAND5.md's two spellings. The kernels are golden-compared by dispatch
+# docs/architectures/DEMAND5.md's two spellings. The kernels are golden-compared by dispatch
 # key; what nothing else exercises is that `torch.roll(...)` and
-# `torch.greater(...)` reach them at all -- the blind spot docs/GOLDEN.md names,
+# `torch.greater(...)` reach them at all -- the blind spot docs/verification/GOLDEN.md names,
 # and the one that has now hidden a missing name four times.
 r6 = torch.arange(6.0)
 rec("roll_fn", lambda: torch.roll(r6, 2).tolist())
@@ -13843,7 +13843,7 @@ def _spell_road_fixture():
 
 
 def test_spelling_road_through_the_vendored_tree():
-    """docs/ARCH20.md §9's 22 fixable names, each through `torch.<name>(...)`
+    """docs/architectures/ARCH20.md §9's 22 fixable names, each through `torch.<name>(...)`
     (and `tensor.<name>(...)` where a member exists), in a real `import torch`
     against the shim -- not `_C._aten_dispatch` with the op string typed by
     the test author, which is exactly what let these 22 sit unreachable while
@@ -13895,7 +13895,7 @@ def test_spelling_road_through_the_vendored_tree():
     eq("ge_fn", [a >= b for a, b in zip(x, y)])
     eq("ge_member", [a >= b for a, b in zip(x, y)])
     # `int32 == float32` used to be recorded here as a documented refusal.
-    # It promotes now (docs/PROMOTE.md §4): the `int32` operand is brought to
+    # It promotes now (docs/numerics/PROMOTE.md §4): the `int32` operand is brought to
     # `float32` and compared there, giving upstream's answer through the
     # vendored `import torch` road rather than through `_aten_dispatch`.
     eq("eq_mixed_dtype", [True, False, False])
@@ -13910,14 +13910,14 @@ def test_spelling_road_through_the_vendored_tree():
     eq("max_dim_member", [[5.0, 9.0], [1, 0]])
     eq("min_whole_fn", -3.0)
     eq("min_whole_member", -3.0)
-    # Both of these asserted a *refusal* until docs/TRIL.md §3 gave them
+    # Both of these asserted a *refusal* until docs/kernels/TRIL.md §3 gave them
     # kernels. x = [-1, 2, -3, 4], y = [1, 1, -3, 5].
     close("min_other_fn", [-1.0, 1.0, -3.0, 4.0])
     close("min_other_member", [-1.0, 1.0, -3.0, 4.0])
     eq("min_dim_fn", [[1.0, 0.0], [0, 1]])
     eq("min_dim_member", [[1.0, 0.0], [0, 1]])
 
-    # docs/TRIL.md's new names, every one through the Python spelling and the
+    # docs/kernels/TRIL.md's new names, every one through the Python spelling and the
     # member -- the route the golden harness cannot see.
     eq("tril_fn", [[1.0, 0.0, 0.0], [4.0, 5.0, 0.0], [7.0, 8.0, 9.0]])
     eq("tril_member", [[1.0, 0.0, 0.0], [4.0, 5.0, 0.0], [7.0, 8.0, 9.0]])
@@ -13974,7 +13974,7 @@ def test_spelling_road_through_the_vendored_tree():
     eq("reshape_matches_raw", True)
     eq("bitwise_and_matches_raw", True)
 
-    # docs/DEMAND5.md's two spellings, checked here rather than in golden: the
+    # docs/architectures/DEMAND5.md's two spellings, checked here rather than in golden: the
     # harness compares by dispatch key and cannot see a name that is missing.
     assert out["roll_fn"] == [4.0, 5.0, 0.0, 1.0, 2.0, 3.0], out["roll_fn"]
     assert out["roll_method"] == out["roll_fn"], (out["roll_method"], out["roll_fn"])
@@ -13987,7 +13987,7 @@ def test_spelling_road_through_the_vendored_tree():
 
 # --- torch.jit.script defaults to unavailable, upstream's own way ----------
 #
-# docs/TORCHSCRIPT.md is the investigation. Short version: there is no
+# docs/graph/TORCHSCRIPT.md is the investigation. Short version: there is no
 # TorchScript frontend here, `bootstrap.py` now sets `PYTORCH_JIT=0` by
 # `os.environ.setdefault` before `torch.jit._state` is first imported, and
 # upstream's own `torch/jit/_script.py` (`if not _enabled: return obj`,
@@ -14117,10 +14117,10 @@ def _gpt_bigcode_import_fixture():
 def test_gpt_bigcode_imports_now_that_scripting_defaults_to_unavailable():
     """The module-scope `@torch.jit.script` at
     `modeling_gpt_bigcode.py:54` used to raise `NotImplementedError:
-    SourceRangeFactory.make_range` at import time (docs/TORCHSCRIPT.md).
+    SourceRangeFactory.make_range` at import time (docs/graph/TORCHSCRIPT.md).
     With scripting off by default, it degrades to a plain function and the
     module imports. This does not mean the architecture forwards -- it
-    still needs `aten.tril` (docs/TORCHSCRIPT.md §6), which is not this
+    still needs `aten.tril` (docs/graph/TORCHSCRIPT.md §6), which is not this
     file's territory -- only that the TorchScript wall specifically is gone.
     """
     if not _ckpt_shim_available() or _upstream_transformers is None:
@@ -14187,10 +14187,10 @@ def test_the_whole_max_min_family_agrees_on_one_nan_rule():
     does not *start* on is skipped. That single fact has produced four separate
     wrong answers in this repository, found four separate times:
 
-        max.default / min.default   docs/E2E_REAL.md   value dropped
-        max.other                   docs/SPELLINGS.md  second operand's NaN dropped
-        amax                        docs/SEQLEN.md     avoided by construction, not repaired
-        max.dim, argmax             docs/TRIL.md       value AND index dropped
+        max.default / min.default   docs/models/E2E_REAL.md   value dropped
+        max.other                   docs/bindings/SPELLINGS.md  second operand's NaN dropped
+        amax                        docs/numerics/SEQLEN.md     avoided by construction, not repaired
+        max.dim, argmax             docs/kernels/TRIL.md       value AND index dropped
 
     Written as one table over all of them rather than as six tests, because
     what keeps going wrong is not any one kernel -- it is that a new member of
@@ -14200,7 +14200,7 @@ def test_the_whole_max_min_family_agrees_on_one_nan_rule():
     **Every case puts the NaN somewhere other than position 0 as well as at
     it.** A NaN in element 0 seeds candle's accumulator and survives even a
     kernel that does nothing about NaN, so a suite of `at=0` cases passes under
-    the bug -- the hole docs/SEQLEN.md §7.12 found in `amax`'s own first test.
+    the bug -- the hole docs/numerics/SEQLEN.md §7.12 found in `amax`'s own first test.
     """
     nan = float("nan")
 
@@ -14286,8 +14286,8 @@ def test_the_two_stale_sdpa_refusals_no_longer_claim_a_missing_kernel():
 
     `scaled_dot_product_attention` refused two inputs -- `dropout_p != 0` and a
     non-4-D query -- and both messages said `aten._safe_softmax.default` had no
-    kernel. It has had one, golden-compared, since docs/SDPA.md. The
-    architecture that stayed blocked for weeks in docs/TORCHSCRIPT.md was
+    kernel. It has had one, golden-compared, since docs/kernels/SDPA.md. The
+    architecture that stayed blocked for weeks in docs/graph/TORCHSCRIPT.md was
     blocked by exactly this shape of mistake, and the bool-mask branch of this
     same function already carries a note about being the first instance of it.
 
@@ -14298,10 +14298,10 @@ def test_the_two_stale_sdpa_refusals_no_longer_claim_a_missing_kernel():
 
     **THE DROPOUT REFUSAL IS GONE, AND THIS TEST IS WHAT CAUGHT IT.** Its
     negative claim -- that `aten.bernoulli_.float` and `aten.div_.Scalar` had
-    no kernels -- went stale the moment docs/TRAIN.md landed them, for the
+    no kernels -- went stale the moment docs/training/TRAIN.md landed them, for the
     third time in this one function. The right answer was not a fourth
     re-wording: with both kernels present the math backend was writable, so
-    `dropout_p != 0` now takes it (docs/TRAIN.md §4) and there is nothing left
+    `dropout_p != 0` now takes it (docs/training/TRAIN.md §4) and there is nothing left
     to claim. The assertions below are inverted rather than deleted, so the
     file still records which refusal this was.
     """
@@ -14346,7 +14346,7 @@ def test_the_two_stale_sdpa_refusals_no_longer_claim_a_missing_kernel():
     # The gap the stale text hid: `torch._safe_softmax` is a real upstream name
     # (`hasattr(torch, '_safe_softmax')` is True on 2.13.0) for a leaf op this
     # shim implements, and it refused with "no table entry" the whole time.
-    # docs/ARCH20.md §9 filed it under "no such public function upstream",
+    # docs/architectures/ARCH20.md §9 filed it under "no such public function upstream",
     # which is how a name nothing calls stops correcting the text about it.
     assert r["safe_softmax_spelling"] is not None, r
     rows = r["safe_softmax_spelling"]
@@ -14369,7 +14369,7 @@ try:
     out["dropout"] = "ACCEPTED"
 except NotImplementedError as e:
     out["dropout"] = "NotImplementedError: %s" % e
-# The math backend, now that `dropout_p != 0` takes it (docs/TRAIN.md §4).
+# The math backend, now that `dropout_p != 0` takes it (docs/training/TRAIN.md §4).
 # `dropout_p=1.0` drops every attention weight, so the output is exactly zero
 # whatever the inputs are -- the one assertion about this path that needs no
 # reference values and still fails if the dropout step were skipped.
@@ -14437,7 +14437,7 @@ def test_max_min_dim_return_types_are_named_for_their_own_op():
     """`min.dim`'s pair must not print as `max(...)`.
 
     Upstream returns a structseq whose type is `torch.return_types.min`; this
-    shim returns a `collections.namedtuple` (docs/TENSORBASE.md says why), and
+    shim returns a `collections.namedtuple` (docs/bindings/TENSORBASE.md says why), and
     the one thing that has to survive the substitution is the *name*, because
     it is what `repr()` shows and what a traceback shows. Sharing one cached
     namedtuple between the two overloads -- the obvious economy, since the
@@ -14519,7 +14519,7 @@ def test_tril_and_triu_zero_by_selecting_not_by_multiplying():
     #
     # **This assertion cannot currently fail, and saying so is the point.**
     # Deleting the kernel's `.contiguous()` was injected as a fault and every
-    # gate stayed green (docs/TRIL.md §5, fault 3) -- candle's `WCond` already
+    # gate stayed green (docs/kernels/TRIL.md §5, fault 3) -- candle's `WCond` already
     # falls back to `strided_index()` for a non-contiguous operand. It is here
     # as coverage of the shape, not as a check of the normalisation; if candle
     # ever loses that fallback this is where it shows, and until then nobody
@@ -14541,7 +14541,7 @@ def test_tril_and_triu_zero_by_selecting_not_by_multiplying():
                 raise AssertionError(f"{op} accepted a rank-{len(shape)} input")
 
 
-# --- docs/KERNELS26.md: the kernels that stopped six architectures ----------
+# --- docs/kernels/KERNELS26.md: the kernels that stopped six architectures ----------
 #
 # Same split as the `_SPELL_ROAD_SCRIPT` section above, and for the same
 # reason: `tools/golden/compare.py` reaches a kernel by its *dispatch key*, so
@@ -14558,7 +14558,7 @@ def test_tril_and_triu_zero_by_selecting_not_by_multiplying():
 
 def test_sqrt_is_a_leaf_kernel_with_ieee_domain_and_sign():
     """`aten.sqrt.default` -- the kernel that stopped `deberta` and
-    `deberta_v2` (docs/ARCH26.md §1), both of which reach `torch.sqrt` before
+    `deberta_v2` (docs/architectures/ARCH26.md §1), both of which reach `torch.sqrt` before
     any weight multiplies.
 
     Three things are asserted that a `pow(x, 0.5)` composite would get wrong,
@@ -14701,7 +14701,7 @@ def test_sqrt_is_reachable_by_name_not_only_by_dispatch_key():
 
 def test_repeat_tiles_rather_than_broadcasts():
     """`aten.repeat.default` -- the kernel `sqrt` uncovered, and the one
-    docs/ARCH26.md §8 found recurring across four of the six architectures.
+    docs/architectures/ARCH26.md §8 found recurring across four of the six architectures.
 
     `repeat` is tiling and `expand` is broadcasting; the assertions here are
     the places the two are confusable, plus the two places candle's own
@@ -14770,7 +14770,7 @@ def test_repeat_tiles_rather_than_broadcasts():
 
 def test_remainder_follows_the_sign_of_the_divisor_not_the_dividend():
     """`aten.remainder.{Scalar,Tensor}` -- `sam3_video`'s wall
-    (docs/ARCH26.md §5), reached through `TensorBase.__mod__` inside a ViT
+    (docs/architectures/ARCH26.md §5), reached through `TensorBase.__mod__` inside a ViT
     rotary embedding's `__init__`.
 
     **This is the op where `fmod` is the wrong answer.** `remainder` takes the
@@ -14885,7 +14885,7 @@ def test_remainder_follows_the_sign_of_the_divisor_not_the_dividend():
 
 
 def test_the_legacy_tensor_size_constructor_allocates_and_the_data_form_refuses():
-    """`torch.Tensor(n)` -- `sew_d`'s wall (docs/ARCH26.md §4).
+    """`torch.Tensor(n)` -- `sew_d`'s wall (docs/architectures/ARCH26.md §4).
 
     Three forms wear the same name upstream and this asserts all three,
     because the whole risk in implementing one of them is answering a
@@ -14976,13 +14976,13 @@ def test_the_legacy_tensor_size_constructor_allocates_and_the_data_form_refuses(
 
 def test_set_from_a_tensor_aliases_where_set_from_a_storage_copies():
     """`aten.set_.source_Tensor` -- the wall `vits` AND `sew_d` both stopped
-    on (docs/ARCH26.md §2), reached through
+    on (docs/architectures/ARCH26.md §2), reached through
     `torch.nn.utils.parametrizations.weight_norm`.
 
     **The two forms of `set_` in this shim have opposite aliasing behaviour,
     and that is not an inconsistency.** The storage form copies, because
     candle owns its memory and a `Storage` is bytes held separately (see
-    `set_`'s own doc comment, and docs/CKPT.md §4). The tensor form aliases,
+    `set_`'s own doc comment, and docs/models/CKPT.md §4). The tensor form aliases,
     because `Repr::Dense` *is* a candle tensor and a candle clone is an `Arc`
     clone of the same storage -- so it gets upstream's semantics for free.
     Both directions are asserted here, next to each other, because "one of
@@ -15162,7 +15162,7 @@ rec("remainder_member", lambda: rm.remainder(rd).tolist())
 rec("remainder_operator", lambda: (rm % rd).tolist())
 rec("remainder_operator_scalar", lambda: (rm % -3.0).tolist())
 rec("remainder_int_operator", lambda: (torch.tensor([7, -7]) % 3).tolist())
-# `fmod` has no kernel here (docs/KERNELS26.md §6 leaves it named), so the
+# `fmod` has no kernel here (docs/kernels/KERNELS26.md §6 leaves it named), so the
 # comparison is against Python's own `math.fmod` -- the same C function
 # upstream's `fmod` kernel calls, and it keeps this file's promise of not
 # needing a second torch to compute an expectation.
@@ -15492,7 +15492,7 @@ def _kernels26_road_fixture():
 
 
 def test_kernels26_road_through_the_vendored_tree():
-    """Every kernel docs/KERNELS26.md adds, reached as a model reaches it.
+    """Every kernel docs/kernels/KERNELS26.md adds, reached as a model reaches it.
 
     Not `_C._aten_dispatch("aten.sqrt.default", ...)` with the key typed by the
     test author -- that is what the section above does, and it is exactly the
@@ -15728,7 +15728,7 @@ def _main():
     return 1 if failures else 0
 
 
-# --- the tape: reverse mode over a captured trace (docs/BACKWARD.md) --------
+# --- the tape: reverse mode over a captured trace (docs/training/BACKWARD.md) --------
 #
 # Every rule in `tape.rs`'s `RULE_OPS` is checked here against **central
 # differences in float64**, which is an oracle that shares no code with the
@@ -15740,7 +15740,7 @@ def _main():
 #
 # `float64` and `h = 1e-6` put the truncation error near 1e-13 and the
 # cancellation error near 2e-9 for the O(1) functions below, so `1e-5` is two
-# orders of margin. docs/BACKWARD.md §6 records where that oracle stops being
+# orders of margin. docs/training/BACKWARD.md §6 records where that oracle stops being
 # usable -- on a real model it disagrees with **upstream's own autograd** by a
 # factor of 600, which is what a check has to be able to say about itself.
 
@@ -15778,7 +15778,7 @@ def _tape_case_bodies():
 
     `fn` takes the trace's single input and returns a scalar. Everything else
     it touches becomes a burned-in constant, which is what makes the weights of
-    a real model constants too (docs/CAPTURE.md §2)."""
+    a real model constants too (docs/graph/CAPTURE.md §2)."""
     d = _C._aten_dispatch
     s = _tape_scalarise
 
@@ -15901,7 +15901,7 @@ def _tape_case_bodies():
     # rule's gradients reach the one gradient this case checks. With constant
     # affine parameters the case would exercise `grad_input` alone and
     # `grad_weight`/`grad_bias` could be anything at all -- which is
-    # docs/BACKWARD.md §7's T8 (an attention case whose input was the query
+    # docs/training/BACKWARD.md §7's T8 (an attention case whose input was the query
     # alone never entered the grouped-query fold) in a second place. The two are
     # built by *different* functions of x so that swapping them is visible.
     def _layer_norm(x):
@@ -15919,7 +15919,7 @@ def _tape_case_bodies():
     # the whole content of the rule -- is checked in closed form on the eager
     # tape instead, by
     # `test_the_eager_graph_differentiates_a_training_mode_batch_norm_that_wrote_its_buffers`
-    # and against a real model in docs/BACKWARD8.md §2. That split is worth
+    # and against a real model in docs/training/BACKWARD8.md §2. That split is worth
     # noticing rather than hiding: this entry proves coverage of the op, not of
     # both its modes.
     #
@@ -15964,7 +15964,7 @@ def _tape_case_bodies():
                               d("aten._log_softmax.default", x, -1, False), other)))
     # One row ignored, deliberately. Without it `total_weight` equals the row
     # count and the `reduction=Mean` divisor cannot be told from a count -- and
-    # the whole `ignore_index` branch is never entered. docs/LOSS.md §3.1 is
+    # the whole `ignore_index` branch is never entered. docs/training/LOSS.md §3.1 is
     # the forward half of the same trap.
     targets = _tape_i64([2, 0, -100, 3], [4])
     cases["aten.nll_loss_forward.default"] = shape_case(
@@ -16022,7 +16022,7 @@ def _tape_case_bodies():
     cases["aten._safe_softmax.default"] = shape_case(
         [2, 3, 4], lambda x: s(d("aten._safe_softmax.default", x, 1)))
 
-    # -- convolution and pooling (docs/TRAIN2.md) ---------------------------
+    # -- convolution and pooling (docs/training/TRAIN2.md) ---------------------------
     # `stride=2, padding=1, groups=2` in one case, deliberately: a rule is
     # right for `stride=1, padding=0, groups=1` even with its input gradient's
     # crop and its weight gradient's stride/dilation the wrong way round. This
@@ -16162,7 +16162,7 @@ def test_the_embedding_rule_zeroes_the_padding_row_and_only_that_row():
 
     What can be checked without an oracle is the structural claim: the padding
     row is exactly zero, every other used row is not, and the used rows are
-    unchanged by the presence of `padding_idx`. docs/BACKWARD.md §13.1 checks
+    unchanged by the presence of `padding_idx`. docs/training/BACKWARD.md §13.1 checks
     the same thing against upstream on a real table.
     """
     d = _C._aten_dispatch
@@ -16276,7 +16276,7 @@ def test_the_dropout_gradient_is_upstreams_draw_for_draw_and_reads_the_mask():
     one is not statistical.
 
     `native_dropout` returns its mask precisely so a backward can reuse it, and
-    docs/TRAIN.md §2 measured why that makes a seeded comparison available at
+    docs/training/TRAIN.md §2 measured why that makes a seeded comparison available at
     all: `bernoulli_` draws in `float64` for *every* dtype, so the shim's
     stream and upstream's agree element for element. The mask is therefore
     checked first -- if the two sides drew different masks the gradient
@@ -16298,7 +16298,7 @@ def test_the_dropout_gradient_is_upstreams_draw_for_draw_and_reads_the_mask():
     is about precision and not about the formula.
     """
     if _upstream_torch is None:
-        return  # no upstream torch in this interpreter -- see docs/E2E.md
+        return  # no upstream torch in this interpreter -- see docs/models/E2E.md
     for dtype_name, p in (("float32", 0.5), ("bfloat16", 0.7)):
         sm, sg, um, ug, _ = _dropout_grad_pair(dtype_name, p, 20260901)
         assert sm == um, (dtype_name, "the two sides drew different masks", sm, um)
@@ -16334,7 +16334,7 @@ def test_the_dropout_gradients_two_guarded_scales_are_the_forwards_two():
       * **`p == 1`** without the guard is `1 / 0 = inf`, and the mask is all
         `False` there, so every element becomes `0 * inf = nan` -- a gradient
         that is not merely wrong but poisons every parameter downstream of it.
-        docs/TRAIN.md §5's S3 is the same edge in the forward and was caught on
+        docs/training/TRAIN.md §5's S3 is the same edge in the forward and was caught on
         the sign of a zero; here it is caught on a `nan`.
       * **`train=False`** without the guard scales an *unscaled* forward by
         `1 / (1 - p)`, so the gradient is off by a constant factor that
@@ -16342,7 +16342,7 @@ def test_the_dropout_gradients_two_guarded_scales_are_the_forwards_two():
         `True` there, so the correct answer is the incoming gradient exactly.
     """
     if _upstream_torch is None:
-        return  # no upstream torch in this interpreter -- see docs/E2E.md
+        return  # no upstream torch in this interpreter -- see docs/models/E2E.md
     sm, sg, um, ug, _ = _dropout_grad_pair("float32", 1.0, 20260901)
     assert not any(sm), sm
     assert sm == um, (sm, um)
@@ -16374,7 +16374,7 @@ def test_the_tape_replays_a_dropout_forward_and_therefore_redraws_its_mask():
 
     That is measurable on a real model: one Tent gradient on `gpt2` in
     `.train()` against upstream's is a relative L2 median of **9.593e-03** with
-    the replay reseeded and **8.731e-01** without (docs/ADAPT.md §14.3), so
+    the replay reseeded and **8.731e-01** without (docs/models/ADAPT.md §14.3), so
     this is the larger term by two orders of magnitude and it is not the
     derivative rule.
 
@@ -16449,7 +16449,7 @@ def test_the_safe_softmax_gradient_of_a_fully_masked_row_is_zero_not_nan():
     finite" only means something if the unsafe spelling's is not.
     """
     if _upstream_torch is None:
-        return  # no upstream torch in this interpreter -- see docs/E2E.md
+        return  # no upstream torch in this interpreter -- see docs/models/E2E.md
     U = _upstream_torch
     d = _C._aten_dispatch
     inf = float("inf")
@@ -16501,7 +16501,7 @@ def test_the_safe_softmax_gradient_of_a_fully_masked_row_is_zero_not_nan():
 
 # --- the mixed-precision oracle this file did not have ----------------------
 #
-# docs/BACKWARD.md §15.1 named a hole rather than a property: **L5** -- the
+# docs/training/BACKWARD.md §15.1 named a hole rather than a property: **L5** -- the
 # layer-norm rule recomputing its statistics instead of reading the two the
 # forward returns -- is *exactly* a no-op at matched dtypes (0 of 32 elements
 # differ, bit for bit) and moves 22 of 24 `grad_input` elements at mixed
@@ -16512,7 +16512,7 @@ def test_the_safe_softmax_gradient_of_a_fully_masked_row_is_zero_not_nan():
 #
 # It has one. Not the two-interpreter shape §15.1 guessed at, either: upstream
 # `torch` is importable **in this process** (see `_E2EBackend` above, and
-# docs/E2E.md for why that is not the two-process split it looks like), so the
+# docs/models/E2E.md for why that is not the two-process split it looks like), so the
 # comparison is direct and costs no subprocess.
 
 
@@ -16566,7 +16566,7 @@ def _mp_layer_norm_gradients():
 
 
 def test_a_mixed_precision_layer_norm_grad_input_is_upstreams_bit_for_bit():
-    """The case docs/BACKWARD.md §15.1's L5 has something to fail on.
+    """The case docs/training/BACKWARD.md §15.1's L5 has something to fail on.
 
     `bfloat16` input, `float32` weight and bias -- the one shape in which
     `native_layer_norm`'s statistics are at a *different* precision from its
@@ -16583,7 +16583,7 @@ def test_a_mixed_precision_layer_norm_grad_input_is_upstreams_bit_for_bit():
     than half a `bfloat16` ulp is still invisible here. L5 moves it by 6.25.
     """
     if _upstream_torch is None:
-        return  # no upstream torch in this interpreter -- see docs/E2E.md
+        return  # no upstream torch in this interpreter -- see docs/models/E2E.md
     (gx, _, _), (ux, _, _) = _mp_layer_norm_gradients()
     got, want = _mp_flat(gx), _mp_flat(ux)
     assert gx.dtype == _C.bfloat16, gx.dtype
@@ -16625,12 +16625,12 @@ def test_mixed_precision_layer_norm_dgamma_is_not_upstreams_and_the_gap_is_upstr
     a zero would mean somebody had made the two agree and the fact above had
     stopped being true. That is the same shape as the `_softmax` rule's
     reduced-precision gap (both accumulate where upstream uses `opmath`), and
-    it is `docs/BACKWARD.md` §13.2's story with the sides swapped: there the
+    it is `docs/training/BACKWARD.md` §13.2's story with the sides swapped: there the
     shim was the more accurate one and was changed to upstream's rounding
     because "arguably more accurate and not upstream's" is still not upstream.
     """
     if _upstream_torch is None:
-        return  # no upstream torch in this interpreter -- see docs/E2E.md
+        return  # no upstream torch in this interpreter -- see docs/models/E2E.md
     (_, gw, gb), (_, uw, ub) = _mp_layer_norm_gradients()
     for name, s, u in (("grad_weight", gw, uw), ("grad_bias", gb, ub)):
         got, want = _mp_flat(s), _mp_flat(u)
@@ -16648,7 +16648,7 @@ def test_mixed_precision_layer_norm_dgamma_is_not_upstreams_and_the_gap_is_upstr
 
 def test_the_tape_has_a_gradient_case_for_every_rule_it_claims():
     """`RULE_OPS` is a second list of op names, which is the shape of the
-    failure docs/AUDIT.md found six times -- a list nobody re-reads going
+    failure docs/verification/AUDIT.md found six times -- a list nobody re-reads going
     stale beside the code it describes.
 
     So it is not read: `differentiable()` reports against it, and this asserts
@@ -16701,13 +16701,13 @@ def test_every_tape_rule_agrees_with_central_differences_in_float64():
 
 
 def test_the_tape_refuses_an_op_it_has_no_rule_for_by_name():
-    """docs/DESIGN.md §6, applied to a derivative: a tape that guessed would
+    """docs/design/DESIGN.md §6, applied to a derivative: a tape that guessed would
     produce a gradient exactly as plausible as a correct one.
 
     `topk` is chosen because it is implemented, differentiable upstream, and
     has no rule here -- so this checks the refusal rather than a missing
     kernel. `differentiable()` names it *before* a backward is run, which is
-    the property docs/BACKWARD.md's wall table is generated from.
+    the property docs/training/BACKWARD.md's wall table is generated from.
     """
     x = _tape_f64(_tape_ramp(6), [6])
     _C._capture_begin([x])
@@ -16734,7 +16734,7 @@ def test_a_gradient_reaches_a_burned_in_constant_and_only_the_ones_asked_for():
     """The split that makes an optimiser step possible.
 
     A model's weights are not trace *inputs* -- capture burns them in as
-    constants (docs/CAPTURE.md §2), which is the same split
+    constants (docs/graph/CAPTURE.md §2), which is the same split
     `ExportedProgram.graph_signature` makes. So "the gradient of the loss with
     respect to this parameter" is "the gradient at this constant", and
     `wrt_constants` is how a caller says which ones it wants. An integer
@@ -16770,7 +16770,7 @@ def test_a_gradient_reaches_a_burned_in_constant_and_only_the_ones_asked_for():
 
 
 def test_a_trace_refuses_to_differentiate_at_constants_that_moved_since_capture():
-    """docs/BACKWARD6.md: W10a, **the inversion of a pinned divergence**.
+    """docs/training/BACKWARD6.md: W10a, **the inversion of a pinned divergence**.
 
     This test used to be
     `test_a_traces_constants_are_read_at_backward_time_not_at_capture_time`
@@ -16778,7 +16778,7 @@ def test_a_trace_refuses_to_differentiate_at_constants_that_moved_since_capture(
     caller's live parameter tensors (`const_objects`), `run()` copied those
     references into the replay `Env`, and so a `backward()` called after
     `optimizer.step()` silently differentiated at the **new** weights.
-    docs/BACKWARD5.md §1.3 measured it and §5 pinned it, with the instruction
+    docs/training/BACKWARD5.md §1.3 measured it and §5 pinned it, with the instruction
     to invert rather than delete this test when the fix landed. This is that
     inversion.
 
@@ -16831,7 +16831,7 @@ def test_a_trace_refuses_to_differentiate_at_constants_that_moved_since_capture(
     else:
         raise AssertionError(
             "the tape differentiated at the moved constant and said nothing -- "
-            "this is docs/BACKWARD5.md §1.3 back, and it returned %r"
+            "this is docs/training/BACKWARD5.md §1.3 back, and it returned %r"
             % (trace.backward([x])["inputs"][0].tolist(),))
     # Named, not merely raised. Each clause is a separate assertion so that a
     # message which loses one of them fails on that one.
@@ -16840,7 +16840,7 @@ def test_a_trace_refuses_to_differentiate_at_constants_that_moved_since_capture(
     assert "is at version" in message and "expected version" in message, message
     assert "captured *before* that tensor moved" in message, message
 
-    # The forward refuses too, and by the same message. docs/BACKWARD5.md §1.2
+    # The forward refuses too, and by the same message. docs/training/BACKWARD5.md §1.2
     # measured that the replayed loss diverges before and by more than the
     # gradient does (1.79 against 179.0), so a check that guarded only
     # `backward()` would leave `replay()` answering 10.5 for a region that
@@ -16862,12 +16862,12 @@ def test_a_trace_refuses_to_differentiate_at_constants_that_moved_since_capture(
 
 
 def test_the_constant_version_check_sees_a_write_through_a_view():
-    """docs/BACKWARD6.md §4: the counter is keyed on the **storage**, not on
+    """docs/training/BACKWARD6.md §4: the counter is keyed on the **storage**, not on
     the Python object, so a write through an alias of a burned-in constant is
     seen. This is not W10b -- nothing here models alias *sets* or view
     metadata; it is the one property that comes free from in-place ops going
     through `tensor::write_into`, which writes into the buffer the wrapper
-    already points at (docs/VIEWS.md §6).
+    already points at (docs/kernels/VIEWS.md §6).
 
     A per-object counter would pass every assertion above and fail this one,
     which is why it is a separate test rather than a line in that one."""
@@ -16913,7 +16913,7 @@ def test_the_tape_seeds_a_one_only_for_a_scalar_and_says_so_otherwise():
 
 
 def test_grad_is_a_real_slot_now_and_takes_only_a_tensor_or_none():
-    """docs/AUTOGRAD.md §7 argued for leaving `.grad` a read-only `None`
+    """docs/training/AUTOGRAD.md §7 argued for leaving `.grad` a read-only `None`
     *while nothing writes to it*. The tape writes to it, so that antecedent is
     gone -- and this pins what replaced it rather than leaving the argument in
     a docstring.
@@ -16942,7 +16942,7 @@ def test_grad_is_a_real_slot_now_and_takes_only_a_tensor_or_none():
     assert _C._aten_dispatch("aten.clone.default", x).grad is None
 
 
-# --- the seed a backward would be handed (docs/BACKWARD3.md) ---------------
+# --- the seed a backward would be handed (docs/training/BACKWARD3.md) ---------------
 #
 # Runs in a *fresh* interpreter with the vendored (shim-backed) `torch` on
 # PYTHONPATH, because everything measured here is upstream **Python** --
@@ -16978,7 +16978,7 @@ out["nonscalar_seed"] = attempt(
     lambda: [None if g is None else g.shape[0] for g in _make_grads((nonscalar,), (None,),
                                                                     is_grads_batched=False)])
 
-# 3. ... and what consumes it. Both doors answer since docs/BACKWARD9.md, so
+# 3. ... and what consumes it. Both doors answer since docs/training/BACKWARD9.md, so
 #    what is recorded is the *answer* rather than the refusal: `.backward()`
 #    fills `x.grad`, and `torch.autograd.grad` over a fresh forward returns the
 #    same numbers without touching it.
@@ -17023,7 +17023,7 @@ def _seed_fixture(env_overrides):
 
 
 def test_the_backward_seed_is_absent_and_nothing_guesses_a_one():
-    """docs/BACKWARD2.md §1.3's warning, pinned instead of left in prose.
+    """docs/training/BACKWARD2.md §1.3's warning, pinned instead of left in prose.
 
     That section states the single most dangerous fact in the refusal chain as
     a block quote and asserts nothing about it:
@@ -17049,7 +17049,7 @@ def test_the_backward_seed_is_absent_and_nothing_guesses_a_one():
     `test_the_autograd_boundary_is_where_autograd_md_says_it_is` -- there it is
     the boundary, here it is the thing that makes the absent seed harmless.
 
-    **W5 landed (docs/BACKWARD4.md) and the assertions were inverted rather
+    **W5 landed (docs/training/BACKWARD4.md) and the assertions were inverted rather
     than deleted, which is what the previous revision of this docstring asked
     for.** The divergence it pinned -- `is_leaf` hardcoded `True`, so
     `torch/optim/optimizer.py:1153` accepted an intermediate as a parameter --
@@ -17066,7 +17066,7 @@ def test_the_backward_seed_is_absent_and_nothing_guesses_a_one():
     which is a harder pair to hold than the old one. An engine written above
     this would no longer be handed a `None` to guess at -- it would be handed
     the right seed and would still have no graph to walk, which is the wall
-    docs/BACKWARD2.md §2.1 puts at W8/W9/W10.
+    docs/training/BACKWARD2.md §2.1 puts at W8/W9/W10.
     """
     if not os.path.isfile(_CKPT_VENDOR_SHIM):
         return  # vendor tree not installed -- see vendor/install_shim.sh
@@ -17081,7 +17081,7 @@ def test_the_backward_seed_is_absent_and_nothing_guesses_a_one():
 
     # -- an intermediate is described as an intermediate: the flag propagated,
     #    `grad_fn` is not None, and it is not a leaf. Inverted from
-    #    `[False, True, True]` by docs/BACKWARD4.md; the three move together
+    #    `[False, True, True]` by docs/training/BACKWARD4.md; the three move together
     #    because upstream's `is_leaf` *is* `grad_fn is None` and its
     #    `grad_fn is not None` implies `requires_grad`.
     assert shim["intermediate"] == [True, False, False], shim["intermediate"]
@@ -17094,7 +17094,7 @@ def test_the_backward_seed_is_absent_and_nothing_guesses_a_one():
     assert shim["nonscalar_seed"].get("exc") == "RuntimeError", shim["nonscalar_seed"]
     assert "scalar outputs" in shim["nonscalar_seed"]["msg"], shim["nonscalar_seed"]
 
-    # 3. **Inverted by docs/BACKWARD9.md.** Both doors into the engine answer
+    # 3. **Inverted by docs/training/BACKWARD9.md.** Both doors into the engine answer
     #    now, and the pair the previous revision held -- "the seed is right AND
     #    nothing consumes it" -- becomes the pair that matters once something
     #    does: the seed is right AND what consumes it produces upstream's
@@ -17115,7 +17115,7 @@ def test_the_backward_seed_is_absent_and_nothing_guesses_a_one():
     #      answers `False`. The message is upstream's own, checked against
     #      upstream below rather than transcribed here.
     assert shim["optim_nonleaf"].get("exc") == "ValueError", (
-        "torch.optim accepts an intermediate again -- docs/BACKWARD4.md §4.1 "
+        "torch.optim accepts an intermediate again -- docs/training/BACKWARD4.md §4.1 "
         "closed this; invert rather than delete if the boundary moves back"
     )
     assert "non-leaf" in shim["optim_nonleaf"]["msg"], shim["optim_nonleaf"]
@@ -17129,24 +17129,24 @@ def test_the_backward_seed_is_absent_and_nothing_guesses_a_one():
 
     # 2. Upstream is the oracle for every row above, and is measured rather
     #    than transcribed -- a hardcoded expectation is a claim about 2.13.0
-    #    that nothing re-checks (docs/AUDIT.md's repeated defect).
+    #    that nothing re-checks (docs/verification/AUDIT.md's repeated defect).
     if _upstream_torch is None:
-        return  # no upstream torch in this interpreter -- see docs/E2E.md
+        return  # no upstream torch in this interpreter -- see docs/models/E2E.md
     up = _seed_fixture({"PYTHONPATH": None, "TORCH_USE_RTLD_GLOBAL": None})
     assert up["who"] == "upstream", up["who"]
 
     assert up["leaf"] == shim["leaf"], (up["leaf"], shim["leaf"])
     # requires_grad propagates there, grad_fn is a node, and it is not a leaf.
     assert up["intermediate"] == [True, False, False], up["intermediate"]
-    # ... and since docs/BACKWARD4.md the shim says the same thing, so this is
+    # ... and since docs/training/BACKWARD4.md the shim says the same thing, so this is
     # an equality rather than two hardcoded triples that could drift apart.
     assert shim["intermediate"] == up["intermediate"], (shim, up)
     # The four rows W5 moved, each checked against the oracle rather than
     # against a literal. `requires_grad_on_nonleaf` is deliberately compared on
     # the exception *type and text*: upstream has three wordings of the
-    # requires_grad rule (docs/BACKWARD2.md §4.2) and this is the longest one.
+    # requires_grad rule (docs/training/BACKWARD2.md §4.2) and this is the longest one.
     assert shim["scalar_seed"] == up["scalar_seed"], (shim, up)
-    # The three rows docs/BACKWARD9.md inverted, against the oracle rather than
+    # The three rows docs/training/BACKWARD9.md inverted, against the oracle rather than
     # against the literals above -- which is what keeps them from drifting
     # together into a shared mistake.
     for key in ("backward", "autograd_grad", "grad_after_autograd_grad"):
@@ -17179,7 +17179,7 @@ def test_the_backward_seed_is_absent_and_nothing_guesses_a_one():
         up["requires_grad_on_nonleaf"])
 
 
-# --- test-time adaptation through the vendored tree (docs/ADAPT.md) --------
+# --- test-time adaptation through the vendored tree (docs/models/ADAPT.md) --------
 #
 # `torchnative.adapt` is a Python layer over the capture/tape pair, so what it
 # has to be held down against is not `_C` but *upstream autograd*: the same
@@ -17194,7 +17194,7 @@ def test_the_backward_seed_is_absent_and_nothing_guesses_a_one():
 # that is the one compared against upstream here; the `nn.LayerNorm` variant of
 # the same model is built beside it by `build_ln` and adapts too, which is what
 # `test_tent_adapts_an_nn_layer_norm_model_and_the_wrong_sign_does_not` pins.
-# docs/ADAPT.md §8 recorded the round in which it could not.
+# docs/models/ADAPT.md §8 recorded the round in which it could not.
 
 _ADAPT_MODEL_SRC = r'''
 V, H, LR, STEPS = 24, 12, 4.0, 10
@@ -17371,7 +17371,7 @@ out["layernorm_anti_history"] = [-wla.step(ids)[1] for _ in range(STEPS)]
 # --- .train(), which is what test-time adaptation actually meets ----------
 # Two rules make this reachable and both are in the model below: `nn.Dropout`
 # reaches `aten.native_dropout.default` (bootstrap's dropout composite takes
-# the functionalised route inside a capture region, docs/TRAIN.md), and an
+# the functionalised route inside a capture region, docs/training/TRAIN.md), and an
 # SDPA call with `dropout_p > 0` drops to the math backend, which is where
 # `aten._safe_softmax.default` lives.
 TRAIN_SEED = 20260901
@@ -17521,7 +17521,7 @@ else:
     out["persist_unrecorded"] = "ACCEPTED"
 
 # --- the destination, and the two reaches for it that still refuse --------
-# `publish` no longer refuses categorically (docs/FEDERATED.md §1): what it
+# `publish` no longer refuses categorically (docs/distributed/FEDERATED.md §1): what it
 # refuses now is publishing *nothing*, and publishing with nobody to publish
 # to. The positive half is a two-process test -- it cannot be checked here,
 # and that is the point.
@@ -17639,7 +17639,7 @@ def _adapt_flat(v):
 
 
 def test_tent_reduces_prediction_entropy_and_upstream_agrees():
-    """The measurement docs/ADAPT.md §3 makes on SmolLM2, in miniature.
+    """The measurement docs/models/ADAPT.md §3 makes on SmolLM2, in miniature.
 
     Three assertions, and the third is the one that could not be faked by an
     implementation that merely ran:
@@ -17726,10 +17726,10 @@ def test_an_adaptation_step_that_cannot_move_anything_is_refused():
 
 
 def test_a_delta_reverts_the_base_weights_bit_for_bit():
-    """docs/DESIGN.md §3's first lifetime question, answered as an equality.
+    """docs/design/DESIGN.md §3's first lifetime question, answered as an equality.
 
     Compared as exact lists rather than with a tolerance, because "reverted"
-    has to mean the bytes are back -- docs/ADAPT.md §5 measures what the
+    has to mean the bytes are back -- docs/models/ADAPT.md §5 measures what the
     tolerant answer costs (2 elements of 35,136 on a real checkpoint), and a
     tolerance here would accept exactly that.
 
@@ -17747,7 +17747,7 @@ def test_a_delta_reverts_the_base_weights_bit_for_bit():
         if n in r["base"]:
             assert after == r["base"][n], n
     # The kept delta goes back on and is the adapted model again, to within
-    # the float32 gap docs/ADAPT.md §5.1 measures. Not asserted as equality:
+    # the float32 gap docs/models/ADAPT.md §5.1 measures. Not asserted as equality:
     # base + (w - base) is not w, and pretending it is would be the fault.
     for n in r["selected"]:
         for a, b in zip(_adapt_flat(r["reapplied"][n]), _adapt_flat(r["adapted"][n])):
@@ -17765,10 +17765,10 @@ def test_a_delta_reverts_the_base_weights_bit_for_bit():
 
 
 def test_a_delta_is_written_and_read_back_bit_for_bit():
-    """docs/DESIGN.md §3's second lifetime question, answered by doing it.
+    """docs/design/DESIGN.md §3's second lifetime question, answered by doing it.
 
     `Delta.persist` writes safetensors rather than going through `torch.save`,
-    and docs/BACKWARD.md §14 is why: `torch.save`'s blocker is a storage object
+    and docs/training/BACKWARD.md §14 is why: `torch.save`'s blocker is a storage object
     that aliases its tensor, which this stack does not have.
 
     What is asserted is **equality of the values**, not that a file appeared.
@@ -17798,12 +17798,12 @@ def test_a_delta_is_written_and_read_back_bit_for_bit():
 
 
 def test_a_delta_names_a_check_for_the_destination_it_cannot_reach():
-    """The third of docs/DESIGN.md §3's lifetime questions -- which now runs.
+    """The third of docs/design/DESIGN.md §3's lifetime questions -- which now runs.
 
     **This test used to assert that `publish` refuses.** The refusal named a
     check (`init_process_group(..., world_size=2)`), the check started
-    returning (docs/TRANSPORT.md), and `publish` was implemented on top of it
-    (docs/FEDERATED.md). That is the seventh time a refusal naming a fact went
+    returning (docs/distributed/TRANSPORT.md), and `publish` was implemented on top of it
+    (docs/distributed/FEDERATED.md). That is the seventh time a refusal naming a fact went
     stale here, and the first time the naming did its job: the message told the
     reader what to run.
 
@@ -17841,7 +17841,7 @@ def test_tent_adapts_an_nn_layer_norm_model_and_the_wrong_sign_does_not():
     """`aten.native_layer_norm.default` has a derivative rule, so the whole
     `nn.LayerNorm` family adapts.
 
-    This test used to assert the refusal. docs/BACKWARD.md §8 predicted the day
+    This test used to assert the refusal. docs/training/BACKWARD.md §8 predicted the day
     it would invert and said the fix was to delete it; deleting it would have
     been wrong, because what is worth pinning is not "Tent refuses" but **that
     a LayerNorm model's entropy actually falls** -- a layer-norm backward with
@@ -17853,7 +17853,7 @@ def test_tent_adapts_an_nn_layer_norm_model_and_the_wrong_sign_does_not():
     objective takes it back **up** from the identical starting value on the
     identical weights, and the base is restored bit for bit. The control is
     what says the fall is the gradient's *direction* rather than any
-    perturbation of an affine parameter -- docs/ADAPT.md §4.1, applied to the
+    perturbation of an affine parameter -- docs/models/ADAPT.md §4.1, applied to the
     architecture the rule opened.
     """
     if not _ckpt_shim_available():
@@ -17888,7 +17888,7 @@ def test_tent_in_training_mode_adapts_and_the_dropout_is_really_on():
     rather than inferred from a step that completed:
     `aten.native_dropout.default` (an `nn.Dropout`, through the functionalised
     route capture takes) and `aten._safe_softmax.default` (an SDPA call with
-    `dropout_p > 0`, which drops to the math backend on CPU -- docs/TRAIN.md
+    `dropout_p > 0`, which drops to the math backend on CPU -- docs/training/TRAIN.md
     §4).
 
     **The dropout is checked to be on.** A `nn.Dropout` that had silently
@@ -17902,7 +17902,7 @@ def test_tent_in_training_mode_adapts_and_the_dropout_is_really_on():
     Each step draws a new mask, so the objective is a different sample every
     time; upstream's own Tent curve on `gpt2` in `.train()` goes
     5.133, 4.268, 4.480, 4.557, ... and is not monotone either
-    (docs/ADAPT.md §14.2). What is asserted is the fall overall and the wrong
+    (docs/models/ADAPT.md §14.2). What is asserted is the fall overall and the wrong
     sign's rise from the identical starting value, which is the control that
     says the movement is the gradient's direction.
     """
@@ -17957,7 +17957,7 @@ def test_an_op_with_no_derivative_rule_is_refused_by_naming_it():
 
 
 def test_a_method_declares_its_differentiation_stage_and_wrap_reads_it():
-    """docs/DESIGN.md §10: the stage is declared per method, not per directory.
+    """docs/design/DESIGN.md §10: the stage is declared per method, not per directory.
 
     All three arms are refusals at `wrap` time -- before a forward, before a
     capture -- which is the property that lets a build without a backward turn
@@ -17977,9 +17977,9 @@ def test_a_method_declares_its_differentiation_stage_and_wrap_reads_it():
 def test_an_offline_wrapper_is_the_model_it_wraps():
     """`adapt.wrap` must not move a plain forward, and `offline` is the default.
 
-    Asserted as exact equality on every logit. docs/ADAPT.md §7 does the same
+    Asserted as exact equality on every logit. docs/models/ADAPT.md §7 does the same
     thing at scale -- the SmolLM2 prefill sha256 at every length
-    docs/SEQLEN.md records, through the wrapper -- and this is the cheap
+    docs/numerics/SEQLEN.md records, through the wrapper -- and this is the cheap
     version that runs in the suite.
     """
     if not _ckpt_shim_available():
@@ -18063,7 +18063,7 @@ def test_the_fast_path_falls_back_rather_than_binding_the_wrong_slot():
     assert V.pow(t, 2.0).tolist() == V.pow(self=t, exponent=2.0).tolist()
 
     # An overload boundary, checked by result rather than by recorded key.
-    # `add.Tensor` and `add.Scalar` promote by different rules (docs/SCALAR.md),
+    # `add.Tensor` and `add.Scalar` promote by different rules (docs/numerics/SCALAR.md),
     # so selecting the wrong schema changes the dtype rather than raising --
     # and the recorded key is not available to look at here, because the fast
     # path is off while a capture is open (see the test above).
@@ -18165,7 +18165,7 @@ def test_quantise_refuses_the_call_that_would_have_done_nothing():
 
 # --- from_pretrained(quantization_config=TorchnativeConfig(...)) -----------
 #
-# docs/HFQUANT.md. The point of the plugin is *when* the swap happens, not
+# docs/graph/HFQUANT.md. The point of the plugin is *when* the swap happens, not
 # that it happens: `quantize_` runs after `from_pretrained` returns, so peak
 # memory is the dense model whatever format you ask for. So the assertions
 # below come in two halves.
@@ -18295,7 +18295,7 @@ if MODE == "compare":
     raise SystemExit(0)
 
 if MODE == "refuse":
-    # A k-quant on a width no k-quant can hold: docs/QUANT2.md §5.2. The
+    # A k-quant on a width no k-quant can hold: docs/graph/QUANT2.md §5.2. The
     # message has to carry the block size, because that is what tells the
     # reader which formats are still open to them.
     try:
@@ -18342,7 +18342,7 @@ if MODE == "refuse":
     raise SystemExit(0)
 
 if MODE == "dtype_int8":
-    # docs/INT8B.md. Three things, and the first one decides the other two.
+    # docs/numerics/INT8B.md. Three things, and the first one decides the other two.
     #
     #   1. `dtype=torch.int8` with no quantization_config is refused by
     #      *transformers*, not by us, and the traceback has to show that --
@@ -18481,7 +18481,7 @@ def test_the_quantizer_plugin_replaces_the_leaves_before_the_weights_land():
     `quantize_` cannot help peak memory: it runs after `from_pretrained` has
     returned, so the dense model is fully built before anything shrinks. That
     is survivable at 135M and self-defeating at 7B, and on-device is the
-    premise of this repository (docs/DESIGN.md §1).
+    premise of this repository (docs/design/DESIGN.md §1).
     `_process_model_before_weight_loading` runs while the model is still a
     meta-device skeleton, so the leaves are replaced first and each weight is
     quantised as it comes off disk.
@@ -18549,7 +18549,7 @@ def test_the_quantizer_plugin_and_quantize_produce_the_same_model():
     would be cheap and wrong, and both of those are shapes this repository has
     actually produced. So the comparison is exact on both sides of the layer:
     the GGML blobs byte for byte (`_quantized_blob`, the same axis
-    docs/QUANT2.md §2.2 builds on), and the logits bit for bit.
+    docs/graph/QUANT2.md §2.2 builds on), and the logits bit for bit.
 
     `q4_differs` is the negative control. Bit equality between two things that
     could not differ proves nothing, so the same comparison is run against a
@@ -18572,7 +18572,7 @@ def test_the_quantizer_plugin_and_quantize_produce_the_same_model():
 def test_the_quantizer_plugin_refuses_the_combinations_that_cannot_work():
     """A format that fits nothing, and a head that has no tensor to quantise.
 
-    Both refusals are the shape docs/QUANT2.md §5.2 and §5.4 describe, and
+    Both refusals are the shape docs/graph/QUANT2.md §5.2 and §5.4 describe, and
     both fire on SmolLM2-135M, which is 576 wide and ties its head. The
     difference from `quantize_` is deliberate and is about the channel:
     `quantize_` returns a report that groups skips by reason, so a caller who
@@ -18640,7 +18640,7 @@ def test_the_quantizer_registers_a_name_and_changes_nothing_else():
 def test_dtype_int8_is_refused_by_transformers_alone_and_works_with_the_config():
     """`from_pretrained(dtype=torch.int8)` -- what the caller actually gets.
 
-    docs/INT8B.md. The user's spelling is `dtype=torch.int8` in the slot where
+    docs/numerics/INT8B.md. The user's spelling is `dtype=torch.int8` in the slot where
     `dtype=torch.bfloat16` works. Half of it is not ours to give:
     `modeling_utils.local_torch_dtype` refuses any non-floating dtype before
     the model is built, and `get_hf_quantizer` -- which runs earlier -- reads
@@ -18701,11 +18701,11 @@ def test_dtype_int8_is_refused_by_transformers_alone_and_works_with_the_config()
 
 
 # ---------------------------------------------------------------------------
-# `torch.save` -- docs/SAVE.md
+# `torch.save` -- docs/models/SAVE.md
 # ---------------------------------------------------------------------------
 #
 # The mirror of the `test_ckpt_*` block above, and it runs the same two
-# interpreters for the same reason (§8.2 of docs/CKPT.md): `torch.save` is
+# interpreters for the same reason (§8.2 of docs/models/CKPT.md): `torch.save` is
 # pure-Python torch, so making it use the shim means importing the vendored
 # tree *as* `torch`, which cannot share a process with the upstream `torch`
 # this file already holds.
@@ -18719,7 +18719,7 @@ def test_dtype_int8_is_refused_by_transformers_alone_and_works_with_the_config()
 # against a JSON transcription of them.
 #
 # The one property that cannot be tested that way is storage sharing, because
-# the shim's loader copies (docs/CKPT.md §5), so sharing present in the input
+# the shim's loader copies (docs/models/CKPT.md §5), so sharing present in the input
 # file is gone by the time the subprocess re-saves. Sharing is therefore built
 # *inside* the subprocess -- `x`, `x.t()`, `x[1]` over one candle buffer -- and
 # checked in the file the shim wrote.
@@ -18738,7 +18738,7 @@ def flat(t):
     return t.reshape(-1).double().tolist()
 
 
-# 1. Read what upstream wrote (this half is docs/CKPT.md's, re-run here so the
+# 1. Read what upstream wrote (this half is docs/models/CKPT.md's, re-run here so the
 #    round trip below cannot be green on a file the shim never understood).
 src = torch.load(os.path.join(d, "upstream_in.pt"), weights_only=True)
 result["read_keys"] = sorted(src)
@@ -18768,7 +18768,7 @@ result["sd"] = {k: {"shape": list(v.shape), "dtype": str(v.dtype), "vals": flat(
                 for k, v in m.state_dict().items()}
 
 # 4. Storage sharing, built here because a shim-loaded pair no longer shares
-#    (docs/CKPT.md §5) -- so this is the only place the property can exist.
+#    (docs/models/CKPT.md §5) -- so this is the only place the property can exist.
 base = torch.tensor([float(i) for i in range(16)], dtype=torch.float32).reshape(4, 4)
 shared = {"base": base, "tr": base.t(), "row": base[1]}
 result["shared_one_storage_in_shim"] = (
@@ -18799,7 +18799,7 @@ result["round_trip"] = {
 #    `tied_a`/`tied_b` are one *object* under two keys, so pickle's memo brings
 #    them back as one object -- identity, not storage, and it survives.
 #    `transposed`/`slice_offset` are two objects over one buffer upstream, and
-#    the shim's loader copies (docs/CKPT.md §5), so that relationship does not
+#    the shim's loader copies (docs/models/CKPT.md §5), so that relationship does not
 #    survive. The second is why §4 above has to build its own sharing; pinned
 #    rather than assumed, because if it stopped being true the sharing test
 #    would be checking nothing.
@@ -18837,7 +18837,7 @@ refuse("copy_", lambda: snap.copy_(snap))
 refuse("resize_", lambda: snap.resize_(8))
 refuse("shim_fill", lambda: snap._shim_fill(b"\x00" * snap.nbytes()))
 # A meta tensor now ANSWERS `untyped_storage()` with a size-and-identity
-# handle (docs/EXPORT5.md §2), so the thing to check is no longer that the
+# handle (docs/graph/EXPORT5.md §2), so the thing to check is no longer that the
 # call refuses -- it is that the handle refuses every door that would need
 # bytes. That is strictly more surface than the single refusal this replaced.
 _meta_storage = torch.zeros(2, device="meta").untyped_storage()
@@ -18929,7 +18929,7 @@ def test_save_upstream_reads_every_dtype_and_view_the_shim_wrote_bit_for_bit():
     comparison is `torch.equal`, not a tolerance: the whole path is a byte
     copy, so anything other than exact equality is a defect and not a rounding.
 
-    The fourteen entries are the ones docs/CKPT.md §5 chose for the read side,
+    The fourteen entries are the ones docs/models/CKPT.md §5 chose for the read side,
     because the interesting *dtypes* are the same in both directions:
     `bfloat16` (which `to_le_bytes` cannot read at all), `float16`, `float64`,
     the integer buffers, a scalar, an empty tensor, and `bool`, whose storage
@@ -18937,7 +18937,7 @@ def test_save_upstream_reads_every_dtype_and_view_the_shim_wrote_bit_for_bit():
 
     **What this test cannot check is view fidelity, and that is measured, not
     assumed.** `transposed` and `slice_offset` go in as views but the shim's
-    *loader* materialises them (docs/CKPT.md §5), so by the time they are
+    *loader* materialises them (docs/models/CKPT.md §5), so by the time they are
     re-saved they are contiguous tensors at offset 0 and their values are all
     that is left to compare. Sabotaging `storage_offset()` to `0` and
     `stride()` to the contiguous stride leaves this test **green** -- only
@@ -18970,7 +18970,7 @@ def test_save_writes_one_record_for_tensors_that_share_a_storage():
     is the test that would catch it going away.
 
     The sharing is built in the subprocess rather than loaded from the input
-    file, because the shim's *loader* copies (docs/CKPT.md §5) -- so two views
+    file, because the shim's *loader* copies (docs/models/CKPT.md §5) -- so two views
     read out of a checkpoint no longer share, which the last assertions pin
     rather than leave implied. They also separate that from the other thing
     called weight tying: one tensor stored under two keys is one *object*, and
@@ -19064,7 +19064,7 @@ def test_save_archive_matches_the_shape_upstream_writes():
     """The container, not the contents.
 
     Three things a reader other than `torch.load` depends on, all measured off
-    a 2.13.0 archive first (docs/SAVE.md §4):
+    a 2.13.0 archive first (docs/models/SAVE.md §4):
 
     * every record's payload starts on the 64-byte boundary the archive's own
       `.storage_alignment` record claims -- torch pads the *local* file
@@ -19109,12 +19109,12 @@ def test_save_refuses_the_legacy_container_and_every_write_into_a_snapshot():
 
     *The legacy container* (`_use_new_zipfile_serialization=False`) and
     *`skip_data`* are refused because writing them would produce a file that
-    reads back as zeros -- the failure docs/CKPT.md §4 spent a section on,
+    reads back as zeros -- the failure docs/models/CKPT.md §4 spent a section on,
     arriving from the writing side. The legacy format fills a storage after
     `set_` has already copied out of it; `skip_data` writes a header with no
     payload at all.
 
-    *The write doors on a snapshot* are the answer to docs/BACKWARD.md §14.3,
+    *The write doors on a snapshot* are the answer to docs/training/BACKWARD.md §14.3,
     which sized `untyped_storage()` and stopped because a storage that is a
     copy would let a write land nowhere silently. That is right about the
     danger and wrong about the remedy: the danger needs the write to refuse,
@@ -19131,7 +19131,7 @@ def test_save_refuses_the_legacy_container_and_every_write_into_a_snapshot():
         assert r[door], f"{door} did not refuse a write into a snapshot"
         assert "snapshot" in r[door], (door, r[door])
     # A meta tensor's storage handle: it answers a size and an identity, and
-    # every door that would need bytes refuses. docs/EXPORT5.md §2.
+    # every door that would need bytes refuses. docs/graph/EXPORT5.md §2.
     assert r["meta_storage_nbytes"] == 8, r["meta_storage_nbytes"]
     assert r["meta_storage_device"] == "meta", r["meta_storage_device"]
     assert r["meta_storage_filled"] is False, "a meta storage claimed to be filled"
@@ -19142,7 +19142,7 @@ def test_save_refuses_the_legacy_container_and_every_write_into_a_snapshot():
     assert r["storage_pickle"], "a storage pickled itself"
 
 
-# --- docs/SPELLINGS.md §9: six real spelling gaps out of 18 alleged ---------
+# --- docs/bindings/SPELLINGS.md §9: six real spelling gaps out of 18 alleged ---------
 #
 # The coordinating session's own probe flagged 18 names as "neither
 # `torch.<name>(...)` nor `tensor.<name>(...)` work". Measured against
@@ -19205,7 +19205,7 @@ rec("clamp__fn", lambda: torch.clamp_(c.clone(), min=-2.0, max=2.0).tolist())
 rec("clamp__member", lambda: c.clone().clamp_(min=-2.0, max=2.0).tolist())
 # The bare no-arg call resolves to `clamp_.Tensor`, which has no kernel
 # (`aten.clamp_.default` is the only one that does) -- still refused by that
-# exact key, unchanged by this round (docs/SPELLINGS.md §7.2/§8.1).
+# exact key, unchanged by this round (docs/bindings/SPELLINGS.md §7.2/§8.1).
 refused("clamp__noargs_fn", lambda: torch.clamp_(c.clone()))
 
 # --- exp_: function door was missing, method door already fully worked ---
@@ -19251,7 +19251,7 @@ rec(
     lambda: torch.index_put_(p.clone(), (rep_idx,), rep_vals, accumulate=True).tolist(),
 )
 
-# --- docs/INPLACE.md: the fourteen in-place names that WERE kernel-less ---
+# --- docs/kernels/INPLACE.md: the fourteen in-place names that WERE kernel-less ---
 # and now have both a spelling and a kernel -- reached through both doors,
 # through the real vendored `torch`, and value-checked against upstream
 # 2.13.0 (transcribed, not derived from this shim). `t.<op>_() is t` is
@@ -19292,7 +19292,7 @@ cm2 = torch.tensor([-2.0, 3.0])
 rec("clamp_min__member", lambda: (lambda t: [t.clamp_min_(0.0).tolist(), t is cm2])(cm2))
 
 # `detach_` is the fifteenth name -- refused BY NAME rather than given a
-# kernel (`aten.rs::detach_inplace_refusal`; docs/INPLACE.md has the
+# kernel (`aten.rs::detach_inplace_refusal`; docs/kernels/INPLACE.md has the
 # reasoning). Both doors have a table entry (so the refusal names the op
 # rather than falling through to `AttributeError`), and both must still
 # refuse after this round -- a kernel silently appearing here would be the
@@ -19338,17 +19338,17 @@ def _spellings_9_road_fixture():
 
 
 def test_spellings_9_the_six_real_gaps_reach_their_kernels_through_the_vendored_tree():
-    """docs/SPELLINGS.md §9's six real gaps, each through a real `import torch`
+    """docs/bindings/SPELLINGS.md §9's six real gaps, each through a real `import torch`
     against the shim -- `torch.<name>(...)` and, where a method exists,
     `tensor.<name>(...)`, value-checked against upstream torch 2.13.0 (values
     below are transcribed from that comparison, not derived from this shim).
 
     Deleting any one of the six `overloads.json`/`bootstrap.py` changes this
     round made turns the matching assertion red by naming the entry it lost
-    -- see the sabotage note in docs/SPELLINGS.md §9 for which one was
+    -- see the sabotage note in docs/bindings/SPELLINGS.md §9 for which one was
     actually tried.
 
-    Kept as one test rather than split, because docs/INPLACE.md's round
+    Kept as one test rather than split, because docs/kernels/INPLACE.md's round
     landed in the same file this one already exercises: §9 measured 15
     in-place names with no kernel (`abs_ ceil_ clamp_min_ cos_ detach_ erf_
     expm1_ log_ log2_ reciprocal_ rsqrt_ sigmoid_ sin_ sqrt_ tanh_`) and this
@@ -19404,7 +19404,7 @@ def test_spellings_9_the_six_real_gaps_reach_their_kernels_through_the_vendored_
     # receives 3+8=11, matching upstream (measured, not derived).
     eq("index_put__accumulate_fn", [11.0, 2.0, 11.0, 4.0])
 
-    # docs/INPLACE.md: the fourteen names that WERE kernel-less and now
+    # docs/kernels/INPLACE.md: the fourteen names that WERE kernel-less and now
     # both reach a kernel and match upstream's value, through both doors --
     # this is the regression guard against a later round quietly losing the
     # spelling or the kernel. `is t` (not `== t`) is what a write-through
@@ -19457,10 +19457,10 @@ def test_spellings_9_the_six_real_gaps_reach_their_kernels_through_the_vendored_
 
 
 # ---------------------------------------------------------------------------
-# docs/DEMAND1.md -- the top of the demand list, through the vendored tree
+# docs/architectures/DEMAND1.md -- the top of the demand list, through the vendored tree
 #
 # The golden harness compares by *dispatch key*, so it is structurally unable
-# to see a missing spelling (docs/SPELLINGS.md's `stack`/`amax` lesson: a
+# to see a missing spelling (docs/bindings/SPELLINGS.md's `stack`/`amax` lesson: a
 # kernel golden-compared for months behind a door that did not exist). Two of
 # this round's four items -- `as_tensor` and `meshgrid` -- are spellings with
 # no new kernel at all, so the harness cannot see them even in principle.
@@ -19485,7 +19485,7 @@ def rec(key, value_fn):
 
 torch.manual_seed(0)
 
-# --- rank 1: nn.BatchNorm2d, the call docs/DEMAND.md says refuses ---------
+# --- rank 1: nn.BatchNorm2d, the call docs/architectures/DEMAND.md says refuses ---------
 # TRAINING. The output is checked, and so are the running statistics -- a
 # kernel that returns the right values and leaves running_mean untouched
 # passes any test that reads only the output.
@@ -19639,7 +19639,7 @@ def _close(got, want, tol=1e-5):
 
 
 def test_demand1_batch_norm_moves_the_running_statistics_in_training_and_not_in_eval():
-    """docs/DEMAND.md rank 1, through a real `nn.BatchNorm2d`.
+    """docs/architectures/DEMAND.md rank 1, through a real `nn.BatchNorm2d`.
 
     `nn.BatchNorm2d(3)(torch.ones(1,3,4,4))` refused before this round; it is
     the wall `resnet` and `mobilenet_v2` both stopped on, one layer past a stem
@@ -19648,7 +19648,7 @@ def test_demand1_batch_norm_moves_the_running_statistics_in_training_and_not_in_
     **The running statistics are asserted, not just the output.** That is the
     point of this test rather than an extra: `native_batch_norm` writes
     `running_mean`/`running_var` in place while declaring no alias on any
-    argument (measured, docs/DEMAND1.md §1.1), so a kernel that computes the
+    argument (measured, docs/architectures/DEMAND1.md §1.1), so a kernel that computes the
     right output and never touches them passes anything that reads only the
     return value. Both modes are checked, because the mutation is the half that
     differs between them and "eval leaves them alone" is as much a claim as
@@ -19707,7 +19707,7 @@ def test_demand1_batch_norm_composite_refuses_with_upstreams_wording_and_order()
     """The four length checks belong to `torch.batch_norm`, not to the kernel.
 
     Upstream's leaf does not check them -- it reads past the end of the buffer
-    (docs/DEMAND1.md §1.6) -- so these messages come from the composite in
+    (docs/architectures/DEMAND1.md §1.6) -- so these messages come from the composite in
     `bootstrap.py`, transcribed from upstream's own. The **order** is asserted
     as well as the wording: a call with a wrong `weight` and a wrong
     `running_mean` must report the `running_mean` one, because `running_mean`
@@ -19727,7 +19727,7 @@ def test_demand1_batch_norm_composite_refuses_with_upstreams_wording_and_order()
         "ERROR:RuntimeError:running_mean should contain 3 elements not 5"
     ), out["bn_bad_both"]
     # Upstream SEGFAULTS at the leaf for this combination (exit 139, reproduced
-    # twice, docs/DEMAND1.md §1.6). The composite refuses first, upstream and
+    # twice, docs/architectures/DEMAND1.md §1.6). The composite refuses first, upstream and
     # here alike, which is why no golden case exists for it -- one would take
     # the harness process down rather than fail.
     assert out["bn_eval_no_stats"] == (
@@ -19798,7 +19798,7 @@ def test_demand1_the_four_spellings_reach_their_kernels_through_the_vendored_tre
     which have been implemented and golden-compared for rounds. The golden
     harness dispatches by key and is therefore structurally unable to notice
     that either name existed, which is exactly the `stack`/`amax` shape
-    docs/SPELLINGS.md records. This test is the only thing that can see them.
+    docs/bindings/SPELLINGS.md records. This test is the only thing that can see them.
 
     Values transcribed from upstream torch 2.13.0.
     """
@@ -19853,7 +19853,7 @@ def test_demand1_the_four_spellings_reach_their_kernels_through_the_vendored_tre
 
 # ---------------------------------------------------------------------------
 # Federated averaging, across two operating-system processes
-# (docs/FEDERATED.md)
+# (docs/distributed/FEDERATED.md)
 #
 # **Nothing here may run in one process, and nothing here may run in two
 # threads.** `FedAvg` at `world_size = 1` is the identity function: it returns
@@ -20060,7 +20060,7 @@ refuses("engine_rounds_string",
 # ranks is a collective and needs the world size, so the door moved into
 # `participate`. This exercises it where it now is, and a proper subset is
 # still what it refuses. Both ranks run the same collective, so the group
-# stays in step (docs/FEDERATED3.md §5).
+# stays in step (docs/distributed/FEDERATED3.md §5).
 refuses("engine_select",
         lambda: federated.Engine(build(), method=adapt.Tent(), lr=LR,
                                  select=lambda world: [0]).participate(
@@ -20410,7 +20410,7 @@ def test_federated_refuses_a_world_of_one_by_name_at_every_door():
         assert "a world of one" in msg, (key, msg)
         assert "identity function" in msg, (key, msg)
         # `>= 2`, not `== 2`: the transport carries any world now
-        # (docs/FEDERATED4.md), and the door that still refuses is the world
+        # (docs/distributed/FEDERATED4.md), and the door that still refuses is the world
         # of *one*, which is what this test is about.
         assert "Check: torch.distributed.get_world_size() >= 2" in msg, (key, msg)
     assert "FedAvg.aggregate" in out["aggregate"], out["aggregate"]
@@ -20448,7 +20448,7 @@ def test_federated_refuses_the_shapes_that_would_average_incomparable_things():
         # The sum-and-compare became a rank-by-rank comparison when the
         # world stopped being exactly two: `h0 + h1 == 2*h0` is an equality
         # test only at two ranks. The refusal moved doors; this is the
-        # stronger message at the new one (docs/FEDERATED4.md §3).
+        # stronger message at the new one (docs/distributed/FEDERATED4.md §3).
         assert "rank by rank rather than summed" in r["schema_mismatch"], \
             r["schema_mismatch"]
 
@@ -20467,7 +20467,7 @@ def test_federated_refuses_the_round_shapes_it_does_not_implement():
 
     Each of these is a thing FedAvg implementations do and this one does not:
     weighting implicitly, dropping a rank, selecting participants, looping
-    rounds. `docs/DESIGN.md` §6 is why they refuse instead: a refusal names the
+    rounds. `docs/design/DESIGN.md` §6 is why they refuse instead: a refusal names the
     next thing to build, and an aggregator that quietly averages unweighted or
     quietly divides by however many ranks arrived reports success either way.
 
@@ -20500,7 +20500,7 @@ def test_federated_refuses_the_round_shapes_it_does_not_implement():
         r0["engine_rounds_string"]
 
     # A proper subset of *two* ranks is a cohort of one, and that is now the
-    # door: the transport carries any world (docs/FEDERATED4.md), so the
+    # door: the transport carries any world (docs/distributed/FEDERATED4.md), so the
     # refusal stopped being "no wire for it" and became the arithmetic one --
     # which is the stronger statement, because it holds at every world size.
     # A subset of three ranks is *served*, and
@@ -20716,12 +20716,12 @@ def rec(key, value_fn):
     except Exception as e:
         out[key] = f"ERROR:{type(e).__name__}:{e}"
 
-# --- the MRO claim docs/CTOR.md §1 turns on ------------------------------
+# --- the MRO claim docs/bindings/CTOR.md §1 turns on ------------------------------
 rec("is_tensorbase", lambda: torch.Tensor is torch._C.TensorBase)
 rec("mro", lambda: [f"{c.__module__}.{c.__name__}" for c in torch.Tensor.__mro__])
 rec("new_installed", lambda: "__new__" in vars(torch.Tensor))
 rec("flag", lambda: bool(getattr(torch._C, "_shim_tensor_constructor", False)))
-# `TensorBase` must NOT have been the one patched -- see docs/CTOR.md §1.1.
+# `TensorBase` must NOT have been the one patched -- see docs/bindings/CTOR.md §1.1.
 # The contrast between these two is the whole assertion: the patched class
 # holds a Python object, the native one still holds the PyO3 slot wrapper.
 rec("tensorbase_new_kind",
@@ -20881,11 +20881,11 @@ def _ctor_road_fixture():
 
 
 def test_ctor_torch_tensor_is_a_vendored_python_subclass_not_tensorbase():
-    """docs/CTOR.md §1 -- the measurement that decides whether this gap was
+    """docs/bindings/CTOR.md §1 -- the measurement that decides whether this gap was
     "structural", and the only test here about the *shape* of the fix rather
     than its behaviour.
 
-    docs/DEMAND.md §0.1 ranked this gap structural because the only class that
+    docs/architectures/DEMAND.md §0.1 ranked this gap structural because the only class that
     could carry a Python-level `__new__` lives in the vendored tree. It does --
     and it *inherits* `__new__` rather than defining one, and it is a settable
     heap type, so it can be given one from outside the file that declares it.
@@ -20900,7 +20900,7 @@ def test_ctor_torch_tensor_is_a_vendored_python_subclass_not_tensorbase():
     while `Tensor.__new__` is the Python `staticmethod` this round installs.
     The two kinds differing is the assertion; if `TensorBase`'s ever becomes a
     Python object too, the native allocator has been made unreachable and
-    `TensorBase(existing)` goes with it (docs/CTOR.md §1.1).
+    `TensorBase(existing)` goes with it (docs/bindings/CTOR.md §1.1).
     """
     if not os.path.isfile(_CKPT_VENDOR_SHIM):
         return
@@ -20919,10 +20919,10 @@ def test_ctor_torch_tensor_is_a_vendored_python_subclass_not_tensorbase():
 
 
 def test_ctor_the_legacy_constructor_accepts_upstreams_shapes():
-    """docs/DEMAND.md §0.1 rank 1 -- `torch.Tensor(...)`, every accepted form.
+    """docs/architectures/DEMAND.md §0.1 rank 1 -- `torch.Tensor(...)`, every accepted form.
 
     Values transcribed from upstream torch 2.13.0, run side by side
-    (docs/CTOR.md §2). The rows worth naming:
+    (docs/bindings/CTOR.md §2). The rows worth naming:
 
     - **`torch.Size` is a size and a plain tuple is data**, and `torch.Size`
       *is* a `tuple` subclass. A sequence-first implementation answers a `(2,)`
@@ -21052,7 +21052,7 @@ def test_ctor_typed_classes_take_an_ndarray_and_read_torch_size_as_a_size():
 
     `PegasusSinusoidalPositionalEmbedding.create_weight` is
     `torch.FloatTensor(np.sin(position_enc[:, 0::2]))`, so this is the exact
-    call docs/DEMAND.md §0.1 rank 1 names for that model. The dtype rule is
+    call docs/architectures/DEMAND.md §0.1 rank 1 names for that model. The dtype rule is
     upstream's and is *not* the plain constructor's: the class's dtype wins
     over both the array's and the default, and the coercion **truncates**
     (`LongTensor(array([1.7, 2.9]))` is `[1, 2]`, measured).
@@ -21067,7 +21067,7 @@ def test_ctor_typed_classes_take_an_ndarray_and_read_torch_size_as_a_size():
 
     `pegasus_create_weight` is the end-to-end row, transcribed from upstream:
     a constructor that works and computes different numbers gives a model that
-    runs and disagrees, which docs/GOLDEN.md rates worse than one that refuses.
+    runs and disagrees, which docs/verification/GOLDEN.md rates worse than one that refuses.
     """
     if not os.path.isfile(_CKPT_VENDOR_SHIM):
         return
@@ -21102,7 +21102,7 @@ def test_ctor_the_ndarray_family_preserves_dtype_where_the_constructor_casts():
     `_tensor_new_from_data` walks nested sequences of Python scalars and
     refused an `ndarray` by name. `as_tensor`'s own docstring said the ndarray
     path worked and merely copied, which was the intended behaviour written
-    down as though it were the observed one. docs/CTOR.md §3.3 corrects it.
+    down as though it were the observed one. docs/bindings/CTOR.md §3.3 corrects it.
 
     They are here rather than in a round of their own because they share
     `_new_from_data` with the constructor, and because the **dtype split** is
@@ -21115,7 +21115,7 @@ def test_ctor_the_ndarray_family_preserves_dtype_where_the_constructor_casts():
     afterwards shows through and upstream answers `99.0`. This shim copies --
     its tensors do not wrap foreign buffers -- so it answers `1.0`. Asserting
     the copy is what stops the difference from moving silently in either
-    direction; it is the same divergence docs/DEMAND1.md §4 recorded for
+    direction; it is the same divergence docs/architectures/DEMAND1.md §4 recorded for
     `as_tensor`, and it is still open.
     """
     if not os.path.isfile(_CKPT_VENDOR_SHIM):
@@ -21134,13 +21134,13 @@ def test_ctor_the_ndarray_family_preserves_dtype_where_the_constructor_casts():
     assert out["alias_probe"] == 1.0, (
         f"expected the recorded COPY behaviour (1.0); got {out['alias_probe']}. "
         "If this is now 99.0 the shim has grown foreign-buffer aliasing, which "
-        "would close docs/DEMAND1.md §4 and docs/CTOR.md §3.3 -- update both "
+        "would close docs/architectures/DEMAND1.md §4 and docs/bindings/CTOR.md §3.3 -- update both "
         "rather than this assertion."
     )
 
 
 def test_ctor_patching_tensor_did_not_break_what_patching_tensorbase_would():
-    """The controls for docs/CTOR.md §1.1, and the reason they are controls.
+    """The controls for docs/bindings/CTOR.md §1.1, and the reason they are controls.
 
     Putting `__new__` on `TensorBase` needs no late hook and is the obvious
     implementation. It also makes the native PyO3 allocator permanently
@@ -21172,7 +21172,7 @@ def test_ctor_patching_tensor_did_not_break_what_patching_tensorbase_would():
     assert out["empty_still_tensor"] == "Tensor", out["empty_still_tensor"]
 
 
-# --- docs/BACKWARD4.md: W5, `grad_fn` as a nullness -------------------------
+# --- docs/training/BACKWARD4.md: W5, `grad_fn` as a nullness -------------------------
 
 _GRAD_FN_SCRIPT = r"""
 import json, sys
@@ -21227,7 +21227,7 @@ CASES = {
     "aten.constant_pad_nd.default": lambda: torch.ops.aten.constant_pad_nd.default(x, [1, 1], 0.0),
     "aten.where.self": lambda: torch.ops.aten.where.self(torch.ops.aten.gt.Scalar(x, 0.0), x, w),
     "aten.masked_fill.Scalar": lambda: torch.ops.aten.masked_fill.Scalar(x, torch.ops.aten.gt.Scalar(x, 0.0), 0.0),
-    # docs/SCALAR2.md §4. Two rows of the scalar family whose trailing digit is
+    # docs/numerics/SCALAR2.md §4. Two rows of the scalar family whose trailing digit is
     # not 0 upstream, both reached by a Python operator (`2 - x`, `2 ** x`) and
     # both previously named by the naive rule. They are here rather than only in
     # the table because the table and the rule fail identically from a caller's
@@ -21339,10 +21339,10 @@ def _grad_fn_fixture(env_overrides):
 
 
 def test_grad_fn_names_and_the_grad_mode_gate_agree_with_upstream():
-    """docs/BACKWARD4.md. The node's *name* is the one thing about it that is real.
+    """docs/training/BACKWARD4.md. The node's *name* is the one thing about it that is real.
 
     `_GradFnNode` has no `next_functions`, no `apply` and no saved operands --
-    docs/BACKWARD4.md §1.3 measured that the only caller on any exercised path
+    docs/training/BACKWARD4.md §1.3 measured that the only caller on any exercised path
     which reaches past `grad_fn is None` is `torch/_tensor_str.py:646`, and what
     it reads is `type(grad_fn).__name__`. So that name is a claim about upstream
     and gets checked against upstream, per aten op, rather than transcribed into
@@ -21358,7 +21358,7 @@ def test_grad_fn_names_and_the_grad_mode_gate_agree_with_upstream():
 
     Two rows must answer `None` on both sides (`detach`, `ones_like`). Without
     them every assertion here would pass against a `grad_fn` that is simply
-    never `None`, which is the fault docs/BACKWARD3.md §7.5's F3 caught from the
+    never `None`, which is the fault docs/training/BACKWARD3.md §7.5's F3 caught from the
     other direction.
 
     The grad-mode rows are here rather than in their own test because they are
@@ -21403,7 +21403,7 @@ def test_grad_fn_names_and_the_grad_mode_gate_agree_with_upstream():
     assert shim["inplace_on_leaf"] == "ok", shim["inplace_on_leaf"]
     assert shim["leaf_after_inplace"] == [True, True, True], (
         "an in-place op turned a parameter into a non-leaf -- see "
-        "mark_from_op's identity test and docs/BACKWARD4.md §4.2 (W10)"
+        "mark_from_op's identity test and docs/training/BACKWARD4.md §4.2 (W10)"
     )
     assert shim["readd_after_inplace"] == "ok", shim["readd_after_inplace"]
     assert shim["nonleaf_after_inplace"] == [False, False], (
@@ -21412,7 +21412,7 @@ def test_grad_fn_names_and_the_grad_mode_gate_agree_with_upstream():
 
     # -- the names, against the oracle.
     if _upstream_torch is None:
-        return  # no upstream torch in this interpreter -- see docs/E2E.md
+        return  # no upstream torch in this interpreter -- see docs/models/E2E.md
     up = _grad_fn_fixture({"PYTHONPATH": None, "TORCH_USE_RTLD_GLOBAL": None})
     assert up["who"] == "upstream", up["who"]
 
@@ -21449,7 +21449,7 @@ def test_grad_fn_names_and_the_grad_mode_gate_agree_with_upstream():
     # it is recorded here as a divergence rather than left to prose. Upstream
     # refuses an in-place op on a leaf that requires grad; this shim performs it
     # and keeps the leaf a leaf. Both answers protect `torch.optim`; upstream's
-    # protects it by refusing, and W10 (docs/BACKWARD2.md §1.5) is the version
+    # protects it by refusing, and W10 (docs/training/BACKWARD2.md §1.5) is the version
     # counter this shim would need to say the same thing.
     assert up["inplace_on_leaf"].startswith("RuntimeError"), up["inplace_on_leaf"]
     assert "in-place operation" in up["inplace_on_leaf"], up["inplace_on_leaf"]
@@ -21520,7 +21520,7 @@ def _size_fixture(env_overrides):
 
 
 def test_shape_and_size_answer_with_torch_size_and_it_behaves_like_upstreams():
-    """docs/SCALAR2.md §5. `Tensor.shape` was a plain tuple; upstream's is `torch.Size`.
+    """docs/numerics/SCALAR2.md §5. `Tensor.shape` was a plain tuple; upstream's is `torch.Size`.
 
     The whole surface is compared field for field against upstream rather than
     against transcribed literals, because every one of these was a measurement
@@ -21559,7 +21559,7 @@ def test_shape_and_size_answer_with_torch_size_and_it_behaves_like_upstreams():
     assert shim["stride_type"] == "tuple", shim["stride_type"]
 
     if _upstream_torch is None:
-        return  # no upstream torch in this interpreter -- see docs/E2E.md
+        return  # no upstream torch in this interpreter -- see docs/models/E2E.md
     up = _size_fixture({"PYTHONPATH": None, "TORCH_USE_RTLD_GLOBAL": None})
     assert up["who"] == "upstream", up["who"]
 
@@ -21567,16 +21567,16 @@ def test_shape_and_size_answer_with_torch_size_and_it_behaves_like_upstreams():
     assert not disagree, f"torch.Size surface disagrees with upstream: {disagree}"
 
 
-# --- `float8_e4m3fn` refuses exactly what upstream refuses (docs/FLOAT8B.md) --
+# --- `float8_e4m3fn` refuses exactly what upstream refuses (docs/numerics/FLOAT8B.md) --
 #
-# docs/FLOAT8.md closed three hangs and then recorded, from an eleven-op probe,
+# docs/numerics/FLOAT8.md closed three hangs and then recorded, from an eleven-op probe,
 # that seven ops answered where upstream declined. Enumerating all 197 ops found
 # 114 -- 48 computing, 27 hanging, 39 refusing in words of their own. What makes
 # that class dangerous is not the count: it is that **nothing can check an answer
 # upstream refuses to produce**. There is no oracle for it.
 #
 # These rows are the closure, and they are written against upstream's exact text
-# because the text is the contract. `docs/PROMOTE.md`'s last section is there
+# because the text is the contract. `docs/numerics/PROMOTE.md`'s last section is there
 # because a refusal once landed as `RuntimeError` carrying `NotImplementedError`'s
 # message, and a caller writing `except NotImplementedError` would have missed it,
 # so the exception *type* is asserted on every row too.
@@ -21586,7 +21586,7 @@ def test_shape_and_size_answer_with_torch_size_and_it_behaves_like_upstreams():
 # kernels (`add`/`sub`/`rsub` -> `add_stub`, `mean`/`sum` -> `sum_cpu`), the
 # near-miss pair (`relu` -> `clamp_min_scalar_cpu` vs `hardtanh` ->
 # `clamp_scalar_cpu`), a CamelCase one, an in-place one, and the seven
-# docs/FLOAT8.md named.
+# docs/numerics/FLOAT8.md named.
 _FLOAT8_TRANSCRIBED = [
     ("aten.add.Tensor", "add_stub"),
     ("aten.add.Scalar", "add_stub"),
@@ -21639,7 +21639,7 @@ def test_float8_transcribes_upstreams_wording_per_op_not_a_house_string():
 def test_float8_refuses_every_op_on_the_table_and_the_table_is_not_a_sample():
     """The whole table, not the sample above.
 
-    docs/FLOAT8.md's finding came from eleven ops and undercounted by an order of
+    docs/numerics/FLOAT8.md's finding came from eleven ops and undercounted by an order of
     magnitude. This row exists so that a *count* is asserted rather than a
     handful: if the gate is removed, or an op is dropped from the table, the
     number moves.
@@ -21659,7 +21659,7 @@ def test_float8_refuses_every_op_on_the_table_and_the_table_is_not_a_sample():
 def test_float8_still_computes_everything_upstream_computes():
     """The other direction, and the one that would make this round a net loss.
 
-    docs/BACKWARD2.md and docs/PROMOTE.md both closed a divergence and this
+    docs/training/BACKWARD2.md and docs/numerics/PROMOTE.md both closed a divergence and this
     project has twice re-opened one in the opposite direction while doing it.
     `mul`, `abs`, `clone` and `cat` are ops upstream ships for this dtype.
     """
@@ -21668,7 +21668,7 @@ def test_float8_still_computes_everything_upstream_computes():
     assert str(got.dtype) == "torch.float8_e4m3fn", got.dtype
     # 1*1 and 2*2, both exactly representable in e4m3, so this is a value check
     # and not just a dtype one. `.tolist()` is refused for this dtype
-    # (docs/FLOAT8.md), so it is read through the lossless widening to float32.
+    # (docs/numerics/FLOAT8.md), so it is read through the lossless widening to float32.
     widened = _C._aten_dispatch("aten._to_copy.default", got, dtype=_C.float32)
     assert widened.tolist() == [1.0, 4.0], widened.tolist()
     for op in ("aten.abs.default", "aten.clone.default"):
@@ -21700,7 +21700,7 @@ def test_float8_matmul_refuses_the_shape_upstream_refuses_and_only_that_shape():
 def test_float8_gate_does_not_fire_on_a_mixed_dtype_call():
     """Upstream refuses `add(float8, float32)` **before** looking up a kernel,
     with a `RuntimeError` about promotion -- a different rule and a different
-    exception type (docs/FLOAT8B.md §2.1). Answering it with the kernel message
+    exception type (docs/numerics/FLOAT8B.md §2.1). Answering it with the kernel message
     would be a new divergence in exception type."""
     f32 = _C._tensor_from_flat([1.0, 2.0], [2], _C.float32)
     exc, message = _f8_refusal("aten.add.Tensor", _f8(), f32)
@@ -21718,8 +21718,8 @@ def _f8_values(tensor):
 
 
 def test_float8_no_op_refuses_in_the_shims_own_words_any_more():
-    """docs/FLOAT8B.md §4.1 listed ten ops upstream computes and this build
-    could not, refused in this shim's own wording. docs/FLOAT8C.md closed all
+    """docs/numerics/FLOAT8B.md §4.1 listed ten ops upstream computes and this build
+    could not, refused in this shim's own wording. docs/numerics/FLOAT8C.md closed all
     ten, so `FLOAT8_E4M3FN_SHIM_ONLY` is empty and **no** float8 call may
     produce that sentence.
 
@@ -21746,7 +21746,7 @@ def test_float8_no_op_refuses_in_the_shims_own_words_any_more():
 def test_float8_all_and_any_compute_and_agree_with_upstreams_values():
     """Five of the ten: `all`/`any` hung because `any_from` widened to `f64`
     through candle's non-terminating arm. `widen_f64` routes them through
-    `f32` (docs/FLOAT8C.md §1), and the answers are upstream's."""
+    `f32` (docs/numerics/FLOAT8C.md §1), and the answers are upstream's."""
     mixed = _f8([0.0, 2.0])
     assert _C._aten_dispatch("aten.all.default", mixed).tolist() is False
     assert _C._aten_dispatch("aten.any.default", mixed).tolist() is True
@@ -21759,7 +21759,7 @@ def test_float8_all_and_any_compute_and_agree_with_upstreams_values():
 
 def test_float8_pow_refuses_the_exponents_upstream_refuses_and_only_those():
     """`pow` is **value-dependent** for this dtype, the way `matmul` is
-    shape-dependent (docs/FLOAT8C.md §2). Measured on 2.13.0:
+    shape-dependent (docs/numerics/FLOAT8C.md §2). Measured on 2.13.0:
     `pow.Tensor_Scalar` short-circuits for exponent 0 and 1 and raises `"pow"`
     for every other exponent; `pow.Scalar` computes only for base 1.
 
@@ -21783,7 +21783,7 @@ def test_float8_pow_refuses_the_exponents_upstream_refuses_and_only_those():
 
 
 def test_float8_adaptive_avg_pool1d_names_the_kernel_the_output_size_selects():
-    """docs/FLOAT8B.md table D had this as an op upstream computes. It does
+    """docs/numerics/FLOAT8B.md table D had this as an op upstream computes. It does
     not: the generic recipe had synthesised `output_size=[0]`, an empty output
     where no kernel is ever dispatched. Re-measured, upstream refuses every
     non-empty output size -- and with **two** kernel names, `"sum_cpu"` for
@@ -21800,9 +21800,9 @@ def test_float8_adaptive_avg_pool1d_names_the_kernel_the_output_size_selects():
 
 
 def test_float8_in_place_writers_reach_the_buffer():
-    """docs/FLOAT8B.md §4.2's other family: `tensor.rs::flat_storage` had no
+    """docs/numerics/FLOAT8B.md §4.2's other family: `tensor.rs::flat_storage` had no
     `F8E4M3` arm, so every in-place writer refused with "cannot write through a
-    view of candle dtype F8E4M3". docs/FLOAT8C.md §3 added the arm."""
+    view of candle dtype F8E4M3". docs/numerics/FLOAT8C.md §3 added the arm."""
     assert _f8_values(_C._aten_dispatch("aten.zero_.default", _f8())) == [0.0, 0.0]
     assert _f8_values(_C._aten_dispatch("aten.fill_.Scalar", _f8(), 3.0)) == [3.0, 3.0]
     assert _f8_values(_C._aten_dispatch("aten.abs_.default", _f8([-1.0, 2.0]))) == [1.0, 2.0]
@@ -21819,7 +21819,7 @@ def test_float8_in_place_writers_reach_the_buffer():
 def test_float8_matmul_widens_to_f32_and_lands_on_upstreams_values():
     """candle has no `F8E4M3` matmul at all. Widening the operands to `f32`,
     multiplying and narrowing back reproduces upstream bit for bit -- measured
-    over 700 random cases, `k` up to 512 (docs/FLOAT8C.md §4). Here the two
+    over 700 random cases, `k` up to 512 (docs/numerics/FLOAT8C.md §4). Here the two
     products are exact in `e4m3` so the assertion is on values, not tolerance.
     """
     square = _f8([0.0, 1.0, 2.0, 3.0], [2, 2])
@@ -21832,7 +21832,7 @@ def test_float8_matmul_widens_to_f32_and_lands_on_upstreams_values():
 
 
 def test_float8_tolist_and_item_answer_instead_of_refusing():
-    """docs/FLOAT8.md's three refusals. `tolist` and `item` widened to `f64`
+    """docs/numerics/FLOAT8.md's three refusals. `tolist` and `item` widened to `f64`
     and hung; the comparisons did too. All three route through `f32` now."""
     assert _C._tensor_from_flat([1.0, 2.0], [2], _C.float8_e4m3fn).tolist() == [1.0, 2.0]
     scalar = _C._tensor_from_flat([1.5], [1], _C.float8_e4m3fn)
@@ -21849,7 +21849,7 @@ def test_float8_tolist_and_item_answer_instead_of_refusing():
 
 
 def test_float8_to_float64_terminates():
-    """The narrowest statement of docs/FLOAT8C.md §1, and the one that was
+    """The narrowest statement of docs/numerics/FLOAT8C.md §1, and the one that was
     still hanging after the first two fixes: `x.to(torch.float64)` goes through
     `reduced::to_dtype`, not through any `aten.rs` helper, so routing it needed
     the funnel itself rather than the call sites.
@@ -21861,9 +21861,9 @@ def test_float8_to_float64_terminates():
 
 # ---------------------------------------------------------------------------
 # Aggregators beyond FedAvg, cohort agreement, and the dropout policy
-# (docs/FEDERATED3.md)
+# (docs/distributed/FEDERATED3.md)
 #
-# The trap of docs/FEDERATED.md is unchanged and applies twice as hard here:
+# The trap of docs/distributed/FEDERATED.md is unchanged and applies twice as hard here:
 # `FedAvg` at `world_size = 1` is the identity, and so is every aggregator
 # built on it -- `FedAvgM`'s velocity over one delta is that delta's running
 # sum, and `FedProx`'s server step *is* FedAvg. So every test below runs in two
@@ -22347,7 +22347,7 @@ def test_fedprox_refuses_to_aggregate_when_its_proximal_term_was_never_installed
     This is the refusal that keeps the class honest: `Delta.publish` hands any
     aggregator the table and takes back the average, so a `FedProx` reached
     that way would compute FedAvg's weighted mean and be reported as FedProx by
-    every caller downstream. `docs/DESIGN.md` §6: name it rather than
+    every caller downstream. `docs/design/DESIGN.md` §6: name it rather than
     approximate it.
     """
     if not _ckpt_shim_available():
@@ -22374,7 +22374,7 @@ def test_participant_selection_is_agreed_across_the_ranks_and_a_subset_refuses()
 
     A **proper subset** at *two* ranks is still refused, and the reason moved:
     it used to be that the transport implemented only worlds of 1 and 2, and
-    it now carries any world (docs/FEDERATED4.md). What is left is the
+    it now carries any world (docs/distributed/FEDERATED4.md). What is left is the
     arithmetic -- at two ranks every proper subset has one member, where
     FedAvg is the identity -- so the refusal holds at every world size instead
     of until the next round of work. The subset that *is* served is asserted
@@ -22395,7 +22395,7 @@ def test_participant_selection_is_agreed_across_the_ranks_and_a_subset_refuses()
 
         # At two ranks a proper subset is a cohort of one, and that is now the
         # door it refuses at -- the transport no longer refuses the world
-        # (docs/FEDERATED4.md), so the reason had to become the arithmetic one.
+        # (docs/distributed/FEDERATED4.md), so the reason had to become the arithmetic one.
         # It has to keep naming what a subset *would* take, or the refusal
         # stops pointing anywhere: the previous message named `world_size N`
         # as the next thing to build, and that thing now exists.
@@ -22538,7 +22538,7 @@ def test_federated_refuses_secure_aggregation_and_differential_privacy_by_name()
         assert msg.startswith("NotImplementedError:"), msg
         assert "divisor nobody chose" in msg or "on_missing=" in msg, msg
 
-        # `on_missing='average_arrived'` is implemented (docs/FEDERATED4.md),
+        # `on_missing='average_arrived'` is implemented (docs/distributed/FEDERATED4.md),
         # so it stopped refusing *itself* and started refusing the three
         # shapes of it that would still divide by a number nobody chose.
         # Asserted at the doors they moved to, and asserted apart: a single
@@ -22559,7 +22559,7 @@ def test_federated_refuses_secure_aggregation_and_differential_privacy_by_name()
 
         # And the world itself: at two ranks the policy is unshowable, and
         # the refusal carries the measurement that says so rather than an
-        # assertion. That number is docs/FEDERATED3.md §4.1's, and
+        # assertion. That number is docs/distributed/FEDERATED3.md §4.1's, and
         # `test_the_partial_average_a_dropout_would_have_produced_is_a_different_model`
         # is what measured it.
         small = r["on_missing_world_two"]
@@ -22576,7 +22576,7 @@ def test_federated_refuses_secure_aggregation_and_differential_privacy_by_name()
         assert "momentum buffer that restarted at zero" in r["velocity_schema"], \
             r["velocity_schema"]
 
-# --- reachability (docs/REACH.md) -------------------------------------------
+# --- reachability (docs/bindings/REACH.md) -------------------------------------------
 
 
 def _reach_module():
@@ -22609,11 +22609,11 @@ def test_reach_probe_tells_a_missing_arm_from_a_refused_call():
 
 
 def test_reach_every_declared_name_reaches_a_kernel_and_every_kernel_a_name():
-    """The gap docs/GOLDEN.md names, made structural.
+    """The gap docs/verification/GOLDEN.md names, made structural.
 
     `compare.py` dispatches by key, so it cannot see a name with no arm behind
     it, a kernel with no name in front of it, or a spelling nothing calls.
-    Those three have bitten four times (docs/REACH.md §1). This is the check
+    Those three have bitten four times (docs/bindings/REACH.md §1). This is the check
     that fails on the fifth, in the suite, rather than months later in a sweep.
     """
     reach, root = _reach_module()
@@ -22635,7 +22635,7 @@ def test_reach_allowlist_reasons_are_answerable_by_upstream():
         # about this environment, not a green light.
         print("NOTE: reach allowlist upstream claims not verified here -- %s" % detail)
 
-# W8 and W9: the eager recorder and its lifetime. docs/BACKWARD7.md
+# W8 and W9: the eager recorder and its lifetime. docs/training/BACKWARD7.md
 # ---------------------------------------------------------------------------
 
 
@@ -22652,10 +22652,10 @@ def _eager_grad(loss, wrt):
 
 
 def test_the_eager_recorder_records_exactly_the_ops_that_get_a_grad_fn():
-    """docs/BACKWARD7.md §2: W8's gate is `mark_from_op`'s answer and nothing
+    """docs/training/BACKWARD7.md §2: W8's gate is `mark_from_op`'s answer and nothing
     else.
 
-    The reason this is a test and not a comment is cost. docs/BACKWARD5.md §7
+    The reason this is a test and not a comment is cost. docs/training/BACKWARD5.md §7
     row 2 lists the per-dispatch cost of an always-on recorder as the number
     nobody has, and the design that makes it near-zero is that the recorder
     asks *no question of its own*: it runs only when the door has just given an
@@ -22700,7 +22700,7 @@ def test_the_eager_recorder_records_exactly_the_ops_that_get_a_grad_fn():
 
 
 def test_the_eager_tape_and_the_capture_tape_are_the_same_derivative_rules():
-    """docs/BACKWARD3.md and docs/BACKWARD5.md §4: **reuse, not a second set of
+    """docs/training/BACKWARD3.md and docs/training/BACKWARD5.md §4: **reuse, not a second set of
     rules.**
 
     This project has said "do not write the second one" about `full`/
@@ -22719,7 +22719,7 @@ def test_the_eager_tape_and_the_capture_tape_are_the_same_derivative_rules():
     """
     def program(x, w):
         # Non-linear in both arguments, so a gradient cannot agree by
-        # coincidence -- docs/BACKWARD5.md §1.1's rule, met inside the test
+        # coincidence -- docs/training/BACKWARD5.md §1.1's rule, met inside the test
         # rather than asserted about it.
         h = _C._aten_dispatch("aten.tanh.default", _C._aten_dispatch("aten.mul.Tensor", x, w))
         return _C._aten_dispatch("aten.sum.default", _C._aten_dispatch("aten.mul.Tensor", h, h))
@@ -22749,12 +22749,12 @@ def test_the_eager_tape_and_the_capture_tape_are_the_same_derivative_rules():
 
 def test_the_eager_graph_is_freed_by_the_backward_that_walks_it():
     """**W9**, and it is upstream's `retain_graph=False` *default* rather than
-    a lesser refusal -- docs/BACKWARD5.md §3 is the measurement that says so
+    a lesser refusal -- docs/training/BACKWARD5.md §3 is the measurement that says so
     (18.9 MiB at S=8, 302.6 at S=128 for SmolLM2-135M, held for one iteration,
     which is what upstream already pays).
 
-    docs/BACKWARD2.md §1.5 asked what would keep the intermediates alive. The
-    answer docs/BACKWARD5.md §4 found is that the thing already existed and was
+    docs/training/BACKWARD2.md §1.5 asked what would keep the intermediates alive. The
+    answer docs/training/BACKWARD5.md §4 found is that the thing already existed and was
     being thrown away: `Recorder`'s keepalive, reshaped into an `Env`. So this
     test is about the *other* end of that -- once it is kept, something has to
     let go of it, and the backward is that something.
@@ -22803,7 +22803,7 @@ def test_the_eager_graph_is_freed_by_the_backward_that_walks_it():
 
 
 def test_the_eager_graph_refuses_a_write_through_a_view_of_a_value_it_holds():
-    """docs/BACKWARD5.md §1.1's A5 and A6 -- the **100x silently wrong
+    """docs/training/BACKWARD5.md §1.1's A5 and A6 -- the **100x silently wrong
     gradient** -- reaching a recorder for the first time.
 
     §6 deferred W10b (storage-shared version counters, view metadata, alias
@@ -22811,7 +22811,7 @@ def test_the_eager_graph_refuses_a_write_through_a_view_of_a_value_it_holds():
     existed. This round is the one that makes it exist, and the verdict is
     unchanged for a reason §6 did not have: **a tape that refuses does not need
     to know what aliases what.** It needs to know that a write landed on bytes
-    it depends on, and docs/BACKWARD6.md §4 already made that one lookup by
+    it depends on, and docs/training/BACKWARD6.md §4 already made that one lookup by
     keying versions on the candle `Storage` rather than on the Python object.
 
     So this is strictly less than upstream, and deliberately: upstream
@@ -22850,7 +22850,7 @@ def test_the_eager_graph_refuses_a_write_through_a_view_of_a_value_it_holds():
 
 
 def test_the_engine_answers_now_that_an_eager_graph_exists():
-    """docs/BACKWARD9.md §1 -- **the inversion docs/BACKWARD7.md §6 asked for.**
+    """docs/training/BACKWARD9.md §1 -- **the inversion docs/training/BACKWARD7.md §6 asked for.**
 
     The previous revision of this test pinned that
     `_ImperativeEngine.run_backward` refused *while a graph existed*, and its
@@ -22859,7 +22859,7 @@ def test_the_engine_answers_now_that_an_eager_graph_exists():
     which is not "it does not raise":
 
       1. the engine **answers** through the same door `Tensor.backward()` and
-         `torch.autograd.grad()` both reach (docs/BACKWARD2.md §1.3);
+         `torch.autograd.grad()` both reach (docs/training/BACKWARD2.md §1.3);
       2. the number it produces is the derivative and not the seed -- `y = x³`
          at `x = 2` gives `12`, which no confusion of seed, operand or zeros
          reaches;
@@ -22903,7 +22903,7 @@ def test_the_engine_answers_now_that_an_eager_graph_exists():
 
 
 def test_two_leaves_of_one_add_do_not_share_one_gradient_tensor():
-    """docs/BACKWARD9.md §2 -- the defect the clone in `_accumulate_into_grad`
+    """docs/training/BACKWARD9.md §2 -- the defect the clone in `_accumulate_into_grad`
     exists to stop, demonstrated as a program rather than argued.
 
     `z = x + y` has the same derivative for both operands, and the tape hands
@@ -22939,7 +22939,7 @@ def test_two_leaves_of_one_add_do_not_share_one_gradient_tensor():
 
 
 def test_the_accumulated_grad_is_dense_enough_to_be_written_in_place():
-    """docs/BACKWARD9.md §2 -- why `_dense_copy_of` is not `clone()`.
+    """docs/training/BACKWARD9.md §2 -- why `_dense_copy_of` is not `clone()`.
 
     `sum()`'s gradient is the seed **expanded** to the operand's shape:
     `stride() == (0, 0)`, one element of storage read from every position. And
@@ -22975,7 +22975,7 @@ def test_the_accumulated_grad_is_dense_enough_to_be_written_in_place():
 
 
 def test_run_backward_accumulates_rather_than_assigning_on_the_second_backward():
-    """docs/BACKWARD9.md §2. `.grad` is `+=`, and `zero_grad` is what resets it.
+    """docs/training/BACKWARD9.md §2. `.grad` is `+=`, and `zero_grad` is what resets it.
 
     Upstream's contract has three parts and each is a row here: `None` before
     the first backward, the gradient after it, and **twice** the gradient after
@@ -23019,7 +23019,7 @@ def test_run_backward_accumulates_rather_than_assigning_on_the_second_backward()
 
 
 def test_retain_graph_differentiates_the_same_forward_twice():
-    """docs/BACKWARD9.md §3. `retain_graph=True`, and the default that is not it.
+    """docs/training/BACKWARD9.md §3. `retain_graph=True`, and the default that is not it.
 
     W9's lifetime rule is upstream's `retain_graph=False` **default**: the
     backward that walks the graph frees it. `retain_graph=True` is the caller
@@ -23038,7 +23038,7 @@ def test_retain_graph_differentiates_the_same_forward_twice():
          upstream's name.
 
     Without row 3 this would pass for an implementation that never freed
-    anything, which is the leak docs/BACKWARD8.md §4 bounded.
+    anything, which is the leak docs/training/BACKWARD8.md §4 bounded.
 
     **Nullified** by making `retain_graph` duplicate nothing (taking the tape
     either way): row 1 goes red with *"Trying to backward through the graph a
@@ -23073,7 +23073,7 @@ def test_retain_graph_differentiates_the_same_forward_twice():
 
 
 def test_allow_unused_is_the_allow_unreachable_slot_and_both_defaults_are_upstreams():
-    """docs/BACKWARD9.md §4 -- **docs/BACKWARD7.md §10's "opposite default",
+    """docs/training/BACKWARD9.md §4 -- **docs/training/BACKWARD7.md §10's "opposite default",
     closed, and closed in the place that makes both reachable.**
 
     §6 recorded that `_eager_backward` returns `None` for a leaf no gradient
@@ -23118,7 +23118,7 @@ def test_allow_unused_is_the_allow_unreachable_slot_and_both_defaults_are_upstre
 
 
 def test_the_engine_refuses_create_graph_and_several_roots_by_name():
-    """docs/BACKWARD9.md §6. What is *not* built, refused where a caller meets it.
+    """docs/training/BACKWARD9.md §6. What is *not* built, refused where a caller meets it.
 
     Both would otherwise be silently wrong rather than slow.
     `create_graph=True` asks for a backward that is itself differentiable, and
@@ -23127,7 +23127,7 @@ def test_the_engine_refuses_create_graph_and_several_roots_by_name():
     fail. Several roots asks for one traversal seeded from several places,
     which the eager tape's single output cannot express.
 
-    Refusing by name is the whole of docs/DESIGN.md §6 here: a
+    Refusing by name is the whole of docs/design/DESIGN.md §6 here: a
     `create_graph=True` that quietly behaved like `False` is the shape of
     wrongness a gradient-penalty term would carry all the way to a number.
     """
@@ -23153,7 +23153,7 @@ def test_the_engine_refuses_create_graph_and_several_roots_by_name():
         raise AssertionError("several roots were accepted")
 
 
-# --- lowering toward a device operator set (docs/DECOMP.md §12) --------------
+# --- lowering toward a device operator set (docs/graph/DECOMP.md §12) --------------
 #
 # `torchnative/export/decompose.py` lowers to Core ATen because that is what
 # ExecuTorch's Edge dialect is defined over. NNAPI and CoreML are listed
@@ -23376,7 +23376,7 @@ def _lowered_spelling(name: str, aten_fallback: str) -> str:
     over `prims` -- `_refs.erf` calls `prims.erf`, `_refs.t` calls
     `prims.transpose`. Whether the lowering *stops* on that prims node or is
     refused and leaves the aten node standing is decided by exactly one thing:
-    whether this build has a kernel for the prims op. docs/PRIMS.md landed
+    whether this build has a kernel for the prims op. docs/kernels/PRIMS.md landed
     thirteen of them and every expectation below moved one level down as a
     result.
 
@@ -23384,7 +23384,7 @@ def _lowered_spelling(name: str, aten_fallback: str) -> str:
     the reason `test_every_implemented_op_has_schema_text` gives about its own
     count: a literal here would go red on the fourteenth prims kernel and
     teach the reader to edit the constant, which is how a claim decays into a
-    change detector. `aten_fallback` is the pre-docs/PRIMS.md answer and is
+    change detector. `aten_fallback` is the pre-docs/kernels/PRIMS.md answer and is
     still the right one for a build without the kernel.
     """
     prim = f"prims.{name}.default"
@@ -23392,7 +23392,7 @@ def _lowered_spelling(name: str, aten_fallback: str) -> str:
 
 
 def test_gelu_lowers_to_erf_primitives_and_computes_the_same_values():
-    """docs/DECOMP.md §12. The task's named example, proven numerically.
+    """docs/graph/DECOMP.md §12. The task's named example, proven numerically.
 
     `gelu` is exactly the shape of decomposition that is target-*independent*:
     it is an identity over primitives, not a layout change, so the same rule
@@ -23466,7 +23466,7 @@ def test_more_ops_lower_toward_nnapi_and_each_keeps_its_values():
     `permute` and `mm`, which NNAPI does *not* have either. Lowering that moves
     an op from one unsupported form to another unsupported form is still
     progress toward Core ATen and still not progress toward NNAPI, and the
-    numbers in docs/DECOMP.md §12 count it honestly as the latter.
+    numbers in docs/graph/DECOMP.md §12 count it honestly as the latter.
     """
     if not os.path.isfile(_CKPT_VENDOR_SHIM):
         print("   (skipped: vendored tree has no _C.abi3.so)")
@@ -23517,7 +23517,7 @@ def test_lowering_a_whole_module_graph_preserves_what_it_computes():
     # sizing round is most likely to overstate -- "9 ops now lower" reads like
     # 9 ops of progress toward NNAPI, and for this module it is zero.
     #
-    # **docs/PRIMS.md moved the two ops on the right and did not move the
+    # **docs/kernels/PRIMS.md moved the two ops on the right and did not move the
     # count.** Before those kernels existed, `erf` and `permute` were where
     # lowering stopped, because `_refs.erf`/`_refs.t` refused on a missing
     # `prims.*` op. With the kernels present the rules run to completion and
@@ -23559,7 +23559,7 @@ def test_lower_to_refuses_a_graph_it_could_not_finish_and_names_the_ops():
         or "has no rule for it" in why
     ), why
     # It stops on a `prims.*` op either way, but **why** it stops there is the
-    # thing docs/PRIMS.md changed, so the two reasons are told apart rather
+    # thing docs/kernels/PRIMS.md changed, so the two reasons are told apart rather
     # than both accepted by a bare `"prims." in why`:
     #
     #   before  the rule ran and hit a `prims.*` op with no kernel
@@ -23708,7 +23708,7 @@ def _demand8_road_fixture():
 
 
 def test_demand8_four_names_reach_their_kernels_through_the_vendored_tree():
-    """docs/DEMAND8.md §2's four names, each through a real `import torch`
+    """docs/architectures/DEMAND8.md §2's four names, each through a real `import torch`
     against this shim.
 
     The golden harness is **blind to spelling**: it calls `_aten_dispatch`
@@ -23724,7 +23724,7 @@ def test_demand8_four_names_reach_their_kernels_through_the_vendored_tree():
     Deleting `overloads.json`'s `floor` entry, `methods.json`'s `floor_` or
     `index_add_` entry, `tensor.rs`'s `ndimension`, or `bootstrap.py`'s
     `_install_nn` registration turns the matching assertion red by name --
-    see docs/DEMAND8.md §2.5 for the sabotage that was actually run.
+    see docs/architectures/DEMAND8.md §2.5 for the sabotage that was actually run.
     """
     if not os.path.isfile(_CKPT_VENDOR_SHIM):
         return  # vendor tree not installed -- see vendor/install_shim.sh
@@ -23781,12 +23781,12 @@ def test_demand8_four_names_reach_their_kernels_through_the_vendored_tree():
 
 
 def test_capture_refuses_demand8_inplace_names_and_lets_the_others_through():
-    """docs/DEMAND8.md §2's two mutating additions (`floor_`, `index_add_`) at
+    """docs/architectures/DEMAND8.md §2's two mutating additions (`floor_`, `index_add_`) at
     the raw `_aten_dispatch` level.
 
     `capture.rs::is_mutating` reads the trailing `_` off the op segment rather
     than consulting a list, so it needed no change for either -- but "needed
-    no change" is a claim to measure, not to assume (docs/INPLACE.md §4 makes
+    no change" is a claim to measure, not to assume (docs/kernels/INPLACE.md §4 makes
     the same point about its fourteen).
 
     The controls are the point of the second half: `floor.default` and
@@ -23825,7 +23825,7 @@ def test_capture_refuses_demand8_inplace_names_and_lets_the_others_through():
 
 
 
-# --- prims.* -- docs/PRIMS.md -----------------------------------------------
+# --- prims.* -- docs/kernels/PRIMS.md -----------------------------------------------
 
 
 _PRIMS_ROAD_SCRIPT = r"""
@@ -23926,7 +23926,7 @@ def _prims_road_fixture():
 
 
 def test_the_thirteen_prims_ops_are_callable_by_their_own_key():
-    """docs/PRIMS.md. Nine are an aten kernel under another name; four are not.
+    """docs/kernels/PRIMS.md. Nine are an aten kernel under another name; four are not.
 
     This is the only place the *spelling* is exercised. Golden compares the
     thirteen keys against upstream by dispatching them directly, which proves
@@ -24028,9 +24028,9 @@ def _rwkv_road_fixture():
 
 
 def test_the_two_names_rwkv_needed_reach_their_kernels_through_the_vendored_tree():
-    """docs/PRIMS.md §6 -- `TensorBase.new_empty` and `torch.maximum`.
+    """docs/kernels/PRIMS.md §6 -- `TensorBase.new_empty` and `torch.maximum`.
 
-    docs/DEMAND8.md §2.6 left `rwkv` as the one model of five that still
+    docs/architectures/DEMAND8.md §2.6 left `rwkv` as the one model of five that still
     refused, at `TensorBase.new_empty`. Behind it stood a second name,
     `torch.maximum`, which nothing found until the first was closed -- so the
     two are checked together, through a real `import torch` against this shim
@@ -24064,10 +24064,10 @@ def test_the_two_names_rwkv_needed_reach_their_kernels_through_the_vendored_tree
 
 
 # ---------------------------------------------------------------------------
-# docs/REACH.md shape 3 -- closing part of the 54-name backlog
+# docs/bindings/REACH.md shape 3 -- closing part of the 54-name backlog
 #
 # `tools/golden/reach.py` cannot see whether a spelling golden compares by
-# dispatch key is reachable from Python at all (docs/REACH.md's whole point).
+# dispatch key is reachable from Python at all (docs/bindings/REACH.md's whole point).
 # The names below were in `reach_allow.json`'s `shape3_unexercised_spelling`
 # with a "backlog" reason and nothing in `pytests/` calling
 # `torch.<name>(...)` or `<something>.<name>(...)`. This road script closes
@@ -24076,7 +24076,7 @@ def test_the_two_names_rwkv_needed_reach_their_kernels_through_the_vendored_tree
 # `PYTHONPATH` stripped (the oracle, not this shim) -- transcribed into the
 # assertions below, not derived from the shim's own output.
 #
-# `cat`, `where`, `erf` and `sigmoid` are first because docs/REACH.md's
+# `cat`, `where`, `erf` and `sigmoid` are first because docs/bindings/REACH.md's
 # check found them appearing in this file only inside a comment or a
 # docstring -- four of the most common ops in the library, uncalled.
 #
@@ -24258,7 +24258,7 @@ def _reach_backlog_road_fixture():
 
 
 def test_reach_backlog_27_unexercised_spellings_reach_their_kernels_and_match_upstream():
-    """docs/REACH.md shape 3's backlog, 27 names, through the vendored tree.
+    """docs/bindings/REACH.md shape 3's backlog, 27 names, through the vendored tree.
 
     Each value is transcribed from upstream torch 2.13.0 run on the same
     script (`env -u PYTHONPATH -u TORCH_USE_RTLD_GLOBAL`), not read off this
@@ -24373,7 +24373,7 @@ def test_reach_backlog_27_unexercised_spellings_reach_their_kernels_and_match_up
 
 
 # ---------------------------------------------------------------------------
-# docs/REACH.md shape 3 -- second pass over the backlog
+# docs/bindings/REACH.md shape 3 -- second pass over the backlog
 #
 # Same shape as the road script above: each name was in `reach_allow.json`'s
 # `shape3_unexercised_spelling` with a "backlog" reason and nothing in
@@ -24537,7 +24537,7 @@ def _reach_backlog2_road_fixture():
 
 
 def test_reach_backlog2_19_more_unexercised_spellings_reach_their_kernels_and_match_upstream():
-    """docs/REACH.md shape 3's backlog, second pass: 19 more names, through the
+    """docs/bindings/REACH.md shape 3's backlog, second pass: 19 more names, through the
     vendored tree.
 
     Each value is transcribed from upstream torch 2.13.0 run on the same
@@ -24613,9 +24613,9 @@ def test_reach_backlog2_19_more_unexercised_spellings_reach_their_kernels_and_ma
 
 
 # world_size N: the transport, and what three ranks make testable
-# (docs/FEDERATED4.md)
+# (docs/distributed/FEDERATED4.md)
 #
-# docs/FEDERATED3.md §11 ended with "nothing was run at a world larger than
+# docs/distributed/FEDERATED3.md §11 ended with "nothing was run at a world larger than
 # two", and named the three things that were waiting on it: a **proper subset**
 # cohort, a **survivor set of two or more**, and an `agree` that is exact above
 # two ranks. All three are here, and all three run in *three* real
@@ -24736,7 +24736,7 @@ out["subset_model"] = {n: p.tolist()
 # an abstention contributes a *zero* -- so a reduction that silently dropped
 # rank 2's contribution would produce exactly the same answer, and the
 # assertions on `subset` above stayed green under the sabotage that did
-# precisely that (docs/FEDERATED4.md §4). Here rank 0, the hub, is the one
+# precisely that (docs/distributed/FEDERATED4.md §4). Here rank 0, the hub, is the one
 # that abstains and rank 2 is a contributor, so losing it changes the number.
 SUB2 = [1, 2]
 out["subset_no_hub"] = tab(federated.FedAvg().aggregate(
@@ -25017,7 +25017,7 @@ def test_the_transport_reduces_three_ranks_in_rank_order_and_says_so():
 def test_agree_is_exact_at_three_ranks_where_the_old_sum_check_was_not():
     """`(h-1, h, h+1)` sums to `3h`. The old check accepted it; this refuses.
 
-    docs/FEDERATED3.md §5 wrote the sum-and-compare down as exact *only at two
+    docs/distributed/FEDERATED3.md §5 wrote the sum-and-compare down as exact *only at two
     ranks* and refused a larger world rather than weaken it. This is that
     weakening made concrete: three digests that differ, whose total is exactly
     what agreement would have totalled.
@@ -25083,7 +25083,7 @@ def test_fedavg_over_three_processes_equals_the_weighted_mean_computed_centrally
 def test_a_proper_subset_cohort_aggregates_over_the_subset_and_not_the_world():
     """Ranks 0 and 1 are selected; rank 2 attends every collective and abstains.
 
-    docs/FEDERATED3.md §8 listed this as refusing because at two ranks every
+    docs/distributed/FEDERATED3.md §8 listed this as refusing because at two ranks every
     proper subset is a world of one. At three it is not, and the acceptance is
     the one that was impossible there: the subset's aggregate has to equal
     `(3 d0 + 7 d1) / 10` **and differ from** `(3 d0 + 7 d1 + 2 d2) / 12`. A
@@ -25130,7 +25130,7 @@ def test_a_proper_subset_cohort_aggregates_over_the_subset_and_not_the_world():
 
     # A cohort that excludes rank 0 -- the hub is not privileged, it is just
     # where the fold happens. This is also the assertion the sabotage in
-    # docs/FEDERATED4.md §4 needed: with `SUB = [0, 1]` the rank whose
+    # docs/distributed/FEDERATED4.md §4 needed: with `SUB = [0, 1]` the rank whose
     # contribution a "drop the last one" fault loses is rank 2, and rank 2 is
     # abstaining, so its contribution is a zero and the loss is invisible.
     # Here rank 2 carries weight 2.0 and rank 0 is the one contributing zero.
@@ -25150,7 +25150,7 @@ def test_a_proper_subset_cohort_aggregates_over_the_subset_and_not_the_world():
 def test_average_arrived_divides_by_the_survivors_and_refuses_below_the_floor():
     """A rank leaves; two survive; the aggregate is theirs and is not either one.
 
-    docs/FEDERATED3.md §4.1 measured what this policy returns at two ranks: the
+    docs/distributed/FEDERATED3.md §4.1 measured what this policy returns at two ranks: the
     survivor's own delta, to 6e-8 -- the identity, reached by a socket close
     instead of a decision. At three ranks the survivor set is two, so the
     partial average is a real weighted mean, and that is asserted against
@@ -25200,7 +25200,7 @@ def test_average_arrived_divides_by_the_survivors_and_refuses_below_the_floor():
                 own = _fed_tensor(reports[rank]["local"][name])
                 assert not t.equal(aggregate, own), (
                     "%s: the partial average is rank %d's own delta -- the "
-                    "identity docs/FEDERATED3.md §4.1 measured at two ranks"
+                    "identity docs/distributed/FEDERATED3.md §4.1 measured at two ranks"
                     % (name, rank))
 
     # Both survivors hold the same aggregate, byte for byte -- one fold on
@@ -25218,7 +25218,7 @@ def test_three_ranks_refuse_the_shapes_they_still_cannot_serve():
     The cohort of one is the same refusal `world_size = 1` gets, moved to the
     cohort: FedAvg over one delta is that delta at any world size. The floor
     refusals are the divisor being chosen rather than observed. `send`/`recv`
-    and secure aggregation are the pair docs/FEDERATED3.md §6 ordered after
+    and secure aggregation are the pair docs/distributed/FEDERATED3.md §6 ordered after
     this round and that are still ordered after it: a star through rank 0 gives
     no route between two leaves that the hub cannot read.
     """
@@ -25268,7 +25268,7 @@ def test_three_ranks_refuse_the_shapes_they_still_cannot_serve():
 
 # --- the mps device: candle's own backend, reached by resolve() alone --------
 #
-# docs/VULKAN3.md §1 is the argument for why this landed before Vulkan and it
+# docs/devices/VULKAN3.md §1 is the argument for why this landed before Vulkan and it
 # is worth restating where the tests are, because the two devices are checked
 # for *different* properties and confusing them would weaken both.
 #
@@ -25396,7 +25396,7 @@ def test_an_op_mps_cannot_run_refuses_and_names_the_op():
     *wrong* answer -- candle raises rather than guessing -- but it does not
     prevent a **correct answer computed on the CPU**: candle will copy a Metal
     tensor back to the host for the ops that need it, and the result is right
-    but the GPU did not compute it. docs/VULKAN3.md §3 names the two ops where
+    but the GPU did not compute it. docs/devices/VULKAN3.md §3 names the two ops where
     that was observed rather than leaving it as a possibility.
 
     So what is asserted is what actually holds: an op the Metal backend does
@@ -25404,7 +25404,7 @@ def test_an_op_mps_cannot_run_refuses_and_names_the_op():
     a `NotImplementedError` naming the op is what an op this shim never
     implemented gives on any device.
 
-    **The paragraph above is corrected by docs/MPS.md and left standing because
+    **The paragraph above is corrected by docs/devices/MPS.md and left standing because
     the assertions below are still exactly right.** candle does *not* copy a
     Metal tensor back for ops its backend lacks -- it bails, which is what this
     test sees. The correct-answer-from-the-CPU that §3 caught came from
@@ -25465,11 +25465,11 @@ def test_mps_is_refused_by_name_where_it_is_not_compiled_in():
 
 
 
-# --- the mps host-readback gate (docs/MPS.md) --------------------------------
+# --- the mps host-readback gate (docs/devices/MPS.md) --------------------------------
 #
 # What the tests above could not see, and what these close.
 #
-# docs/VULKAN3.md §3 recorded that an `mps` tensor can be computed on the CPU
+# docs/devices/VULKAN3.md §3 recorded that an `mps` tensor can be computed on the CPU
 # and still report `mps`, and attributed the readback to candle. It is not
 # candle's: candle's Metal backend has no silent fallback at all -- every op it
 # lacks bails, which is why `aten.sort.default` raises `Metal contiguous
@@ -25673,10 +25673,10 @@ def test_every_host_readback_in_aten_is_classified():
 def test_an_mps_op_that_would_compute_on_the_cpu_is_refused_and_names_the_op():
     """The gate, from the caller's side.
 
-    `nonzero` is the op docs/VULKAN3.md §3 caught returning a correct value
+    `nonzero` is the op docs/devices/VULKAN3.md §3 caught returning a correct value
     from the CPU under an `mps` label; `gather` is the second name here because
     it is the one still standing between a plain `BertModel(input_ids)` and an
-    `mps` forward (docs/MPSATTN.md §6).
+    `mps` forward (docs/devices/MPSATTN.md §6).
 
     **`_softmax` used to be the second name and is deliberately not any more.**
     It was rewritten onto the device and left the list, and `test_mpsattn.py`
@@ -25739,7 +25739,7 @@ def test_the_mps_refusal_list_is_not_empty_and_covers_the_named_regressions():
                   "aten.where.default", "aten.index.Tensor"):
         assert named in ops, named
     # `_softmax` and `_safe_softmax` were on this list and are not any more:
-    # they were rewritten onto the device (docs/MPSATTN.md), which is the only
+    # they were rewritten onto the device (docs/devices/MPSATTN.md), which is the only
     # way off it. Named here rather than left as an absence so that putting a
     # readback back into either kernel has to come past this line as well as
     # past the derivation.
@@ -25752,7 +25752,7 @@ def test_the_mps_refusal_list_is_not_empty_and_covers_the_named_regressions():
 
 
 def test_tril_on_mps_computes_on_the_gpu_after_all():
-    """A correction to docs/VULKAN3.md §3, kept as a test so it stays corrected.
+    """A correction to docs/devices/VULKAN3.md §3, kept as a test so it stays corrected.
 
     That section named `aten.tril.default` alongside `aten.nonzero.default` as
     an op computing on the CPU under an `mps` label. `nonzero` is: its kernel
@@ -25787,12 +25787,12 @@ def test_tril_on_mps_computes_on_the_gpu_after_all():
 
 # --- the vulkan device: a representation candle has no variant for -----------
 #
-# The contrast with the mps tests above is the point, and docs/VULKAN3.md §4
+# The contrast with the mps tests above is the point, and docs/devices/VULKAN3.md §4
 # is the long form of it.
 #
 # `mps` needed one arm of `resolve()` because candle owns the backend. `vulkan`
 # needs a fourth arm of `tensor::Repr` because candle's `Device` is a closed
-# enum with nowhere to put a `VkDevice` (docs/VULKAN2.md §5.1). That cost buys
+# enum with nowhere to put a `VkDevice` (docs/devices/VULKAN2.md §5.1). That cost buys
 # something the mps path does not have: `PyTensorBase::tensor()` refuses on
 # every non-`Dense` arm, and it has 396 call sites, so a kernel that has not
 # been taught this device *cannot* read CPU storage off a Vulkan tensor by
@@ -25804,7 +25804,7 @@ def test_tril_on_mps_computes_on_the_gpu_after_all():
 #   1. the values come back right through real GPU memory, and
 #   2. everything not on `_C._vulkan_ops()` refuses **naming the op**.
 #
-# Nothing is installed to make these run. `docs/VULKAN2.md` §4 found a loader
+# Nothing is installed to make these run. `docs/devices/VULKAN2.md` §4 found a loader
 # and four ICDs already on disk inside the Android emulator bundle, and
 # `libkosmickrisp_icd.json` reaches the real Apple M1. Without `VK_DRIVER_FILES`
 # and `DYLD_LIBRARY_PATH` pointing there, `dlopen` finds nothing, so on an
@@ -25814,7 +25814,7 @@ def test_tril_on_mps_computes_on_the_gpu_after_all():
 def _sip_stripped_the_loader_path():
     """Did macOS SIP eat the `DYLD_*` this process was supposed to inherit?
 
-    docs/VULKAN3.md §6.1: running the suite as `DYLD_LIBRARY_PATH=... sh
+    docs/devices/VULKAN3.md §6.1: running the suite as `DYLD_LIBRARY_PATH=... sh
     run.sh` skipped all four Vulkan tests *while the loader was pointed at
     correctly*, because SIP strips `DYLD_*` from the environment when exec'ing
     a protected binary such as `/bin/sh`. The variable was in the caller's
@@ -25843,7 +25843,7 @@ def _vulkan_or_skip(what):
                   "DYLD_LIBRARY_PATH is not -- macOS SIP strips DYLD_* when "
                   "exec'ing /bin/sh, so run.sh never received it. Pass it as "
                   "TORCH_C_DYLD_LIBRARY_PATH instead, which run.sh re-exports "
-                  "(docs/VULKAN3.md §6.1). The loader said: "
+                  "(docs/devices/VULKAN3.md §6.1). The loader said: "
                   f"{str(probe['error']).splitlines()[0]})")
             return None
         print(f"   (skipped {what}: no vulkan -- {str(probe['error']).splitlines()[0]})")
@@ -26323,7 +26323,7 @@ def _npu_coreml_fixture():
 
 
 def test_upstreams_nnapi_serialiser_needs_a_jit_graph_this_build_cannot_make():
-    """The finding docs/NPU.md leads with, measured rather than asserted.
+    """The finding docs/graph/NPU.md leads with, measured rather than asserted.
 
     `serialize_model(model, inputs)` starts at `model.graph.inputs()`. This
     shim has no TorchScript compiler: `torch.jit.trace` hands back the module
@@ -26500,7 +26500,7 @@ def test_the_blob_decoder_rejects_blobs_that_do_not_decode():
 def test_what_serialises_is_smaller_than_what_nnapi_nominally_accepts():
     """`supported_ops()` is a subset of `target.nnapi_ops()`, and says why.
 
-    docs/DECOMP.md §12.2 warned that the 29-name count is an upper bound
+    docs/graph/DECOMP.md §12.2 warned that the 29-name count is an upper bound
     because `ADDER_MAP` is keyed without overloads. This is that warning turned
     into a number that cannot drift: what has an actual calling convention here
     is strictly fewer base names than `ADDER_MAP` carries, and the difference
@@ -26552,9 +26552,9 @@ def test_coreml_models_are_compiled_and_actually_run():
     compared against `DecomposedTrace.replay`, our own graph back through
     `_aten_dispatch`. Both sides see the same inputs, so agreement is evidence
     about the MIL lowering rather than about two libraries implementing an op
-    the same way (docs/CAPTURE.md §3).
+    the same way (docs/graph/CAPTURE.md §3).
 
-    Contrast the NNAPI tests above, which are structural only. docs/NPU.md
+    Contrast the NNAPI tests above, which are structural only. docs/graph/NPU.md
     keeps the two apart and so does this file: nothing here claims a blob ran
     on an NPU, and nothing there claims a CoreML model was merely inspected.
     """
@@ -26638,12 +26638,12 @@ def test_an_op_with_no_mil_lowering_is_refused_by_name():
 
 
 # ---------------------------------------------------------------------------
-# W11 (docs/BACKWARD8.md): what docs/BACKWARD7.md §10 left unestablished
+# W11 (docs/training/BACKWARD8.md): what docs/training/BACKWARD7.md §10 left unestablished
 # ---------------------------------------------------------------------------
 
 
 def test_the_eager_graph_differentiates_a_training_mode_batch_norm_that_wrote_its_buffers():
-    """docs/BACKWARD8.md §2 -- **docs/BACKWARD7.md §10 row 3, measured and then
+    """docs/training/BACKWARD8.md §2 -- **docs/training/BACKWARD7.md §10 row 3, measured and then
     fixed.**
 
     §10 row 3 predicted that a model writing a buffer *mid-forward* -- a KV
@@ -26685,7 +26685,7 @@ def test_the_eager_graph_differentiates_a_training_mode_batch_norm_that_wrote_it
     the same reason, so the discriminating quantity is `dL/db = M`, and the
     input gradient is asserted *small* rather than merely present.
 
-    docs/BACKWARD8.md §2.3 nullifies `forgive_own_write` and records that this
+    docs/training/BACKWARD8.md §2.3 nullifies `forgive_own_write` and records that this
     goes red with the freshness message when it is removed.
     """
     _C._eager_reset()
@@ -26707,7 +26707,7 @@ def test_the_eager_graph_differentiates_a_training_mode_batch_norm_that_wrote_it
     after = [float(v) for v in running_mean.flatten()]
     assert before != after, (
         "the running statistics did not move -- this program no longer poses "
-        "the question docs/BACKWARD7.md §10 row 3 asked"
+        "the question docs/training/BACKWARD7.md §10 row 3 asked"
     )
     assert _C._eager_tape_size() > 0, "the batch norm was not recorded at all"
     assert _C._eager_reason() is None, _C._eager_reason()
@@ -26750,7 +26750,7 @@ def test_the_eager_graph_differentiates_a_training_mode_batch_norm_that_wrote_it
 
 
 def test_the_eager_guard_still_refuses_a_second_write_to_a_batch_norm_buffer():
-    """docs/BACKWARD8.md §2.2 -- the control on the test above.
+    """docs/training/BACKWARD8.md §2.2 -- the control on the test above.
 
     `forgive_own_write` advances the stamp by **one**, for the write the op
     being recorded has already made. It would have been a line shorter to
@@ -26800,7 +26800,7 @@ def test_the_eager_guard_still_refuses_a_second_write_to_a_batch_norm_buffer():
     # `aten.zero_.default`, and `note_mutation`'s ordinary in-place arm calls
     # `poison_on_write_to_recorded_storage`, so the tape is refused at the
     # *write* rather than one guard later at `backward()`. That is the guard
-    # docs/BACKWARD7.md §5 described, firing on the case it was written for --
+    # docs/training/BACKWARD7.md §5 described, firing on the case it was written for --
     # and its absence on the batch-norm forward above is why the fix belonged
     # in the stamp and not here.
     assert "an in-place operation wrote into a tensor the eager graph holds" in message, message
@@ -26808,7 +26808,7 @@ def test_the_eager_guard_still_refuses_a_second_write_to_a_batch_norm_buffer():
 
 
 def test_the_batch_norm_rule_agrees_with_the_eval_mode_closed_form_too():
-    """docs/BACKWARD8.md §2.4.
+    """docs/training/BACKWARD8.md §2.4.
 
     `training=False` is a different function, not a special case: the
     statistics are the running buffers rather than the batch's, `x` reaches the
@@ -26860,7 +26860,7 @@ def test_the_batch_norm_rule_agrees_with_the_eval_mode_closed_form_too():
 
 
 def test_the_eager_graph_survives_a_kv_cache_update_because_the_cache_is_concatenated():
-    """docs/BACKWARD8.md §2 -- the other half of docs/BACKWARD7.md §10 row 3,
+    """docs/training/BACKWARD8.md §2 -- the other half of docs/training/BACKWARD7.md §10 row 3,
     and the half the prediction got wrong.
 
     Measured on real SmolLM2-135M with `use_cache=True` (§2): a prefill and a
@@ -26892,9 +26892,9 @@ def test_the_eager_graph_survives_a_kv_cache_update_because_the_cache_is_concate
 
 
 def test_the_eager_backward_uses_the_dropout_draw_the_forward_made():
-    """docs/BACKWARD8.md §3 -- **docs/BACKWARD7.md §10 row 5, tested.**
+    """docs/training/BACKWARD8.md §3 -- **docs/training/BACKWARD7.md §10 row 5, tested.**
 
-    §10 row 5 recorded an *argument* that docs/CAPTURE.md §9-1's failure -- a
+    §10 row 5 recorded an *argument* that docs/graph/CAPTURE.md §9-1's failure -- a
     gradient taken at a different dropout draw than the one reported -- cannot
     happen on the eager path, because the draw is held in `node_objects` rather
     than replayed, and said the argument had not been tested because the two
@@ -26964,7 +26964,7 @@ def test_the_eager_backward_uses_the_dropout_draw_the_forward_made():
     # differentiates by replaying the forward, so `native_dropout` draws a
     # second time -- that is
     # `test_the_tape_replays_a_dropout_forward_and_therefore_redraws_its_mask`,
-    # and docs/ADAPT.md §14.3 measures it as the larger error term on a real
+    # and docs/models/ADAPT.md §14.3 measures it as the larger error term on a real
     # gpt2 Tent step by two orders of magnitude. Running the same program that
     # way and applying the same comparator to it **fails**, on almost every
     # element, which is what says the eager result above was earned.
@@ -27001,7 +27001,7 @@ def test_the_eager_backward_uses_the_dropout_draw_the_forward_made():
 
 
 def test_the_tape_byte_count_excludes_parameters_and_counts_each_storage_once():
-    """docs/BACKWARD8.md §4.1 -- the instrument the growth measurement rests on.
+    """docs/training/BACKWARD8.md §4.1 -- the instrument the growth measurement rests on.
 
     `_eager_tape_bytes` exists because RSS is not an instrument on this
     machine: `ru_maxrss` is a peak and reported `+0.0 MiB` for a tape that had
@@ -27066,7 +27066,7 @@ def test_the_tape_byte_count_excludes_parameters_and_counts_each_storage_once():
 
 
 def test_the_eager_tape_refuses_and_releases_when_it_grows_past_its_bound():
-    """docs/BACKWARD8.md §4 -- **docs/BACKWARD7.md §10 row 2, closed.**
+    """docs/training/BACKWARD8.md §4 -- **docs/training/BACKWARD7.md §10 row 2, closed.**
 
     §10 row 2: the tape is freed by `backward()` and by nothing else, so a
     forward that is never differentiated retains every intermediate, and
@@ -27086,7 +27086,7 @@ def test_the_eager_tape_refuses_and_releases_when_it_grows_past_its_bound():
     """
     default = _C._eager_max_nodes()
     assert default == 100000, (
-        "the default bound moved -- docs/BACKWARD8.md §4 derives 100000 from a "
+        "the default bound moved -- docs/training/BACKWARD8.md §4 derives 100000 from a "
         "measured 1720-node SmolLM2-135M prefill; move the derivation with it",
         default,
     )
@@ -27143,7 +27143,7 @@ def build():
     model = nn.Sequential(nn.Linear(4, 3), nn.Tanh(), nn.Linear(3, 2))
     # Deterministic without depending on either interpreter's RNG stream: the
     # two draw from different generators, so seeded init would compare two
-    # different programs. docs/BACKWARD8.md §3 is the same problem, solved the
+    # different programs. docs/training/BACKWARD8.md §3 is the same problem, solved the
     # other way because there a mask had to be shared.
     with torch.no_grad():
         k = 0
@@ -27224,7 +27224,7 @@ def _training_loop_fixture(env_overrides):
 
 
 def test_a_real_training_loop_runs_through_loss_backward_and_agrees_with_upstream():
-    """docs/BACKWARD9.md §1 -- **the bar for this round**, and the reason the
+    """docs/training/BACKWARD9.md §1 -- **the bar for this round**, and the reason the
     engine is claimed rather than the parts of it.
 
         loss = criterion(model(x), y)
@@ -27235,9 +27235,9 @@ def test_a_real_training_loop_runs_through_loss_backward_and_agrees_with_upstrea
     Six steps of it, on a real `nn.Sequential(Linear, Tanh, Linear)` with a real
     `torch.optim.SGD`, and every number compared element-wise to **upstream
     torch running the identical program** -- the central-oracle pattern
-    docs/FEDERATED3.md §2 uses, and the reason nothing here is a literal. A
+    docs/distributed/FEDERATED3.md §2 uses, and the reason nothing here is a literal. A
     hardcoded trajectory is a claim about 2.13.0 that nothing re-checks
-    (docs/AUDIT.md's repeated defect); a second interpreter running the same
+    (docs/verification/AUDIT.md's repeated defect); a second interpreter running the same
     source is a claim that re-checks itself every run.
 
     The loop is where the pieces meet, and it is the only test here that
@@ -27262,7 +27262,7 @@ def test_a_real_training_loop_runs_through_loss_backward_and_agrees_with_upstrea
         `zero_grad(set_to_none=False)`.
 
     The parameters are initialised arithmetically rather than from a seed
-    because the two interpreters do not share an RNG stream (docs/BACKWARD8.md
+    because the two interpreters do not share an RNG stream (docs/training/BACKWARD8.md
     §3 met the same wall from the other side).
     """
     if not os.path.isfile(_CKPT_VENDOR_SHIM):
@@ -27290,7 +27290,7 @@ def test_a_real_training_loop_runs_through_loss_backward_and_agrees_with_upstrea
     assert losses[-1] < losses[0] * 0.6, losses
 
     if _upstream_torch is None:
-        return  # no upstream torch in this interpreter -- see docs/E2E.md
+        return  # no upstream torch in this interpreter -- see docs/models/E2E.md
     up = _training_loop_fixture({"PYTHONPATH": None, "TORCH_USE_RTLD_GLOBAL": None})
     assert up["who"] == "upstream", up["who"]
 
@@ -27304,7 +27304,7 @@ def test_a_real_training_loop_runs_through_loss_backward_and_agrees_with_upstrea
         assert worst <= tolerance, (name, worst, ours, theirs)
         return len(ours), worst
 
-    # float32 rounding, and no more. docs/BACKWARD9.md §1 records the measured
+    # float32 rounding, and no more. docs/training/BACKWARD9.md §1 records the measured
     # worst over all three quantities.
     compare("losses", 1e-6)
     compare("first_grads", 1e-6)
@@ -27315,7 +27315,7 @@ def test_a_real_training_loop_runs_through_loss_backward_and_agrees_with_upstrea
 
 
 # ---------------------------------------------------------------------------
-# docs/REFOLD.md -- prims -> aten refold, and the conv+BatchNorm fold
+# docs/graph/REFOLD.md -- prims -> aten refold, and the conv+BatchNorm fold
 # ---------------------------------------------------------------------------
 #
 # Both passes live in the vendored tree (`torchnative.export.refold` and
@@ -27418,7 +27418,7 @@ except R.RefoldRefused as error:
 out["broadcast_best_effort"] = [
     n["op"] for n in R.refold(bcast, best_effort=True)[0].nodes
 ]
-# ... and the control docs/PRIMS.md §1 keeps: expand cannot do it.
+# ... and the control docs/kernels/PRIMS.md §1 keeps: expand cannot do it.
 try:
     torch._C._aten_dispatch("aten.expand.default", torch.ones(3), [3, 2])
     out["expand_control"] = "ACCEPTED"
@@ -27517,7 +27517,7 @@ for name, (module, inputs) in models.items():
 out["models"] = per_model
 
 # -- 5. the batch-norm affine is upstream's fused one, bit for bit ---------
-# docs/DEMAND1.md §5: the algebraically identical unfused form is *exact*
+# docs/architectures/DEMAND1.md §5: the algebraically identical unfused form is *exact*
 # where upstream is not, and therefore disagrees with it. Both are measured
 # here on the same numbers; the fused one must agree exactly and the obvious
 # one must not, or `batch_norm_affine` has been quietly swapped for the wrong
@@ -27543,7 +27543,7 @@ out["affine"] = {
     "fused_max_abs_diff": float((fused_affine - reference).abs().max()),
     "obvious_max_abs_diff": float((obvious - reference).abs().max()),
 }
-# And the cancellation case docs/DEMAND1.md §5 found it on: a constant
+# And the cancellation case docs/architectures/DEMAND1.md §5 found it on: a constant
 # channel, where beta = bias - mean*alpha subtracts two nearly equal numbers.
 const_x = torch.full((1, 1, 2, 2), 632.0)
 const_mean = torch.tensor([632.0])
@@ -27600,7 +27600,7 @@ refusals["transposed"] = len(
 out["refusals"] = refusals
 
 # -- 7. the deliverable: a whole model inside NNAPI's set, serialised ------
-# docs/NPU.md §7 measured this network at one unmapped op before lowering
+# docs/graph/NPU.md §7 measured this network at one unmapped op before lowering
 # (native_batch_norm) and ten after. With the fold it is zero, and the blob
 # upstream's serialiser writes for it decodes.
 net = torch.nn.Sequential(
@@ -27633,7 +27633,7 @@ out["whole"]["pairs"] = len(pairs)
 out["whole"]["outside_before_folding"] = sorted(
     {n["op"] for n in fused_whole.nodes} - supported
 )
-# `aten.t` over a constant weight is the one docs/NPU.md §5 is about: the
+# `aten.t` over a constant weight is the one docs/graph/NPU.md §5 is about: the
 # recorded graph is unserialisable while the graph it denotes is not, and
 # constant folding is part of the serialisation path rather than an
 # optimisation on top of it.
@@ -27666,7 +27666,7 @@ def test_the_refold_goes_prims_to_aten_because_the_other_direction_is_partial():
 
     `prims.transpose` takes a full permutation, as `aten.permute` does, but it
     validates it first: `[-1, 0]` raises where `aten.permute` computes
-    (docs/PRIMS.md §1). So every permutation prims accepts, permute accepts and
+    (docs/kernels/PRIMS.md §1). So every permutation prims accepts, permute accepts and
     computes identically -- prims -> aten is total -- while aten -> prims is
     partial and would turn a working graph into a raise on an argument real
     graphs produce.
@@ -27694,7 +27694,7 @@ def test_every_refold_table_entry_computes_the_same_value_as_the_prim():
     """Per entry, not once for the table.
 
     Nine of the thirteen prims are the aten kernel under another key, and it is
-    tempting to prove that by pointing at docs/PRIMS.md. The four with their own
+    tempting to prove that by pointing at docs/kernels/PRIMS.md. The four with their own
     kernels are the reason not to: three of them mean something *different* from
     the aten op of the same name, so `prims.transpose` -> `aten.transpose.int`
     would be a plausible-looking rewrite that computes something else. So each
@@ -27758,7 +27758,7 @@ def test_a_prim_with_no_aten_spelling_is_refused_by_name():
 
 
 def test_the_refold_recovers_vits_regression_and_claims_nothing_more():
-    """The number docs/PRIMS.md §3 reported going the wrong way, and the two
+    """The number docs/kernels/PRIMS.md §3 reported going the wrong way, and the two
     that do not move.
 
     `vit` under the union table lowers to 11 ops outside NNAPI where the
@@ -27790,7 +27790,7 @@ def test_the_refold_recovers_vits_regression_and_claims_nothing_more():
     mobile = models["mobilenet_v2"]
     assert mobile["union"]["outside_lowered"] == 6, mobile["union"]
     assert mobile["union"]["outside_refolded"] == 6, (
-        "mobilenet_v2 was reported as improved by the refold; docs/REFOLD.md "
+        "mobilenet_v2 was reported as improved by the refold; docs/graph/REFOLD.md "
         "says it is not, and the two must not drift apart: " + repr(mobile)
     )
     assert mobile["union"]["refolded"], mobile["union"]
@@ -27826,7 +27826,7 @@ def test_the_refold_is_a_respelling_and_replays_bit_for_bit():
 
 
 def test_the_batch_norm_affine_this_fold_uses_is_upstreams():
-    """docs/DEMAND1.md §5's defect, re-armed as a check on the fold.
+    """docs/architectures/DEMAND1.md §5's defect, re-armed as a check on the fold.
 
     Upstream's inference batch norm applies a *fused* affine,
     `alpha = invstd*w`, `beta = b - mean*alpha`, `out = x*alpha + beta`, whose
@@ -27883,7 +27883,7 @@ def test_the_batch_norm_fold_refuses_where_the_algebra_does_not_hold():
     assert refusals["conv_used_twice"] == 0, refusals
     assert refusals["transposed"] == 0, refusals
     # A training-mode batch norm mutates its running statistics, and
-    # docs/CAPTURE.md §4 refuses mutation, so capture may refuse before the
+    # docs/graph/CAPTURE.md §4 refuses mutation, so capture may refuse before the
     # fold is ever asked. Either outcome is a refusal; folding is not.
     assert refusals["training_mode"] in (0,) or isinstance(
         refusals["training_mode"], str
@@ -27891,12 +27891,12 @@ def test_the_batch_norm_fold_refuses_where_the_algebra_does_not_hold():
 
 
 def test_folding_batch_norm_into_conv_takes_mobilenet_to_one_op_outside():
-    """docs/NPU.md §7's "two ops away", now one -- and the one is named.
+    """docs/graph/NPU.md §7's "two ops away", now one -- and the one is named.
 
     `mobilenet_v2` records 203 nodes with two ops NNAPI's serialiser has no
     calling convention for: `native_batch_norm` and `constant_pad_nd`. The fold
     removes the first by fusing **52** conv+BN pairs, taking the graph to 151
-    nodes. `constant_pad_nd` remains, and docs/REFOLD.md §5 says exactly why it
+    nodes. `constant_pad_nd` remains, and docs/graph/REFOLD.md §5 says exactly why it
     is not the same kind of problem.
 
     The count is asserted rather than the direction: a fold that quietly stopped
@@ -27933,7 +27933,7 @@ def test_a_whole_model_now_lowers_with_nothing_outside_nnapis_set():
     """The bar this round was set at, and the negative control beside it.
 
     `Conv -> BatchNorm -> ReLU -> Conv -> ReLU6 -> AvgPool -> Linear -> Softmax`
-    is the network docs/NPU.md §7 measured at one unmapped op before lowering
+    is the network docs/graph/NPU.md §7 measured at one unmapped op before lowering
     and ten after. Unfused, `serialize` refuses it **by name**. Fused, nothing
     is outside `nnapi.supported_ops()`, upstream's serialiser writes a blob, the
     blob decodes through the layout it was written in, and every operand shape
@@ -27955,7 +27955,7 @@ def test_a_whole_model_now_lowers_with_nothing_outside_nnapis_set():
     assert "native_batch_norm" in whole["unfused_serialises"], whole
     assert whole["pairs"] == 1, whole["pairs"]
     # Before constant folding the only thing left is `aten.t` over the linear
-    # layer's weight, which docs/NPU.md §5 already established is folded rather
+    # layer's weight, which docs/graph/NPU.md §5 already established is folded rather
     # than serialised. The batch norm is gone, and that is this round's work.
     assert whole["outside_before_folding"] == ["aten.t.default"], whole
     assert whole["outside"] == [], whole["outside"]
@@ -27972,7 +27972,7 @@ def test_a_whole_model_now_lowers_with_nothing_outside_nnapis_set():
 
 
 
-# --- torch.compile refuses by name (docs/COMPILE.md) ------------------------
+# --- torch.compile refuses by name (docs/graph/COMPILE.md) ------------------------
 
 
 _COMPILE_REFUSAL_SCRIPT = r"""
@@ -28025,7 +28025,7 @@ print(json.dumps(out))
 
 
 def test_torch_compile_refuses_by_name_without_breaking_transformers():
-    """docs/COMPILE.md's §5.1 refusal, and the carve-out that keeps it usable.
+    """docs/graph/COMPILE.md's §5.1 refusal, and the carve-out that keeps it usable.
 
     Two assertions, and the second is the one that matters. `torch.compile`
     refusing is easy; refusing *only* when something tries to install a hook is
@@ -28065,7 +28065,7 @@ def test_torch_compile_refuses_by_name_without_breaking_transformers():
     # missing symbols. Asserted only as "raises", because pinning *which*
     # symbol would make this test a tripwire on unrelated stubbing work. What
     # matters is that it does not silently return a compiled-looking function:
-    # docs/COMPILE.md measured that outcome with five stubs in place, and the
+    # docs/graph/COMPILE.md measured that outcome with five stubs in place, and the
     # guard above is why it can no longer happen.
     assert r["compile"] != "RETURNED -- no exception", r["compile"]
 
@@ -28078,7 +28078,7 @@ def test_torch_compile_refuses_by_name_without_breaking_transformers():
 def test_the_arch_sweep_classifier_maps_real_refusals_to_the_operator_they_name():
     """`arch_sweep.py`'s classifier, checked against refusal texts it must sort.
 
-    docs/ARCH100.md's ranked list is produced by parsing refusal messages, so the
+    docs/architectures/ARCH100.md's ranked list is produced by parsing refusal messages, so the
     number it reports is only as good as this classifier. The sweep itself is not
     in this suite -- it constructs 528 models and takes minutes -- but the
     classifier is pure text and there is no reason to leave it unchecked.
@@ -28128,7 +28128,7 @@ def test_the_arch_sweep_classifier_maps_real_refusals_to_the_operator_they_name(
     for text, want_kind, want_op in cases:
         kind, op = arch_sweep.classify(text)
         assert (kind, op) == (want_kind, want_op), (
-            "the classifier that produces docs/ARCH100.md's ranking sorted\n"
+            "the classifier that produces docs/architectures/ARCH100.md's ranking sorted\n"
             f"  {text!r}\n"
             f"as {(kind, op)}, expected {(want_kind, want_op)}"
         )
@@ -28143,9 +28143,9 @@ def test_the_arch_sweep_classifier_maps_real_refusals_to_the_operator_they_name(
 
 
 
-# --- docs/VOICE.md: the four spellings the speech round added ---------------
+# --- docs/architectures/VOICE.md: the four spellings the speech round added ---------------
 #
-# docs/REACH.md shape 3 -- a kernel that golden compares but nothing spells is
+# docs/bindings/REACH.md shape 3 -- a kernel that golden compares but nothing spells is
 # reachable only by `_aten_dispatch`, and the voicestudio models reach these
 # four by name (`torch.hann_window` in four of the five `__init__`s,
 # `torch.sinc` in BigVGAN's resampler, `torch.clip` in Vocos, `torch.cumprod`

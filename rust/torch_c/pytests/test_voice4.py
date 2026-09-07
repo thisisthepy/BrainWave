@@ -1,4 +1,4 @@
-"""docs/VOICE4.md -- the first voicestudio model run end to end, and the wall
+"""docs/architectures/VOICE4.md -- the first voicestudio model run end to end, and the wall
 that a coverage list structurally could not see.
 
 Seven rounds of `docs/VOICE*.md` closed operators that speech models *tripped
@@ -32,7 +32,7 @@ wrong in a way its own method guaranteed:
     this model specifically (`replication_pad1d`, `kaiser_window.beta`, `sinc`,
     `convolution`), so truncating it fails rather than passes.
 
-  * **The tolerance is not a choice.** docs/AGREE.md derives its number from
+  * **The tolerance is not a choice.** docs/numerics/AGREE.md derives its number from
     upstream's own float32-vs-float64 error, and so does this one: upstream
     BigVGAN disagrees with *itself* across those two dtypes by **6.78e-05
     relative** on the waveform, which is ~57x the 1.186e-06 that AGREE.md's
@@ -47,7 +47,7 @@ under `TorchDispatchMode`; `voice4_capture.py` regenerates it.
 
 The replay under the shim needs the vendored tree *and* a converted checkpoint,
 neither of which is hermetic, so it is behind `TORCH_C_VOICE4_ASSETS` and skips
-loudly rather than silently passing when they are absent. docs/VOICE4.md §5 is
+loudly rather than silently passing when they are absent. docs/architectures/VOICE4.md §5 is
 what it measured when it was run by hand.
 """
 
@@ -87,9 +87,9 @@ _ORACLE_FACTOR = 4.0
 #
 #   replication_pad1d   the anti-aliased activation pads by replication before
 #                       every upsample and every downsample -- 218 calls. It was
-#                       docs/VOICE.md rank 13, open at that round.
+#                       docs/architectures/VOICE.md rank 13, open at that round.
 #   kaiser_window.beta  the resampling filters are built in __init__ from a
-#                       Kaiser window; docs/VOICE3.md §2.1 landed it and this is
+#                       Kaiser window; docs/architectures/VOICE3.md §2.1 landed it and this is
 #                       the model that asked for it.
 #   sinc                the other half of that filter (VOICE.md rank 6).
 #   convolution         the generator IS a convolution stack; 334 calls, both
@@ -130,7 +130,7 @@ def test_bigvgan_construction_needs_no_operator_this_shim_lacks():
     missing = sorted(op for op in manifest["construction_ops"] if op not in implemented)
     assert not missing, (
         "BigVGAN's __init__ dispatches operators this build does not implement: "
-        f"{missing}. Construction blocked three of docs/VOICE.md's five models, "
+        f"{missing}. Construction blocked three of docs/architectures/VOICE.md's five models, "
         "so this half is not a formality."
     )
 
@@ -198,10 +198,10 @@ def test_the_tolerance_is_read_off_upstreams_own_error_not_chosen():
     # `_ORACLE_FACTOR * oracle`, so it holds for any factor whatsoever. That was
     # found by nullification: setting `_ORACLE_FACTOR = 400.0` left this whole
     # file green, the end-to-end replay included, because a 100x wider tolerance
-    # still accepts a correct answer. docs/VOICE4.md §6 records it as the one
+    # still accepts a correct answer. docs/architectures/VOICE4.md §6 records it as the one
     # nullification the round's first draft did not catch.
     #
-    # So the factor is pinned to the value docs/AGREE.md §2 derived and cited.
+    # So the factor is pinned to the value docs/numerics/AGREE.md §2 derived and cited.
     # Widening it is now an edit to this assertion, which is a visible act,
     # rather than an edit to a constant nobody checks.
     assert _ORACLE_FACTOR == 4.0, (
@@ -242,14 +242,14 @@ def test_the_tolerance_would_actually_reject_a_wrong_waveform():
 
 def test_the_manifest_says_which_checkpoint_and_which_upstream_it_came_from():
     """A measurement whose provenance is not recorded cannot be reproduced or
-    contradicted. docs/AGREE.md's own opening caveat is that its numbers are a
+    contradicted. docs/numerics/AGREE.md's own opening caveat is that its numbers are a
     snapshot of one checkout; this manifest carries the equivalent."""
     manifest = _manifest()
     assert manifest["checkpoint"] == "nvidia/bigvgan_v2_24khz_100band_256x"
     assert manifest["num_parameters"] == 112414512
     assert manifest["upstream_torch"] == "2.13.0"
     assert manifest["model"] == "voicestudio.models.bigvgan.BigVGANModel"
-    # Real weights, not from_config: docs/VOICE.md §2.1 is explicit that the two
+    # Real weights, not from_config: docs/architectures/VOICE.md §2.1 is explicit that the two
     # are different claims, and four of its five models could only make the
     # weaker one.
     assert manifest["mel_shape"] == [1, 100, 93]
@@ -264,7 +264,7 @@ def test_the_generated_waveform_is_speech_scaled_and_not_silence_or_clipping():
     """The vocoder's output is bounded by a tanh, so `absmax` near 1.0 would mean
     it is clipping and near 0.0 would mean it produced silence -- either of which
     a relative-error comparison against an equally degenerate reference would
-    happily call agreement. docs/AGREE.md excludes `degenerate` outputs from its
+    happily call agreement. docs/numerics/AGREE.md excludes `degenerate` outputs from its
     denominator for exactly this reason; this asserts the case does not need
     excluding."""
     manifest = _manifest()
@@ -279,10 +279,10 @@ def test_bigvgan_replays_under_the_shim_and_agrees_with_upstream():
     """The end-to-end replay. Needs the vendored tree (`install_shim.sh`) and a
     converted checkpoint plus the captured mel, which are not hermetic -- so it
     is opt-in through `TORCH_C_VOICE4_ASSETS` and says why it skipped instead of
-    passing quietly. docs/VOICE4.md §5 records the run."""
+    passing quietly. docs/architectures/VOICE4.md §5 records the run."""
     assets = os.environ.get("TORCH_C_VOICE4_ASSETS")
     if not assets:
-        print("   (skipped: TORCH_C_VOICE4_ASSETS is not set -- see docs/VOICE4.md §5)")
+        print("   (skipped: TORCH_C_VOICE4_ASSETS is not set -- see docs/architectures/VOICE4.md §5)")
         return
     if not os.path.isfile(_VENDOR_SHIM):
         print("   (skipped: vendored tree has no _C.abi3.so)")
@@ -293,7 +293,7 @@ def test_bigvgan_replays_under_the_shim_and_agrees_with_upstream():
     # The mel arrives as JSON rather than through `numpy.load`, because
     # `torch.from_numpy` is itself not implemented in the shim -- the first wall
     # this replay hit, and one that belongs to the harness rather than to
-    # BigVGAN (docs/VOICE4.md §4). Loading it the other way keeps the thing
+    # BigVGAN (docs/architectures/VOICE4.md §4). Loading it the other way keeps the thing
     # under test the model.
     script = r"""
 import json, os, sys
@@ -340,7 +340,7 @@ json.dump({"_marker": marker, "audio": audio.reshape(-1).tolist()}, sys.stdout)
 
 # --------------------------------------------------------------------------
 # The two meta kernels this round landed, each against upstream's own meta
-# answer. docs/VOICE4.md §4.
+# answer. docs/architectures/VOICE4.md §4.
 #
 # These are NOT new operators: `aten.sum.default` and `aten.view.default` have
 # had dense kernels and golden cases for a long time. What was missing was

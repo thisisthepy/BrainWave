@@ -1,16 +1,16 @@
-"""`reflection_pad{1,2,3}d` / `replication_pad{1,2,3}d` -- docs/PAD.md.
+"""`reflection_pad{1,2,3}d` / `replication_pad{1,2,3}d` -- docs/kernels/PAD.md.
 
 The op that sits in front of the speech roadmap from two directions.
-docs/COMPLEX.md §5 measured that `torch.stft` raises the *identical* error for
+docs/kernels/COMPLEX.md §5 measured that `torch.stft` raises the *identical* error for
 `return_complex=True` and `return_complex=False`, before any transform, because
 `stft` reflect-pads by `n_fft // 2` when `center=True`. Independently,
-docs/VOICE.md §1 ranks `F.pad(mode="reflect")` as blocking four of its five
+docs/architectures/VOICE.md §1 ranks `F.pad(mode="reflect")` as blocking four of its five
 speech models and `mode="replicate"` a fifth case. Neither has anything to do
 with complex numbers.
 
 These tests go through `_C._aten_dispatch`, the same door `test_shim.py` uses,
 because `torch._C._nn.pad` is a `bootstrap.py::_install_nn` composite and
-`bootstrap.py` was another agent's file this round -- see docs/PAD.md §5 for
+`bootstrap.py` was another agent's file this round -- see docs/kernels/PAD.md §5 for
 the exact patch that makes `F.pad` reach these kernels.
 
 What is pinned here, all of it measured against upstream 2.13.0 rather than
@@ -277,7 +277,7 @@ def test_pad2d_equals_padding_the_last_axis_then_the_one_before():
 def test_the_stft_pad_shape():
     """What `torch.stft(signal, n_fft=64, center=True)` asks for: a reflect
     pad of `n_fft // 2` on a signal `view`ed up to `(1, 1, L)`.
-    docs/PAD.md §4 -- this is the call that used to be `torch.stft`'s first
+    docs/kernels/PAD.md §4 -- this is the call that used to be `torch.stft`'s first
     wall, and the wall is now the FFT behind it."""
     n_fft, length = 64, 400
     sig = _C._aten_dispatch("aten.arange.start_step", 0, length, 1)
@@ -294,9 +294,9 @@ def test_the_stft_pad_shape():
 
 
 # --------------------------------------------------------------------------
-# aten.rms_norm.default -- docs/VOICE.md rank 16 (f5), taken in the same round
+# aten.rms_norm.default -- docs/architectures/VOICE.md rank 16 (f5), taken in the same round
 # because it is real-valued and independent of the complex question.
-# docs/PAD.md §8.
+# docs/kernels/PAD.md §8.
 # --------------------------------------------------------------------------
 
 def _rms(x, ns, weight=None, eps=None):
@@ -332,7 +332,7 @@ def test_rms_norm_eps_is_inside_the_square_root():
 
 
 def test_the_default_eps_is_the_accumulation_dtypes_epsilon_not_the_inputs():
-    """docs/PAD.md §8's measured trap.
+    """docs/kernels/PAD.md §8's measured trap.
 
     For a float16 input upstream uses `finfo(float32).eps` (1.19e-07), not
     `finfo(float16).eps` (9.77e-04). The two agree to every printed digit on
@@ -430,7 +430,7 @@ def test_torch_rms_norm_reaches_its_kernel_in_the_vendored_tree():
     """The spelling, not the kernel.
 
     `tools/golden/compare.py` dispatches by key, so it cannot see whether any
-    Python name reaches the arm -- docs/REACH.md §1's shape 3, which has bitten
+    Python name reaches the arm -- docs/bindings/REACH.md §1's shape 3, which has bitten
     four times. `torch.rms_norm` exists upstream, so unlike this round's six
     padding kernels it gets a real `overloads.json` row rather than an
     allowlist entry, and this is what proves the row resolves.

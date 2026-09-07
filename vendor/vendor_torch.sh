@@ -84,7 +84,7 @@ rsync -a --delete \
 # It stops being invisible the moment the tree is packaged into a wheel and put
 # on a machine that has no upstream torch: `torch/nn/modules/module.py:17` ->
 # `torch/utils/_python_dispatch.py:13` -> `import torchgen`, and the import dies
-# 2254 lines into `torch/__init__.py`. Recorded in docs/WHEEL.md.
+# 2254 lines into `torch/__init__.py`. Recorded in docs/platform/WHEEL.md.
 #
 # Read from top_level.txt rather than hard-coded so an upstream bump that adds
 # or drops a sibling is followed, not silently missed the same way.

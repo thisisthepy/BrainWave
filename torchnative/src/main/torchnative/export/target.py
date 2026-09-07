@@ -5,7 +5,7 @@ ExecuTorch's Edge dialect is defined over. The device column of the README
 lists NNAPI and CoreML unsupported for a different reason: each takes a graph
 of its *own* small fixed operator set, and neither set is Core ATen.
 
-Measured, not assumed (docs/DECOMP.md §12). Of the 29 `aten::` ops NNAPI's
+Measured, not assumed (docs/graph/DECOMP.md §12). Of the 29 `aten::` ops NNAPI's
 in-tree serializer can actually emit:
 
     14 are also Core ATen          add addmm avg_pool2d cat div hardtanh mean
@@ -95,7 +95,7 @@ def full_decomposition_table() -> dict[str, Any]:
 
     Measured on this build: core table 386 entries, post-autograd table 1008.
     Of the ops real captured graphs hit that NNAPI lacks, the core table has a
-    rule for 5 and the post-autograd table for 22. docs/DECOMP.md §12 carries
+    rule for 5 and the post-autograd table for 22. docs/graph/DECOMP.md §12 carries
     the per-op table.
 
     No rule is written here either. This is a different *view of upstream's own
@@ -152,7 +152,7 @@ def coreml_ops() -> frozenset[str]:
     This function raises rather than returning a plausible list, because a
     hand-written CoreML set would decide the answer to "how many ops need
     decomposing for CoreML" by the act of writing it, and that answer would
-    then be reported as a measurement. docs/DECOMP.md §12 records the CoreML
+    then be reported as a measurement. docs/graph/DECOMP.md §12 records the CoreML
     number as *not measured* for exactly this reason.
     """
     raise NotImplementedError(

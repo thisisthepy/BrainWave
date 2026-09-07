@@ -1,14 +1,14 @@
 """The complex-number wall, asserted from both sides.
 
-`docs/COMPLEX.md` is the round; this file is the part of it that fails when
-something changes. Four names in the `docs/ARCH100.md` tail --
+`docs/kernels/COMPLEX.md` is the round; this file is the part of it that fails when
+something changes. Four names in the `docs/architectures/ARCH100.md` tail --
 `view_as_complex` (`llama4`, at construction), `polar` (`llama4_text`),
 `fft_fftn` (`fnet`) and the `torch.stft` a concurrent speech round wants -- are
 one question: **can this shim hold a complex tensor at all?**
 
 The measured answer is no, and the reason is one level below this repository:
 `candle_core::DType` has no complex variant, and unlike `torch.int8`
-(docs/INT8.md) it cannot get one without relaxing `WithDType`'s `PartialOrd`
+(docs/numerics/INT8.md) it cannot get one without relaxing `WithDType`'s `PartialOrd`
 bound, which every comparison and reduction kernel in candle is generic over.
 COMPLEX.md §2 sizes that.
 
@@ -17,7 +17,7 @@ directions:
 
 1.  **The refusal is correct today, and must stay correct.** A complex tensor
     that silently loses its imaginary part still returns plausible numbers --
-    it is the failure mode that survives a smoke test, and `docs/VULKAN2.md`
+    it is the failure mode that survives a smoke test, and `docs/devices/VULKAN2.md`
     set the standard that the wrong-answer path be *unrepresentable* rather
     than merely unused. `TorchDType` already carries `Complex32/64/128` tags
     whose `storage()` is `None`, so construction refuses by name. The tests
@@ -140,7 +140,7 @@ PROBES = {
     "polar": lambda: torch.polar(torch.ones(2), torch.zeros(2)),
     "zeros_complex64": lambda: torch.zeros(2, dtype=torch.complex64),
     "empty_complex64": lambda: torch.empty(2, dtype=torch.complex64),
-    # Reports the DC term, not just a shape: docs/FFT.md's `normalization` is a
+    # Reports the DC term, not just a shape: docs/kernels/FFT.md's `normalization` is a
     # code rather than a `norm=` string and the same codes serve both
     # directions, so a wrong reading scales every bin uniformly -- which a
     # shape check cannot see. `arange(8)` sums to 28.
@@ -171,17 +171,17 @@ for name, fn in PROBES.items():
         out[name] = {"raised": type(e).__name__, "msg": str(e)}
     else:
         # NOT `repr(r)`. Once `view_as_complex` started returning a tensor
-        # (docs/COMPLEX2.md), `repr` of it reached `torch/_tensor_str.py`,
+        # (docs/kernels/COMPLEX2.md), `repr` of it reached `torch/_tensor_str.py`,
         # which calls `self.resolve_conj()` for every complex tensor -- and
         # that is not implemented, so formatting the *success* of one probe
         # crashed the whole script and reported every other probe as a
         # failure to run. A probe that cannot survive its own subject
         # succeeding is not a probe. Recorded as a live gap in
-        # docs/COMPLEX2.md §7: `print(z)` on a complex tensor still refuses.
+        # docs/kernels/COMPLEX2.md §7: `print(z)` on a complex tensor still refuses.
         # A dict result is a probe that reports values on purpose; anything
         # else gets the type-and-shape string. `repr` is deliberately not used:
         # once `view_as_complex` began returning a tensor it reached
-        # `torch/_tensor_str.py` and refused (docs/COMPLEX2.md).
+        # `torch/_tensor_str.py` and refused (docs/kernels/COMPLEX2.md).
         out[name] = {"ok": r if isinstance(r, dict)
                      else f"{type(r).__name__}{tuple(getattr(r, 'shape', ()))}"}
 json.dump(out, sys.stdout)
@@ -195,7 +195,7 @@ def _probe():
 
     Returns `None` when the vendored shim is not installed -- the same silent
     skip `test_shim.py`'s checkpoint section uses, and for the same reason
-    (docs/E2E.md): `pytests/run.sh` builds the *standalone* `_C`, while this
+    (docs/models/E2E.md): `pytests/run.sh` builds the *standalone* `_C`, while this
     needs the one `vendor/install_shim.sh` writes into the tree.
     """
     if "r" in _probe_cache:
@@ -345,7 +345,7 @@ def test_constructing_a_complex_tensor_refuses_by_name():
 
 
 def test_view_as_complex_and_polar_compute_against_the_recorded_spec():
-    """`llama4` and `llama4_text`'s walls, **now closed** (docs/COMPLEX2.md).
+    """`llama4` and `llama4_text`'s walls, **now closed** (docs/kernels/COMPLEX2.md).
 
     This test asserted the *absence* of these three operators, exactly as this
     module's docstring says such tests should: a work item that goes red when
@@ -368,7 +368,7 @@ def test_view_as_complex_and_polar_compute_against_the_recorded_spec():
     for label in ("view_as_complex", "polar"):
         r = p[label]
         assert "ok" in r, (
-            f"torch.{label} refused after docs/COMPLEX2.md landed it: {r}"
+            f"torch.{label} refused after docs/kernels/COMPLEX2.md landed it: {r}"
         )
     # `view_as_real` is the third op and its probe passes a *real* tensor, so
     # it still raises -- and must, with upstream's own sentence. That is a
@@ -424,7 +424,7 @@ def test_view_as_complex_copies_rather_than_aliasing():
     assert got["through"] == 1.0, (
         f"the shim's view_as_complex now aliases its base (saw "
         f"{got['through']}). That matches upstream and is an improvement, but "
-        f"docs/COMPLEX2.md records the copy as a narrowing -- remove it there "
+        f"docs/kernels/COMPLEX2.md records the copy as a narrowing -- remove it there "
         f"first."
     )
 
@@ -435,19 +435,19 @@ def test_stft_and_fft_fftn_both_compute_now():
     The sequence is the record and it is why this test was never deleted:
 
       1. `stft` refused at `_nn.pad(mode='reflect')`, before any complex value
-         existed -- `docs/COMPLEX.md`'s reason for ordering reflect pad first.
-      2. `docs/BIND2.md` gave the pad its kernel; the wall moved one line, to
+         existed -- `docs/kernels/COMPLEX.md`'s reason for ordering reflect pad first.
+      2. `docs/bindings/BIND2.md` gave the pad its kernel; the wall moved one line, to
          `stft`'s own missing table row.
-      3. `docs/FFT.md` implemented the transform; `stft` computed, and this
+      3. `docs/kernels/FFT.md` implemented the transform; `stft` computed, and this
          test kept asserting `fft_fftn`'s absence, which was still true.
-      4. `docs/BIND4.md` bound `_fft.fft_fftn` and `docs/COMPLEX3.md` taught
+      4. `docs/bindings/BIND4.md` bound `_fft.fft_fftn` and `docs/kernels/COMPLEX3.md` taught
          `_to_copy(complex64)`. **Neither alone was enough** -- BIND4 measured
          `fnet` stopping *inside* `fft_fftn` at the `_to_copy` gate, and said
          it should clear once the two met. It did, on this merge.
 
     So what is asserted is the values, and specifically the DC term, because a
     transform that returns the right shape and the wrong normalisation is the
-    plausible failure `docs/FFT.md` warned about: `normalization` is a code,
+    plausible failure `docs/kernels/FFT.md` warned about: `normalization` is a code,
     not a `norm=` string, and the same three codes serve both directions, so a
     shim reading it as a string is right forward and wrong by `n` inverse.
     `fftn` of `arange(8)` has DC equal to the sum, 28.
@@ -496,7 +496,7 @@ def test_linalg_norm_binding_landed_on_the_kernel_that_was_already_there():
     """OWL-ViT's wall (`owlv2`, `owlvit`). This test used to pin the *gap* --
     the kernel present, the name unreachable, COMPLEX.md §6 naming the install
     site -- and said in its own message that when the binding landed it should
-    become an element-wise comparison instead. It has landed (docs/BINDINGS.md),
+    become an element-wise comparison instead. It has landed (docs/bindings/BINDINGS.md),
     so this is the other half: the kernel is still what the binding is built
     on, and the binding computes rather than raising.
 
@@ -519,7 +519,7 @@ def test_linalg_norm_binding_landed_on_the_kernel_that_was_already_there():
     # `ones(2, 2)` flattens to four ones, so the 2-norm is exactly 2.
     # The probe records a type-and-shape string, not `repr(r)` -- once
     # `view_as_complex` began returning a tensor, `repr` reached
-    # `torch/_tensor_str.py` and refused (docs/COMPLEX2.md). So the *value*
+    # `torch/_tensor_str.py` and refused (docs/kernels/COMPLEX2.md). So the *value*
     # is asserted here directly rather than looked for in that string, which
     # is the stronger check anyway: `linalg_norm(ones(2, 2))` is the Frobenius
     # norm of four ones, and 2.0 is the one number a correct binding gives.
@@ -647,7 +647,7 @@ def test_only_the_expected_complex_ops_landed():
         "aten.view_as_complex.default",
         "aten.view_as_real.default",
     ]
-    # **Inverted by docs/FFT.md**, which is what this file's docstring asks an
+    # **Inverted by docs/kernels/FFT.md**, which is what this file's docstring asks an
     # implementing round to do rather than delete the assertion. Three
     # `_fft_*` keys landed, all three parked for the same reason the five
     # above are: two of them return a complex tensor and one takes one, so a
@@ -663,9 +663,9 @@ def test_only_the_expected_complex_ops_landed():
         "result -- see aten.rs's note on IMPLEMENTED_AWAITING_GOLDEN"
     )
     # `aten.stft.*` IS advertised, and deliberately: its `return_complex=False`
-    # form is real on both sides (docs/FFT.md §3).
+    # form is real on both sides (docs/kernels/FFT.md §3).
     assert {"aten.stft.default", "aten.stft.center"} <= implemented
-    # Still nothing: docs/COMPLEX.md §3.3 step 5 (`fft_fftn`, for `fnet`) is a
+    # Still nothing: docs/kernels/COMPLEX.md §3.3 step 5 (`fft_fftn`, for `fnet`) is a
     # separate decision -- `_fft_r2c` takes a multi-axis `dim` here, which is
     # the arithmetic `fft_fftn` needs, but no `aten.fft_fftn.default` kernel
     # or spelling was added. §7 (vmap) is untouched.

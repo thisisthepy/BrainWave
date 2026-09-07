@@ -1,6 +1,6 @@
 """ExecuTorch's Qualcomm (QNN) backend, as a subgraph delegate behind an nn.Module.
 
-docs/QNN.md is this module's design record. The two decisions it exists to
+docs/devices/QNN.md is this module's design record. The two decisions it exists to
 implement, both taken before any code:
 
 **The lowering is upstream's and it happens offline.** `torch.export.export`,
@@ -8,7 +8,7 @@ implement, both taken before any code:
 run on a Linux x86-64 host with the Qualcomm AI Engine Direct SDK installed,
 under **upstream** torch and **upstream** executorch. torchnative is not in
 that process. What crosses the boundary is one file -- a `.pte` -- and this
-module's runtime half only loads it. That is deliberate: `docs/EXPORT5.md`
+module's runtime half only loads it. That is deliberate: `docs/graph/EXPORT5.md`
 measures torchnative's own `torch.export` at four hand-written modules and
 **zero** real architectures, and a design that put it on the critical path to
 an NPU would be betting the whole path on the weakest thing in the tree.
@@ -36,14 +36,14 @@ Measured, not assumed -- `probe()` re-measures it on every call:
 ## What this module will not claim
 
 Getting the right answer out of a `.pte` is **not** evidence that it ran on the
-HTP. docs/NPU2.md is this project's record of paying for that mistake twice:
-the CoreML models docs/NPU.md called "executed" had run on the CPU, and every
+HTP. docs/graph/NPU2.md is this project's record of paying for that mistake twice:
+the CoreML models docs/graph/NPU.md called "executed" had run on the CPU, and every
 NNAPI driver on the emulator was software. The results were correct either way.
 
 So the artefact reader below answers a narrower question than "did it run on
 the NPU" -- it answers **"could it have"**, by decoding, from upstream's own
 schema, which backend each delegated segment names and which SoC and HTP
-architecture its compile spec was built for. `docs/QNN.md` §6 is what would
+architecture its compile spec was built for. `docs/devices/QNN.md` §6 is what would
 have to be observed on a device for the wider claim, and §6.4 is why this round
 does not make it.
 """
@@ -84,7 +84,7 @@ class QnnRefused(RuntimeError):
     """This host, this artefact or this runtime cannot do what was asked.
 
     Always carries the name of the missing thing. A refusal that says only
-    "unsupported" sends the reader to the wrong place; docs/NPU.md §4 is the
+    "unsupported" sends the reader to the wrong place; docs/graph/NPU.md §4 is the
     precedent -- an op with no calling convention is *absent* and named, never
     approximated.
     """
@@ -136,7 +136,7 @@ def executorch_version():
         raise QnnRefused(
             "torchnative qnn: executorch is importable but reports no version "
             f"({type(exc).__name__}). Refusing rather than reporting 'unknown', "
-            "since every version-dependent statement in docs/QNN.md is keyed to "
+            "since every version-dependent statement in docs/devices/QNN.md is keyed to "
             "a number."
         ) from exc
 
@@ -149,7 +149,7 @@ def qnn_sdk_version():
     back to a literal otherwise; reading the resulting module attribute gets
     whichever one is true for the installed wheel. Transcribing the number here
     would go stale the first time ExecuTorch bumps it, which is the mistake
-    docs/DECOMP.md §12.6 named for operator lists and this is the same mistake
+    docs/graph/DECOMP.md §12.6 named for operator lists and this is the same mistake
     one size smaller.
     """
     mod = _import("executorch.backends.qualcomm.scripts.download_qnn_sdk")
@@ -204,7 +204,7 @@ def qnn_aot_refusal():
             "SDK ships host libraries under lib/x86_64-linux-clang only -- "
             "ExecuTorch's own installer gates on is_linux_x86(). Every one of "
             "the QNN op builders imports it at module scope, so the lowering "
-            "cannot start. Lower on a Linux x86-64 host; docs/QNN.md §3 is the "
+            "cannot start. Lower on a Linux x86-64 host; docs/devices/QNN.md §3 is the "
             "procedure."
         )
     try:
@@ -233,7 +233,7 @@ def soc_targets():
     lowering does not -- which is the point: a refusal that can list the SoCs
     it would have accepted is more useful than one that cannot.
 
-    docs/DECOMP.md §12.2 is the rule being followed. Copying twenty-three
+    docs/graph/DECOMP.md §12.2 is the rule being followed. Copying twenty-three
     chipset names into this file would make torchnative the authority on
     Qualcomm's part numbers, and it would be wrong the first time a part is
     added.
@@ -273,7 +273,7 @@ def resolve_soc(name):
     raise QnnRefused(
         f"torchnative qnn: {name!r} is not a SoC ExecuTorch's QNN backend "
         f"knows. Known: {known}. The name is read from the device's "
-        "`ro.soc.model` property (docs/QNN.md §5); if a real device reports "
+        "`ro.soc.model` property (docs/devices/QNN.md §5); if a real device reports "
         "one that is not on this list, the SDK and ExecuTorch both need to "
         "grow it and no lowering here can substitute."
     )
@@ -338,9 +338,9 @@ def compiler_spec(soc_model, fp16=True, profile_level=0, online_prepare=False):
     on this machine.
 
     `fp16` selects `kHtpFp16` over `kHtpQuantized`, and it is the single most
-    consequential argument in this file. docs/QNN.md §7: the HTP is not float32
+    consequential argument in this file. docs/devices/QNN.md §7: the HTP is not float32
     hardware, so a float32 numerical claim and an HTP execution claim exclude
-    each other exactly the way docs/NPU2.md §1.1 measured for the Neural
+    each other exactly the way docs/graph/NPU2.md §1.1 measured for the Neural
     Engine. `kHtpQuantized` needs a calibrated quantizer as well and is a
     different round.
     """
@@ -376,7 +376,7 @@ def lower(module, example_inputs, soc_model, out_path, fp16=True,
 
     `module` is an eager `nn.Module` and `example_inputs` a tuple of tensors;
     the exporter is `torch.export.export` and it is **upstream's**, not this
-    project's. docs/QNN.md §2 says where that boundary falls and why.
+    project's. docs/devices/QNN.md §2 says where that boundary falls and why.
     """
     refusal = qnn_aot_refusal()
     if refusal is not None:
@@ -392,7 +392,7 @@ def lower(module, example_inputs, soc_model, out_path, fp16=True,
     # :450). Exporting first and handing it the ExportedProgram raises
     # `Expected `mod` to be an instance of `torch.nn.Module``. Found by the
     # first CI run -- it cannot be found here, because `lower()` refuses on
-    # every host this project can reach (docs/QNN.md §1.3).
+    # every host this project can reach (docs/devices/QNN.md §1.3).
     module = module.eval()
     edge = utils.to_edge_transform_and_lower_to_qnn(
         module, tuple(example_inputs), specs
@@ -441,7 +441,7 @@ def lower_cpu_reference(module, example_inputs, out_path):
 def delegation_report(edge_manager):
     """How much of the graph the partitioner claimed. The AOT half of §6.
 
-    This is the number that catches the silent fallback docs/QNN.md §6.2 is
+    This is the number that catches the silent fallback docs/devices/QNN.md §6.2 is
     about. QNN does not fall back at *runtime* -- an HTP that cannot initialise
     aborts the load, loudly (§6.3). What it does silently is decline nodes at
     partition time: whatever `QnnPartitioner` did not tag stays in the program
@@ -503,11 +503,11 @@ class PteArtefact:
     schema -- `executorch.exir._serialize._deserialize_pte_binary` for the
     program and `qc_schema_serialize.flatbuffer_to_option` for the QNN compile
     spec. There is no second parser here that could agree with the first by
-    sharing a mistake, which is the same reason docs/NPU2.md §3.1 gives for
+    sharing a mistake, which is the same reason docs/graph/NPU2.md §3.1 gives for
     `nnapi_runner.c` being a replayer and not a converter.
 
     It answers **"could this have run on the HTP"**. It does not answer "did
-    it" -- nothing in a file can. docs/QNN.md §6.
+    it" -- nothing in a file can. docs/devices/QNN.md §6.
     """
 
     def __init__(self, path, program, methods, delegates):
@@ -583,7 +583,7 @@ class PteArtefact:
     def htp_plan(self):
         """`{backend_type, soc_model, htp_arch, precision}` for the first segment.
 
-        This is the artefact-level half of docs/QNN.md §6's evidence. Three of
+        This is the artefact-level half of docs/devices/QNN.md §6's evidence. Three of
         the four fields are what a silent fallback moves:
 
         * `backend_type` other than `htp` -- the compile spec asked for QNN's
@@ -645,7 +645,7 @@ def match_device(artefact, soc_name):
             f"artefact's backend_type is {plan['backend_type_name']}, not HTP. "
             "It will delegate, it will compute the right answer, and it will "
             "do so on QNN's CPU or GPU reference implementation. This is the "
-            "fallback that looks most like success (docs/QNN.md §6.2)."
+            "fallback that looks most like success (docs/devices/QNN.md §6.2)."
         )
     return True, (
         f"HTP v{have_arch}, backend_type {plan['backend_type_name']}, "
@@ -778,7 +778,7 @@ def _build_classes():
         * `QnnBackend` is not registered in this process's runtime -- so it
           could not be executed here even if it did.
 
-        Neither is deferred to the first `forward`. docs/QNN.md §6.2: an
+        Neither is deferred to the first `forward`. docs/devices/QNN.md §6.2: an
         artefact that quietly ran its CPU half is the failure this whole file
         is arranged against, and checking late means the model is already built
         and the caller already believes it.
@@ -800,7 +800,7 @@ def _build_classes():
                     f"{QNN_BACKEND_ID} delegate -- its backends are "
                     f"{list(artefact.backend_ids) or '(none)'}. Running it "
                     "would produce correct numbers off the CPU and no output "
-                    "would say so (docs/QNN.md §6.2)."
+                    "would say so (docs/devices/QNN.md §6.2)."
                 )
             #: What the compile spec asked the HTP for. See `PteArtefact.htp_plan`.
             self.plan = artefact.htp_plan()

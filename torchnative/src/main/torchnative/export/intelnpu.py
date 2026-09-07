@@ -1,13 +1,13 @@
 """Intel NPU (Core Ultra / AI Boost) reach-the-device layer.
 
-`docs/INTELNPU.md` is the design record. This module reaches the Intel NPU through
+`docs/devices/INTELNPU.md` is the design record. This module reaches the Intel NPU through
 the OpenVINO **C** API over `ctypes`, compiles a model for device `"NPU"`, runs it,
 and **asserts where it actually ran** by reading OpenVINO's own `EXECUTION_DEVICES`
 property back off the compiled model. The assertion, not the arithmetic, is the
 point --- see below.
 
 Why that assertion is the whole point. `intel_npu_acceleration_library`, whose
-source `docs/INTELNPU.md` §1 dissects, silently rewrites the target device in C++
+source `docs/devices/INTELNPU.md` §1 dissects, silently rewrites the target device in C++
 when the NPU is missing --- `inference.h:77-79`:
 
     if (!_isNPUAvailable(core)) {
@@ -16,13 +16,13 @@ when the NPU is missing --- `inference.h:77-79`:
     }
 
 and the Python side only calls `warnings.warn` about it (`backend/utils.py:56-60`).
-The answers stay correct, so nothing downstream notices. `docs/NPU2.md` records the
+The answers stay correct, so nothing downstream notices. `docs/graph/NPU2.md` records the
 CoreML round making exactly this mistake and only catching it by asking CoreML's own
 `MLComputePlan` which unit it picked. `EXECUTION_DEVICES` is this stack's equivalent
 question, and this module raises on the wrong answer instead of warning.
 
 Why the C API and not the C++ one, and not the archived library. Per
-`docs/INTELNPU.md` §1.1, the archived library's own extension links **only**
+`docs/devices/INTELNPU.md` §1.1, the archived library's own extension links **only**
 `openvino::runtime` --- no libtorch, no ATen, no `c10`, no `PyInit_`; it is a plain
 `extern "C"` DLL that Python loads with `ctypes` and feeds numpy pointers. That is
 what makes any of this hostable by torchnative at all, since torchnative replaces
@@ -51,7 +51,7 @@ the refusals at the bottom of this file.
 Where the claims in this file were measured. The IR, the C bindings, the weights
 blob, the inference and the numerics were all exercised against a real OpenVINO
 2026.3.1 --- on an arm64 Mac, for device `"CPU"`. What an Intel NPU machine adds
-is the string `"NPU"` coming back out of `EXECUTION_DEVICES`. docs/INTELNPU.md
+is the string `"NPU"` coming back out of `EXECUTION_DEVICES`. docs/devices/INTELNPU.md
 section 3.3 draws that line precisely and section 4 is the Windows procedure.
 """
 
@@ -187,7 +187,7 @@ def library_candidates(platform: str | None = None) -> tuple[str, ...]:
     raise IntelNPUUnavailable(
         f"torchnative intelnpu: platform {platform!r} has no Intel NPU path. The NPU "
         f"is reached through OpenVINO's NPU plugin, which Intel ships for Windows and "
-        f"Linux on x86-64 only -- see docs/INTELNPU.md section 1.3. The archived "
+        f"Linux on x86-64 only -- see docs/devices/INTELNPU.md section 1.3. The archived "
         f"intel_npu_acceleration_library draws the same line explicitly at "
         f"backend/bindings.py:56-59, refusing every sys.platform that is not 'win32' or "
         f"'linux'. This is not a missing feature; there is no such hardware here."
@@ -219,7 +219,7 @@ def verdict_execution_devices(devices, expect: str = "NPU") -> str:
 
     The second half matters. A ``HETERO:NPU,CPU`` compilation reports both, which
     means part of the graph runs on the CPU -- exactly the partial-offload case
-    `docs/NPU2.md` caught on the CoreML side, where results were right and the
+    `docs/graph/NPU2.md` caught on the CoreML side, where results were right and the
     Neural Engine was never touched. Accepting "NPU is in the list" would let that
     through.
     """
@@ -234,7 +234,7 @@ def verdict_execution_devices(devices, expect: str = "NPU") -> str:
         raise IntelNPUExecutionError(
             f"torchnative intelnpu: asked OpenVINO to compile for {expect!r}, but the "
             f"compiled model reports EXECUTION_DEVICES = {list(devices)!r}. This is the "
-            f"silent fallback described in docs/INTELNPU.md section 1.3 -- "
+            f"silent fallback described in docs/devices/INTELNPU.md section 1.3 -- "
             f"intel_npu_acceleration_library's inference.h:77-79 rewrites the device to "
             f"\"CPU\" when the NPU is absent and only warns. The results would still be "
             f"correct, which is why this has to be checked and not inferred."
@@ -244,7 +244,7 @@ def verdict_execution_devices(devices, expect: str = "NPU") -> str:
             f"torchnative intelnpu: compiled model reports EXECUTION_DEVICES = "
             f"{list(devices)!r}. {expect!r} is present but so is at least one other "
             f"device, meaning the graph is split and part of it runs elsewhere. "
-            f"docs/NPU2.md records a partial offload of exactly this kind going "
+            f"docs/graph/NPU2.md records a partial offload of exactly this kind going "
             f"unnoticed because the answers were still right. Refused."
         )
     return devices[0]
@@ -258,14 +258,14 @@ def minimal_ir(name: str = "torchnative_intelnpu_probe", size: int = 8) -> str:
     (ov_core.h:189-194) with a NULL weights tensor, which is legal because the graph
     has no constants.
 
-    f16 is deliberate. Per `docs/NPU2.md`, the CoreML round's models ran on the CPU
+    f16 is deliberate. Per `docs/graph/NPU2.md`, the CoreML round's models ran on the CPU
     precisely *because* they were compiled float32, and the Neural Engine is
     float16-only; the Intel NPU is likewise a low-precision engine, and asking it for
     f32 is a good way to get a compile-time redirect to the CPU and never notice.
 
     This document is **accepted by a real OpenVINO**: `test_the_hand_written_ir_is
     _accepted_by_a_real_openvino` reads it back through
-    `ov_core_read_model_from_memory_buffer` and compiles it. See docs/INTELNPU.md
+    `ov_core_read_model_from_memory_buffer` and compiles it. See docs/devices/INTELNPU.md
     section 3.3 for where that was measured and what it does and does not settle.
     """
     dims = f"<dim>1</dim><dim>{int(size)}</dim>"
@@ -324,7 +324,7 @@ def linear_ir(in_features: int, out_features: int, batch: int = 1, bias: bool = 
     The emitted shape was not written from the schema. It was **read off a
     reference document** that OpenVINO's own `ov.save_model` produced for this
     exact graph, and then checked back through `ov_core_read_model_from_memory_buffer`
-    -- docs/INTELNPU.md section 3.3.
+    -- docs/devices/INTELNPU.md section 3.3.
 
     Raises:
         IntelNPUUnsupported: for a dimension above `MAX_DIM`, by name.
@@ -337,7 +337,7 @@ def linear_ir(in_features: int, out_features: int, batch: int = 1, bias: bool = 
                 f"the same line at nn/linear.py:66 but *returns the torch layer "
                 f"unchanged*, which leaves it running on the CPU inside a model the "
                 f"caller believes is on the NPU. Refusing by name instead -- an "
-                f"unannounced CPU layer is the failure docs/NPU2.md is about."
+                f"unannounced CPU layer is the failure docs/graph/NPU2.md is about."
             )
         if int(value) < 1:
             raise IntelNPUUnsupported(
@@ -411,7 +411,7 @@ def pack_f16(values) -> bytes:
     Neither of those exists on torchnative's shim -- both raise
     `NotImplementedError`, measured in `test_the_shim_has_no_numpy_bridge_which_is
     _why_this_packs_bytes`. So the numpy boundary, not libtorch, is what would
-    actually stop that library from being hosted here (docs/INTELNPU.md section 1.5),
+    actually stop that library from being hosted here (docs/devices/INTELNPU.md section 1.5),
     and it is why this module crosses in bytes.
     """
     values = list(values)
@@ -495,7 +495,7 @@ def load_openvino_c(path: str | None = None) -> ctypes.CDLL:
             f"pinned 2024.4; any release with an NPU plugin will do) and either put "
             f"its bin directory on PATH / LD_LIBRARY_PATH, or set {LIBRARY_ENV} to the "
             f"full path of openvino_c.dll / libopenvino_c.so. On Windows the runtime "
-            f"also needs its sibling DLLs resolvable -- see docs/INTELNPU.md section 4."
+            f"also needs its sibling DLLs resolvable -- see docs/devices/INTELNPU.md section 4."
         )
 
     c_char_pp = ctypes.POINTER(ctypes.c_char_p)
@@ -785,7 +785,7 @@ def assert_execution_device(xml: str | None = None, expect: str = "NPU", path: s
     This is the single-question form, and on its own it is **not** enough to claim
     NPU execution: a device reading that never moves is not tracking the request,
     and a right device with a cached answer is not running anything. `probe()` is
-    the form with all four questions and their controls (docs/INTELNPU.md section
+    the form with all four questions and their controls (docs/devices/INTELNPU.md section
     3.2). Use this when you already have the controls elsewhere; use `probe()` to
     make the claim.
     """
@@ -835,7 +835,7 @@ def evidence(ov, device: str, control_device: str) -> dict:
     # 2. The same document compiled for the *other* device. A property that
     #    reports the same thing either way is not tracking the request, and the
     #    first reading would then be evidence of nothing. This is the direct
-    #    analogue of docs/NPU2.md section 2's third row.
+    #    analogue of docs/graph/NPU2.md section 2's third row.
     control = ov.compile_ir(xml, control_device)
     try:
         control_devices = ov.execution_devices(control)
@@ -843,7 +843,7 @@ def evidence(ov, device: str, control_device: str) -> dict:
         ov.free_compiled(control)
     out["execution_devices_control"] = list(control_devices)
 
-    # 3. Now run something. A compute plan is a statement of intent; docs/NPU2.md
+    # 3. Now run something. A compute plan is a statement of intent; docs/graph/NPU2.md
     #    is explicit that identical outputs are what an ignored plan would look
     #    like, so the arithmetic has to be shown too.
     rows, cols = 4, 3
@@ -901,7 +901,7 @@ def judge(bundle: dict, device: str, control_device: str, tolerance: float = 1e-
             f"reference by {agreement}, outside the f16 tolerance {tolerance}. The "
             f"device assignment is not the question here -- the arithmetic is wrong."
         )
-    # docs/NPU2.md section 3.5: a tolerance is only worth something if a wrong
+    # docs/graph/NPU2.md section 3.5: a tolerance is only worth something if a wrong
     # input fails it by a wide margin. That round's first attempt at this check
     # ran on a model so flat that feeding it an entirely different picture moved
     # the answer by less than a thousandth, and it would have passed on the
@@ -921,7 +921,7 @@ def judge(bundle: dict, device: str, control_device: str, tolerance: float = 1e-
             f"produced answers {control} apart, against an agreement of {agreement} "
             f"with the reference; this requires the gap to exceed {floor}. A device "
             f"returning a cached or constant answer looks exactly like this. Refusing "
-            f"to report the agreement as evidence (docs/NPU2.md section 3.5)."
+            f"to report the agreement as evidence (docs/graph/NPU2.md section 3.5)."
         )
     return {
         "verdict": device.lower(),
@@ -937,7 +937,7 @@ def probe(path: str | None = None, device: str = "NPU") -> dict:
     """Full evidence bundle plus verdict. The thing to run on the Intel NPU laptop.
 
     Returns a dict; raises `IntelNPUUnavailable` or `IntelNPUExecutionError` rather
-    than reporting a soft failure. docs/INTELNPU.md section 4 is what to read the
+    than reporting a soft failure. docs/devices/INTELNPU.md section 4 is what to read the
     output against, field by field, including what each way of failing means.
     """
     control_device = "CPU" if device != "CPU" else "NPU"
@@ -961,7 +961,7 @@ def probe(path: str | None = None, device: str = "NPU") -> dict:
 
 
 # --------------------------------------------------------------------------
-# The module-tree rewrite: the mechanism docs/INTELNPU.md section 1.2 found.
+# The module-tree rewrite: the mechanism docs/devices/INTELNPU.md section 1.2 found.
 #
 # `intel_npu_acceleration_library.compile(model, config)` (`compiler.py:42-81`)
 # is not a compiler in the torch.compile sense and does no tracing at all. It
@@ -1030,7 +1030,7 @@ class NPULinear:
                 f"torchnative intelnpu: NPULinear will not lower a {weight.dtype} "
                 f"weight. This stage emits f16 IR only; integer weights need the "
                 f"quantized path, which is refused by name in quantize_() and "
-                f"described in docs/INTELNPU.md section 1.4."
+                f"described in docs/devices/INTELNPU.md section 1.4."
             )
         self.out_features, self.in_features = int(weight.shape[0]), int(weight.shape[1])
         # Raises here, at construction, for an oversized layer -- before the model
@@ -1127,7 +1127,7 @@ def compile_model(model, device: str = "NPU", library: str | None = None):
     any model with a `LayerNorm` in it, and the archived library does not say so:
     `lower_linear` returns `None` for anything it does not recognise
     (`compiler.py:173`) and the caller gets a model it believes is offloaded.
-    docs/NPU2.md is a whole document about a partial offload that went unnoticed
+    docs/graph/NPU2.md is a whole document about a partial offload that went unnoticed
     because the answers were right.
 
     Raises:
@@ -1167,7 +1167,7 @@ def compile_model(model, device: str = "NPU", library: str | None = None):
             f"lowered and nothing runs on {device}. Leaf module types found: "
             f"{sorted(left) or ['<none>']}. Returning the model unchanged with a "
             f"success message would be the silent CPU fallback this module exists to "
-            f"prevent -- see docs/INTELNPU.md section 3.1. Linear is the only leaf "
+            f"prevent -- see docs/devices/INTELNPU.md section 3.1. Linear is the only leaf "
             f"lowered at this stage; intel_npu_acceleration_library's own lowering "
             f"starts at the same place (compiler.py:144-160)."
         )
@@ -1214,7 +1214,7 @@ def supported_ops() -> frozenset:
 
     There is no captured-graph lowering table here and `compile_module` says so.
     This module reaches the device by *module replacement*, the mechanism
-    docs/INTELNPU.md section 1.2 found underneath `NPUModelForCausalLM`, not by
+    docs/devices/INTELNPU.md section 1.2 found underneath `NPUModelForCausalLM`, not by
     serialising a `decompose` -> `refold` trace. The two are different doors and
     this function answers for the one that is open.
     """
@@ -1225,7 +1225,7 @@ def compile_module(module=None, example_inputs=None, **kwargs):
     """Refused: **captured-graph** lowering is not implemented.
 
     Not to be confused with `compile_model`, which is implemented and is a
-    different mechanism. The distinction is the one docs/INTELNPU.md section 1.2
+    different mechanism. The distinction is the one docs/devices/INTELNPU.md section 1.2
     turns on:
 
     * `compile_model` replaces `torch.nn.Linear` leaves with `NPULinear`. No
@@ -1238,7 +1238,7 @@ def compile_module(module=None, example_inputs=None, **kwargs):
     Refusing rather than quietly falling back to `compile_model` matters: the
     two have different coverage, and a caller who asked for the whole graph and
     silently got the Linears would be told a model was offloaded that mostly is
-    not. That is the failure docs/NPU2.md records.
+    not. That is the failure docs/graph/NPU2.md records.
     """
     raise IntelNPUUnsupported(
         "torchnative intelnpu: compile_module is not implemented -- there is no "
@@ -1246,11 +1246,11 @@ def compile_module(module=None, example_inputs=None, **kwargs):
         "to OpenVINO IR in memory and compile it through the path this module "
         "already opens, the way coreml.py and nnapi.py do for their targets. What "
         "*is* implemented is compile_model(), which replaces torch.nn.Linear leaves "
-        "with NPULinear -- the mechanism docs/INTELNPU.md section 1.2 found "
+        "with NPULinear -- the mechanism docs/devices/INTELNPU.md section 1.2 found "
         "underneath NPUModelForCausalLM. Use that, and read its report: it names "
         "every leaf left on the CPU, which whole-graph lowering would not have to. "
         "This refuses rather than silently redirecting to compile_model, because the "
-        "two cover different amounts of the model and docs/NPU2.md is about being "
+        "two cover different amounts of the model and docs/graph/NPU2.md is about being "
         "told a model was offloaded when part of it was not."
     )
 
@@ -1263,11 +1263,11 @@ def quantize_(model=None, format=None, **kwargs):
         "(quantization.py:90-109, PostTrainingQuantConfig(approach='weight_only', "
         "algorithm='RTN')), which reaches deep into PyTorch internals and is not "
         "hostable on torchnative's shim. torchnative already has the same shape at "
-        "torchnative.quant.quantize_(model, format='q8_0') -- see docs/QUANT2.md "
+        "torchnative.quant.quantize_(model, format='q8_0') -- see docs/graph/QUANT2.md "
         "section 3, which cites that library's module-replacement approach as the "
         "precedent. Note that the archived library also carries a dependency-free "
         "per-row symmetric quantizer (quantization.py:15-64) that needs no "
-        "neural-compressor; docs/INTELNPU.md section 1.4 has the details."
+        "neural-compressor; docs/devices/INTELNPU.md section 1.4 has the details."
     )
 
 
@@ -1277,8 +1277,8 @@ def dynamo_backend(*args, **kwargs):
         "torchnative intelnpu: there is no torch.compile backend and there will not "
         "be one. Dynamo needs CPython's PEP 523 frame-evaluation hook "
         "(_PyInterpreterState_SetEvalFrameFunc plus the _PyInterpreterFrame layout), "
-        "neither of which is reachable from an abi3 extension -- see docs/COMPILE.md. "
-        "This costs nothing here: docs/INTELNPU.md section 1.2 establishes that "
+        "neither of which is reachable from an abi3 extension -- see docs/graph/COMPILE.md. "
+        "This costs nothing here: docs/devices/INTELNPU.md section 1.2 establishes that "
         "intel_npu_acceleration_library's own NPU path does not use torch.compile "
         "either. Its compile() (compiler.py:42-81) is plain nn.Module subtree "
         "replacement; the @register_backend npu at compiler.py:270 is a separate, "
@@ -1299,7 +1299,7 @@ if __name__ == "__main__":  # pragma: no cover - this is the Windows entry point
     if report.get("verdict") != device.lower():
         print(
             f"\nNOT PROVEN: verdict is {report.get('verdict')!r}, not {device.lower()!r}. "
-            f"Missing: {report.get('missing')!r}. See docs/INTELNPU.md section 4."
+            f"Missing: {report.get('missing')!r}. See docs/devices/INTELNPU.md section 4."
         )
         raise SystemExit(2)
     print(

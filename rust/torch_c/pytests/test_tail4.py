@@ -1,11 +1,11 @@
-"""docs/TAIL4.md -- `as_strided`'s verdict, and the four walls behind it.
+"""docs/kernels/TAIL4.md -- `as_strided`'s verdict, and the four walls behind it.
 
 `tools/golden/cases.py` compares every op this round landed against upstream
 element-wise, and this file deliberately does not repeat that. What is here is
 the part a value comparison structurally cannot hold down:
 
   * **The `as_strided` verdict, which is that the refusal stands.**
-    `docs/TAIL3.md` §6 refused it because candle has no storage-sharing
+    `docs/kernels/TAIL3.md` §6 refused it because candle has no storage-sharing
     constructor. This round asked the narrower question -- can a *read-only*
     `as_strided` be made safe, one that refuses the moment its result is
     written to rather than one that hopes nobody writes -- and the answer is
@@ -29,8 +29,8 @@ the part a value comparison structurally cannot hold down:
     refused where `index_add_` accepts one, and the out-of-bounds message
     carries the index and the extent where `index_add_`'s carries neither.
     Each is asserted against the *other op in the same process*, which is the
-    shape a per-op golden case cannot take. `docs/DEMAND8.md` recorded the
-    same trap one op over and `docs/TAIL3.md` §3 recorded it again.
+    shape a per-op golden case cannot take. `docs/architectures/DEMAND8.md` recorded the
+    same trap one op over and `docs/kernels/TAIL3.md` §3 recorded it again.
 
   * **`t_`'s alias, which no value comparison sees.** It is the first in-place
     op here that changes the receiver's shape, so it goes through
@@ -234,13 +234,13 @@ def _aten_source():
 
 
 def test_the_as_strided_refusal_was_INVERTED_by_the_strided_round():
-    """**Inverted, not deleted** -- `docs/FFT.md`'s pattern, as this test's own
+    """**Inverted, not deleted** -- `docs/kernels/FFT.md`'s pattern, as this test's own
     previous body instructed.
 
-    What it said until `docs/STRIDED.md` landed: `as_strided` is refused, it is
+    What it said until `docs/kernels/STRIDED.md` landed: `as_strided` is refused, it is
     not in `_aten_implemented()`, and `longformer`/`led` are blocked on it on
-    purpose. That was the answer for two rounds (`docs/TAIL3.md` §6,
-    `docs/TAIL4.md` §1) and the reason is kept here rather than thrown away,
+    purpose. That was the answer for two rounds (`docs/kernels/TAIL3.md` §6,
+    `docs/kernels/TAIL4.md` §1) and the reason is kept here rather than thrown away,
     because the reason is what changed and not the facts it rested on:
 
       * candle 0.11.0 still has no storage-sharing strided constructor. That
@@ -249,12 +249,12 @@ def test_the_as_strided_refusal_was_INVERTED_by_the_strided_round():
       * So the result is still a materialised **gather**, and a gather is
         silently wrong for a writer in both directions.
 
-    What `docs/STRIDED.md` added is the third option neither previous round
+    What `docs/kernels/STRIDED.md` added is the third option neither previous round
     reached: **refuse the writes**. `storage.rs::StridedBarrier` bars in-place
     writes to the result's storage and to the base's while the result is alive,
     keyed on the storage address -- with a keep-alive that makes the address
     reservation and the registry entry end in the same statement, which is what
-    `docs/TAIL4.md` §1.2 correctly said an address-keyed poison set could not
+    `docs/kernels/TAIL4.md` §1.2 correctly said an address-keyed poison set could not
     do without one.
 
     So the op is implemented and it is a **narrowing**, not a widening: every
@@ -263,7 +263,7 @@ def test_the_as_strided_refusal_was_INVERTED_by_the_strided_round():
     """
     assert "aten.as_strided.default" in _C._aten_implemented(), (
         "as_strided left _aten_implemented(). If it was reverted, this test "
-        "should be inverted BACK rather than deleted -- docs/STRIDED.md §1"
+        "should be inverted BACK rather than deleted -- docs/kernels/STRIDED.md §1"
     )
     pair = _both("as_strided")
     if pair == "skip":
@@ -280,11 +280,11 @@ def test_the_as_strided_refusal_was_INVERTED_by_the_strided_round():
 def test_the_write_door_is_single_which_is_the_precondition_a_read_only_as_strided_would_need():
     """Why a *read-only* `as_strided` is not merely unwritten but unreachable.
 
-    The question this round asked was narrower than `docs/TAIL3.md`'s: not
+    The question this round asked was narrower than `docs/kernels/TAIL3.md`'s: not
     "can the aliasing be produced" (it cannot -- candle 0.11.0's
     `Tensor::from_storage` takes an owned `Storage` and documents contiguous
     strides) but "can a *materialising* `as_strided` be made to refuse the
-    moment its result is written to", which is `docs/COMPLEX2.md`'s standard:
+    moment its result is written to", which is `docs/kernels/COMPLEX2.md`'s standard:
     make the wrong answer unrepresentable rather than merely unlikely.
 
     Two facts decide it, and both are checkable here rather than argued:
@@ -314,7 +314,7 @@ def test_the_write_door_is_single_which_is_the_precondition_a_read_only_as_strid
     assert len(calls) == 1, (
         f"aten.rs now calls write_into {len(calls)} times. A read-only "
         "as_strided guard was sized against there being exactly one; "
-        "docs/TAIL4.md §1 is the argument that has to be re-read."
+        "docs/kernels/TAIL4.md §1 is the argument that has to be re-read."
     )
     assert "fn write_back(" in text
     if os.path.isfile(_TENSOR_RS):
@@ -330,7 +330,7 @@ def test_the_as_strided_reach_allowlist_entry_was_removed_when_the_gap_closed():
 
     The entry's own text said "Delete this entry the day either lands". One of
     the two landed -- not the constructor, but the third option in
-    `docs/STRIDED.md` -- so the entry is gone, and this asserts it *stayed*
+    `docs/kernels/STRIDED.md` -- so the entry is gone, and this asserts it *stayed*
     gone. An allowlist entry that outlives its gap is how a closed gap goes on
     being reported as a known one.
     """
@@ -342,7 +342,7 @@ def test_the_as_strided_reach_allowlist_entry_was_removed_when_the_gap_closed():
     blob = json.dumps(table)
     assert "methods:as_strided" not in blob, (
         "as_strided is implemented but reach_allow.json still declares it a "
-        "gap -- docs/STRIDED.md §1"
+        "gap -- docs/kernels/STRIDED.md §1"
     )
 
 
@@ -491,7 +491,7 @@ def test_index_copy_REFUSES_an_int32_index_where_index_add_ACCEPTS_one():
 
 
 def test_both_refuse_a_negative_index_and_only_one_says_which():
-    """The third. Both refuse -- `docs/DEMAND8.md`'s finding is that
+    """The third. Both refuse -- `docs/architectures/DEMAND8.md`'s finding is that
     `index_put_` wraps and these two do not -- but the messages differ, and
     the difference is information a house string would erase.
     """
@@ -580,7 +580,7 @@ def test_t_was_rwkvs_fifth_wall_and_the_construction_now_completes():
     This asserts the *op* is reachable through the vendored tree's own
     spelling and that the two `t_` calls `orthogonal_` makes both work, which
     is the part of "rwkv constructs" that belongs in a unit suite. The sweep
-    is where "rwkv constructs" itself is measured, and docs/TAIL4.md §5 records
+    is where "rwkv constructs" itself is measured, and docs/kernels/TAIL4.md §5 records
     that it now does.
     """
     assert "aten.t_.default" in _C._aten_implemented()
@@ -650,7 +650,7 @@ def test_logsumexp_promotes_an_integral_input_where_amax_keeps_and_sum_widens():
 def test_logical_not_and_bitwise_not_agree_on_bool_and_on_nothing_else():
     """`~` and `bitwise_not` already worked, which is the trap.
 
-    `docs/TAIL1.md` measured the same distinction for the `and` pair --
+    `docs/kernels/TAIL1.md` measured the same distinction for the `and` pair --
     `bitwise_and` on `[1, 2, 4, 3]` gives all zeros where `logical_and` gives
     all True -- and it holds for `not` as well. Both ops are run on the same
     values in the same process at three dtypes, so the assertion is that they
@@ -722,7 +722,7 @@ def test_logical_not_treats_nan_as_TRUE_and_minus_zero_as_FALSE():
 
 
 def test_embedding_takes_an_int32_index_which_is_what_cpmant_hands_it():
-    """`docs/ARCH200.md` classified `cpmant` as a *backend limitation*, and it
+    """`docs/architectures/ARCH200.md` classified `cpmant` as a *backend limitation*, and it
     was an index dtype.
 
     `modeling_cpmant.py:602` casts `input_ids` to `int32` before the embedding
@@ -828,7 +828,7 @@ def test_none_of_this_rounds_kernels_reads_a_tensor_back_to_the_host():
 
     This asserts the property directly rather than relying on the derivation
     to notice, because the derivation follows helpers only one level by name
-    (`docs/VOICE3.md` found `var`/`std` nearly invisible to it for that
+    (`docs/architectures/VOICE3.md` found `var`/`std` nearly invisible to it for that
     reason) and a future refactor could hide a readback one level further
     down.
     """
@@ -876,7 +876,7 @@ def _function_body(text, name):
 
 
 def test_the_new_spellings_are_reachable_from_python_not_only_by_dispatch_key():
-    """docs/REACH.md shape 3, for this round's six names.
+    """docs/bindings/REACH.md shape 3, for this round's six names.
 
     `tools/golden/cases.py` dispatches by key, so it cannot see whether
     `torch.round(x)` or `x.index_copy_(...)` resolves at all -- and a table row

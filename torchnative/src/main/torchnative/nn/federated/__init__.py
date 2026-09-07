@@ -14,7 +14,7 @@ adaptation alone does not pull in the aggregation stack. See DESIGN.md §3.
 **What this is built on, and why it is one round.** DESIGN.md §11.1 stacks
 rounds/selection/aggregation above ``torch.distributed``, and aggregation *is*
 collective communication -- so ``FedAvg`` here is a weighted ``all_reduce`` and
-not a private channel. The transport under it (docs/TRANSPORT.md) implements
+not a private channel. The transport under it (docs/distributed/TRANSPORT.md) implements
 ``world_size`` 2 with ``ReduceOp.SUM``; everything past that refuses by name,
 and so does everything here that would need it.
 
@@ -48,7 +48,7 @@ says so.
 ======================================  ====================================
 more than one round                     built -- ``Engine(rounds=n)``, over
                                         ``Delta.re_snapshot``
-                                        (docs/FEDERATED2.md)
+                                        (docs/distributed/FEDERATED2.md)
 participant selection                   *half* built. :func:`cohort` agrees
                                         the participant set across the ranks,
                                         which nothing downstream would notice
@@ -76,7 +76,7 @@ privacy, compression                    not offered at all -- no surface here
                                         things each would need first
 ======================================  ====================================
 
-docs/FEDERATED.md records the measurements and what each refusal was weighed
+docs/distributed/FEDERATED.md records the measurements and what each refusal was weighed
 against.
 """
 
@@ -92,7 +92,7 @@ __all__ = ["FedAvg", "FedAvgM", "FedProx", "Engine", "Round", "digest",
            "agree", "cohort", "RankDropped", "ABSTAIN", "tolerate_missing"]
 
 
-# The wire is JSON over a socket (docs/TRANSPORT.md §2). This guard existed
+# The wire is JSON over a socket (docs/distributed/TRANSPORT.md §2). This guard existed
 # because both ranks used to `sendall` before either received, so a payload
 # larger than the kernel's socket buffer blocked both of them until the 30 s
 # timeout: 2,836,968 B completed in 0.17 s and 4,053,011 B failed after 30 s,
@@ -149,7 +149,7 @@ def _group(group):
             "Check: import torchnative.distributed; "
             "torch.distributed.init_process_group(backend='local', "
             "init_method='tcp://127.0.0.1:<port>', rank=<0 or 1>, "
-            "world_size=2)  -- docs/TRANSPORT.md"
+            "world_size=2)  -- docs/distributed/TRANSPORT.md"
         )
     return dist.get_world_size(group), dist.get_rank(group)
 
@@ -166,7 +166,7 @@ def _require_world(group, who, minimum=2):
 
     ``minimum`` is 2 for aggregation itself and larger for the things that
     two ranks cannot show: a **proper subset** cohort and a **survivor set**
-    of two or more both need three (docs/FEDERATED4.md), because at two ranks
+    of two or more both need three (docs/distributed/FEDERATED4.md), because at two ranks
     each of them is a world of one and FedAvg over one delta is that delta.
     """
     world, rank = _group(group)
@@ -181,13 +181,13 @@ def _require_world(group, who, minimum=2):
             "degenerate case is named instead of served.\n"
             "Check: torch.distributed.get_world_size() >= 2, reached through "
             "init_process_group(backend='local', init_method='tcp://...', "
-            "world_size=2) -- docs/TRANSPORT.md" % (who,)
+            "world_size=2) -- docs/distributed/TRANSPORT.md" % (who,)
         )
     if world < minimum:
         raise NotImplementedError(
             "torchnative.nn.federated: world_size %d, reached through %s, "
             "which needs at least %d. The transport carries any world "
-            "(docs/FEDERATED4.md), but %d ranks are not enough to show what "
+            "(docs/distributed/FEDERATED4.md), but %d ranks are not enough to show what "
             "this does: whatever it selects or whatever survives is a world "
             "of one, and FedAvg over one delta is that delta -- so a test of "
             "it would pass with no aggregation at all.\n"
@@ -289,7 +289,7 @@ def _backend(group, what):
             "torchnative.nn.federated: %r is not this shim's process group, "
             "and %s has no upstream spelling -- a collective that completes "
             "over whoever arrived is not an allreduce, so no backend but this "
-            "one offers it (docs/FEDERATED4.md)" % (pg, what)
+            "one offers it (docs/distributed/FEDERATED4.md)" % (pg, what)
         )
     return sole(what)
 
@@ -344,7 +344,7 @@ class RankDropped(RuntimeError):
     """A rank that was selected for this round did not report.
 
     Raised *instead of* an aggregate, never alongside one.  The failure this
-    names is the one docs/DESIGN.md §6 puts below a refusal: an aggregator that
+    names is the one docs/design/DESIGN.md §6 puts below a refusal: an aggregator that
     divides by however many ranks arrived returns a number, and the round
     reports success while the model it produced is a weighted mean over a
     cohort nobody chose.  ``sum(w_k d_k) / sum_{arrived}(w_k)`` is not the
@@ -364,7 +364,7 @@ class RankDropped(RuntimeError):
 def _collective(fn, group, what):
     """Run one collective, turning a lost peer into :class:`RankDropped`.
 
-    The transport is a socket (docs/TRANSPORT.md §2), so a rank that exits
+    The transport is a socket (docs/distributed/TRANSPORT.md §2), so a rank that exits
     mid-round surfaces as ``RuntimeError('connection closed')`` from
     ``_recv_all``, as a ``socket.timeout`` after 30 s, or as ``BrokenPipeError``
     on the send.  All three mean the same thing to this layer and none of them
@@ -399,12 +399,12 @@ def _collective(fn, group, what):
         "round has no aggregate. The collective over %s rank(s) did not "
         "complete, and no partial average was produced -- averaging over "
         "whichever ranks arrived would divide by a number nobody chose and "
-        "would report success (docs/DESIGN.md §6).\n"
+        "would report success (docs/design/DESIGN.md §6).\n"
         "Policy: Engine(on_missing='refuse') is the default and is this. "
         "Engine(on_missing='average_arrived', min_participants=k) divides by "
         "the survivors instead, and needs k >= 2 and a world of at least "
         "three -- at two ranks the survivor set is one and FedAvg over one "
-        "delta is that delta (docs/FEDERATED4.md)."
+        "delta is that delta (docs/distributed/FEDERATED4.md)."
         % (",".join(str(r) for r in missing) or "?", what, world),
         rank=rank, missing=missing, during=what,
     )
@@ -456,9 +456,9 @@ def agree(value, group=None, what="this value"):
     members: ``h0 + h1 == 2 * h0`` iff ``h0 == h1``.  At three it accepts
     ``(h - 1, h, h + 1)`` -- three ranks that disagree about the schema, the
     base or the cohort, summing to exactly what agreement would have summed
-    to.  docs/FEDERATED3.md §5 named that and refused the larger world rather
+    to.  docs/distributed/FEDERATED3.md §5 named that and refused the larger world rather
     than weaken here; ``ProcessGroupLocal.allgather`` at ``world_size N``
-    (docs/FEDERATED4.md) is what settles it, so the refusal is gone and the
+    (docs/distributed/FEDERATED4.md) is what settles it, so the refusal is gone and the
     check is stronger rather than wider.
 
     Inside :func:`tolerate_missing` the gather is the partial spelling and the
@@ -573,7 +573,7 @@ class FedAvg:
     There is no default sample count and none is inferred from a batch: an
     aggregator that silently weighted every client equally when the caller
     meant to weight by data volume produces a different model and reports
-    success, which docs/DESIGN.md §6 puts below a refusal.
+    success, which docs/design/DESIGN.md §6 puts below a refusal.
     """
 
     def __init__(self, weighted=True):
@@ -708,7 +708,7 @@ class FedAvgM:
 
     **Every rank holds the same velocity without communicating it.** The mean
     is already identical on both ranks (``all_reduce`` leaves the same bits
-    everywhere, docs/FEDERATED.md §2.1), and the update applied to it is
+    everywhere, docs/distributed/FEDERATED.md §2.1), and the update applied to it is
     deterministic, so the states cannot drift.  This is checked rather than
     argued: the test asserts the two ranks' outputs are equal at every round.
     Nothing here reduces the velocity itself -- a server state that needed a
@@ -835,7 +835,7 @@ class FedProx:
         """Install the proximal term on ``adapted``'s local step. Idempotent.
 
         The base is read at *call* time from the live delta, not captured here,
-        so a round that re-snapshots (docs/FEDERATED2.md §1.1) gets the new
+        so a round that re-snapshots (docs/distributed/FEDERATED2.md §1.1) gets the new
         global weights without re-arming: ``w_global`` is by definition the
         weights the round started from, which is exactly what the delta's base
         holds.
@@ -879,7 +879,7 @@ class FedProx:
         """FedAvg's weighted mean -- but only if the local term was installed.
 
         A FedProx that never armed is FedAvg wearing a different name, and it
-        would report success at every world size. docs/DESIGN.md §6.
+        would report success at every world size. docs/design/DESIGN.md §6.
         """
         if self._armed is None:
             raise RuntimeError(
@@ -915,7 +915,7 @@ def cohort(select, group=None, who="federated.cohort"):
     then the cohort's weight and the result is the cohort's weighted mean,
     exactly.  What ``torch.distributed.new_group`` would add on top is that the
     unselected ranks are not *reached* at all, which is a property of the wire
-    and not of the arithmetic; it is named in docs/FEDERATED4.md as still
+    and not of the arithmetic; it is named in docs/distributed/FEDERATED4.md as still
     missing, because a client that is asleep cannot attend a barrier.
 
     A cohort of **one** still refuses, at any world size, and so does any
@@ -956,7 +956,7 @@ def cohort(select, group=None, who="federated.cohort"):
     # two the only proper subsets have one member, so the check above had
     # already refused every input that could reach it. A refusal that cannot
     # fire is not a refusal, so its reason was folded into the one that does
-    # (docs/FEDERATED4.md §5).
+    # (docs/distributed/FEDERATED4.md §5).
     if len(ranks) < 2:
         raise NotImplementedError(
             "torchnative.nn.federated.cohort: %s of a world of %d is a cohort "
@@ -966,7 +966,7 @@ def cohort(select, group=None, who="federated.cohort"):
             "test of it would pass with no aggregation at all.\n"
             "In a world of two this is the only shape a proper subset can "
             "have, which is why a proper subset needs a world of at least "
-            "three. The transport carries one now (docs/FEDERATED4.md), so "
+            "three. The transport carries one now (docs/distributed/FEDERATED4.md), so "
             "what refuses here is the arithmetic and no longer the wire: a "
             "subset of a world of three is served, and aggregates over the "
             "subset.\n"
@@ -1084,7 +1084,7 @@ class Engine:
                 "torchnative.nn.federated.Engine: allow_missing= is dropout "
                 "handling by another name. Averaging over whichever ranks "
                 "arrived makes the divisor a number nobody chose, and the "
-                "round reports success -- docs/DESIGN.md §6 puts that below a "
+                "round reports success -- docs/design/DESIGN.md §6 puts that below a "
                 "refusal.\n"
                 "The policy surface is on_missing=. 'refuse' is the default "
                 "and is implemented: a rank that does not report raises "
@@ -1111,7 +1111,7 @@ class Engine:
                     "min_participants=k. Averaging over whoever arrived, with "
                     "no floor, makes the divisor a number nobody chose: the "
                     "round returns a weighted mean over a cohort decided by a "
-                    "socket close and reports success (docs/DESIGN.md §6). "
+                    "socket close and reports success (docs/design/DESIGN.md §6). "
                     "The floor is the caller saying how few ranks an aggregate "
                     "may still be built from.\n"
                     "Check: min_participants=2 or more."
@@ -1122,7 +1122,7 @@ class Engine:
                     "has to be an integer of at least 2 -- a survivor set of "
                     "one is a world of one, where FedAvg returns the "
                     "survivor's own delta and a round over it would report "
-                    "success having aggregated nothing (docs/FEDERATED3.md "
+                    "success having aggregated nothing (docs/distributed/FEDERATED3.md "
                     "§4.1 measured that identity to 6e-8)."
                     % (min_participants,)
                 )
@@ -1141,7 +1141,7 @@ class Engine:
                 "implemented, and it is not one flag's worth of work. Masked "
                 "aggregation (Bonawitz et al. 2017) needs pairwise secrets "
                 "between clients, which needs point-to-point send/recv -- "
-                "ProcessGroupLocal refuses both by name (docs/TRANSPORT.md §3) "
+                "ProcessGroupLocal refuses both by name (docs/distributed/TRANSPORT.md §3) "
                 "-- plus a key agreement, a threshold secret-sharing scheme so "
                 "a dropout does not destroy the sum, and an unmasking round. "
                 "The dropout half is the same problem on_missing= names.\n"
@@ -1242,7 +1242,7 @@ class Engine:
                     "on_missing='average_arrived' in a world of %d. One rank "
                     "leaving leaves %d, and FedAvg over one delta is that "
                     "delta -- the partial average would be the survivor's own "
-                    "weights (docs/FEDERATED3.md §4.1 measured that identity "
+                    "weights (docs/distributed/FEDERATED3.md §4.1 measured that identity "
                     "to 6e-8), so this policy cannot be shown to do anything "
                     "here.\n"
                     "Check: init_process_group(..., world_size=3) or more."

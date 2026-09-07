@@ -48,14 +48,14 @@ method:
 
   * **the glibc half is unresolvable.** Versioned imports name `libc.so.6` and a
     `GLIBC_x.y`, and there is no glibc on this machine to check them against --
-    no container runtime either (docs/LINUX.md §7). What is verified is that the
+    no container runtime either (docs/platform/LINUX.md §7). What is verified is that the
     requirement is *internally consistent* and within the manylinux policy; that
     the symbols exist in a real glibc of that version is taken on the linker's
     word.
   * **`--self-test` still does not use our artefact.** It runs against real
     Linux x86-64 CPython extension modules from the target distribution, which
     exercises the resolver but says nothing about our extension. Passing a
-    wheel does use ours: since docs/LINUX.md §9.2 the crate cross-compiles with
+    wheel does use ours: since docs/platform/LINUX.md §9.2 the crate cross-compiles with
     cargo-zigbuild, and §9.4 is the first run of this script over
     `torch/_C.abi3.so` -- 243 undefined, 0 unresolved.
 """
@@ -189,7 +189,7 @@ def resolve(data: bytes, what: str, exports: set[str],
         print(f"    {len(entries):>4}  -> {library}  (bound by .gnu.version_r; "
               f"needs {', '.join(floors)})")
         print(f"          not resolved here -- no {library} on this machine "
-              "(docs/LINUX.md §6)")
+              "(docs/platform/LINUX.md §6)")
 
     # Union, against libpython plus whatever else the caller supplied. Weaker on
     # purpose and labelled so, because ELF gives nothing better for these.
@@ -246,7 +246,7 @@ def check_wheel(wheel: Path) -> None:
             bad += resolve(data, hit, exports)
 
     print()
-    print("ladder (docs/LINUX.md §6):")
+    print("ladder (docs/platform/LINUX.md §6):")
     print(f"  built              yes -- the archive holds ELF {ARCH} shared "
           "objects")
     print("  tagged             yes -- see tools/wheel/build.py LinuxTarget")
@@ -263,7 +263,7 @@ def check_wheel(wheel: Path) -> None:
 def self_test() -> int:
     """Run the resolver against real Linux x86-64 CPython extension modules.
 
-    Not our artefact -- none exists (docs/LINUX.md §4). These are the extension
+    Not our artefact -- none exists (docs/platform/LINUX.md §4). These are the extension
     modules shipped inside the target CPython distribution, which are the same
     shape as `torch/_C.abi3.so` would be: ELF x86-64 shared objects that import
     `Py*` unversioned from libpython and libc symbols versioned from glibc.
@@ -381,7 +381,7 @@ def self_test() -> int:
               "Linux ELF from the target distribution.")
         print("  This exercises the resolver. It says nothing about "
               "torch/_C.abi3.so,")
-        print("  which does not exist on this machine (docs/LINUX.md §4).")
+        print("  which does not exist on this machine (docs/platform/LINUX.md §4).")
     return bad
 
 

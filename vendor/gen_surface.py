@@ -179,7 +179,7 @@ def parse_package_stub(dir_path: str) -> dict:
     `submodule_stubs()` registers a directory stub (`_dynamo/`, `_export/`)
     by its `__init__.pyi` alone, which is what made `_dynamo.guards` and
     `_dynamo.eval_frame` invisible to the surface even though the vendored
-    tree declares them in full (docs/DYNAMO.md §5: 8 of 137 names known,
+    tree declares them in full (docs/graph/DYNAMO.md §5: 8 of 137 names known,
     6%). This walks the rest of the directory -- sibling `.pyi` files and,
     in case a package ever nests a package, sibling subdirectories with
     their own `__init__.pyi` -- and files each one under `submodules`,
