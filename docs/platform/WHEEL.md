@@ -428,7 +428,7 @@ TensorBase._is_zerotensor
 
 | | |
 |---|---|
-| **라이선스 메타데이터** | `pyproject.toml` 은 `license = "MIT"` 인데 휠의 대부분은 **BSD-3 인 상류 PyTorch 소스**다. 상류 LICENSE 와 third-party 라이선스들은 주입한 dist-info 안에 함께 실려 있지만, 배포본 메타데이터가 그것을 진술하지 않는다. **업로드 전에 정리해야 한다** |
+| **라이선스 메타데이터** | ~~`pyproject.toml` 은 `license = "MIT"` 인데 휠의 대부분은 상류 PyTorch 소스다~~ — **정리됐다.** `license` 는 이제 상류 torch 2.13.0 의 `License-Expression` 을 그대로 쓰고, `license-files` 가 `LICENSE` 와 `NOTICE` 를 싣는다. 우리 코드는 0.0.13a0 부터 **Apache-2.0** 이고, 그 항은 상류 식에 이미 들어 있어 **식이 한 글자도 바뀌지 않는다** |
 | **`torch` 이름을 점유한다** | 설치되면 `pip list` 에 `torch 2.13.0` 이 뜨고 `pip install torch` 가 무시된다. 의도한 것이지만(pyproject 주석), 사용자가 상류 torch 를 원할 때 되돌리는 절차가 문서화돼 있지 않다. 지금은 `pip uninstall torchnative` 뒤 재설치가 유일한 경로다 |
 | **`pip uninstall torch` 의 오진단** | 거절 메시지가 "uv 가 설치한 것 같다" 고 추측한다. RECORD 가 없기 때문인데, 우리가 일부러 안 넣은 것이므로 메시지가 사용자를 엉뚱한 곳으로 보낸다 |
 | **sdist** | 만들지 않았다. 벤더링 트리가 git 에 없으므로 sdist 는 지금의 `py3-none-any` 와 같은 껍데기가 된다. `python -m build` 를 기본으로 쓰지 않는 이유이기도 하다 |

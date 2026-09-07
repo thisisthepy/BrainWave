@@ -6,7 +6,7 @@
 
 [![PyPI](https://img.shields.io/pypi/v/torchnative?color=blue)](https://pypi.org/project/torchnative/)
 [![Python](https://img.shields.io/badge/python-3.13%2B-blue)](https://www.python.org/)
-[![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+[![License](https://img.shields.io/badge/license-Apache--2.0-green)](LICENSE)
 [![Platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Android%20%7C%20iOS%20%7C%20Linux%20%7C%20Windows-lightgrey)](#platform-support)
 [![Status](https://img.shields.io/badge/status-pre--alpha-orange)](#status)
 
@@ -687,7 +687,26 @@ Start with [`DESIGN.md`](docs/design/DESIGN.md); [`SURFACE_HONESTY.md`](docs/des
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+**Apache-2.0** — see [LICENSE](LICENSE). This project's own
+code was MIT through `0.0.12a0` and is Apache-2.0 from `0.0.13a0` onward.
 
-PyTorch is vendored under its own BSD-3-Clause license. The vendored tree is assembled at build
-time and is not redistributed in this repository.
+**The repository and the wheel are not the same thing, and they carry different
+licences.** This repository contains only this project's code: the vendored
+PyTorch tree is assembled at build time (`vendor/vendor_torch.sh`) and is not
+redistributed here. A **platform wheel is different** — it carries upstream
+PyTorch's entire Python tree with `torch._C` replaced, so most of the files in
+an installed `torchnative` are upstream's, under upstream's licences.
+
+Upstream's terms are not one licence. `pyproject.toml`'s `license` field is
+torch 2.13.0's own `License-Expression`, **verbatim**:
+
+```
+Apache-2.0 AND Apache-2.0 WITH LLVM-exception AND BSD-2-Clause
+AND BSD-3-Clause AND BSL-1.0 AND MIT
+```
+
+That expression is unchanged by this project's move from MIT to Apache-2.0,
+because it already contained both terms — the field cannot express which term
+is this project's. The upstream licence texts themselves ride along:
+`tools/wheel/build.py` injects torch's `dist-info`, third-party notices
+included.

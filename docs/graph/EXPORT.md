@@ -58,7 +58,7 @@ ops=255** — no Rust changed.
 
 ## 1. The census reproduces exactly
 
-`spike/export_depth3.py`, unmodified, on this tree:
+`tools/spike/export_depth3.py`, unmodified, on this tree:
 
 ```
  0  torch._C._unset_dispatch_mode                    12  TensorBase.is_inference
@@ -477,7 +477,7 @@ bash vendor/install_shim.sh
 PYTHON=$PY sh rust/torch_c/pytests/run.sh          # 602 ok, DOCWATCH: PASS
 
 # COMPILE.md's census, unmodified
-PYTHONPATH=$PWD/torchnative/src/main TORCH_USE_RTLD_GLOBAL=1 $PY spike/export_depth3.py
+PYTHONPATH=$PWD/torchnative/src/main TORCH_USE_RTLD_GLOBAL=1 $PY tools/spike/export_depth3.py
 
 # §4.1 in four lines
 PYTHONPATH=$PWD/torchnative/src/main TORCH_USE_RTLD_GLOBAL=1 $PY -c '

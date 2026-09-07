@@ -7,16 +7,24 @@ name = "torchnative"
 version = "0.0.13a0"
 description = "Run the real PyTorch ecosystem on device, not reimplementing it"
 readme = { file = "README.md", content-type = "text/markdown" }
-# Our own code is MIT; the rest of the expression is upstream PyTorch's, copied
-# verbatim from its own `License-Expression` (torch 2.13.0). A platform wheel
-# carries the upstream Python tree, so declaring MIT alone would describe a few
-# thousand lines of this distribution and misdescribe two million.
+# This is upstream PyTorch's own `License-Expression` (torch 2.13.0) VERBATIM,
+# and our own code's licence is already one of its members. A platform wheel
+# carries the upstream Python tree, so declaring our licence alone would
+# describe a few thousand lines of this distribution and misdescribe two
+# million.
+#
+# Our code moved from MIT to Apache-2.0 (LICENSE, from 0.0.13a0 onward), and
+# that move does not change one character of this line -- upstream's expression
+# already contains BOTH terms, so the set is identical either way. Worth
+# writing down rather than discovering later: this field cannot express which
+# term is ours, and the previous comment here claimed MIT was "ours" while the
+# rest was upstream's, which was never true.
 #
 # The upstream licence texts themselves ride along -- `tools/wheel/build.py`
 # injects torch's dist-info, third-party notices included -- so this line is
 # about the metadata being true, not about supplying attribution that was
 # missing.
-license = "MIT AND Apache-2.0 AND Apache-2.0 WITH LLVM-exception AND BSD-2-Clause AND BSD-3-Clause AND BSL-1.0"
+license = "Apache-2.0 AND Apache-2.0 WITH LLVM-exception AND BSD-2-Clause AND BSD-3-Clause AND BSL-1.0 AND MIT"
 license-files = ["LICENSE"]
 requires-python = ">=3.13"
 
@@ -73,7 +81,18 @@ keywords = ["pytorch", "on-device", "edge", "federated-learning", "test-time-ada
 classifiers = [
     "Development Status :: 2 - Pre-Alpha",
     "Intended Audience :: Developers",
+    # 3.13 is the abi3 FLOOR, not the ceiling. One `cp313-abi3` wheel installs
+    # on 3.13 and on every later CPython -- that is what `setup.py`'s
+    # `py_limited_api` buys, and building a `cp314-abi3` wheel beside it would
+    # NARROW support rather than widen it.
+    #
+    # Measured, not assumed: the 0.0.12a0 macOS arm64 wheel installs and
+    # computes on 3.14.7 and on 3.15.0rc1 -- same wheel, `a @ b` sums to 134.0
+    # on both, `_aten_implemented()` answers on both.
+    # `test_release.py::test_the_abi3_wheel_loads_on_later_cpythons` holds it.
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: 3.15",
     "Programming Language :: Rust",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
     "Operating System :: Android",

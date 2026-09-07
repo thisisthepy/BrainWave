@@ -241,6 +241,30 @@ jobs:
           print("qnn_aot_refusal:", qnn.qnn_aot_refusal())
           version, url = qnn.qnn_sdk_version()
           print("QNN_SDK_ROOT =", os.environ.get("QNN_SDK_ROOT"))
+
+          # Carry the SDK into the LATER steps. `install_qnn_sdk()` sets
+          # QNN_SDK_ROOT inside THIS process only, and each `run:` block is a
+          # new shell, so without this the lowering step starts with neither
+          # the root nor the loader path. The first run died exactly there:
+          # "Failed to initialize QNN backend for kHtpBackend. Ensure QNN SDK
+          # libraries are available (e.g. LD_LIBRARY_PATH includes
+          # $QNN_SDK_ROOT/lib/x86_64-linux-clang/)" -- which is docs/QNN.md §5
+          # step 4's `export LD_LIBRARY_PATH=...` line, missing.
+          root = os.environ.get("QNN_SDK_ROOT")
+          if not root:
+              sys.exit("install_qnn_sdk() ran but set no QNN_SDK_ROOT")
+          hostlib = os.path.join(root, "lib", "x86_64-linux-clang")
+          if not os.path.isdir(hostlib):
+              sys.exit(f"no host libraries at {hostlib}")
+          github_env = os.environ.get("GITHUB_ENV")
+          if github_env:
+              with open(github_env, "a") as handle:
+                  handle.write(f"QNN_SDK_ROOT={root}\n")
+                  handle.write(
+                      "LD_LIBRARY_PATH=" + hostlib + ":"
+                      + os.environ.get("LD_LIBRARY_PATH", "") + "\n"
+                  )
+          print("host libraries =", hostlib)
           print("QNN SDK version =", version)
           print("QNN SDK url     =", url)
           expected = os.environ["EXPECTED_QNN_SDK_VERSION"]
@@ -378,8 +402,8 @@ jobs:
         run: |
           set -euo pipefail
           git clone --depth 1 --branch "v${EXECUTORCH_VERSION}" \
-            https://github.com/pytorch/executorch.git executorch-src
-          cd executorch-src
+            https://github.com/pytorch/executorch.git executorch
+          cd executorch
           git submodule update --init --recursive --depth 1
           python -m pip install --upgrade pip
           ./install_requirements.sh
@@ -392,8 +416,8 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p device-side
-          find executorch-src -name qnn_executor_runner -type f -exec cp {} device-side/ \;
-          find executorch-src -name libqnn_executorch_backend.so -type f -exec cp {} device-side/ \;
+          find executorch -name qnn_executor_runner -type f -exec cp {} device-side/ \;
+          find executorch -name libqnn_executorch_backend.so -type f -exec cp {} device-side/ \;
           ls -la device-side
           test -f device-side/qnn_executor_runner
           test -f device-side/libqnn_executorch_backend.so
