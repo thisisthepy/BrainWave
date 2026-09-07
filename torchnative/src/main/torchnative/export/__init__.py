@@ -14,7 +14,18 @@ vendored `torch.backends`, and making a bare `import torchnative.export` depend
 on either would turn a missing optional package into an import error for the
 lowering passes that do not need it.
 
-`torchnative.export.nnapi_device` is a third, and is not imported here for the
+`torchnative.export.intelnpu` is a third and is likewise not imported here: it
+loads the OpenVINO C runtime through `ctypes`, which exists on no developer
+machine by default. docs/INTELNPU.md is its design record. Two findings in that
+document are why it can exist at all: §1.1, that the archived Intel NPU
+library's own extension links `openvino::runtime` and nothing else -- no
+libtorch, no ATen, not even a `PyInit_` -- and §1.2, that the mechanism
+underneath `NPUModelForCausalLM` is `nn.Module` subtree replacement rather than
+`torch.compile`, which would have been a permanent wall (docs/COMPILE.md).
+§1.5 is why it does not simply host that library instead: its FFI boundary is
+numpy on every dispatch, and this shim has no numpy bridge.
+
+`torchnative.export.nnapi_device` is a fourth, and is not imported here for the
 same reason twice over: it needs `adb`, an `ANDROID_SERIAL`, and an NDK to
 build `nnapi_runner.c` with. It is what makes the NNAPI blob *executed* rather
 than merely decoded -- docs/NPU2.md §3, which also records that the CoreML
