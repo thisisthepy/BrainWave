@@ -23,6 +23,13 @@ a module that ran *something* and reported success would be reporting on the
 CPU path. What this module does is answer the two questions the device
 procedure in docs/devices/QNN.md §5 starts with, from the device rather than from a
 guess: **which SoC is this** and **is the HTP reachable**.
+
+Those two are answered by different evidence and must not be run together. The
+SoC is a *name*, mapped through a table; it describes the part number, and it
+reads the same on a unit whose cDSP is fused off, powered down, or not exposed
+to userspace at all. Only `htp_reachable` answers the second question, and it
+answers it from the FastRPC compute-DSP endpoints -- see `CDSP_FASTRPC_NODES`
+for the measurement that forced the two apart.
 """
 
 from __future__ import annotations
@@ -38,6 +45,7 @@ __all__ = [
     "SOC_PROPERTIES",
     "HTP_RUNTIME_LIBRARIES",
     "FASTRPC_NODES",
+    "CDSP_FASTRPC_NODES",
     "SOC_KNOWN",
     "SOC_NOT_IN_TABLE",
     "SOC_TABLE_UNAVAILABLE",
@@ -47,6 +55,8 @@ __all__ = [
     "getprop",
     "device_soc",
     "fastrpc_nodes",
+    "cdsp_fastrpc_nodes",
+    "htp_reachable",
     "device_abi",
     "htp_stub_for",
     "staged_libraries",
@@ -197,23 +207,55 @@ def htp_stub_for(htp_arch):
     return (f"libQnnHtpV{htp_arch}Stub.so", f"libQnnHtpV{htp_arch}Skel.so")
 
 
-#: The FastRPC character devices the HTP is reached through. `libQnnHtpSkel.so`
-#: is loaded *onto the DSP* over one of these, so their absence means no
-#: Hexagon NPU is reachable however good the artefact is.
+#: Every FastRPC character device this module looks for, compute and audio
+#: alike. Reported for context; **not** evidence of an NPU on its own, for the
+#: reason `CDSP_FASTRPC_NODES` gives.
+FASTRPC_NODES = (
+    "/dev/adsprpc-smd",
+    "/dev/adsprpc-smd-secure",
+    "/dev/fastrpc-adsp",
+    "/dev/cdsprpc-smd",
+    "/dev/cdsprpc-smd-secure",
+    "/dev/fastrpc-cdsp",
+)
+
+#: The subset of `FASTRPC_NODES` that reaches the **compute** DSP, which is the
+#: only DSP the HTP runs on. `libQnnHtpV<arch>Skel.so` is loaded *onto the cDSP*
+#: over one of these, so their absence means no Hexagon NPU is reachable
+#: however good the artefact is and whatever the SoC is called.
 #:
-#: Which names exist varies by device and neither is guaranteed: measured on a
-#: Galaxy Tab S9 Ultra (SM8550, Android 16), `/dev/adsprpc-smd` is present and
-#: `/dev/cdsprpc-smd` is not.
-FASTRPC_NODES = ("/dev/adsprpc-smd", "/dev/cdsprpc-smd", "/dev/fastrpc-adsp")
+#: **Separating these two tuples is the whole point.** The first version of this
+#: module had one flat tuple with `/dev/adsprpc-smd` at the front of it, and
+#: `device_report` reported `fastrpc: ("/dev/adsprpc-smd",)` on the Galaxy Tab
+#: S9 Ultra as if that were a positive finding. It is not. `adsprpc` is the
+#: **audio** DSP: it is present on essentially every Qualcomm phone and tablet
+#: ever shipped, it is present when the cDSP is fused off, and nothing that
+#: runs on it is an NPU workload. Measured on that tablet (SM8550, Android 16,
+#: API 36): `/sys/class/fastrpc/` -- the kernel driver's own registration list,
+#: which is what this should have been reading -- contains exactly
+#: `adsprpc-smd` and `adsprpc-smd-secure` and **no cDSP endpoint at all**,
+#: while `/dev/adsprpc-smd` is `crw-rw-r-- system:system` and so is not even
+#: openable read-write by the `shell` user that would have to open it.
+#:
+#: Both the downstream (`cdsprpc-smd`) and mainline (`fastrpc-cdsp`) names are
+#: listed because which one a kernel exposes is not fixed.
+CDSP_FASTRPC_NODES = (
+    "/dev/cdsprpc-smd",
+    "/dev/cdsprpc-smd-secure",
+    "/dev/fastrpc-cdsp",
+)
 
 
 def fastrpc_nodes():
     """Which of `FASTRPC_NODES` exist on the device. Stat, never `ls /dev`.
 
-    `ls /dev` returns nothing for the `shell` user on a modern Android image
-    (measured: Android 16 / API 36 returns an empty listing while `ls -l` on a
-    named path under it succeeds), so a check that listed the directory would
-    conclude "no DSP" on a device that has one. Each path is stat'd by name.
+    Each path is stat'd by name rather than the directory being listed, so that
+    a device whose `/dev` the `shell` user cannot enumerate is not reported as
+    having no DSP.
+
+    **A non-empty return is not an NPU.** Nearly every entry that comes back on
+    a real handset is `adsprpc`, the audio DSP. Use `cdsp_fastrpc_nodes` for the
+    question anybody actually means.
     """
     found = []
     for path in FASTRPC_NODES:
@@ -221,6 +263,55 @@ def fastrpc_nodes():
         if out == path:
             found.append(path)
     return tuple(found)
+
+
+def cdsp_fastrpc_nodes():
+    """Which compute-DSP FastRPC endpoints exist. The HTP is reached over these.
+
+    Two sources, and the disagreement between them matters, so both are
+    consulted and the union is returned:
+
+    * `/sys/class/fastrpc/` -- the FastRPC driver's own list of registered
+      endpoints. This is the authoritative one: a name here was registered by
+      the kernel driver, not merely left in a `/dev` populated by ueventd.
+    * `ls -d` on each of `CDSP_FASTRPC_NODES`, for kernels that do not export
+      the sysfs class.
+    """
+    found = []
+    listing = adb(
+        "shell", "ls -1 /sys/class/fastrpc 2>/dev/null || true"
+    ).split()
+    for path in CDSP_FASTRPC_NODES:
+        name = path.rsplit("/", 1)[-1]
+        if name in listing:
+            found.append(path)
+            continue
+        out = adb("shell", f"ls -d {path} 2>/dev/null || true").strip()
+        if out == path:
+            found.append(path)
+    return tuple(found)
+
+
+def htp_reachable():
+    """`(bool, reason)` -- is there a path to the Hexagon NPU on this device?
+
+    Deliberately **not** a function of the SoC name. `device_soc` answering
+    `SM8550`/`htp_arch=73` says the silicon that model number denotes has a V73
+    HTP in its datasheet; it does not say this unit's cDSP is powered, fused in,
+    exposed to userspace, or reachable by the uid holding the adb shell. Those
+    are different claims and only the second one licenses `device.npu`.
+    """
+    nodes = cdsp_fastrpc_nodes()
+    if not nodes:
+        return False, (
+            "no compute-DSP FastRPC endpoint on the device: none of "
+            f"{', '.join(CDSP_FASTRPC_NODES)} exists and /sys/class/fastrpc "
+            "registers none. The HTP skeleton is loaded onto the cDSP over one "
+            "of these, so there is no path to a Hexagon NPU here regardless of "
+            "what the SoC is called. (An `adsprpc` node is the *audio* DSP and "
+            "does not substitute.)"
+        )
+    return True, None
 
 
 def staged_libraries():
@@ -264,6 +355,12 @@ def device_report():
             else HTP_RUNTIME_LIBRARIES
         )
         report["fastrpc"] = fastrpc_nodes()
+        report["cdsp_fastrpc"] = cdsp_fastrpc_nodes()
+        # The SoC name says what the datasheet has; this says what the device
+        # will actually let a caller reach. `device.npu` gates on this one.
+        reachable, why = htp_reachable()
+        report["htp_reachable"] = reachable
+        report["htp_unreachable_reason"] = why
         report["staged"] = staged_libraries()
         report["staged_complete"] = all(
             name in report["staged"] for name in report["htp_libraries"]

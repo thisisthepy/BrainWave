@@ -505,6 +505,24 @@ class NpuDevice(CompiledDevice):
                 f"device is reachable but reports no HTP architecture, so there "
                 f"is no Hexagon NPU to target on it."
             )
+        # `htp_arch` alone is not enough, and this gate is here because for a
+        # while it was the only gate. It comes from `ro.soc.model` mapped
+        # through ExecuTorch's chipset table -- it is a *name*. Measured on a
+        # Galaxy Tab S9 Ultra: `ro.soc.model=SM8550` yields `htp_arch=73` and
+        # this function returned a confident "Qualcomm Hexagon NPU", on a device
+        # whose `/sys/class/fastrpc` registers no compute-DSP endpoint at all
+        # and on which not one QNN runtime library is present. That is the
+        # `_mps_is_available` shape inverted: a hardcoded yes instead of a
+        # hardcoded no, and it would have said the same thing about any device
+        # that merely *calls itself* an SM8550.
+        if not report.get("htp_reachable"):
+            raise NpuUnresolved(
+                f"torchnative.device.npu resolves to the {unit} on {h}, and the "
+                f"device names an SoC whose datasheet has a V{report['htp_arch']} "
+                f"HTP -- but that is the part number, not a probe. "
+                f"{report.get('htp_unreachable_reason')} Refusing by name rather "
+                f"than reporting a Hexagon NPU that nothing here has reached."
+            )
         return NpuResolution(h, backend, unit, source, report)
 
     # -- availability is resolution, caught ---------------------------------
