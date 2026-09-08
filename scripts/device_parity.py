@@ -9,16 +9,28 @@ can say whether it holds. Several ops here deliberately route through libm
 Apple's libm and the device links bionic's, and those are different
 implementations of the same specification.
 
-That bet paid: 30 of 32 comparable cases came out bit-identical, and the two
-that did not are `tanh.default` and `_softmax.default` (whose kernel calls
-`expf`) -- by exactly 1 ULP. `cos`, `sin`, `gelu`, `silu`, `rsqrt` and `pow`
-were identical, so the divergence is per-function, not a blanket libm effect.
-docs/DEVICE.md records the run and the reference-value analysis.
+That bet paid, on the original 33-case battery: 30 of 32 comparable cases came
+out bit-identical, and the two that did not are `tanh.default` and
+`_softmax.default` (whose kernel calls `expf`) -- by exactly 1 ULP. `cos`,
+`sin`, `gelu`, `silu`, `rsqrt` and `pow` were identical, so the divergence is
+per-function, not a blanket libm effect. docs/devices/DEVICE.md records that run and
+the reference-value analysis, and the runs after each battery expansion.
 
 Inputs avoid exactly-representable values on purpose. `1.5 + 2.25 = 3.75` is
 bit-identical under any arithmetic that is not actively broken, so it proves
 nothing; the tensors here are built from `arange`-derived fractions that do not
 terminate in binary.
+
+The battery grows as ops land that this file never ran on real hardware --
+`_aten_implemented()` reached 116 while this file still tested 33 (mamba and
+mixtral's 12, plus a `cat`/`max` semantics fix, went un-verified on device for
+days). New cases below target what a bigger battery is *for*: an edge each op
+is specifically known to get wrong if it is not careful (`cat`'s legacy-empty
+skip, `max`'s NaN propagation, a matmul size that crossed the gemm threading
+threshold in 25a79df) rather than another easy interior point. Uninitialized-
+memory ops (`empty`, `empty_like`) are deliberately absent -- there is no bit
+pattern to compare, the same reasoning tools/golden/cases.py's
+`_dtype_shape_only_check` encodes for the golden suite.
 
 Judgement is by exit code and by the emitted JSON, never by scraping stdout for
 a success word (IMPORT_WALLS 2차 lost a round to a traceback that echoed its own
@@ -219,6 +231,17 @@ def _(a, b):
     return torch.ops.aten.sum.default(a)
 
 
+@case("sum.dim_IntList (dim=[])")
+def _(a, b):
+    # The fix docs/graph/DECOMP.md §6.1 records: an empty `dim` list means "reduce
+    # every dimension", not "reduce none". `rust/torch_c/src/aten.rs` is
+    # ordinary CPU-only Rust with no platform-conditional code in this
+    # function, so there is no reason to expect the device to disagree with
+    # the host here -- this case exists to check that expectation rather
+    # than assume it.
+    return torch.ops.aten.sum.dim_IntList(a, [], False)
+
+
 @case("mean.dim")
 def _(a, b):
     return torch.ops.aten.mean.dim(a, [1], False, None)
@@ -327,6 +350,188 @@ def _(a, b):
         net[2].weight.copy_(torch.tensor([[0.5, -0.25, 0.75], [-1.5, 0.125, 0.25]]))
         net[2].bias.copy_(torch.tensor([-0.5, 0.25]))
     return net(a)
+
+
+# --- expansion: the "repr" kernels (docs/graph/DECOMP.md's naming) -----------------
+#
+# `abs`, `ceil`, `gt`, `masked_select`, `min` and `unbind` landed together and
+# were never run on the device before this expansion.
+
+
+@case("abs.default")
+def _(a, b):
+    return torch.ops.aten.abs.default(b)
+
+
+@case("ceil.default")
+def _(a, b):
+    return torch.ops.aten.ceil.default(a)
+
+
+@case("gt.Scalar")
+def _(a, b):
+    return torch.ops.aten.gt.Scalar(a, 1.0)
+
+
+@case("masked_select.default")
+def _(a, b):
+    mask = torch.ops.aten.lt.Scalar(b, 0.0)
+    return torch.ops.aten.masked_select.default(b, mask)
+
+
+@case("min.default")
+def _(a, b):
+    return torch.ops.aten.min.default(a)
+
+
+@case("unbind.int")
+def _(a, b):
+    # `unbind` hands back a tuple of tensors, not one -- `encode()` only
+    # knows how to describe a single tensor, so this reads the first row.
+    # Same pattern as `max.dim`/`topk.default`/`sort.default` above.
+    return torch.ops.aten.unbind.int(a, 0)[0]
+
+
+@case("max.default")
+def _(a, b):
+    # The bug this pins: candle's reduction used to *skip* NaN, so
+    # `max([3, nan, 1])` came back `3.0` where upstream (and IEEE `maximum`)
+    # says the result is `nan`. Fixed on the host; never run on device.
+    # `min.default` shares the same reduction path -- `min.default` above
+    # covers the ordinary case, this covers the propagation rule.
+    nan_input = torch.tensor([3.0, float("nan"), 1.0, 0.5, -2.0, 4.0], dtype=torch.float32)
+    return torch.ops.aten.max.default(nan_input)
+
+
+@case("cat.default (empty)")
+def _(a, b):
+    # torch's "legacy empty" rule: a 1-D tensor of shape exactly (0,) is
+    # skipped by `cat` regardless of the other operands' rank; anything else
+    # empty (e.g. shape (0, 5)) is NOT exempt. `docs/models/E2E_REAL.md` -- every
+    # transformers KV cache's first decoder step concatenates against
+    # exactly this shape, so getting the *rule*, not just the ordinary case
+    # `cat.default` above already covers, right matters on device too.
+    empty = torch.ops.aten.full.default([0], 1.0)
+    return torch.ops.aten.cat.default([empty, a], 0)
+
+
+# --- expansion: mamba's and mixtral's 12 ops (never run on device) -----------
+
+
+@case("clamp_.default")
+def _(a, b):
+    # mixtral's exact call shape: max only, min absent. Clone first --
+    # in-place, and `a`/`b` are shared across every case in this file.
+    x = torch.ops.aten.clone.default(a)
+    return torch.ops.aten.clamp_.default(x, None, 3.0)
+
+
+@case("convolution.default")
+def _(a, b):
+    # mamba's exact shape: depthwise causal 1-D conv -- groups == in_channels
+    # == out_channels, padding == kernel_size - 1. Values from
+    # tools/golden/cases.py::convolution_cases, the same fixture already
+    # measured against upstream.
+    x = torch.tensor(
+        [1.0, 2.0, 3.0, 4.0, 5.0, -1.0, 0.5, 2.0, -2.0, 1.0, 0.0, 1.0, -1.0, 2.0, 3.0]
+    ).reshape(1, 3, 5)
+    w = torch.tensor(
+        [1.0, -1.0, 0.5, 0.0, 0.5, 0.5, 0.5, 0.5, -1.0, 1.0, 0.0, 2.0]
+    ).reshape(3, 1, 4)
+    bias = torch.tensor([0.1, -0.2, 0.3])
+    return torch.ops.aten.convolution.default(x, w, bias, [1], [3], [1], False, [0], 3)
+
+
+@case("div_.Tensor")
+def _(a, b):
+    # mixtral's exact call shape: top_k_weights.div_(top_k_weights.sum(-1,
+    # keepdim=True)). Clone first -- in-place.
+    x = torch.ops.aten.clone.default(a)
+    denom = torch.ops.aten.sum.dim_IntList(x, [-1], True)
+    return torch.ops.aten.div_.Tensor(x, denom)
+
+
+@case("exp.default")
+def _(a, b):
+    return torch.ops.aten.exp.default(a)
+
+
+@case("floor_divide.default")
+def _(a, b):
+    return torch.ops.aten.floor_divide.default(a, b)
+
+
+@case("ge.Scalar")
+def _(a, b):
+    return torch.ops.aten.ge.Scalar(a, 1.0)
+
+
+@case("histc.default")
+def _(a, b):
+    # mixtral's exact call shape: bins=num_experts, min=0, max=num_experts-1.
+    return torch.ops.aten.histc.default(a, 4, 0, 3)
+
+
+@case("index_put_.default")
+def _(a, b):
+    # mixtral's exact call shape: inv_perm[perm] = torch.arange(perm.size(0)).
+    # A single int64 index tensor, no accumulate. Freshly built, not a
+    # clone of `a`/`b` -- nothing here is shared with another case.
+    self_ = torch.ops.aten.full.default([5], 0.0)
+    index = torch.tensor([4, 3, 2, 1, 0], dtype=torch.int64)
+    values = torch.tensor([10.0, 20.0, 30.0, 40.0, 50.0])
+    return torch.ops.aten.index_put_.default(self_, [index], values, False)
+
+
+@case("masked_fill_.Scalar")
+def _(a, b):
+    # mixtral's exact shape: a (N,1) sentinel mask broadcasts into an
+    # (N,hidden_dim) receiver, filled with a large negative sentinel. Clone
+    # first -- in-place.
+    x = torch.ops.aten.clone.default(a)
+    mask = torch.tensor([[True], [False], [True]])
+    return torch.ops.aten.masked_fill_.Scalar(x, mask, -1e9)
+
+
+@case("softplus.default")
+def _(a, b):
+    return torch.ops.aten.softplus.default(a)
+
+
+@case("zeros_like.default")
+def _(a, b):
+    return torch.ops.aten.zeros_like.default(a)
+
+
+# --- expansion: the gemm threading threshold (25a79df) ------------------------
+#
+# Correctness only -- CLAUDE.md says not to measure performance on a shared,
+# loaded emulator, and this script never has. 25a79df raised the threading
+# crossover from 589,824 to 4,000,000 total multiply-adds; n=128 (2,097,152)
+# sits between the two, so a matmul this size took the threaded path before
+# and takes the sequential path now. The commit argued the answer cannot
+# change (columns split between threads, k-accumulation stays whole) and
+# checked it by hashing host output at three thresholds -- this is the
+# device-side half of that same claim, on the artefact that actually shipped
+# the change.
+@case("mm.default (n=128, gemm threading threshold)")
+def _(a, b):
+    n = 128
+    x = torch.ops.aten.view.default(
+        torch.ops.aten.div.Tensor(
+            torch.ops.aten.arange.start_step(0.0, float(n * n), 1.0),
+            torch.ops.aten.full.default([n * n], 7.0),
+        ),
+        [n, n],
+    )
+    y = torch.ops.aten.view.default(
+        torch.ops.aten.div.Tensor(
+            torch.ops.aten.arange.start_step(0.0, float(n * n), 1.0),
+            torch.ops.aten.full.default([n * n], 5.0),
+        ),
+        [n, n],
+    )
+    return torch.ops.aten.mm.default(x, torch.ops.aten.t.default(y))
 
 
 def main() -> int:

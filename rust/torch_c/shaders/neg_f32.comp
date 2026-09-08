@@ -1,0 +1,22 @@
+#version 450
+
+// `aten.neg.default` for f32: out[i] = -a[i].
+//
+// Binding 1 is bound to the same buffer as binding 0 by the caller: the
+// descriptor set layout in `vulkan.rs` is three storage buffers for every
+// kernel here, and a unary op declares the slot it does not use rather than
+// having a second layout that would have to be kept in step with this file.
+
+layout(local_size_x = 64) in;
+
+layout(std430, set = 0, binding = 0) readonly  buffer A { float a[]; };
+layout(std430, set = 0, binding = 1) readonly  buffer B { float unused_b[]; };
+layout(std430, set = 0, binding = 2) writeonly buffer C { float c[]; };
+
+layout(push_constant) uniform Push { uint n; uint p1; uint p2; uint p3; } pc;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n) return;
+    c[i] = -a[i];
+}

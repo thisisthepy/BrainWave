@@ -1,0 +1,51 @@
+[package]
+name = "vk_probe"
+version = "0.0.0"
+edition = "2021"
+
+# Deliberately NOT a dependency of `rust/torch_c`, and deliberately not in a
+# workspace with it. This crate exists to answer one question -- can a Vulkan
+# compute shader run on our Android target and agree with the CPU -- and adding
+# a Vulkan dependency to the real extension module before that is answered would
+# put all three platform builds at risk for nothing.
+[[bin]]
+name = "vk_probe"
+path = "src/main.rs"
+
+[dependencies]
+# `ash` is a thin generated binding over the Vulkan headers; it adds no runtime
+# of its own. `linked` is deliberately OFF so that nothing links against
+# libvulkan.so at build time: `Entry::load()` dlopens it, which means the binary
+# still loads on a device with no Vulkan and can report that as a value rather
+# than failing at exec time.
+#
+# `debug` is on only so that flag/enum values print as names instead of
+# integers; the probe's whole output is a report, and `flags=0x3` would need a
+# header open next to it to mean anything.
+ash = { version = "0.38", default-features = false, features = ["loaded", "std", "debug"] }
+
+[profile.release]
+opt-level = 2
+
+# The wgpu route, behind a feature so the default build stays at three crates.
+# `cargo build` proves the ash route; `cargo build --features wgpu-route` adds
+# the comparison. Nothing here is a dependency of `rust/torch_c`.
+[[bin]]
+name = "vk_probe_wgpu"
+path = "src/wgpu_main.rs"
+required-features = ["wgpu-route"]
+
+[features]
+wgpu-route = ["dep:wgpu", "dep:pollster"]
+
+[dependencies.wgpu]
+version = "30"
+optional = true
+default-features = false
+# Vulkan only. The other backends would pull in translation layers we have no
+# use for on Android and cannot test here.
+features = ["vulkan", "wgsl"]
+
+[dependencies.pollster]
+version = "0.4"
+optional = true

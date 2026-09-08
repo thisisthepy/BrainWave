@@ -1,0 +1,291 @@
+# Does the CUDA extension BUILD? -- and nothing beyond that.
+#
+# **The runner has no GPU. This job makes a BUILD claim only.** It is modelled
+# on `verify-published-wheel.yml`, which exists because a hosted runner is the
+# Linux and Windows machine this project does not have; that job is careful to
+# distinguish "the wheel installs" from "the wheel computes", and this one has
+# to be careful about a wider gap still. A green check here means the CUDA
+# artefact compiled and links the libraries it should. It does not mean a
+# kernel ran, and every step below that could be misread as saying otherwise
+# says so in its own output.
+#
+# The procedure that *would* settle whether kernels run is in `docs/devices/CUDA.md` §6
+# and needs a machine with an NVIDIA GPU. GitHub's hosted runners do not have
+# one; larger GPU runners are a paid feature this repository has not enabled.
+#
+# **Why this job is worth having anyway.** Nothing on this project's own
+# machine -- an arm64 Mac with no nvcc -- can compile a single line of the
+# CUDA-gated code. `cargo check` cannot even resolve the dependency graph:
+# `cudarc`'s build script runs `nvcc --version` and panics without it. So this
+# job is the *only* compiler that ever sees `device.rs`'s
+# `#[cfg(torch_c_cuda)]` island, and a red run here is a real defect report.
+#
+# It also settles three claims in `docs/devices/CUDA.md` §2 empirically rather than by
+# reading crate sources, which is how they were established: that a CUDA build
+# needs nvcc, that it needs `CUDA_COMPUTE_CAP` on a GPU-less machine, and that
+# the resulting `_C.abi3.so` carries libcuda/libcudart/libcublas as **load-time**
+# dependencies -- which is the fact that forces CUDA into a separate wheel.
+name: build cuda wheel (BUILD CLAIM ONLY -- runner has no GPU)
+
+on:
+  workflow_dispatch:
+    inputs:
+      compute_cap:
+        description: >-
+          Compute capability to compile the CUDA kernels for. The default is 75
+          (Turing, which is the T4 in Google Colab's free tier and the cheapest
+          GPU a reader of docs/devices/CUDA.md is likely to reach). PTX is
+          forward-compatible, so a build at 75 JITs onto anything newer; it will
+          NOT run on anything older.
+        required: false
+        default: "75"
+      cuda_version:
+        description: "CUDA toolkit version (must be one cudarc 0.19.8 supports)"
+        required: false
+        default: "12.6.0"
+  push:
+    paths:
+      - ".github/workflows/build-cuda-wheel.yml"
+      - "rust/torch_c/Cargo.toml"
+      - "rust/torch_c/build.rs"
+      - "rust/torch_c/src/device.rs"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    name: linux-x86_64 cuda (build only, no GPU)
+
+    env:
+      # `candle-kernels`'s build script detects the target architecture with
+      # `nvidia-smi --query-gpu=compute_cap` and **fails** when there is no GPU
+      # to ask. On a hosted runner there never is, so this variable is not a
+      # tuning knob here -- without it the build cannot start. `cudaforge`'s
+      # `detect_compute_cap` reads it first, before trying nvidia-smi.
+      #
+      # This crate reads it too, at compile time, so that `device.rs` can refuse
+      # a GPU older than these kernels *by name* at `resolve()` (docs/devices/CUDA.md §4).
+      CUDA_COMPUTE_CAP: ${{ inputs.compute_cap || '75' }}
+      # Not the same claim as the CPU wheels' floor -- it is the same floor.
+      # abi3-py313, so one binary per platform across CPython versions
+      # (docs/design/ABI3.md). CUDA does not change that axis; it changes a different
+      # one, and docs/devices/CUDA.md §3 is about exactly which.
+      PYTHON_VERSION: "3.13"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # The full CUDA toolkit is several gigabytes and a hosted runner starts
+      # with about fourteen free. Removing the preinstalled Android SDK and
+      # .NET is the standard reclamation and costs about a minute.
+      - name: Make room for the toolkit
+        run: |
+          df -h /
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc
+          df -h /
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: What we are standing on
+        run: |
+          set -eux
+          python -c "import platform,sys; print(platform.platform()); print(sys.version)"
+          # Said out loud, at the top of the log, because it is the single most
+          # important fact about this run.
+          echo "=============================================================="
+          echo "THIS RUNNER HAS NO GPU. This job is a BUILD CLAIM ONLY."
+          echo "nvidia-smi below is expected to fail; that is not an error."
+          echo "=============================================================="
+          nvidia-smi || echo "no GPU here, as expected"
+
+      - name: Install the CUDA toolkit
+        id: cuda
+        env:
+          # The human-facing form, e.g. `12.6.0`. apt wants `12-6` and the
+          # install prefix wants `12.6`; both are derived below rather than
+          # being three inputs that can disagree.
+          CUDA_VERSION: ${{ inputs.cuda_version || '12.6.0' }}
+        run: |
+          set -eux
+          # NOT the `cuda` meta-package, and not `Jimver/cuda-toolkit`'s
+          # default either. The first run of this job proved why: both pull in
+          # `nvidia-driver-560-open` and `nvidia-dkms-560-open`, whose DKMS
+          # build fails on a runner with no GPU, and dpkg then exits 100.
+          #
+          # The same log also showed `cuda-toolkit-12-6` SETTING UP CLEANLY
+          # before that failure, so this is the package the evidence points at:
+          # nvcc, the headers, the math libraries, and the driver stub -- and
+          # no kernel module.
+          #
+          # `cudarc`'s `dynamic-linking` links `-lcuda` against the toolkit's
+          # STUB at `$CUDA_PATH/lib64/stubs/libcuda.so`, which its build script
+          # already puts on the link search path (cudarc 0.19.8,
+          # `link_searches`). That stub is precisely why a LINK is possible on
+          # a machine with no driver while a RUN is not.
+          . /etc/os-release
+          distro="ubuntu${VERSION_ID//./}"
+          wget -q "https://developer.download.nvidia.com/compute/cuda/repos/${distro}/x86_64/cuda-keyring_1.1-1_all.deb"
+          sudo dpkg -i cuda-keyring_1.1-1_all.deb
+          sudo apt-get update -qq
+          mm="${CUDA_VERSION%.*}"          # 12.6.0 -> 12.6
+          sudo apt-get install -y --no-install-recommends "cuda-toolkit-${mm/./-}"
+          cuda_home="/usr/local/cuda-${mm}"
+          test -x "$cuda_home/bin/nvcc"
+          echo "CUDA_PATH=$cuda_home"       >> "$GITHUB_ENV"
+          echo "CUDA_HOME=$cuda_home"       >> "$GITHUB_ENV"
+          echo "$cuda_home/bin"             >> "$GITHUB_PATH"
+
+      - name: The toolkit answers, and cudarc's version detection will work
+        run: |
+          set -eux
+          nvcc --version
+          echo "CUDA_PATH=$CUDA_PATH"
+          ls "$CUDA_PATH/lib64/stubs"
+          # docs/devices/CUDA.md §2, claim 1, checked rather than asserted: `nvcc
+          # --version`'s fourth line is what cudarc's build script parses.
+          nvcc --version | sed -n '4p'
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # The cfg key arrives through `$CARGO_HOME/config.toml` rather than as a
+      # `--config` flag or `RUSTFLAGS`, and the choice matters twice.
+      #
+      # Not `RUSTFLAGS`: it *replaces* the rustflags from `.cargo/config.toml`
+      # rather than adding to them, which is the trap `rust/torch_c/Cargo.toml`
+      # records against the Accelerate opt-out. Nothing in this repository's
+      # `.cargo/config.toml` targets Linux today, so it would happen to work --
+      # and would break silently the day something does.
+      #
+      # Not `--config` on the command line: `vendor/install_shim.sh` runs its
+      # own `cargo build --release`, and a flag passed here would not reach it.
+      # A config file reaches every cargo invocation in the job, so the shim
+      # that gets vendored is the same artefact this job verified.
+      - name: Turn the cuda cfg on for every cargo invocation in this job
+        run: |
+          set -eux
+          mkdir -p "$HOME/.cargo"
+          cat >> "$HOME/.cargo/config.toml" <<'EOF'
+          [target.x86_64-unknown-linux-gnu]
+          rustflags = ["--cfg", "torch_c_cuda"]
+          EOF
+          cat "$HOME/.cargo/config.toml"
+
+      # THE LOAD-BEARING STEP. Everything after this is packaging; this is the
+      # claim the job exists to make, kept as its own step so that a failure
+      # further down cannot be confused with the compiler rejecting the code.
+      - name: Build the CUDA extension
+        working-directory: rust/torch_c
+        run: |
+          set -eux
+          cargo build --release
+          ls -la target/release/lib_C.so
+
+      # Cargo's own answer to "did the cfg actually reach the dependency table",
+      # which is the failure mode that would otherwise produce a green CPU build
+      # wearing this job's name. `cargo tree -e features` is how docs/devices/VULKAN3.md
+      # §1.3 checked the same thing for Metal.
+      - name: The cuda feature really is in the graph
+        working-directory: rust/torch_c
+        run: |
+          set -eux
+          cargo tree -e features --target x86_64-unknown-linux-gnu | tee /tmp/tree.txt
+          grep -q "candle-core feature \"cuda\"" /tmp/tree.txt
+          grep -q "cudarc" /tmp/tree.txt
+
+      # docs/devices/CUDA.md §3's central claim, measured here rather than argued:
+      # the artefact names CUDA libraries as load-time dependencies, so it
+      # cannot be the same wheel as the CPU one.
+      - name: What the artefact needs at load time
+        working-directory: rust/torch_c
+        run: |
+          set -eux
+          readelf -d target/release/lib_C.so | tee /tmp/needed.txt
+          for lib in libcuda.so libcudart.so libcublas.so; do
+            grep -q "$lib" /tmp/needed.txt \
+              || { echo "expected $lib in NEEDED; docs/devices/CUDA.md §3 is wrong"; exit 1; }
+          done
+          echo "--------------------------------------------------------------"
+          echo "The above is why the CUDA build is a SEPARATE WHEEL. On a host"
+          echo "without these libraries this .so does not load, and it takes"
+          echo "'import torch' down with it. That is the difference from"
+          echo "'vulkan', where ash's dlopen turns absence into a value."
+          echo "--------------------------------------------------------------"
+
+      # Whether it imports on *this* runner. Reported, not asserted: the
+      # toolkit's stub libcuda may or may not be on the loader path depending on
+      # what the toolkit action exported, and neither outcome is a defect. It is
+      # here because it is the observation a reader of this log will want.
+      - name: Does it even import here (observation, not a gate)
+        working-directory: rust/torch_c
+        run: |
+          set -eu
+          cp target/release/lib_C.so /tmp/_C.abi3.so
+          if PYTHONPATH=/tmp python -c "import _C; print(_C._cuda_probe())"; then
+            echo "NOTE: it imported. The probe above will say why cuda is still"
+            echo "unavailable -- there is no GPU on this runner."
+          else
+            echo "NOTE: it did not import, which is the expected outcome on a"
+            echo "host with no CUDA driver and is the whole of docs/devices/CUDA.md §3."
+          fi
+
+      # Packaging. Separate from the build claim above on purpose.
+      #
+      # UNTESTED on a hosted runner at the time of writing -- this project's
+      # only machine cannot run GitHub Actions, and the same honesty is applied
+      # here as `verify-published-wheel.yml` applies to its iOS block.
+      - name: Vendor the upstream tree the wheel packages
+        run: |
+          set -eux
+          # The CPU index, deliberately: this project does not bundle cuBLAS or
+          # cuDNN or NCCL, and pulling upstream's CUDA wheels here would drag in
+          # gigabytes of exactly the thing docs/devices/CUDA.md §3 says we do not ship.
+          python -m pip install --index-url https://download.pytorch.org/whl/cpu torch
+          python -c "import torch, os; print(torch.__version__)"
+          SRC=$(python -c "import sysconfig; print(sysconfig.get_paths()['purelib'])")
+          TORCHNATIVE_TORCH_SRC="$SRC" sh vendor/vendor_torch.sh
+
+      - name: Install the CUDA shim into the vendored tree
+        run: |
+          set -eux
+          # Picks up the cfg from $CARGO_HOME/config.toml, so this is the same
+          # artefact the build step verified rather than a fresh CPU one.
+          PYTHON=python bash vendor/install_shim.sh
+          readelf -d torchnative/src/main/torch/_C.abi3.so | grep -E "libcuda|libcublas"
+
+      - name: Build the wheel
+        run: |
+          set -eux
+          python -m pip install build setuptools wheel
+          python tools/wheel/build.py
+          ls -la dist/
+
+      - name: Say what this run did and did not establish
+        if: always()
+        run: |
+          cat <<'EOF'
+          ================================================================
+          WHAT THIS RUN ESTABLISHED
+
+            * The CUDA-gated code compiles. This is the only compiler that
+              ever sees it -- the project's own machine has no nvcc.
+            * candle-core's `cuda` feature and cudarc are in the graph.
+            * The artefact names libcuda / libcudart / libcublas as
+              load-time dependencies (readelf, above).
+
+          WHAT THIS RUN DID **NOT** ESTABLISH
+
+            * That any kernel ran on a GPU. This runner has no GPU.
+            * That the wheel computes anything at all on CUDA.
+            * That the compute-capability refusal, the no-driver refusal or
+              the no-device refusal behave as intended against a real
+              driver. Their classifier is tested in test_cuda.py; the
+              states themselves are not entered here.
+
+          To settle those, follow the numbered procedure in docs/devices/CUDA.md §6
+          on a machine with an NVIDIA GPU.
+          ================================================================
+          EOF

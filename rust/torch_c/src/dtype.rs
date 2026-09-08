@@ -80,7 +80,7 @@ pub enum TorchDType {
     // unconditionally, before a single byte of the checkpoint is read. Missing
     // any one of the fourteen makes *every* `torch.load` raise
     // `AttributeError: module 'torch' has no attribute 'uint1'` -- measured,
-    // and it was the second wall on that path (docs/CKPT.md §2).
+    // and it was the second wall on that path (docs/models/CKPT.md §2).
     //
     // Nothing can be stored under them: `storage()` returns `None` for all
     // fourteen, so a tensor tagged with one refuses by name rather than
@@ -169,6 +169,36 @@ pub const ALIASES: &[(&str, TorchDType)] = &[
 ];
 
 impl TorchDType {
+    /// The name torch's *C++* `ScalarType` prints, which is not the Python one.
+    ///
+    /// `torch.uint8` is `Byte` in a C++ error message, `torch.float32` is
+    /// `Float`, `torch.int64` is `Long`. This exists because `aten::view.dtype`
+    /// raises from C++ and its message names both dtypes -- "must be divisible
+    /// by 4 to view Byte as Float" -- and a shim that reproduced the sentence
+    /// but not the vocabulary would hand callers a message that is upstream's
+    /// everywhere except where it identifies the problem.
+    ///
+    /// Only the dtypes this build can hold are spelled out; the rest fall back
+    /// to the Python name, which is what a caller who reaches them will
+    /// already have been told by `storage()`'s refusal. All measured on 2.13.0.
+    pub fn cpp_name(self) -> &'static str {
+        match self {
+            Float32 => "Float",
+            Float64 => "Double",
+            Float16 => "Half",
+            BFloat16 => "BFloat16",
+            UInt8 => "Byte",
+            Int8 => "Char",
+            Int16 => "Short",
+            Int32 => "Int",
+            Int64 => "Long",
+            UInt32 => "UInt32",
+            Bool => "Bool",
+            Float8E4M3FN => "Float8_e4m3fn",
+            other => other.name(),
+        }
+    }
+
     pub fn name(self) -> &'static str {
         match self {
             Float32 => "float32",
@@ -412,10 +442,69 @@ impl TorchDType {
         match self {
             Complex128 => 16,
             Float64 | Complex64 | Int64 | UInt64 => 8,
-            Float32 | Int32 | UInt32 | QInt32 => 4,
-            Float16 | BFloat16 | Int16 | UInt16 | Complex32 | Bits16 => 2,
+            // `complex32` is **4**, not 2: it is a pair of `float16`, and
+            // `itemsize` is the width of the whole complex element. Measured
+            // on 2.13.0 (`torch.complex32.itemsize` is 4) -- this row said 2
+            // until docs/kernels/COMPLEX2.md, which is the silent-wrong-number shape:
+            // `numel * element_size` would have sized a complex32 buffer at
+            // half its bytes. Nothing checked it, because the only assertion
+            // in the tree was about `complex64`.
+            Complex32 | Float32 | Int32 | UInt32 | QInt32 => 4,
+            Float16 | BFloat16 | Int16 | UInt16 | Bits16 => 2,
             _ => 1,
         }
+    }
+
+    /// The complex tag whose *component* dtype candle is storing, for
+    /// `Repr::Complex`'s two halves.
+    ///
+    /// The Rust-level counterpart of the `to_complex()` pymethod below, and
+    /// deliberately keyed on `candle_core::DType` rather than on `TorchDType`:
+    /// `PyTensorBase::complex` is handed two candle tensors and has to name
+    /// the tag from what they actually store, not from what a caller says
+    /// they store. `None` is the whole guard on the arm's invariant -- there
+    /// is no complex tag over `int64` or `bfloat16` (upstream has no
+    /// `complex(bfloat16)` either), so a pair of those cannot be built.
+    ///
+    /// It is the same table as `to_complex`, read from the storage side, and
+    /// `pytests/test_complex.py` asserts the two agree rather than trusting
+    /// that they were kept in step by hand.
+    pub fn complex_for_component(component: DType) -> Option<Self> {
+        Some(match component {
+            DType::F16 => Complex32,
+            DType::F32 => Complex64,
+            DType::F64 => Complex128,
+            _ => return None,
+        })
+    }
+
+    /// The inverse: the component dtype behind a complex tag. `None` for every
+    /// tag that is not complex, which is what makes `is_complex_tag` a derived
+    /// question rather than a second list to keep in step.
+    pub fn complex_component(self) -> Option<DType> {
+        Some(match self {
+            Complex32 => DType::F16,
+            Complex64 => DType::F32,
+            Complex128 => DType::F64,
+            _ => return None,
+        })
+    }
+
+    /// Is this one of the three complex tags?
+    pub fn is_complex_tag(self) -> bool {
+        self.complex_component().is_some()
+    }
+
+    /// The real tag a complex tag's halves wear -- the Rust-level `to_real()`.
+    /// `None` on every non-complex tag, so `view_as_real` cannot be reached
+    /// with a tag that has no real partner.
+    pub fn to_real_tag(self) -> Option<Self> {
+        Some(match self {
+            Complex32 => Float16,
+            Complex64 => Float32,
+            Complex128 => Float64,
+            _ => return None,
+        })
     }
 }
 
@@ -523,6 +612,22 @@ impl PyDtype {
             Float16 => Complex32,
             Float32 => Complex64,
             Float64 => Complex128,
+            // **`bfloat16` maps to `complex64`, not to itself.** Measured on
+            // 2.13.0: `torch.bfloat16.to_complex()` is `torch.complex64`,
+            // because there is no `complex(bfloat16)` and upstream promotes to
+            // the next complex type that can hold it rather than returning the
+            // input. This row returned `bfloat16` until docs/kernels/COMPLEX2.md.
+            //
+            // The complex tags map to themselves, as upstream.
+            //
+            // Still divergent, and recorded rather than fixed: upstream
+            // *raises* `RuntimeError` for `to_complex()` on an integral, bool
+            // or float8 dtype, where this returns the input unchanged. That is
+            // a wider change than this round's subject (it turns a total
+            // function partial for thirty tags with no measured caller), and
+            // it is written down in docs/kernels/COMPLEX2.md §7 rather than left
+            // silent.
+            BFloat16 => Complex64,
             other => other,
         })
     }
@@ -538,6 +643,137 @@ pub fn get_all_dtypes() -> Vec<PyDtype> {
         .filter(|d| d.in_all_dtypes())
         .map(|d| PyDtype::new(*d))
         .collect()
+}
+
+// --- the default floating dtype ---------------------------------------------
+//
+// `torch.set_default_dtype` / `torch.get_default_dtype`, and the value every
+// dtype-inference rule in `aten.rs` and `lib.rs` reads when the caller did not
+// name a dtype. This used to be `aten::DEFAULT_FLOAT`, a `const`; docs/
+// DISTRIBUTED.md §3.4 refused the setter on the grounds that it would have to
+// reach a Rust constant. `transformers` ended that argument --
+// `modeling_utils.py:239` calls `torch.set_default_dtype(dtype)` on the way
+// into `from_pretrained`, so the const had to become a global.
+//
+// **Representation: an `AtomicU8` index into `DEFAULT_FLOAT_CHOICES`.** The
+// alternatives and why not:
+//
+//   `RwLock<TorchDType>`   Reads happen on the dispatcher's hottest path -- a
+//                          factory call, an integral-to-float promotion -- and
+//                          each would pay an atomic read-modify-write plus a
+//                          poison check to guard a value that is one byte
+//                          wide. A `Relaxed` load of an `AtomicU8` is a plain
+//                          byte load.
+//   `OnceLock`             Cannot change, which is the entire requirement.
+//   `static mut`           Unsound under any concurrent read, and Rust 2024
+//                          makes even taking a reference to one an error.
+//
+// `Relaxed` is the right ordering, not a shortcut: the dtype tag is the whole
+// of the payload. Nothing else is being published alongside it, so there is no
+// happens-before edge for a stronger ordering to establish. (Upstream's own is
+// a plain non-atomic C++ global, so this is if anything stricter.) In practice
+// every read and every write here happens under the GIL as well.
+//
+// The value is an index into `DEFAULT_FLOAT_CHOICES` rather than the enum's
+// discriminant so that no `transmute` and no `#[repr(u8)]` is needed, and so
+// that the accept set has exactly one spelling: `set_default_dtype` refuses
+// anything `position()` cannot find, and `default_float()` can only ever
+// return something from that list.
+use std::sync::atomic::{AtomicU8, Ordering};
+
+/// The dtypes `torch.set_default_dtype` accepts, measured against upstream
+/// 2.13.0 over every `torch.dtype` it exposes. The float8/float4 tags are
+/// deliberately absent: they pass upstream's floating-point gate and then fail
+/// its storage-class lookup, which is a different refusal and is reproduced as
+/// one below.
+///
+/// Index 0 is the value torch starts at, and `DEFAULT_FLOAT_CHOICE` starts at
+/// 0 to match.
+const DEFAULT_FLOAT_CHOICES: &[TorchDType] = &[Float32, Float64, Float16, BFloat16];
+
+static DEFAULT_FLOAT_CHOICE: AtomicU8 = AtomicU8::new(0);
+
+/// The current default floating dtype. Every "the caller named no dtype" rule
+/// in the shim goes through here; `set_default_dtype` is only load-bearing to
+/// the extent that they do.
+pub fn default_float() -> TorchDType {
+    // Total by construction: the only writer is `set_default_dtype`, and the
+    // only value it writes is a `position()` within this same slice.
+    DEFAULT_FLOAT_CHOICES[DEFAULT_FLOAT_CHOICE.load(Ordering::Relaxed) as usize]
+}
+
+/// `torch._C._set_default_dtype`, which `torch.set_default_dtype` forwards to
+/// (`torch/__init__.py:1385`).
+///
+/// The three refusals are upstream's, reproduced by message rather than
+/// invented; the table in `test_shim.py` above
+/// `test_set_default_dtype_moves_every_rule_that_reads_the_default` records
+/// the measurement that produced them.
+#[pyfunction]
+#[pyo3(name = "_set_default_dtype")]
+pub fn set_default_dtype(dtype: &Bound<'_, PyAny>) -> PyResult<()> {
+    let tag = dtype
+        .extract::<PyDtype>()
+        .map_err(|_| {
+            pyo3::exceptions::PyTypeError::new_err(
+                "invalid dtype object: only floating-point types are supported \
+                 as the default type",
+            )
+        })?
+        .tag();
+    if !tag.is_floating_point() {
+        return Err(pyo3::exceptions::PyTypeError::new_err(
+            "only floating-point types are supported as the default type",
+        ));
+    }
+    let choice = DEFAULT_FLOAT_CHOICES
+        .iter()
+        .position(|d| *d == tag)
+        .ok_or_else(|| {
+            // Upstream gets here by looking for a `torch.<Name>Storage` class
+            // and not finding one, so it names the class rather than the
+            // dtype. The spelling is the dtype name with its first character
+            // capitalised: `float8_e4m3fn` -> `Float8_e4m3fnStorage`.
+            let mut name = tag.name().to_owned();
+            name[..1].make_ascii_uppercase();
+            pyo3::exceptions::PyTypeError::new_err(format!(
+                "couldn't find storage object {name}Storage"
+            ))
+        })?;
+    DEFAULT_FLOAT_CHOICE.store(choice as u8, Ordering::Relaxed);
+    Ok(())
+}
+
+/// `torch.get_default_dtype()`. Upstream binds `THPModule_getDefaultDtype`
+/// straight onto `_C` (`torch/_C/__init__.pyi:1399`) rather than routing it
+/// through the operator table; `bootstrap.py` used to install a constant
+/// function here, which is what made this a getter with only one answer.
+///
+/// It returns the *interned* object, so `torch.get_default_dtype() is
+/// torch.float32` holds as it does upstream -- dtypes are used as dict keys
+/// across the vendored tree.
+#[pyfunction]
+#[pyo3(name = "get_default_dtype")]
+pub fn get_default_dtype(py: Python<'_>) -> PyResult<Py<PyAny>> {
+    interned(py, default_float())
+}
+
+/// The module-level `torch.float32` and friends, kept so that anything handing
+/// a dtype back to Python can hand back *the* object rather than an equal one.
+static INTERNED: std::sync::OnceLock<Vec<(TorchDType, Py<PyAny>)>> =
+    std::sync::OnceLock::new();
+
+pub(crate) fn interned(py: Python<'_>, tag: TorchDType) -> PyResult<Py<PyAny>> {
+    INTERNED
+        .get()
+        .and_then(|made| made.iter().find(|(d, _)| *d == tag))
+        .map(|(_, object)| object.clone_ref(py))
+        .ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "torch._C shim: torch.{} was never registered on the module",
+                tag.name()
+            ))
+        })
 }
 
 /// Look a dtype up by its torch spelling, aliases included.
@@ -559,6 +795,8 @@ pub fn by_name(name: &str) -> Option<TorchDType> {
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyDtype>()?;
     m.add_function(wrap_pyfunction!(get_all_dtypes, m)?)?;
+    m.add_function(wrap_pyfunction!(set_default_dtype, m)?)?;
+    m.add_function(wrap_pyfunction!(get_default_dtype, m)?)?;
 
     // One Python object per dtype, shared with its aliases. torch guarantees
     // `torch.float is torch.float32`, and the tree uses dtypes as dict keys
@@ -579,5 +817,10 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
             .expect("every alias names a dtype in ALL");
         m.add(*alias, object)?;
     }
+    // Keep them reachable from Rust, for `get_default_dtype` -- see `interned`.
+    // A second call would be a second module init, which this build does not
+    // support (no multi-interpreter slot), so losing the race is not a case
+    // that can arise; `set` rather than `get_or_init` says so by ignoring it.
+    let _ = INTERNED.set(made);
     Ok(())
 }

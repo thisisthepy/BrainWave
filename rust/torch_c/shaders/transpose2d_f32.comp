@@ -1,0 +1,38 @@
+#version 450
+
+// `aten.t.default` / `aten.transpose.int` for a 2-D f32 tensor, materialised.
+//
+// `VkTensor` carries a shape and no strides, so a transpose on this device
+// cannot be the metadata-only operation it is upstream: there is nowhere to
+// record the swapped strides. It moves the bytes instead. That is a real
+// difference from upstream and it is the reason a transposed tensor here is
+// always contiguous; it is recorded in `docs/VULKAN4.md` rather than hidden,
+// because the alternative -- inventing strides -- is a much larger change than
+// this round.
+//
+// One invocation per *output* element, which is the convention every kernel in
+// this directory follows so that `dispatch_kernel` can size the grid from the
+// element count alone.
+//
+//   input  a is [p1, p2] row-major        (rows = p1, cols = p2)
+//   output c is [p2, p1] row-major
+//   c[r, s] = a[s, r]   with  r < p2, s < p1
+//
+// Pure data movement: no arithmetic happens, so the result is bit-identical to
+// the CPU answer by construction and the test asserts exactly that.
+
+layout(local_size_x = 64) in;
+
+layout(std430, set = 0, binding = 0) readonly  buffer A { float a[]; };
+layout(std430, set = 0, binding = 1) readonly  buffer B { float unused_b[]; };
+layout(std430, set = 0, binding = 2) writeonly buffer C { float c[]; };
+
+layout(push_constant) uniform Push { uint n; uint p1; uint p2; uint p3; } pc;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n) return;
+    uint r = i / pc.p1;          // row of the output, 0 .. p2-1
+    uint s = i - r * pc.p1;      // col of the output, 0 .. p1-1
+    c[i] = a[s * pc.p2 + r];
+}

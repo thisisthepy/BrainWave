@@ -1,0 +1,65 @@
+[package]
+name = "wasm_probe"
+version = "0.0.0"
+edition = "2021"
+
+# Deliberately NOT a dependency of `rust/torch_c`, and deliberately not in a
+# workspace with it -- the same arrangement, and for the same reason, as
+# `rust/vk_probe`. This crate exists to answer one question: does the candle
+# surface `torch_c` actually calls compile for `wasm32`? Adding a wasm target's
+# constraints to the real extension module before that is answered would put
+# the three platforms that currently build at risk for nothing.
+#
+# `torch_c` itself is a `cdylib` holding a PyO3 `extension-module`. This probe
+# is an `rlib` with no PyO3 at all, because PyO3 is layer 2 and layer 1 has to
+# be answered first: if candle does not compile for wasm32 there is nothing for
+# PyO3 to be embedded in.
+[lib]
+name = "wasm_probe"
+# `cdylib` because `rust/torch_c` is a `cdylib`, and that is not a cosmetic
+# difference: an `rlib` build never invokes the linker, so it cannot tell you
+# whether the undefined `_Py*` symbols an `extension-module` build leaves
+# behind can actually be resolved on the target. `rlib` is kept alongside so a
+# candle-only layer-1 answer is still available if the cdylib link is what
+# fails.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# Same version and same feature pinning as `rust/torch_c/Cargo.toml:36`.
+# Accelerate is Apple-only and is not requested here; on wasm32 candle falls
+# back to the `gemm` CPU path, which is what a wasm build would use anyway.
+candle-core = { version = "0.11.0", default-features = false }
+half = "2.7"
+
+# Not wanted, and not a candle dependency we chose -- this is here purely to get
+# `wasm32-unknown-unknown` to link. `getrandom` refuses that target unless a
+# backend is named, and the only backend it offers is `wasm_js`, i.e. Web
+# Crypto via `js-sys`. Two major versions are in candle's graph at once
+# (`rand` 0.8 pulls 0.3, `rand` 0.9 pulls 0.4), so both have to be pinned.
+#
+# The fact that this block is necessary is itself the finding: see
+# docs/platform/WASM.md §1c. `wasm32-wasip1` needs none of it.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom_03 = { package = "getrandom", version = "0.3", features = ["wasm_js"] }
+getrandom_04 = { package = "getrandom", version = "0.4", features = ["wasm_js"] }
+
+# Layer 2, behind a feature so the default build stays candle-only -- the same
+# arrangement as `vk_probe`'s `wgpu-route`. `cargo build` answers layer 1;
+# `cargo build --features pyo3-route` answers layer 2.
+#
+# Same version and same two features as `rust/torch_c/Cargo.toml:23`, because
+# the question is not "does some PyO3 build for wasm" but "does *our* pairing
+# -- abi3-py313 plus extension-module -- build for wasm".
+[features]
+pyo3-route = ["dep:pyo3"]
+# docs/platform/WASM.md §7 (this session's addition): an unresolvable `extern "C"`
+# symbol, exposed as its own pyfunction, for the aborting-stub negative
+# control against a *real* Emscripten CPython host. Off by default -- it is
+# never linkable, on purpose, so it must not be part of the artefact anyone
+# else loads.
+bogus-symbol-test = ["pyo3-route"]
+
+[dependencies.pyo3]
+version = "0.29.2"
+optional = true
+features = ["extension-module", "abi3-py313"]

@@ -1,0 +1,871 @@
+diff -ru src.orig/convert.rs src/convert.rs
+--- src.orig/convert.rs	2026-09-06 15:49:28
++++ src/convert.rs	2026-09-06 15:51:22
+@@ -95,6 +95,7 @@
+ from_tensor!(i64);
+ from_tensor!(i32);
+ from_tensor!(i16);
++from_tensor!(i8);
+ from_tensor!(u32);
+ from_tensor!(u8);
+ 
+@@ -135,6 +136,11 @@
+             DType::I16 => {
+                 for v in vs.to_vec1::<i16>()? {
+                     f.write_i16::<LittleEndian>(v)?
++                }
++            }
++            DType::I8 => {
++                for v in vs.to_vec1::<i8>()? {
++                    f.write_i8(v)?
+                 }
+             }
+             DType::I32 => {
+diff -ru src.orig/cpu/kernels.rs src/cpu/kernels.rs
+--- src.orig/cpu/kernels.rs	2026-09-06 15:49:28
++++ src/cpu/kernels.rs	2026-09-06 15:50:51
+@@ -221,6 +221,17 @@
+         <Self as Ord>::max(self, other)
+     }
+ }
++impl VecOps for i8 {
++    #[inline(always)]
++    fn min(self, other: Self) -> Self {
++        <Self as Ord>::min(self, other)
++    }
++
++    #[inline(always)]
++    fn max(self, other: Self) -> Self {
++        <Self as Ord>::max(self, other)
++    }
++}
+ impl VecOps for i32 {
+     #[inline(always)]
+     fn min(self, other: Self) -> Self {
+diff -ru src.orig/cpu_backend/mod.rs src/cpu_backend/mod.rs
+--- src.orig/cpu_backend/mod.rs	2026-09-06 15:49:28
++++ src/cpu_backend/mod.rs	2026-09-06 15:51:22
+@@ -23,6 +23,7 @@
+     U8(Vec<u8>),
+     U32(Vec<u32>),
+     I16(Vec<i16>),
++    I8(Vec<i8>),
+     I32(Vec<i32>),
+     I64(Vec<i64>),
+     BF16(Vec<bf16>),
+@@ -42,6 +43,7 @@
+     U8(&'a [u8]),
+     U32(&'a [u32]),
+     I16(&'a [i16]),
++    I8(&'a [i8]),
+     I32(&'a [i32]),
+     I64(&'a [i64]),
+     BF16(&'a [bf16]),
+@@ -1711,6 +1713,17 @@
+                     .concat();
+                 Self::I16(storages)
+             }
++            Self::I8(_) => {
++                let storages = storages
++                    .iter()
++                    .map(|s| match s {
++                        Self::I8(s) => Ok(s.as_slice()),
++                        _ => crate::bail!("dtype mismatch"),
++                    })
++                    .collect::<Result<Vec<_>>>()?
++                    .concat();
++                Self::I8(storages)
++            }
+             Self::I32(_) => {
+                 let storages = storages
+                     .iter()
+@@ -1845,6 +1858,7 @@
+             Self::U8(_) => DType::U8,
+             Self::U32(_) => DType::U32,
+             Self::I16(_) => DType::I16,
++            Self::I8(_) => DType::I8,
+             Self::I32(_) => DType::I32,
+             Self::I64(_) => DType::I64,
+             Self::BF16(_) => DType::BF16,
+@@ -2121,46 +2135,87 @@
+                 Ok(Self::F64(data))
+             }
+             // Conversions to I16
++            // Conversions to I8
+             (Self::U8(storage), DType::I16) => {
+                 let data = unary_map(storage, layout, |v| v as i16);
+                 Ok(Self::I16(data))
+             }
++            (Self::U8(storage), DType::I8) => {
++                let data = unary_map(storage, layout, |v| v as i8);
++                Ok(Self::I8(data))
++            }
+             (Self::U32(storage), DType::I16) => {
+                 let data = unary_map(storage, layout, |v| v as i16);
+                 Ok(Self::I16(data))
+             }
++            (Self::U32(storage), DType::I8) => {
++                let data = unary_map(storage, layout, |v| v as i8);
++                Ok(Self::I8(data))
++            }
+             (Self::I16(storage), DType::I16) => {
+                 let data = unary_map(storage, layout, |v| v);
+                 Ok(Self::I16(data))
+             }
++            (Self::I8(storage), DType::I8) => {
++                let data = unary_map(storage, layout, |v| v);
++                Ok(Self::I8(data))
++            }
+             (Self::I32(storage), DType::I16) => {
+                 let data = unary_map(storage, layout, |v| v as i16);
+                 Ok(Self::I16(data))
+             }
++            (Self::I32(storage), DType::I8) => {
++                let data = unary_map(storage, layout, |v| v as i8);
++                Ok(Self::I8(data))
++            }
+             (Self::I64(storage), DType::I16) => {
+                 let data = unary_map(storage, layout, |v| v as i16);
+                 Ok(Self::I16(data))
+             }
++            (Self::I64(storage), DType::I8) => {
++                let data = unary_map(storage, layout, |v| v as i8);
++                Ok(Self::I8(data))
++            }
+             (Self::BF16(storage), DType::I16) => {
+                 let data = unary_map(storage, layout, |v| v.to_f32() as i16);
+                 Ok(Self::I16(data))
+             }
++            (Self::BF16(storage), DType::I8) => {
++                let data = unary_map(storage, layout, |v| v.to_f32() as i8);
++                Ok(Self::I8(data))
++            }
+             (Self::F16(storage), DType::I16) => {
+                 let data = unary_map(storage, layout, |v| v.to_f32() as i16);
+                 Ok(Self::I16(data))
+             }
++            (Self::F16(storage), DType::I8) => {
++                let data = unary_map(storage, layout, |v| v.to_f32() as i8);
++                Ok(Self::I8(data))
++            }
+             (Self::F32(storage), DType::I16) => {
+                 let data = unary_map(storage, layout, |v| v as i16);
+                 Ok(Self::I16(data))
+             }
++            (Self::F32(storage), DType::I8) => {
++                let data = unary_map(storage, layout, |v| v as i8);
++                Ok(Self::I8(data))
++            }
+             (Self::F64(storage), DType::I16) => {
+                 let data = unary_map(storage, layout, |v| v as i16);
+                 Ok(Self::I16(data))
+             }
++            (Self::F64(storage), DType::I8) => {
++                let data = unary_map(storage, layout, |v| v as i8);
++                Ok(Self::I8(data))
++            }
+             (Self::F8E4M3(storage), DType::I16) => {
+                 let data = unary_map(storage, layout, |v| v.to_f32() as i16);
+                 Ok(Self::I16(data))
+             }
++            (Self::F8E4M3(storage), DType::I8) => {
++                let data = unary_map(storage, layout, |v| v.to_f32() as i8);
++                Ok(Self::I8(data))
++            }
+             // Conversions to I32
+             (Self::U8(storage), DType::I32) => {
+                 let data = unary_map(storage, layout, |v| v as i32);
+@@ -2170,10 +2225,22 @@
+                 let data = unary_map(storage, layout, |v| v as i32);
+                 Ok(Self::I32(data))
+             }
++            (Self::I16(storage), DType::I8) => {
++                let data = unary_map(storage, layout, |v| v as i8);
++                Ok(Self::I8(data))
++            }
++            (Self::I8(storage), DType::I16) => {
++                let data = unary_map(storage, layout, |v| v as i16);
++                Ok(Self::I16(data))
++            }
+             (Self::I16(storage), DType::I32) => {
+                 let data = unary_map(storage, layout, |v| v as i32);
+                 Ok(Self::I32(data))
+             }
++            (Self::I8(storage), DType::I32) => {
++                let data = unary_map(storage, layout, |v| v as i32);
++                Ok(Self::I32(data))
++            }
+             (Self::I32(storage), DType::I32) => {
+                 let data = unary_map(storage, layout, |v| v);
+                 Ok(Self::I32(data))
+@@ -2203,38 +2270,71 @@
+                 Ok(Self::I32(data))
+             }
+             // Conversions from I16
++            // Conversions from I8
+             (Self::I16(storage), DType::U8) => {
+                 let data = unary_map(storage, layout, |v| v as u8);
+                 Ok(Self::U8(data))
+             }
++            (Self::I8(storage), DType::U8) => {
++                let data = unary_map(storage, layout, |v| v as u8);
++                Ok(Self::U8(data))
++            }
+             (Self::I16(storage), DType::U32) => {
+                 let data = unary_map(storage, layout, |v| v as u32);
+                 Ok(Self::U32(data))
+             }
++            (Self::I8(storage), DType::U32) => {
++                let data = unary_map(storage, layout, |v| v as u32);
++                Ok(Self::U32(data))
++            }
+             (Self::I16(storage), DType::I64) => {
+                 let data = unary_map(storage, layout, |v| v as i64);
+                 Ok(Self::I64(data))
+             }
++            (Self::I8(storage), DType::I64) => {
++                let data = unary_map(storage, layout, |v| v as i64);
++                Ok(Self::I64(data))
++            }
+             (Self::I16(storage), DType::BF16) => {
+                 let data = unary_map(storage, layout, |v| bf16::from_f32(v as f32));
+                 Ok(Self::BF16(data))
+             }
++            (Self::I8(storage), DType::BF16) => {
++                let data = unary_map(storage, layout, |v| bf16::from_f32(v as f32));
++                Ok(Self::BF16(data))
++            }
+             (Self::I16(storage), DType::F16) => {
+                 let data = unary_map(storage, layout, |v| f16::from_f32(v as f32));
+                 Ok(Self::F16(data))
+             }
++            (Self::I8(storage), DType::F16) => {
++                let data = unary_map(storage, layout, |v| f16::from_f32(v as f32));
++                Ok(Self::F16(data))
++            }
+             (Self::I16(storage), DType::F32) => {
+                 let data = unary_map(storage, layout, |v| v as f32);
+                 Ok(Self::F32(data))
+             }
++            (Self::I8(storage), DType::F32) => {
++                let data = unary_map(storage, layout, |v| v as f32);
++                Ok(Self::F32(data))
++            }
+             (Self::I16(storage), DType::F64) => {
+                 let data = unary_map(storage, layout, |v| v as f64);
+                 Ok(Self::F64(data))
+             }
++            (Self::I8(storage), DType::F64) => {
++                let data = unary_map(storage, layout, |v| v as f64);
++                Ok(Self::F64(data))
++            }
+             (Self::I16(storage), DType::F8E4M3) => {
+                 let data = unary_map(storage, layout, |v| F8E4M3::from_f32(v as f32));
+                 Ok(Self::F8E4M3(data))
+             }
++            (Self::I8(storage), DType::F8E4M3) => {
++                let data = unary_map(storage, layout, |v| F8E4M3::from_f32(v as f32));
++                Ok(Self::F8E4M3(data))
++            }
+             // Conversions from I32
+             (Self::I32(storage), DType::U8) => {
+                 let data = unary_map(storage, layout, |v| v as u8);
+@@ -2417,6 +2517,7 @@
+             Self::U8(_) => Err(Error::UnsupportedDTypeForOp(DType::U8, "powf").bt()),
+             Self::U32(_) => Err(Error::UnsupportedDTypeForOp(DType::U32, "powf").bt()),
+             Self::I16(_) => Err(Error::UnsupportedDTypeForOp(DType::I16, "powf").bt()),
++            Self::I8(_) => Err(Error::UnsupportedDTypeForOp(DType::I8, "powf").bt()),
+             Self::I32(_) => Err(Error::UnsupportedDTypeForOp(DType::I32, "powf").bt()),
+             Self::I64(_) => Err(Error::UnsupportedDTypeForOp(DType::I64, "powf").bt()),
+             Self::F6E2M3(_) => Err(Error::UnsupportedDTypeForOp(DType::F6E2M3, "powf").bt()),
+@@ -2452,6 +2553,7 @@
+             Self::U8(_) => Err(Error::UnsupportedDTypeForOp(DType::U8, "elu").bt()),
+             Self::U32(_) => Err(Error::UnsupportedDTypeForOp(DType::U32, "elu").bt()),
+             Self::I16(_) => Err(Error::UnsupportedDTypeForOp(DType::I16, "elu").bt()),
++            Self::I8(_) => Err(Error::UnsupportedDTypeForOp(DType::I8, "elu").bt()),
+             Self::I32(_) => Err(Error::UnsupportedDTypeForOp(DType::I32, "elu").bt()),
+             Self::I64(_) => Err(Error::UnsupportedDTypeForOp(DType::I64, "elu").bt()),
+             Self::F6E2M3(_) => Err(Error::UnsupportedDTypeForOp(DType::F6E2M3, "elu").bt()),
+@@ -2491,6 +2593,10 @@
+                 let data = unary_map(storage, layout, B::i16);
+                 Ok(Self::I16(data))
+             }
++            Self::I8(storage) => {
++                let data = unary_map(storage, layout, B::i8);
++                Ok(Self::I8(data))
++            }
+             Self::I32(storage) => {
+                 let data = unary_map(storage, layout, B::i32);
+                 Ok(Self::I32(data))
+@@ -2589,6 +2695,18 @@
+                 );
+                 Ok(Self::I16(data))
+             }
++            (Self::I8(lhs), Self::I8(rhs)) => {
++                let data = binary_map_vec(
++                    lhs_l,
++                    rhs_l,
++                    lhs,
++                    rhs,
++                    B::i8,
++                    B::i8_vec,
++                    B::i8_scalar_vec,
++                );
++                Ok(Self::I8(data))
++            }
+             (Self::I32(lhs), Self::I32(rhs)) => {
+                 let data = binary_map_vec(
+                     lhs_l,
+@@ -2652,6 +2770,9 @@
+             (Self::I16(src), Self::I16(dst)) => {
+                 copy2d_(src, dst, d1, d2, src_s, dst_s, src_o, dst_o)
+             }
++            (Self::I8(src), Self::I8(dst)) => {
++                copy2d_(src, dst, d1, d2, src_s, dst_s, src_o, dst_o)
++            }
+             (Self::I32(src), Self::I32(dst)) => {
+                 copy2d_(src, dst, d1, d2, src_s, dst_s, src_o, dst_o)
+             }
+@@ -2700,6 +2821,7 @@
+             (Self::U8(src), Self::U8(dst)) => copy_strided_src_(src, dst, dst_offset, src_l),
+             (Self::U32(src), Self::U32(dst)) => copy_strided_src_(src, dst, dst_offset, src_l),
+             (Self::I16(src), Self::I16(dst)) => copy_strided_src_(src, dst, dst_offset, src_l),
++            (Self::I8(src), Self::I8(dst)) => copy_strided_src_(src, dst, dst_offset, src_l),
+             (Self::I32(src), Self::I32(dst)) => copy_strided_src_(src, dst, dst_offset, src_l),
+             (Self::I64(src), Self::I64(dst)) => copy_strided_src_(src, dst, dst_offset, src_l),
+             (Self::BF16(src), Self::BF16(dst)) => copy_strided_src_(src, dst, dst_offset, src_l),
+@@ -2744,6 +2866,7 @@
+             Self::U8(pred) => WCond(pred, layout).map(t, t_l, f, f_l),
+             Self::U32(pred) => WCond(pred, layout).map(t, t_l, f, f_l),
+             Self::I16(pred) => WCond(pred, layout).map(t, t_l, f, f_l),
++            Self::I8(pred) => WCond(pred, layout).map(t, t_l, f, f_l),
+             Self::I32(pred) => WCond(pred, layout).map(t, t_l, f, f_l),
+             Self::I64(pred) => WCond(pred, layout).map(t, t_l, f, f_l),
+             _ => Err(Error::UnsupportedDTypeForOp(self.dtype(), "where-cond")),
+@@ -2919,6 +3042,7 @@
+             Self::U8(ids) => Scatter::<_, Add>::new(ids, ids_l, dim).map(self, l, src, src_l),
+             Self::U32(ids) => Scatter::<_, Add>::new(ids, ids_l, dim).map(self, l, src, src_l),
+             Self::I16(ids) => Scatter::<_, Add>::new(ids, ids_l, dim).map(self, l, src, src_l),
++            Self::I8(ids) => Scatter::<_, Add>::new(ids, ids_l, dim).map(self, l, src, src_l),
+             Self::I32(ids) => Scatter::<_, Add>::new(ids, ids_l, dim).map(self, l, src, src_l),
+             Self::I64(ids) => Scatter::<_, Add>::new(ids, ids_l, dim).map(self, l, src, src_l),
+             _ => Err(Error::UnsupportedDTypeForOp(self.dtype(), "scatter-add").bt()),
+@@ -2956,6 +3080,13 @@
+                 };
+                 IndexAdd { ids, dim }.map(self, l, src, src_l)
+             }
++            Self::I8(ids) => {
++                let ids = match ids_l.contiguous_offsets() {
++                    Some((a, b)) => &ids[a..b],
++                    None => Err(Error::RequiresContiguous { op: "index-add" }.bt())?,
++                };
++                IndexAdd { ids, dim }.map(self, l, src, src_l)
++            }
+             Self::I32(ids) => {
+                 let ids = match ids_l.contiguous_offsets() {
+                     Some((a, b)) => &ids[a..b],
+@@ -3040,6 +3171,7 @@
+             (Self::U8(storage), Scalar::U8(v)) => set(storage, l, v),
+             (Self::U32(storage), Scalar::U32(v)) => set(storage, l, v),
+             (Self::I16(storage), Scalar::I16(v)) => set(storage, l, v),
++            (Self::I8(storage), Scalar::I8(v)) => set(storage, l, v),
+             (Self::I32(storage), Scalar::I32(v)) => set(storage, l, v),
+             (Self::I64(storage), Scalar::I64(v)) => set(storage, l, v),
+             (Self::F8E4M3(storage), Scalar::F8E4M3(v)) => set(storage, l, v),
+@@ -3110,6 +3242,7 @@
+             DType::U8
+             | DType::U32
+             | DType::I16
++            | DType::I8
+             | DType::I32
+             | DType::I64
+             | DType::F6E2M3
+@@ -3173,6 +3306,7 @@
+             DType::U8
+             | DType::U32
+             | DType::I16
++            | DType::I8
+             | DType::I32
+             | DType::I64
+             | DType::F6E2M3
+@@ -3249,6 +3383,11 @@
+                 v.set_len(elem_count);
+                 CpuStorage::I16(v)
+             }
++            DType::I8 => {
++                let mut v = Vec::with_capacity(elem_count);
++                v.set_len(elem_count);
++                CpuStorage::I8(v)
++            }
+             DType::I32 => {
+                 let mut v = Vec::with_capacity(elem_count);
+                 v.set_len(elem_count);
+@@ -3297,6 +3436,7 @@
+             DType::U8 => CpuStorage::U8(vec![0u8; elem_count]),
+             DType::U32 => CpuStorage::U32(vec![0u32; elem_count]),
+             DType::I16 => CpuStorage::I16(vec![0i16; elem_count]),
++            DType::I8 => CpuStorage::I8(vec![0i8; elem_count]),
+             DType::I32 => CpuStorage::I32(vec![0i32; elem_count]),
+             DType::I64 => CpuStorage::I64(vec![0i64; elem_count]),
+             DType::BF16 => CpuStorage::BF16(vec![bf16::ZERO; elem_count]),
+diff -ru src.orig/cpu_backend/utils.rs src/cpu_backend/utils.rs
+--- src.orig/cpu_backend/utils.rs	2026-09-06 15:49:28
++++ src/cpu_backend/utils.rs	2026-09-06 15:49:28
+@@ -12,6 +12,7 @@
+             C::U8(vs) => Ok(C::U8(self.f(vs, layout)?)),
+             C::U32(vs) => Ok(C::U32(self.f(vs, layout)?)),
+             C::I16(vs) => Ok(C::I16(self.f(vs, layout)?)),
++            C::I8(vs) => Ok(C::I8(self.f(vs, layout)?)),
+             C::I32(vs) => Ok(C::I32(self.f(vs, layout)?)),
+             C::I64(vs) => Ok(C::I64(self.f(vs, layout)?)),
+             C::BF16(vs) => Ok(C::BF16(self.f(vs, layout)?)),
+@@ -36,6 +37,7 @@
+             C::U8(vs) => Ok(self.f(vs, layout, C::U8)?),
+             C::U32(vs) => Ok(self.f(vs, layout, C::U32)?),
+             C::I16(vs) => Ok(self.f(vs, layout, C::I16)?),
++            C::I8(vs) => Ok(self.f(vs, layout, C::I8)?),
+             C::I32(vs) => Ok(self.f(vs, layout, C::I32)?),
+             C::I64(vs) => Ok(self.f(vs, layout, C::I64)?),
+             C::BF16(vs) => Ok(self.f(vs, layout, C::BF16)?),
+@@ -61,6 +63,7 @@
+             (C::U8(v1), C::U8(v2)) => Ok(C::U8(self.f(v1, l1, v2, l2)?)),
+             (C::U32(v1), C::U32(v2)) => Ok(C::U32(self.f(v1, l1, v2, l2)?)),
+             (C::I16(v1), C::I16(v2)) => Ok(C::I16(self.f(v1, l1, v2, l2)?)),
++            (C::I8(v1), C::I8(v2)) => Ok(C::I8(self.f(v1, l1, v2, l2)?)),
+             (C::I32(v1), C::I32(v2)) => Ok(C::I32(self.f(v1, l1, v2, l2)?)),
+             (C::I64(v1), C::I64(v2)) => Ok(C::I64(self.f(v1, l1, v2, l2)?)),
+             (C::BF16(v1), C::BF16(v2)) => Ok(C::BF16(self.f(v1, l1, v2, l2)?)),
+@@ -87,6 +90,7 @@
+             (C::U8(v1), C::U8(v2)) => self.f(v1, l1, v2, l2)?,
+             (C::U32(v1), C::U32(v2)) => self.f(v1, l1, v2, l2)?,
+             (C::I16(v1), C::I16(v2)) => self.f(v1, l1, v2, l2)?,
++            (C::I8(v1), C::I8(v2)) => self.f(v1, l1, v2, l2)?,
+             (C::I32(v1), C::I32(v2)) => self.f(v1, l1, v2, l2)?,
+             (C::I64(v1), C::I64(v2)) => self.f(v1, l1, v2, l2)?,
+             (C::BF16(v1), C::BF16(v2)) => self.f(v1, l1, v2, l2)?,
+@@ -114,6 +118,7 @@
+             (C::U8(v1), C::U8(v2)) => Ok(C::U8(self.f(v1, l1, v2, l2)?)),
+             (C::U32(v1), C::U32(v2)) => Ok(C::U8(self.f(v1, l1, v2, l2)?)),
+             (C::I16(v1), C::I16(v2)) => Ok(C::U8(self.f(v1, l1, v2, l2)?)),
++            (C::I8(v1), C::I8(v2)) => Ok(C::U8(self.f(v1, l1, v2, l2)?)),
+             (C::I32(v1), C::I32(v2)) => Ok(C::U8(self.f(v1, l1, v2, l2)?)),
+             (C::I64(v1), C::I64(v2)) => Ok(C::U8(self.f(v1, l1, v2, l2)?)),
+             (C::BF16(v1), C::BF16(v2)) => Ok(C::U8(self.f(v1, l1, v2, l2)?)),
+diff -ru src.orig/display.rs src/display.rs
+--- src.orig/display.rs	2026-09-06 15:49:28
++++ src/display.rs	2026-09-06 15:49:28
+@@ -57,6 +57,7 @@
+             DType::U8 => self.fmt_dt::<u8>(f),
+             DType::U32 => self.fmt_dt::<u32>(f),
+             DType::I16 => self.fmt_dt::<i16>(f),
++            DType::I8 => self.fmt_dt::<i8>(f),
+             DType::I32 => self.fmt_dt::<i32>(f),
+             DType::I64 => self.fmt_dt::<i64>(f),
+             DType::BF16 => self.fmt_dt::<bf16>(f),
+@@ -477,6 +478,12 @@
+             }
+             DType::I16 => {
+                 let tf: IntFormatter<i16> = IntFormatter::new();
++                let max_w = tf.max_width(&to_display);
++                tf.fmt_tensor(self, 1, max_w, summarize, &po, f)?;
++                writeln!(f)?;
++            }
++            DType::I8 => {
++                let tf: IntFormatter<i8> = IntFormatter::new();
+                 let max_w = tf.max_width(&to_display);
+                 tf.fmt_tensor(self, 1, max_w, summarize, &po, f)?;
+                 writeln!(f)?;
+diff -ru src.orig/dtype.rs src/dtype.rs
+--- src.orig/dtype.rs	2026-09-06 15:49:28
++++ src/dtype.rs	2026-09-06 15:49:37
+@@ -11,10 +11,9 @@
+     U8,
+     // Unsigned 32 bits integer.
+     U32,
+-    // Signed 8 bits integer.
+-    I8,
+     // Signed 16 bits integer.
+     I16,
++    I8,
+     // Signed 32 bits integer.
+     I32,
+     // Signed 64 bits integer.
+@@ -57,6 +56,7 @@
+             "u8" => Ok(Self::U8),
+             "u32" => Ok(Self::U32),
+             "i16" => Ok(Self::I16),
++            "i8" => Ok(Self::I8),
+             "i32" => Ok(Self::I32),
+             "i64" => Ok(Self::I64),
+             "bf16" => Ok(Self::BF16),
+@@ -80,6 +80,7 @@
+             Self::U8 => "u8",
+             Self::U32 => "u32",
+             Self::I16 => "i16",
++            Self::I8 => "i8",
+             Self::I32 => "i32",
+             Self::I64 => "i64",
+             Self::BF16 => "bf16",
+@@ -100,6 +101,7 @@
+             Self::U8 => 1,
+             Self::U32 => 4,
+             Self::I16 => 2,
++            Self::I8 => 1,
+             Self::I32 => 4,
+             Self::I64 => 8,
+             Self::BF16 => 2,
+@@ -117,6 +119,7 @@
+     pub fn is_int(&self) -> bool {
+         match self {
+             Self::U8 | Self::U32 | Self::I16 | Self::I32 | Self::I64 => true,
++            Self::U8 | Self::U32 | Self::I8 | Self::I32 | Self::I64 => true,
+             Self::BF16
+             | Self::F16
+             | Self::F32
+@@ -132,6 +135,7 @@
+     pub fn is_float(&self) -> bool {
+         match self {
+             Self::U8 | Self::U32 | Self::I16 | Self::I32 | Self::I64 => false,
++            Self::U8 | Self::U32 | Self::I8 | Self::I32 | Self::I64 => false,
+             Self::BF16
+             | Self::F16
+             | Self::F32
+@@ -230,6 +234,7 @@
+ with_dtype!(u8, U8, |v: f64| v as u8, |v: u8| v as f64);
+ with_dtype!(u32, U32, |v: f64| v as u32, |v: u32| v as f64);
+ with_dtype!(i16, I16, |v: f64| v as i16, |v: i16| v as f64);
++with_dtype!(i8, I8, |v: f64| v as i8, |v: i8| v as f64);
+ with_dtype!(i32, I32, |v: f64| v as i32, |v: i32| v as f64);
+ with_dtype!(i64, I64, |v: f64| v as i64, |v: i64| v as f64);
+ with_dtype!(f16, F16, f16::from_f64, f16::to_f64);
+@@ -271,6 +276,14 @@
+ }
+ 
+ impl IntDType for i16 {
++    fn is_true(&self) -> bool {
++        *self != 0
++    }
++    fn as_usize(&self) -> usize {
++        *self as usize
++    }
++}
++impl IntDType for i8 {
+     fn is_true(&self) -> bool {
+         *self != 0
+     }
+diff -ru src.orig/npy.rs src/npy.rs
+--- src.orig/npy.rs	2026-09-06 15:49:28
++++ src/npy.rs	2026-09-06 15:49:28
+@@ -86,6 +86,7 @@
+             DType::F32 => "f4",
+             DType::F64 => "f8",
+             DType::I16 => "i2",
++            DType::I8 => "i1",
+             DType::I32 => "i4",
+             DType::I64 => "i8",
+             DType::U32 => "u4",
+@@ -168,6 +169,7 @@
+                     "i" | "i4" => DType::I32,
+                     "q" | "i8" => DType::I64,
+                     "h" | "i2" => DType::I16,
++                    "h" | "i1" => DType::I8,
+                     // "b" | "i1" => DType::S8,
+                     "B" | "u1" => DType::U8,
+                     "I" | "u4" => DType::U32,
+@@ -240,6 +242,11 @@
+                 Tensor::from_vec(data_t, shape, &Device::Cpu)
+             }
+             DType::I16 => {
++                let mut data_t = vec![0i16; elem_count];
++                reader.read_i16_into::<LittleEndian>(&mut data_t)?;
++                Tensor::from_vec(data_t, shape, &Device::Cpu)
++            }
++            DType::I8 => {
+                 let mut data_t = vec![0i16; elem_count];
+                 reader.read_i16_into::<LittleEndian>(&mut data_t)?;
+                 Tensor::from_vec(data_t, shape, &Device::Cpu)
+diff -ru src.orig/op.rs src/op.rs
+--- src.orig/op.rs	2026-09-06 15:49:28
++++ src/op.rs	2026-09-06 15:50:51
+@@ -200,6 +200,7 @@
+     fn u8(v1: u8) -> u8;
+     fn u32(v1: u32) -> u32;
+     fn i16(v1: i16) -> i16;
++    fn i8(v1: i8) -> i8;
+     fn i32(v1: i32) -> i32;
+     fn i64(v1: i64) -> i64;
+     fn f8e4m3(v1: f8e4m3) -> f8e4m3;
+@@ -233,6 +234,7 @@
+     fn u8(v1: u8, v2: u8) -> u8;
+     fn u32(v1: u32, v2: u32) -> u32;
+     fn i16(v1: i16, v2: i16) -> i16;
++    fn i8(v1: i8, v2: i8) -> i8;
+     fn i32(v1: i32, v2: i32) -> i32;
+     fn i64(v1: i64, v2: i64) -> i64;
+     fn f8e4m3(v1: f8e4m3, v2: f8e4m3) -> f8e4m3;
+@@ -286,6 +288,12 @@
+             .zip(ys)
+             .for_each(|((&a, &b), y)| *y = Self::i16(a, b))
+     }
++    fn i8_vec(xs1: &[i8], xs2: &[i8], ys: &mut [i8]) {
++        xs1.iter()
++            .zip(xs2)
++            .zip(ys)
++            .for_each(|((&a, &b), y)| *y = Self::i8(a, b))
++    }
+     #[inline(always)]
+     fn i32_vec(xs1: &[i32], xs2: &[i32], ys: &mut [i32]) {
+         xs1.iter()
+@@ -346,6 +354,11 @@
+             .zip(ys)
+             .for_each(|(&x, y)| *y = Self::i16(x, scalar))
+     }
++    fn i8_scalar_vec(scalar: i8, xs: &[i8], ys: &mut [i8]) {
++        xs.iter()
++            .zip(ys)
++            .for_each(|(&x, y)| *y = Self::i8(x, scalar))
++    }
+     #[inline(always)]
+     fn i32_scalar_vec(scalar: i32, xs: &[i32], ys: &mut [i32]) {
+         xs.iter()
+@@ -409,6 +422,7 @@
+             fn u32(v1: u32, v2: u32) -> u32 { $e(v1, v2) }
+             #[inline(always)]
+             fn i16(v1: i16, v2: i16) -> i16 { $e(v1, v2) }
++            fn i8(v1: i8, v2: i8) -> i8 { $e(v1, v2) }
+             #[inline(always)]
+             fn i32(v1: i32, v2: i32) -> i32 { $e(v1, v2) }
+             #[inline(always)]
+@@ -495,6 +509,9 @@
+             fn i16(_: i16) -> i16 {
+                 todo!("no unary function for i16")
+             }
++            fn i8(_: i8) -> i8 {
++                todo!("no unary function for i8")
++            }
+             #[inline(always)]
+             fn i32(_: i32) -> i32 {
+                 todo!("no unary function for i32")
+@@ -543,6 +560,9 @@
+             fn i16(_: i16) -> i16 {
+                 todo!("no unary function for i16")
+             }
++            fn i8(_: i8) -> i8 {
++                todo!("no unary function for i8")
++            }
+             #[inline(always)]
+             fn i32(_: i32) -> i32 {
+                 todo!("no unary function for i32")
+@@ -646,6 +666,9 @@
+     fn i16(_: i16) -> i16 {
+         0
+     }
++    fn i8(_: i8) -> i8 {
++        0
++    }
+     #[inline(always)]
+     fn i32(_: i32) -> i32 {
+         0
+@@ -726,6 +749,9 @@
+     fn i16(_: i16) -> i16 {
+         0
+     }
++    fn i8(_: i8) -> i8 {
++        0
++    }
+     #[inline(always)]
+     fn i32(_: i32) -> i32 {
+         0
+@@ -772,6 +798,9 @@
+     fn i16(_: i16) -> i16 {
+         0
+     }
++    fn i8(_: i8) -> i8 {
++        0
++    }
+     #[inline(always)]
+     fn i32(_: i32) -> i32 {
+         0
+@@ -843,6 +872,9 @@
+     fn i16(v: i16) -> i16 {
+         v.abs()
+     }
++    fn i8(v: i8) -> i8 {
++        v.abs()
++    }
+     #[inline(always)]
+     fn i32(v: i32) -> i32 {
+         v.abs()
+@@ -889,6 +921,9 @@
+     fn i16(v: i16) -> i16 {
+         v
+     }
++    fn i8(v: i8) -> i8 {
++        v
++    }
+     #[inline(always)]
+     fn i32(v: i32) -> i32 {
+         v
+@@ -935,6 +970,9 @@
+     fn i16(v: i16) -> i16 {
+         v
+     }
++    fn i8(v: i8) -> i8 {
++        v
++    }
+     #[inline(always)]
+     fn i32(v: i32) -> i32 {
+         v
+@@ -981,6 +1019,9 @@
+     fn i16(v: i16) -> i16 {
+         v
+     }
++    fn i8(v: i8) -> i8 {
++        v
++    }
+     #[inline(always)]
+     fn i32(v: i32) -> i32 {
+         v
+@@ -1027,6 +1068,9 @@
+     fn i16(_: i16) -> i16 {
+         0
+     }
++    fn i8(_: i8) -> i8 {
++        0
++    }
+     #[inline(always)]
+     fn i32(_: i32) -> i32 {
+         0
+@@ -1073,6 +1117,9 @@
+     fn i16(v: i16) -> i16 {
+         v.max(0)
+     }
++    fn i8(v: i8) -> i8 {
++        v.max(0)
++    }
+     #[inline(always)]
+     fn i32(v: i32) -> i32 {
+         v.max(0)
+@@ -1182,6 +1229,9 @@
+     #[inline(always)]
+     fn i16(v: i16) -> i16 {
+         (v > 0) as i16 - (v < 0) as i16
++    }
++    fn i8(v: i8) -> i8 {
++        (v > 0) as i8 - (v < 0) as i8
+     }
+     #[inline(always)]
+     fn i32(v: i32) -> i32 {
+diff -ru src.orig/safetensors.rs src/safetensors.rs
+--- src.orig/safetensors.rs	2026-09-06 15:49:28
++++ src/safetensors.rs	2026-09-06 15:49:28
+@@ -25,6 +25,7 @@
+             DType::U8 => st::Dtype::U8,
+             DType::U32 => st::Dtype::U32,
+             DType::I16 => st::Dtype::I16,
++            DType::I8 => st::Dtype::I8,
+             DType::I32 => st::Dtype::I32,
+             DType::I64 => st::Dtype::I64,
+             DType::BF16 => st::Dtype::BF16,
+@@ -47,6 +48,7 @@
+             st::Dtype::U8 => Ok(DType::U8),
+             st::Dtype::U32 => Ok(DType::U32),
+             st::Dtype::I16 => Ok(DType::I16),
++            st::Dtype::I8 => Ok(DType::I8),
+             st::Dtype::I32 => Ok(DType::I32),
+             st::Dtype::I64 => Ok(DType::I64),
+             st::Dtype::BF16 => Ok(DType::BF16),
+@@ -216,6 +218,7 @@
+             DType::U8 => convert_slice::<u8>(data, shape, device),
+             DType::U32 => convert_slice::<u32>(data, shape, device),
+             DType::I16 => convert_slice::<i16>(data, shape, device),
++            DType::I8 => convert_slice::<i8>(data, shape, device),
+             DType::I32 => convert_slice::<i32>(data, shape, device),
+             DType::I64 => convert_slice::<i64>(data, shape, device),
+             DType::BF16 => convert_slice::<half::bf16>(data, shape, device),
+@@ -296,6 +299,7 @@
+         }
+         st::Dtype::U32 => convert_::<u32>(view, device),
+         st::Dtype::I16 => convert_::<i16>(view, device),
++        st::Dtype::I8 => convert_::<i8>(view, device),
+         st::Dtype::I32 => convert_::<i32>(view, device),
+         st::Dtype::I64 => convert_::<i64>(view, device),
+         st::Dtype::BF16 => convert_::<half::bf16>(view, device),
+@@ -392,6 +396,7 @@
+         DType::U8 => Ok(convert_back_::<u8>(tensor.to_vec1()?)),
+         DType::U32 => Ok(convert_back_::<u32>(tensor.to_vec1()?)),
+         DType::I16 => Ok(convert_back_::<i16>(tensor.to_vec1()?)),
++        DType::I8 => Ok(convert_back_::<i8>(tensor.to_vec1()?)),
+         DType::I32 => Ok(convert_back_::<i32>(tensor.to_vec1()?)),
+         DType::I64 => Ok(convert_back_::<i64>(tensor.to_vec1()?)),
+         DType::F16 => Ok(convert_back_::<half::f16>(tensor.to_vec1()?)),
+diff -ru src.orig/scalar.rs src/scalar.rs
+--- src.orig/scalar.rs	2026-09-06 15:49:28
++++ src/scalar.rs	2026-09-06 15:49:28
+@@ -9,6 +9,7 @@
+     U8(u8),
+     U32(u32),
+     I16(i16),
++    I8(i8),
+     I32(i32),
+     I64(i64),
+     BF16(bf16),
+@@ -30,6 +31,7 @@
+             DType::U8 => Scalar::U8(0),
+             DType::U32 => Scalar::U32(0),
+             DType::I16 => Scalar::I16(0),
++            DType::I8 => Scalar::I8(0),
+             DType::I32 => Scalar::I32(0),
+             DType::I64 => Scalar::I64(0),
+             DType::BF16 => Scalar::BF16(bf16::ZERO),
+@@ -48,6 +50,7 @@
+             DType::U8 => Scalar::U8(1),
+             DType::U32 => Scalar::U32(1),
+             DType::I16 => Scalar::I16(1),
++            DType::I8 => Scalar::I8(1),
+             DType::I32 => Scalar::I32(1),
+             DType::I64 => Scalar::I64(1),
+             DType::BF16 => Scalar::BF16(bf16::ONE),
+@@ -66,6 +69,7 @@
+             Scalar::U8(_) => DType::U8,
+             Scalar::U32(_) => DType::U32,
+             Scalar::I16(_) => DType::I16,
++            Scalar::I8(_) => DType::I8,
+             Scalar::I32(_) => DType::I32,
+             Scalar::I64(_) => DType::I64,
+             Scalar::BF16(_) => DType::BF16,
+@@ -81,6 +85,7 @@
+             Scalar::U8(v) => *v as f64,
+             Scalar::U32(v) => *v as f64,
+             Scalar::I16(v) => *v as f64,
++            Scalar::I8(v) => *v as f64,
+             Scalar::I32(v) => *v as f64,
+             Scalar::I64(v) => *v as f64,
+             Scalar::BF16(v) => v.to_f64(),
+diff -ru src.orig/sort.rs src/sort.rs
+--- src.orig/sort.rs	2026-09-06 15:49:28
++++ src/sort.rs	2026-09-06 15:49:28
+@@ -117,6 +117,7 @@
+             crate::CpuStorage::U8(vs) => self.asort(vs, layout),
+             crate::CpuStorage::U32(vs) => self.asort(vs, layout),
+             crate::CpuStorage::I16(vs) => self.asort(vs, layout),
++            crate::CpuStorage::I8(vs) => self.asort(vs, layout),
+             crate::CpuStorage::I32(vs) => self.asort(vs, layout),
+             crate::CpuStorage::I64(vs) => self.asort(vs, layout),
+             crate::CpuStorage::BF16(vs) => self.asort(vs, layout),
+@@ -184,6 +185,7 @@
+                     DType::U8 => "asort_asc_u8",
+                     DType::U32 => "asort_asc_u32",
+                     DType::I16 => "asort_asc_i16",
++                    DType::I8 => "asort_asc_i16",
+                     DType::I32 => "asort_asc_i32",
+                     DType::I64 => "asort_asc_i64",
+                     DType::F8E4M3 => crate::bail!("Metal device does not yet support F8E4M3."),
+@@ -202,6 +204,7 @@
+                     DType::U8 => "asort_desc_u8",
+                     DType::U32 => "asort_desc_u32",
+                     DType::I16 => "asort_desc_i16",
++                    DType::I8 => "asort_desc_i16",
+                     DType::I32 => "asort_desc_i32",
+                     DType::I64 => "asort_desc_i64",
+                     DType::F8E4M3 => crate::bail!("Metal device does not yet support F8E4M3."),

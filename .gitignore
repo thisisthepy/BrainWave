@@ -176,7 +176,7 @@ cython_debug/
 # Rust: build output lives in CARGO_TARGET_DIR on the external volume
 /rust/*/target/
 
-# Vendored upstream trees (docs/VENDOR.md). The torch Python tree alone is
+# Vendored upstream trees (docs/platform/VENDOR.md). The torch Python tree alone is
 # ~1084 modules; it is reproduced by vendor/vendor_torch.sh, never committed.
 #
 # It now lands inside the package, at torchnative/src/main/torch/, so that one
@@ -190,6 +190,13 @@ cython_debug/
 !/torchnative/src/main/torch/nn/federated.py
 /torchnative/src/main/torch-*.dist-info/
 /torchnative/src/main/.stamp
+# The torch distribution installs three top-level packages, not one (its own
+# top_level.txt names them), and the wheel needs all three -- `import torch`
+# reaches `import torchgen` by way of `torch/utils/_python_dispatch.py`.
+# Nothing of ours lives in these two, so they are blanket-ignored rather than
+# negated the way `torch/` above has to be.
+/torchnative/src/main/torchgen/
+/torchnative/src/main/functorch/
 /vendor/probe/
 
 # The tree used to land in /vendor. Kept ignored so a checkout made before the
@@ -197,3 +204,7 @@ cython_debug/
 /vendor/torch/
 /vendor/torch-*.dist-info/
 /vendor/.stamp
+
+# macOS Finder metadata. Three of these had been committed, and the sdist
+# carried them to PyPI.
+.DS_Store

@@ -1,0 +1,257 @@
+# Does the published wheel actually compute, on the platforms nobody here can run?
+#
+# The README's `computes` row is ⚠️ for Linux and Windows: the wheels are on
+# PyPI and their symbols resolve, but this project's only machine is an arm64
+# Mac with no Linux, no Windows and no container runtime, so nothing has ever
+# executed on either. A hosted runner is the missing machine.
+#
+# It installs from **PyPI**, not from this checkout. The question is what a user
+# gets, and a wheel built in the job would answer a different one.
+name: verify published wheel
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "torchnative version to install from PyPI"
+        required: false
+        # The default is the **latest release actually on PyPI**, not the
+        # version in `pyproject.toml`: this job installs from PyPI, so pointing
+        # it at an unpublished version turns every push into a red run that
+        # says nothing about any platform. Bump it in the release commit, after
+        # the upload -- checks written for a newer release skip themselves by
+        # name here (`tools/ci/verify_published.py`), so an older default is
+        # honest rather than broken.
+        default: "0.1.0b0"
+  push:
+    paths:
+      - ".github/workflows/verify-published-wheel.yml"
+      - "tools/ci/verify_published.py"
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            label: linux-x86_64
+          - os: windows-latest
+            label: windows-amd64
+          # A hosted macOS runner has Xcode and simulators, but that was never the
+          # missing piece. `verify_ios_sim.py` does not run the wheel against the
+          # runner's own CPython -- it unpacks it into an **iOS CPython**'s
+          # site-packages and drives that interpreter inside a booted simulator.
+          # The first attempt at this job assumed such a CPython would already be
+          # on the runner and failed in sixteen seconds:
+          #
+          #     no simulator CPython at
+          #     .../caches/target-python/arm64-iphonesimulator
+          #
+          # docs/platform/TARGET_PYTHON.md identified that distribution afterwards: a local
+          # build of CPython's own in-tree `iOS/` support at a pinned commit, with
+          # no published URL. So this job builds an equivalent one itself (see the
+          # `Build the arm64-iphonesimulator CPython` step below) rather than
+          # expecting it to already exist. docs/platform/IOS_CI.md and docs/platform/IOS_CI2.md
+          # record the sizing and what is, and is not, verified here.
+          - os: macos-15
+            label: ios-simulator-arm64
+    runs-on: ${{ matrix.os }}
+    name: ${{ matrix.label }}
+
+    # The CPython commit this project's iOS distributions were built from
+    # (docs/platform/TARGET_PYTHON.md §1). Pinned, not "latest 3.13", because the iOS
+    # cross-build needs a same-version *host* interpreter to run its own build
+    # scripts, and the wheel's ABI tag was produced against this exact source.
+    env:
+      IOS_CPYTHON_COMMIT: d894d467a615ada8150e9e6987f1969f0a5e2cd9
+      IOS_DEPS_TAG_XZ: XZ-5.6.4-2
+      IOS_DEPS_TAG_BZIP2: BZip2-1.0.8-2
+      IOS_DEPS_TAG_LIBFFI: libFFI-3.4.7-2
+      IOS_DEPS_TAG_OPENSSL: OpenSSL-3.5.8-1
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # 3.13 is the abi3 floor the wheels are tagged against. An older
+      # interpreter does not fail interestingly -- pip simply finds no
+      # candidate -- so pinning it here keeps a version skew from reading as
+      # "the wheel is broken". It also serves as the ios-simulator job's
+      # download-time interpreter (the pip that fetches the wheel, not the one
+      # that runs it -- that one is the framework built below).
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: What we are standing on
+        run: |
+          python -c "import platform,sys; print(platform.platform()); print(platform.machine()); print(sys.version)"
+
+      # --- iOS simulator: build the arm64-iphonesimulator CPython this project's
+      # verification needs. Nothing below runs for the linux-x86_64 /
+      # windows-amd64 legs; nothing above or below this block is iOS-specific.
+      - name: Xcode in use
+        if: matrix.label == 'ios-simulator-arm64'
+        id: xcode
+        run: |
+          xcodebuild -version
+          echo "version=$(xcodebuild -version | head -1 | tr ' ' '_')" >> "$GITHUB_OUTPUT"
+
+      # Keyed on the pinned commit and the runner's Xcode version, per
+      # docs/platform/TARGET_PYTHON.md's sizing: 30-60 minutes to build host-python, the
+      # four dependencies and the iphonesimulator configuration is not a cost
+      # worth paying on every run.
+      - name: Cache the iOS-simulator CPython
+        if: matrix.label == 'ios-simulator-arm64'
+        id: cache-ios-python
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/ios-sim-python
+          key: ios-sim-cpython-${{ env.IOS_CPYTHON_COMMIT }}-${{ steps.xcode.outputs.version }}
+
+      # UNTESTED on a hosted runner -- see the coordinating report. Follows
+      # CPython's own iOS/README.rst build procedure (fetched and read at the
+      # pinned commit while writing this) plus prebuilt dependency archives from
+      # beeware/cpython-apple-source-deps, the same source docs/platform/TARGET_PYTHON.md
+      # names as the recipe. Two independent checkouts of the same commit: one
+      # built as a plain macOS host interpreter (needed to run the cross build's
+      # own Python scripts), one cross-configured for the simulator.
+      - name: Build the arm64-iphonesimulator CPython
+        if: matrix.label == 'ios-simulator-arm64' && steps.cache-ios-python.outputs.cache-hit != 'true'
+        run: |
+          set -eux
+          WORK="${{ runner.temp }}"
+          JOBS="$(sysctl -n hw.ncpu)"
+
+          # --- 1. the four prebuilt dependencies, iphonesimulator/arm64 slices.
+          mkdir -p "$WORK/deps"/{xz,bzip2,libffi,openssl}
+          fetch_dep () {
+            name="$1"; tag="$2"; dir="$3"
+            url="https://github.com/beeware/cpython-apple-source-deps/releases/download/${tag}/${tag}-iphonesimulator.arm64.tar.gz"
+            curl -fL --retry 3 -o "$WORK/${name}.tar.gz" "$url"
+            tar -xzf "$WORK/${name}.tar.gz" -C "$WORK/deps/${dir}"
+          }
+          fetch_dep xz "$IOS_DEPS_TAG_XZ" xz
+          fetch_dep bzip2 "$IOS_DEPS_TAG_BZIP2" bzip2
+          fetch_dep libffi "$IOS_DEPS_TAG_LIBFFI" libffi
+          fetch_dep openssl "$IOS_DEPS_TAG_OPENSSL" openssl
+
+          # --- 2. the pinned commit, twice: once to build a host interpreter,
+          # once to cross-build the simulator framework. A single tree cannot be
+          # configured for both at once.
+          for dest in cpython-host cpython-ios; do
+            mkdir -p "$WORK/$dest"
+            git -C "$WORK/$dest" init -q
+            git -C "$WORK/$dest" remote add origin https://github.com/python/cpython.git
+            git -C "$WORK/$dest" fetch --depth 1 origin "$IOS_CPYTHON_COMMIT"
+            git -C "$WORK/$dest" checkout -q FETCH_HEAD
+          done
+
+          # --- 3. host python3.13, plain macOS build. iOS/README.rst: the cross
+          # build runs some of its own build steps with this interpreter, and it
+          # must be the same version as the one being cross-built.
+          ( cd "$WORK/cpython-host" \
+            && ./configure --prefix="$WORK/host-python" \
+            && make -j"$JOBS" \
+            && make install )
+
+          # --- 4. the arm64-iphonesimulator framework itself.
+          IOS_SIM_PREFIX="$WORK/ios-sim-python"
+          (
+            cd "$WORK/cpython-ios"
+            export PATH="$PWD/iOS/Resources/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Library/Apple/usr/bin"
+            export LIBLZMA_CFLAGS="-I$WORK/deps/xz/include"
+            export LIBLZMA_LIBS="-L$WORK/deps/xz/lib -llzma"
+            export BZIP2_CFLAGS="-I$WORK/deps/bzip2/include"
+            export BZIP2_LIBS="-L$WORK/deps/bzip2/lib -lbz2"
+            export LIBFFI_CFLAGS="-I$WORK/deps/libffi/include"
+            export LIBFFI_LIBS="-L$WORK/deps/libffi/lib -lffi"
+            ./configure \
+              --enable-framework="$IOS_SIM_PREFIX" \
+              --host=arm64-apple-ios-simulator \
+              --build=arm64-apple-darwin \
+              --with-build-python="$WORK/host-python/bin/python3.13" \
+              --with-openssl="$WORK/deps/openssl"
+            make -j"$JOBS"
+            make install
+          )
+          ls -la "$IOS_SIM_PREFIX"
+
+      # Both paths, not just the interpreter. `verify_ios_sim.py` also defaults
+      # its scratch directory to `/Volumes/macMini/caches/...`, which on a hosted
+      # runner is an unwritable `/Volumes` -- and it is only touched *after* the
+      # CPython build, so leaving it unset fails half an hour in, at a mkdir.
+      - name: Point the harness at the built CPython
+        if: matrix.label == 'ios-simulator-arm64'
+        run: |
+          echo "TARGET_PYTHON_IOS_SIM=${{ runner.temp }}/ios-sim-python" >> "$GITHUB_ENV"
+          echo "IOS_SIM_SCRATCH=${{ runner.temp }}/ios-wheel-check" >> "$GITHUB_ENV"
+          echo "SPIKE_SITE=${{ runner.temp }}/ios-sim-deps" >> "$GITHUB_ENV"
+
+      # The harness copies the wheel's pure-Python requirements into the
+      # simulator prefix from `SPIKE_SITE`, which defaults to this project's
+      # own machine. On a runner that path does not exist, so they must be
+      # fetched. `--no-deps` is deliberate: the list staged is read from the
+      # wheel's METADATA, and letting pip resolve transitively here could pull
+      # an upstream torch on top of the one under test.
+      - name: Fetch the wheel's pure-Python requirements
+        if: matrix.label == 'ios-simulator-arm64'
+        run: |
+          # `setuptools<81` is not a whim: the wheel's METADATA requires
+          # `pkg_resources`, setuptools stopped shipping it in 84.0.0, and pip
+          # resolved that latest -- so the staging step "succeeded" and the
+          # harness then refused with
+          #     no pkg_resources under .../ios-sim-deps
+          # half an hour into the job (run 34021836088). The requirement is
+          # read from METADATA, so the pin belongs here rather than in the
+          # harness.
+          python -m pip install --target "${{ runner.temp }}/ios-sim-deps" \
+            typing_extensions filelock networkx jinja2 fsspec sympy packaging pyyaml "setuptools<81"
+          ls "${{ runner.temp }}/ios-sim-deps"
+
+      # The simulator wheel cannot be installed into the runner's own CPython --
+      # different Mach-O platform. It is downloaded from PyPI (what a user gets,
+      # not what this checkout would build) and handed to the harness, which
+      # unpacks it into the iOS CPython built above, inside a booted simulator.
+      - name: Download the simulator wheel
+        if: matrix.label == 'ios-simulator-arm64'
+        run: |
+          python -m pip download --no-deps --only-binary :all: \
+            --platform ios_14_0_arm64_iphonesimulator --python-version 3.13 --abi abi3 \
+            -d dist "torchnative==${{ inputs.version || '0.1.0b0' }}"
+          ls -la dist
+
+      - name: Verify it computes in a simulator
+        if: matrix.label == 'ios-simulator-arm64'
+        run: python tools/wheel/verify_ios_sim.py dist/torchnative-*-ios_*_iphonesimulator.whl
+      # --- end iOS simulator block.
+
+      # No torch is installed on a fresh runner, which is what this needs:
+      # this distribution *provides* `torch`, and there is one per interpreter.
+      - name: Install the published wheel
+        if: matrix.label != 'ios-simulator-arm64'
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "torchnative==${{ inputs.version || '0.1.0b0' }}"
+
+      - name: Which wheel landed
+        if: matrix.label != 'ios-simulator-arm64'
+        run: python -m pip show torchnative
+
+      - name: Compute
+        if: matrix.label != 'ios-simulator-arm64'
+        run: python tools/ci/verify_published.py
+
+      # transformers last: if it drags in an upstream torch it would replace
+      # ours, and the script's first assertion catches that rather than the
+      # run quietly measuring somebody else's build.
+      - name: Install transformers
+        if: matrix.label != 'ios-simulator-arm64'
+        run: python -m pip install "transformers>=5,<6"
+
+      - name: Run a real model
+        if: matrix.label != 'ios-simulator-arm64'
+        run: python tools/ci/verify_published.py --model

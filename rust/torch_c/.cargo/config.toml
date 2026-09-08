@@ -19,7 +19,7 @@ rustflags = ["-C", "link-arg=-undefined", "-C", "link-arg=dynamic_lookup"]
 # The simulator behaves like macOS here. The physical device does not -- it has
 # no libpython3.13.{a,dylib} at all, only Python.framework/Python, so it needs a
 # framework search path. That path is injected by `build.rs` from
-# BRAINWAVE_PYTHON_FRAMEWORK_DIR, and PyO3's own (unsatisfiable) `-lpython3.13`
+# TORCHNATIVE_PYTHON_FRAMEWORK_DIR, and PyO3's own (unsatisfiable) `-lpython3.13`
 # must be suppressed with PYO3_CONFIG_FILE at the same time.
 [target.aarch64-apple-ios-sim]
 rustflags = ["-C", "link-arg=-undefined", "-C", "link-arg=dynamic_lookup"]

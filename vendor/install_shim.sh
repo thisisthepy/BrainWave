@@ -8,7 +8,7 @@
 #
 # `cd` into the crate rather than using `--manifest-path`: cargo discovers
 # `.cargo/config.toml` from the working directory, and without it the host link
-# loses `-undefined dynamic_lookup` (docs/TORCH_C.md §3).
+# loses `-undefined dynamic_lookup` (docs/design/TORCH_C.md §3).
 set -eu
 
 repo=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
@@ -33,6 +33,7 @@ else
     exit 1
 fi
 
+rm -f "$dest/torch/_C.abi3.so"
 cp "$artefact" "$dest/torch/_C.abi3.so"
 echo "installed $(basename "$artefact") -> $dest/torch/_C.abi3.so"
 
@@ -46,7 +47,7 @@ echo "installed $(basename "$artefact") -> $dest/torch/_C.abi3.so"
 # is not executed until someone actually uses `torch.multiprocessing`. So a
 # zero-byte marker is enough, and it is left as a marker rather than quietly
 # fixed up so that the requirement stays visible. Recorded as wall 4 in
-# docs/VENDOR.md.
+# docs/platform/VENDOR.md.
 mkdir -p "$dest/torch/bin"
 : > "$dest/torch/bin/torch_shm_manager"
-echo "placed empty torch/bin/torch_shm_manager (wall 4 -- see docs/VENDOR.md)"
+echo "placed empty torch/bin/torch_shm_manager (wall 4 -- see docs/platform/VENDOR.md)"

@@ -15,11 +15,13 @@
 //! | `dtype` | `torch.float32` and friends, as `_C`-owned instances |
 //! | `device` | `torch.device`, a label rather than a live backend handle |
 //! | `aten` | the single dispatch entrance, and the ops behind it |
+//! | `capture` | recording a straight-line region at that entrance, and replaying it |
+//! | `quant` | block-quantised weights: candle's `QTensor` behind the third `Repr` arm |
 //! | `err` | the message shapes; §6's discovery mechanism lives on these |
 //!
 //! This is a floor, not a coverage effort. Three ops are implemented. Everything
 //! else raises with its own name, so running a model produces the work queue by
-//! itself, in frequency order (§6). Details in docs/TORCH_C.md.
+//! itself, in frequency order (§6). Details in docs/design/TORCH_C.md.
 // The module must be named `_C` -- that is the name Python imports. rustc's
 // snake-case lint has no opinion worth honouring here.
 #![allow(non_snake_case)]
@@ -29,13 +31,19 @@ use pyo3::prelude::*;
 use pyo3::types::PyModule;
 
 mod aten;
+mod capture;
 mod device;
 mod dtype;
 mod err;
+mod flash;
 mod info;
+mod quant;
+mod reduced;
 mod rng;
 mod storage;
+mod tape;
 mod tensor;
+mod vulkan;
 
 use crate::device::PyDevice;
 use crate::dtype::PyDtype;
@@ -69,7 +77,7 @@ fn _tensor_from_flat(
     // BOOL.md §6.3 lists this function as one of the two ways the `torch.bool`
     // invariant could be broken quietly, since arbitrary `f64`s come in here.
     // It used to refuse the tag outright. It now *normalises* instead, for the
-    // reason docs/OVERLOAD.md §6.7 gave when `_tensor_new_from_data` was added:
+    // reason docs/bindings/OVERLOAD.md §6.7 gave when `_tensor_new_from_data` was added:
     // the invariant is kept by construction, not by hope, as long as every byte
     // under a `bool` tag goes through `PyTensorBase::boolean` after being
     // reduced to 0/1. `!= 0` is that reduction, and it is also what torch
@@ -187,6 +195,34 @@ fn walk_data(
 /// inventing an `aten::tensor` call -- `bootstrap.py` builds the data here and
 /// then passes the result through `lift_fresh`, which *is* dispatched.
 ///
+/// Build the literal on the **host**, narrow it there, and then move it.
+///
+/// `Tensor::from_vec(values, shape, device)` materialises the buffer in the
+/// dtype `values` has -- `f64` or `i64` -- and `to_dtype` then asks *that
+/// device* to narrow it. Metal has neither an `f64` buffer nor an `F64 -> F32`
+/// conversion, so `torch.tensor([...], device="mps")` died with
+/// `candle: Metal contiguous to_dtype F64 F32 not implemented`. That is where a
+/// GPT-2 forward on `mps` stopped, in `modeling_gpt2.py`'s attention mask
+/// (docs/devices/MPSATTN.md §3).
+///
+/// Doing both steps on the CPU first is `aten.rs::host_const`'s argument at
+/// literal scale, and it is **not** a host readback: nothing of any dispatched
+/// tensor travels. These bytes were made here, out of a Python list, and they
+/// travel host -> device, which is the direction `.to(device)` already goes.
+///
+/// The CPU path is unchanged value for value -- `from_vec` then `to_dtype` on
+/// `Device::Cpu` is what it already did, with the `to_device` a no-op.
+fn host_built<T: candle_core::WithDType>(
+    values: Vec<T>,
+    shape: Vec<usize>,
+    storage: candle_core::DType,
+    device: &candle_core::Device,
+) -> candle_core::Result<Tensor> {
+    Tensor::from_vec(values, shape, &candle_core::Device::Cpu)?
+        .to_dtype(storage)?
+        .to_device(device)
+}
+
 /// Distinct from `_tensor_from_flat`, which stays what it is: scaffolding due
 /// for deletion that takes an already-flat `f64` list and refuses `torch.bool`
 /// outright (BOOL.md §6.3). This one has to accept booleans, because
@@ -222,13 +258,32 @@ fn _tensor_new_from_data(
     let inferred = if all_bool {
         crate::dtype::TorchDType::Bool
     } else if any_float || leaves.is_empty() {
-        crate::aten::DEFAULT_FLOAT
+        crate::dtype::default_float()
     } else {
         crate::dtype::TorchDType::Int64
     };
     let tag = dtype.map(|d| d.tag()).unwrap_or(inferred);
+    let label = device.unwrap_or_else(PyDevice::cpu);
+    // `torch.tensor([1., 2.], device="meta")` keeps the shape and dtype the
+    // data implies and throws the data away, which is what upstream does
+    // (measured: `tensor(..., device='meta', size=(2,))`). The walk above still
+    // runs -- a ragged nested sequence is a `ValueError` on meta too -- because
+    // the shape *is* the answer here, and a shape that had not been validated
+    // would be worth nothing.
+    //
+    // This is also on the `with torch.device("meta")` path and not only the
+    // explicit one: `torch.get_default_device()` inside a device context is
+    // implemented upstream as `torch.tensor([]).device`
+    // (`torch/__init__.py:1222`), so the context manager cannot report itself
+    // without this branch.
+    if label.is_meta() {
+        return crate::tensor::promote(
+            py,
+            PyTensorBase::meta(shape, tag).into_pyobject(py)?.into_any().unbind(),
+        );
+    }
     let storage = PyDtype::new(tag).storage(OP)?;
-    let device = device.unwrap_or_else(PyDevice::cpu).resolve()?;
+    let device = label.resolve()?;
 
     let tensor = if tag == crate::dtype::TorchDType::Bool {
         let bytes: Vec<u8> = leaves
@@ -251,7 +306,7 @@ fn _tensor_new_from_data(
                 Leaf::Float(v) => *v as i64,
             })
             .collect();
-        Tensor::from_vec(values, shape, &device).and_then(|t| t.to_dtype(storage))
+        host_built(values, shape, storage, &device)
     } else {
         let values: Vec<f64> = leaves
             .iter()
@@ -261,7 +316,7 @@ fn _tensor_new_from_data(
                 Leaf::Float(v) => *v,
             })
             .collect();
-        Tensor::from_vec(values, shape, &device).and_then(|t| t.to_dtype(storage))
+        host_built(values, shape, storage, &device)
     }
     .map_err(|e| candle_err(OP, e))?;
 
@@ -288,7 +343,7 @@ fn _tensor_new_from_data(
 /// Rust extension and then calls exactly one torch function per tensor --
 /// `torch.frombuffer(v["data"], dtype=dtype).reshape(v["shape"])`
 /// (`safetensors/torch.py:468`). Measured: with this function and nothing else,
-/// that path goes from its first wall to a full state dict. See docs/CKPT.md.
+/// that path goes from its first wall to a full state dict. See docs/models/CKPT.md.
 ///
 /// **This copies; upstream aliases.** `torch.frombuffer` upstream returns a
 /// tensor that shares memory with the buffer -- writing to the buffer changes
@@ -298,7 +353,7 @@ fn _tensor_new_from_data(
 /// invisible (the buffer is read once and dropped), and it is recorded rather
 /// than fixed because fixing it means a storage concept candle does not have.
 /// Anything that relies on the aliasing gets wrong answers quietly, so it is
-/// written down here and in docs/CKPT.md rather than left to be discovered.
+/// written down here and in docs/models/CKPT.md rather than left to be discovered.
 ///
 /// The `ValueError` messages are upstream's, transcribed from torch 2.13.0 by
 /// running each failing case. Behaviour, not just wording: `count == 0` is an
@@ -315,12 +370,6 @@ fn _frombuffer(
     requires_grad: bool,
 ) -> PyResult<Py<PyAny>> {
     const OP: &str = "torch.frombuffer";
-
-    if requires_grad {
-        return Err(crate::err::not_implemented(format!(
-            "{OP}(requires_grad=True) -- there is no autograd behind this shim"
-        )));
-    }
 
     // The buffer protocol rather than a `bytes`/`bytearray` downcast: upstream
     // takes anything that implements it, and `safetensors` hands over a
@@ -372,9 +421,124 @@ fn _frombuffer(
     // buffer. Sharing it means the dtype narrowing and the `torch.bool`
     // normalisation cannot drift between the safetensors path and the
     // `torch.load` path -- both are checkpoint readers, and the two agreeing is
-    // exactly what docs/CKPT.md §1 measures (worst difference: 0.0).
+    // exactly what docs/models/CKPT.md §1 measures (worst difference: 0.0).
     let wrapped = crate::tensor::from_le_bytes(OP, slice, &[numel as usize], dtype.tag())?;
-    crate::tensor::promote(py, wrapped.into_pyobject(py)?.into_any().unbind())
+    let out = crate::tensor::promote(py, wrapped.into_pyobject(py)?.into_any().unbind())?;
+    carry_requires_grad(py, out, requires_grad)
+}
+
+/// `requires_grad=True` on a factory that builds its tensor in Rust.
+///
+/// The two here (`frombuffer`, `asarray`) used to refuse it, alongside the five
+/// Python-level doors `bootstrap.py::_strip_python_only_kwargs` covers. Those
+/// five now carry the flag (docs/training/BACKWARD2.md §4.1: the refusal protected a
+/// *spelling*, since `.requires_grad_(True)` reaches the same tensor), and
+/// leaving these two refusing would re-create the inconsistency one door over.
+///
+/// The dtype rule and its wording come from `TensorBase.set_requires_grad`, so
+/// there is exactly one statement of it on this path.
+fn carry_requires_grad(
+    py: Python<'_>,
+    out: Py<PyAny>,
+    requires_grad: bool,
+) -> PyResult<Py<PyAny>> {
+    if requires_grad {
+        out.bind(py).setattr("requires_grad", true)?;
+    }
+    Ok(out)
+}
+
+/// `torch.asarray(obj, *, dtype=None, device=None, copy=None, requires_grad=False)`,
+/// narrowed to the one shape that reaches it: a storage.
+///
+/// Like `frombuffer` above, not an aten op -- `torch.ops.aten.asarray` does not
+/// exist on 2.13.0, the function is `torch::utils::asarray` behind
+/// `_C._VariableFunctions.asarray` -- so it is here rather than behind the
+/// dispatcher, for the same reason and with the same shared byte reader.
+///
+/// **Who calls it.** safetensors' default `mmap` backend, once per tensor.
+/// Measured by wrapping `torch.asarray` and running `safe_open(..., backend=
+/// "mmap")`: it is called with a `torch.UntypedStorage` and
+/// `dtype=torch.uint8`, plus `device="cpu"` on the `get_tensor` path. The
+/// result is then `.view(real_dtype).reshape(shape)`. Together with
+/// `UntypedStorage.from_file` and `aten::view.dtype` this is what the default
+/// `from_pretrained` route to a safetensors checkpoint costs; docs/models/CKPT2.md §4.
+///
+/// **The narrowing is real and is refused by name.** Upstream's `asarray` also
+/// takes tensors, sequences, scalars, numpy arrays and buffer objects, and
+/// implementing those would be re-deriving `torch.tensor`'s conversion rules
+/// with no measured caller -- docs/models/E2E_REAL.md §1.2 is about exactly that kind
+/// of speculative surface. Anything but a storage stops here with the type it
+/// was given and a pointer at the two functions that do take those.
+///
+/// **This copies; upstream aliases**, the same divergence `_frombuffer`
+/// records, and invisible for the same reason: the storage is read once while
+/// a checkpoint is being loaded and nothing writes through either handle.
+#[pyfunction]
+#[pyo3(signature = (obj, *, dtype = None, device = None, copy = None, requires_grad = false))]
+fn _asarray(
+    py: Python<'_>,
+    obj: &Bound<'_, PyAny>,
+    dtype: Option<PyDtype>,
+    device: Option<&Bound<'_, PyAny>>,
+    copy: Option<bool>,
+    requires_grad: bool,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "torch.asarray";
+
+    // `requires_grad` is carried at the end -- see `carry_requires_grad`.
+    // `copy=False` still refuses, and the two are not the same case: the copy
+    // names an aliasing this shim's tensors cannot express.
+    if copy == Some(false) {
+        return Err(crate::err::not_implemented(format!(
+            "{OP}(copy=False) -- upstream would alias the source's memory, and \
+             this shim's tensors own theirs (see `_frombuffer`). Refusing rather \
+             than copying, because a caller that asked for no copy asked for the \
+             aliasing, not for the values"
+        )));
+    }
+    if let Some(d) = device {
+        let label = d.str()?.to_string();
+        if label != "cpu" {
+            return Err(crate::err::not_implemented(format!(
+                "{OP}(device={label:?}) -- storages in this shim are CPU byte \
+                 buffers, so there is nothing to read on another device"
+            )));
+        }
+    }
+
+    let Ok(storage) = obj.extract::<PyRef<'_, crate::storage::PyStorageBase>>() else {
+        return Err(crate::err::not_implemented(format!(
+            "{OP}: torch._C shim implements this only for a torch.UntypedStorage, \
+             which is the form safetensors calls it with; got {}. For a buffer use \
+             torch.frombuffer, for a sequence or scalar use torch.tensor",
+            obj.get_type().name()?,
+        )));
+    };
+
+    let tag = dtype
+        .ok_or_else(|| {
+            crate::err::not_implemented(format!(
+                "{OP}(storage) without dtype -- an untyped storage is bytes, so \
+                 there is no dtype to infer. safetensors always passes one"
+            ))
+        })?
+        .tag();
+    let bytes = storage.bytes();
+    let itemsize = tag.itemsize();
+    if bytes.len() % itemsize != 0 {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "{OP}: storage of {} bytes is not a whole number of torch.{} elements \
+             ({itemsize} bytes each)",
+            bytes.len(),
+            tag.name()
+        )));
+    }
+    // Same byte reader as `frombuffer` and `TensorBase.set_`; see the comment
+    // at the end of `_frombuffer`.
+    let wrapped = crate::tensor::from_le_bytes(OP, bytes, &[bytes.len() / itemsize], tag)?;
+    let out = crate::tensor::promote(py, wrapped.into_pyobject(py)?.into_any().unbind())?;
+    carry_requires_grad(py, out, requires_grad)
 }
 
 /// The triple this artefact was built for. Three targets are cross-compiled and
@@ -385,6 +549,30 @@ fn _shim_target() -> &'static str {
     env!("TORCH_C_TARGET")
 }
 
+/// Reads, and optionally sets, whether `sdpa` computes with `crate::flash` --
+/// upstream's blocked kernel reproduced bit for bit -- instead of candle's
+/// tensor ops. Answers the value that was in force before the call, so a
+/// caller can restore it.
+///
+/// Off by default: the reference kernel costs 20x at T=512. `crate::flash`
+/// carries the measurement, the argument, and -- in `apply_env` -- why this is
+/// a name of ours rather than one of upstream's.
+///
+/// A setter and not only `BW_SDPA_REFERENCE`, because the things that have to
+/// run with it on are individual cases inside a suite that must stay fast:
+/// `pytests/test_shim.py`'s three tolerance-free sdpa tests and
+/// `tools/golden/cases.py`'s sixteen block-boundary cases, both of which flip
+/// it and flip it back. An env-only switch would mean a second process for
+/// them, which neither harness has a place to spawn.
+#[pyfunction]
+#[pyo3(signature = (enabled=None))]
+fn _shim_sdpa_reference(enabled: Option<bool>) -> bool {
+    match enabled {
+        Some(enabled) => crate::flash::set_reference(enabled),
+        None => crate::flash::reference_enabled(),
+    }
+}
+
 /// The name surface the vendored tree expects `_C` to present, extracted from
 /// the tree's own `.pyi` stubs by `vendor/gen_surface.py` and compiled in so
 /// the artefact needs nothing on disk at runtime. See `bootstrap.py`.
@@ -393,7 +581,7 @@ const SURFACE: &str = include_str!("surface.json");
 /// The signature list `torch.<op>(...)` resolves against, per op, in order.
 /// Unlike `SURFACE` this is not generated from the vendored tree -- the tree
 /// carries aten overload *names* and Python-level signatures but nothing that
-/// joins them (docs/OVERLOAD.md §2) -- so it is transcribed and checked by
+/// joins them (docs/bindings/OVERLOAD.md §2) -- so it is transcribed and checked by
 /// `pytests/verify_schemas.py` against an installed upstream torch. Compiled
 /// in the same way: nothing is read from disk at runtime.
 const OVERLOADS: &str = include_str!("overloads.json");
@@ -401,7 +589,7 @@ const OVERLOADS: &str = include_str!("overloads.json");
 /// The same, for `tensor.<method>(...)`. A separate table because upstream has
 /// a separate binding: `THPVariable_mul` (a `TensorBase` method) and the
 /// `_VariableFunctions` entry are different C functions with different
-/// signature lists, which is why docs/C_SURFACE.md counted the two surfaces
+/// signature lists, which is why docs/design/C_SURFACE.md counted the two surfaces
 /// apart -- 50 `TensorBase` members called against 13 hoisted functions.
 /// Checked by the same `pytests/verify_schemas.py`.
 const METHODS: &str = include_str!("methods.json");
@@ -433,19 +621,64 @@ fn run_bootstrap(m: &Bound<'_, PyModule>) -> PyResult<()> {
     Ok(())
 }
 
+/// How much arithmetic a matmul must contain before `gemm` is allowed to spread
+/// it over threads. `gemm`'s own default is `48 * 48 * 256 = 589_824`, and on
+/// both machines this repository can measure, that number is too low: it hands
+/// a job that takes tens of microseconds on one core to four or eight cores and
+/// pays more in wakeups than it saves.
+///
+/// `docs/perf/PERF_ANDROID.md` §4 has the sweep. On the host (M1, 8 cores, idle) a
+/// 96x96x96 matmul is 0.0247 ms on one thread and 0.042-0.049 ms threaded --
+/// threading loses 1.7-2.0x -- while 192x192x192 and up win 2-3.4x. The
+/// crossover sits at 2-4 M multiply-adds. On the Android device the crossover
+/// is much higher still (128x128x128 is 0.051 ms single, 0.35 ms threaded, a
+/// 6.9x loss), so a value chosen from the host is the conservative one.
+///
+/// This cannot change any result. `gemm` parallelises by splitting the *output
+/// columns* between threads; the `k` accumulation loop is outside that split
+/// and runs identically either way, so every output element is the same
+/// sequence of operations. That is checked rather than assumed -- §5 of the
+/// same document hashes `mm` output over n = 96..512 at three thresholds
+/// (fully parallel, this value, fully serial) and gets one digest. The golden
+/// suite cannot check it: every shape in it is below even gemm's own default,
+/// so it is single-threaded on both sides of the change.
+const GEMM_THREADING_THRESHOLD: usize = 4_000_000;
+
+/// `candle` hands every matmul to `gemm` with `Parallelism::Rayon(n)` and lets
+/// `gemm` decide whether to use the threads. That decision is a process-global
+/// `AtomicUsize` with a public setter, so this is the whole of the fix.
+///
+/// `BW_GEMM_THREADING_THRESHOLD` overrides it so the measurement in
+/// `docs/perf/PERF_ANDROID.md` can be re-run without a rebuild.
+fn apply_gemm_threading_threshold() {
+    let value = std::env::var("BW_GEMM_THREADING_THRESHOLD")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .unwrap_or(GEMM_THREADING_THRESHOLD);
+    gemm::set_threading_threshold(value);
+}
+
 #[pymodule]
 fn _C(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    apply_gemm_threading_threshold();
+    flash::apply_env();
     dtype::register(m)?;
     device::register(m)?;
     info::register(m)?;
     tensor::register(m)?;
     aten::register(m)?;
+    capture::register(m)?;
+    tape::register(m)?;
     rng::register(m)?;
     storage::register(m)?;
+    quant::register(m)?;
+    vulkan::register(m)?;
     m.add_function(wrap_pyfunction!(_tensor_from_flat, m)?)?;
     m.add_function(wrap_pyfunction!(_tensor_new_from_data, m)?)?;
     m.add_function(wrap_pyfunction!(_frombuffer, m)?)?;
+    m.add_function(wrap_pyfunction!(_asarray, m)?)?;
     m.add_function(wrap_pyfunction!(_shim_target, m)?)?;
+    m.add_function(wrap_pyfunction!(_shim_sdpa_reference, m)?)?;
     run_bootstrap(m)?;
     Ok(())
 }

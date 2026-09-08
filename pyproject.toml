@@ -1,50 +1,51 @@
+# Why the non-obvious fields are what they are: PROJECT.md.
+# Several of them have been set to the "obvious" value before and broke the
+# wheel; PROJECT.md has a section per field saying what broke.
+
 [build-system]
 requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "torchnative"
-version = "0.0.1a0"
-description = "Run the real PyTorch ecosystem on device -- not a reimplementation of it"
+version = "0.1.0b0"
+description = "Run the real PyTorch ecosystem on device, not reimplementing it"
 readme = { file = "README.md", content-type = "text/markdown" }
-license = "MIT"
+# Upstream torch 2.13.0's own License-Expression, verbatim. PROJECT.md.
+license = "Apache-2.0 AND Apache-2.0 WITH LLVM-exception AND BSD-2-Clause AND BSD-3-Clause AND BSL-1.0 AND MIT"
 license-files = ["LICENSE"]
 requires-python = ">=3.13"
 
-# Empty on purpose. This distribution **provides** `torch` -- the upstream
-# Python tree with `_C` replaced (DESIGN.md §2) -- rather than consuming
-# somebody else's, so requiring `torch` here would be a package declaring a
-# dependency on itself.
-#
-# Two earlier attempts at this line were both wrong, in opposite directions.
-# Empty with a module-scope `from torch import nn` installed cleanly and then
-# failed on import. Requiring `torch` unconditionally was unresolvable on
-# Android and iOS, where upstream publishes no wheel at all -- which is to say
-# on exactly the platforms this project exists for. The mistake underneath both
-# was reading upstream torch as a runtime dependency when it is a *comparison
-# baseline*: the golden harness needs one installed to diff against, and nothing
-# at runtime does.
-#
-# It follows that this cannot coexist with an installed PyTorch once the wheels
-# carry the tree. That is not a defect to route around; there is one `torch` on
-# a given interpreter, and this is a build of it.
-dependencies = []
+# `torch` is absent on purpose -- this distribution PROVIDES it. What is listed
+# is upstream torch's own pure-Python `Requires-Dist`, minus its CUDA/triton
+# entries. PROJECT.md.
+dependencies = [
+    "filelock",
+    "typing-extensions>=4.10.0",
+    "setuptools>=77.0.3",
+    "sympy>=1.13.3",
+    "networkx>=2.5.1",
+    "jinja2",
+    "fsspec>=0.8.5",
+]
 authors = [{ name = "thisisthepy" }]
 keywords = ["pytorch", "on-device", "edge", "federated-learning", "test-time-adaptation"]
 
-# Pre-alpha on purpose. The Python surface here is still a skeleton; the working
-# part of this project is the `torch._C` replacement under `rust/torch_c`, which
-# is not yet built into this wheel. See the README's Status section.
+# 3.13 is the abi3 floor, not a ceiling: one `cp313-abi3` wheel serves 3.13 and
+# every later CPython. PROJECT.md.
 classifiers = [
     "Development Status :: 2 - Pre-Alpha",
     "Intended Audience :: Developers",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: 3.15",
     "Programming Language :: Rust",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
     "Operating System :: Android",
     "Operating System :: iOS",
     "Operating System :: MacOS",
     "Operating System :: POSIX :: Linux",
+    "Operating System :: Microsoft :: Windows",
 ]
 
 [project.urls]
@@ -53,35 +54,45 @@ Documentation = "https://github.com/thisisthepy/torchnative/tree/develop/docs"
 Source = "https://github.com/thisisthepy/torchnative"
 
 [project.optional-dependencies]
-# Aggregation, transport and privacy live behind this extra so that using
-# adaptation alone does not pull in the federated stack. See docs/DESIGN.md §10.
 federated = []
-
-# Upstream PyTorch, as the thing the golden harness diffs against -- not as a
-# runtime dependency. Pinned to what is actually compared: this shim implements
-# one release's `_C` surface, so a tree from another release expects different
-# symbols from it. Installing this alongside the wheels that carry our own tree
-# will conflict, which is why it is an extra and not a dependency.
+# cpu/gpu/npu install the SAME wheel and are empty deliberately: a wheel
+# filename has no backend axis, so one binary carries all three and selects at
+# runtime. PROJECT.md.
+cpu = []
+gpu = []
+npu = []
+# Upstream torch as the golden harness's comparison baseline, not a runtime
+# dependency. Conflicts with the platform wheels by design. PROJECT.md.
 test = ["torch>=2.13,<2.14"]
 
-# Without this, setuptools auto-discovery treats `src` as the root and ships
-# `main/` and `test/` as importable packages -- which is what it did, so a wheel
-# built before this section answered `import main.torchnative` and not
-# `import torchnative`. The source-set layout has to be spelled out.
+# Without package-dir, auto-discovery ships `main/` and a wheel answers
+# `import main.torchnative`. PROJECT.md.
 [tool.setuptools]
 package-dir = { "" = "torchnative/src/main" }
 
+# Three upstream packages, not one -- `torch` alone looked fine for a long time
+# because PYTHONPATH shadowed only that one. PROJECT.md.
 [tool.setuptools.packages.find]
 where = ["torchnative/src/main"]
-# `torch` is deliberately not shipped from this distribution. src/main/torch is
-# the add-hook that grafts `torchnative.nn.federated` onto the torch namespace
-# (DESIGN.md §2), and writing files into another distribution's package would
-# collide with an installed PyTorch, break its uninstall, and conflict outright
-# if upstream ever adds that path. It stays a build-time graft against the
-# vendored tree we assemble ourselves.
-include = ["torchnative*"]
+include = [
+    "torchnative*",
+    "torch", "torch.*",
+    "torchgen", "torchgen.*",
+    "functorch", "functorch.*",
+]
+
+# A recursive catch-all, because a per-extension list silently dropped files.
+# PROJECT.md.
+[tool.setuptools.package-data]
+torch = ["**/*"]
+torchgen = ["**/*"]
+functorch = ["**/*"]
+torchnative = ["**/*"]
+
+# `.pyc` would pin an abi3 wheel to the building interpreter's magic number;
+# `.DS_Store` is here because one reached a published wheel. PROJECT.md.
+[tool.setuptools.exclude-package-data]
+"*" = ["**/__pycache__/**", "**/*.pyc", "**/*.pyo", "**/.DS_Store", ".DS_Store"]
 
 [tool.ppp]
-# Platform source sets follow the pypackpack layout: src/main is scanned for
-# top-level Python packages, which is what lets one package provide both
-# `torch` and `torchnative`. See docs/DESIGN.md §10.
+# pypackpack source-set layout; PROJECT.md.

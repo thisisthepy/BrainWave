@@ -27,4 +27,236 @@ pyo3 = { version = "0.29.2", features = ["extension-module", "abi3-py313"] }
 # Upstream's default feature set is already empty; it is pinned off here so a
 # future upstream default can never quietly link Accelerate/Metal/MKL/CUDA into
 # a device build.
+#
+# Accelerate is enabled per-target below rather than here. docs/perf/PERF.md has the
+# measurement: without it a two-layer block runs 7.0x upstream, with it 0.97x,
+# and the golden suite is 2258/2258 either way -- which had to be checked rather
+# than assumed, BLAS being free to accumulate in a different order. It is
+# Apple-only, so this blanket pin stays and the exception is scoped.
 candle-core = { version = "0.11.0", default-features = false }
+
+# The GEMM `candle-core` calls when no BLAS feature is on -- which is every
+# non-Apple target, Android included. Named here only so `lib.rs` can reach
+# `gemm::set_threading_threshold`; the version is the one candle-core already
+# resolves, so this adds no code to the artefact (docs/perf/PERF_ANDROID.md §4
+# records the before/after sizes).
+#
+# The coupling is deliberate and it is the reason to keep the version pinned
+# rather than floating: if candle-core ever changes its CPU GEMM, this
+# dependency stops matching and the build says so, instead of the call silently
+# tuning a crate nobody calls any more.
+gemm = "0.19.0"
+
+# The `float16`/`bfloat16` scalar types, named for the same reason `gemm` is:
+# `src/reduced.rs` calls them, and the version is the one candle-core already
+# resolves, so this adds no code to the artefact.
+#
+# It is the reference implementation and not merely a convenience type. Every
+# kernel in `reduced.rs` is checked bitwise against the `half` function it
+# replaces -- over all 65536 bit patterns where that set is finite -- and the
+# numbers docs/numerics/BF16.md pinned this shim to were produced by these very
+# functions, so "agrees with `half`" and "agrees with what shipped" are one
+# statement rather than two.
+half = "2.7"
+
+# The `float8_e4m3fn` scalar type, named for the same reason `half` and `gemm`
+# are: this crate calls it, and the version is the one candle-core already
+# resolves, so it adds no code to the artefact.
+#
+# One call site: `tensor.rs::flat_storage` and the `WriteThrough` arm beside it,
+# which is what lets an in-place op write through a `float8_e4m3fn` view
+# (docs/numerics/FLOAT8C.md §3). `CpuStorage::F8E4M3(Vec<F8E4M3>)` cannot be matched
+# without naming the type, and candle-core does not re-export it.
+#
+# Note what this dependency is *not* for: it is not a way to reach the crate's
+# inherent `to_f64`. §1's hang is routed around inside candle's own converter
+# by going through `F32`, and no code here calls `F8E4M3::to_f64` at all.
+float8 = "0.7"
+
+# The Vulkan bindings for `src/vulkan.rs`.
+#
+# **`loaded`, not `linked`, and that is the whole reason this is safe to put in
+# the shipping extension module.** `ash` is a generated binding over the Vulkan
+# headers with no runtime of its own, and with `loaded` it *dlopens* the loader
+# at first use rather than linking it. So the artefact still builds and still
+# loads on iOS, on a Linux box with no GPU and on an Android device without a
+# Vulkan driver -- absence becomes a value `_C._vulkan_probe()` reports, not a
+# link error and not an `ImportError` for the whole of `torch._C`.
+#
+# `debug` is on for one reason: `_vulkan_probe()` reports the physical device
+# type, and without it that field is an integer the reader would have to open a
+# header to interpret.
+#
+# `default-features = false` keeps `linked` off; leaving the defaults on is the
+# mistake that would turn every platform build into "requires libvulkan".
+ash = { version = "0.38", default-features = false, features = ["loaded", "std", "debug"] }
+
+# Apple only. `target_vendor = "apple"` covers macOS and iOS, device and
+# simulator alike, and excludes Android and Linux -- where turning this on would
+# not merely be useless but would fail to link, there being no Accelerate
+# framework to bind against.
+#
+# Cargo unions features across a dependency's entries, so this adds `accelerate`
+# on top of the pinned-off base rather than replacing it.
+#
+# `not(torch_c_no_accelerate)` is the one opt-out, and it exists for exactly one
+# caller: `scripts/device_android.sh parity` builds its host end with that cfg
+# set, into its own CARGO_TARGET_DIR, and measures that build rather than the
+# shipped one. Cargo evaluates these `cfg()` keys against `rustc --print cfg`
+# *with the target's rustflags applied*, so a `--cfg` in rustflags reaches this
+# table (measured -- a probe crate lost its dependency entirely under that flag).
+#
+# It has to arrive as `--config target."cfg(...)".rustflags`, not as the
+# `RUSTFLAGS` environment variable. `RUSTFLAGS` *replaces* the rustflags from
+# `.cargo/config.toml` rather than adding to them, which silently drops this
+# crate's `-undefined dynamic_lookup` and the host link then fails with a wall
+# of undefined `_Py*` symbols (measured -- same trap as building from the wrong
+# working directory, docs/design/TORCH_C.md §3). Two `--config`/config-file rustflags
+# entries for the same target are joined, so the link wiring survives.
+#
+# Why a cfg and not a Cargo feature: a dependency entry's `features = [...]`
+# list is static, so making the exception switchable means making the *entry*
+# switchable, and the only switchable entries are optional ones -- which have to
+# be renamed to be referenced by `dep:`, and a renamed `candle-core` alongside
+# the plain one is rejected outright ("depends on crate `candle-core` multiple
+# times with different names"). The cfg key switches the entry without
+# duplicating it, and it leaves `cargo build --release` -- what
+# `vendor/install_shim.sh`, `rust/torch_c/pytests/run.sh` and
+# `scripts/device_android.sh build` all run -- spelled exactly as before, with
+# no `--no-default-features` sitting around for a future shipping path to copy.
+#
+# Why parity wants it: with Accelerate on the host and `gemm` on the device the
+# two ends run different BLAS, so a bit comparison between them can only restate
+# something already known (docs/devices/DEVICE.md §5.1). Off, it is gemm against gemm,
+# which is the comparison that can catch a device-specific kernel fault.
+#
+# What must not happen is this going off for a *shipped* build: that is a 7x
+# model-level regression (docs/perf/PERF.md §3) with no other symptom. `parity`
+# guards the other direction too -- it refuses to measure a host artefact that
+# still links Accelerate, so a cfg key that stops working is a loud failure and
+# not a quietly meaningless comparison.
+[target.'cfg(all(target_vendor = "apple", not(torch_c_no_accelerate)))'.dependencies]
+candle-core = { version = "0.11.0", default-features = false, features = ["accelerate"] }
+
+# Apple only, and a *separate* entry from the Accelerate one above on purpose.
+#
+# Metal is candle's own backend -- `Device::Metal(MetalDevice)` is already a
+# variant of the closed enum that `docs/devices/VULKAN2.md` §5.1 found had nowhere to
+# put a Vulkan handle. So unlike Vulkan, an `mps` tensor is an **ordinary
+# `candle_core::Tensor`**: it needs no `tensor::Repr` arm, no dispatcher arm and
+# no kernel of ours. The entire difference is `PyDevice::resolve()` learning to
+# return `Device::new_metal(index)`, after which every one of this crate's
+# kernels that already goes through candle runs on the GPU because candle's own
+# op does. That asymmetry is why `mps` landed before `vulkan` this round
+# (docs/devices/VULKAN3.md §1).
+#
+# Why not folded into the entry above: that one is gated on
+# `not(torch_c_no_accelerate)`, which `scripts/device_android.sh parity` sets to
+# take Accelerate *out* of the host build so it compares gemm against gemm. That
+# switch is about BLAS and has nothing to say about the GPU; folding metal in
+# would make the parity build silently lose the `mps` device as well, and the
+# `mps` tests would then skip rather than fail -- a gate that stops testing
+# without saying so. Cargo unions features across a dependency's entries, so two
+# entries add up to `["accelerate", "metal"]` here and to `["metal"]` alone under
+# the parity cfg, which is what each build wants.
+#
+# Cost, measured on this checkout and recorded in docs/devices/VULKAN3.md §2: it adds
+# the `metal`/`objc2` binding crates and `candle-metal-kernels`, and the shaders
+# are compiled by candle at runtime from source it embeds, so there is no build
+# step and no `.metallib` to ship. It does not reach the Android or wasm targets
+# at all -- they do not match `target_vendor = "apple"` -- and the iOS cross
+# build was re-run to confirm the one target that *does* match still links.
+[target.'cfg(target_vendor = "apple")'.dependencies]
+candle-core = { version = "0.11.0", default-features = false, features = ["metal"] }
+
+# NVIDIA only, and **off unless asked for** -- which is the one way this entry
+# differs from the two above, and the reason it is a third entry rather than a
+# clause added to either of them.
+#
+# The design argument is the *Metal* one, not the Vulkan one, and that is worth
+# stating before the wiring. `Device::Cuda(CudaDevice)` is already a variant of
+# the closed enum that `docs/devices/VULKAN2.md` §5.1 found had nowhere to put a Vulkan
+# handle -- it sits directly beside `Device::Metal`. So a `cuda` tensor is an
+# **ordinary `candle_core::Tensor`**: no `tensor::Repr` arm, no dispatcher arm,
+# no kernel of ours. Adding a `Repr` arm would buy the Vulkan cost instead --
+# 396 `tensor()` call sites become relevant -- and buy nothing, because candle
+# already owns the backend. The whole device-side change is `PyDevice::resolve()`
+# learning to return `Device::new_cuda(index)`, exactly as `mps` was.
+#
+# **Why a cfg key and not a Cargo feature**, restating the Accelerate entry's
+# reasoning because it applies here unchanged: a dependency entry's
+# `features = [...]` list is static, so making the exception switchable means
+# making the *entry* switchable, and the only switchable entries are optional
+# ones -- which have to be renamed to be referenced by `dep:`, and a renamed
+# `candle-core` alongside the plain one is rejected outright. The cfg key
+# switches the entry without duplicating it and leaves `cargo build --release`
+# spelled exactly as it is everywhere else in this repository.
+#
+# **Why the target list and not `torch_c_cuda` alone.** The cfg key on its own
+# would be reachable from any target, and `--cfg torch_c_cuda` on an Android or
+# iOS or wasm build must not be able to pull a CUDA toolchain into the graph.
+# `target_os` is the discriminator that actually holds: Android is
+# `target_os = "android"`, iOS is `"ios"`, wasm is `"emscripten"`/`"unknown"` --
+# none of them match `linux` or `windows`, so this entry is unreachable from
+# them *even with the cfg set*. That is the same care the Metal entry takes with
+# `target_vendor = "apple"`, applied from the other side: there the target list
+# was the whole gate, here it is the half that cannot be turned off.
+# `aarch64` is admitted alongside `x86_64` for Linux because Jetson and
+# Grace-Hopper are real CUDA targets and are not Android; Windows is x86_64
+# only, there being no CUDA toolkit for `aarch64-pc-windows-msvc`.
+#
+# **What this costs at build time, measured against the crates rather than
+# assumed** (docs/devices/CUDA.md §2 has the readings and the sources):
+#
+# * `candle-core`'s `cuda` feature pins `cudarc` with
+#   `cuda-version-from-build-system` and `dynamic-linking`. The first runs
+#   `nvcc --version` in cudarc's build script and `panic!`s if nvcc is absent;
+#   the second emits `cargo:rustc-link-lib=dylib=cuda,cudart,cublas,cublasLt,
+#   curand,nvrtc`. So a CUDA build **requires the CUDA toolkit** and the
+#   artefact **hard-links** those libraries.
+# * `cudarc`'s `dynamic-loading` feature -- the `ash`-style dlopen that would
+#   have avoided all of that -- **cannot be reached from here.** Cargo unions
+#   features across entries, and cudarc's own build script says
+#   `panic!("Both `dynamic-loading` and `dynamic-linking` features are active")`.
+#   The two are mutually exclusive and candle has already chosen.
+# * `candle-kernels` compiles `.cu` with nvcc at build time and emits
+#   `cargo:rustc-link-lib=dylib=cudart` itself, independent of cudarc.
+#
+# **Therefore this is not the `ash` situation and must not be described as
+# one.** `ash`'s `loaded` feature is why `vulkan` is safe to put in the shipping
+# extension module: absence of a driver becomes a value `_vulkan_probe()`
+# reports. A CUDA-enabled `_C.so` instead fails to *load* where libcuda is
+# absent, taking the whole of `torch._C` -- and therefore `import torch` -- with
+# it. That is why this entry is off by default and why the CUDA build is a
+# **separate wheel**, not a wider default one.
+[target.'cfg(all(any(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")), all(target_os = "windows", target_arch = "x86_64")), torch_c_cuda))'.dependencies]
+candle-core = { version = "0.11.0", default-features = false, features = ["cuda"] }
+
+# Named for the same reason `gemm`, `half` and `float8` are named above: this
+# crate calls it, and the version is the one `candle-core` already resolves, so
+# it adds no code to the artefact. Two call sites, both in `device.rs`, and each
+# buys something the crate cannot get from candle's public API:
+#
+# * `CudaContext::compute_capability()` -- so a GPU older than the one the
+#   kernels were compiled for is refused **by name at `resolve()` time**, before
+#   a kernel launch turns it into `CUDA_ERROR_NO_BINARY_FOR_GPU` several frames
+#   deeper. `docs/devices/CUDA.md` §4 is the taxonomy.
+# * `CudaContext::mem_get_info()` -- the runtime evidence that the GPU is
+#   actually holding the tensors. `docs/devices/MPSATTN.md` §3.1 records how a
+#   *source-scanning* proof of "it ran on the GPU" can be defeated by moving the
+#   thing it greps for one call deeper; a free-memory reading taken from the
+#   driver cannot be moved out of the way, because it is not a description of
+#   this crate's source at all.
+#
+# The requirement is spelled `0.19.8` because that is `candle-core`'s own; the
+# lock resolves `0.19.9`, and every fact in docs/devices/CUDA.md §2 was re-checked
+# against 0.19.9 rather than assumed to carry over.
+#
+# The feature list is candle's own, copied rather than narrowed **on purpose**:
+# it documents the pin that makes `dynamic-loading` unreachable, and a narrower
+# list would resolve to the same union while hiding that. Nothing here may add
+# `dynamic-loading` -- see the entry above for what that would do.
+cudarc = { version = "0.19.8", default-features = false, features = [
+    "std", "cublas", "cublaslt", "curand", "driver", "nvrtc", "f16", "f8",
+    "cuda-version-from-build-system", "dynamic-linking",
+] }

@@ -10,7 +10,7 @@
     "reach the same kernels, but they are *different bindings* upstream:",
     "`THPVariable_mul` (a method on TensorBase) and the `_VariableFunctions`",
     "entry are separate C functions with separate signature lists, and",
-    "docs/C_SURFACE.md measured the two surfaces separately for that reason --",
+    "docs/design/C_SURFACE.md measured the two surfaces separately for that reason --",
     "50 TensorBase members called versus 13 hoisted functions. A method is not",
     "reachable by putting its name in `overloads.json`; nothing looks there.",
     "",
@@ -22,7 +22,7 @@
     "would be the wrong one, are noted per entry below.",
     "",
     "Not every TensorBase member is here. Three kinds are elsewhere, for",
-    "reasons docs/TENSORBASE.md gives:",
+    "reasons docs/bindings/TENSORBASE.md gives:",
     "  * identity (`shape`, `dtype`, `device`, `dim`, `numel`, `size`) is",
     "    answered in Rust from the wrapper -- no aten call exists for it;",
     "  * `to`/`float`/`long`, `item`, `__bool__`, `__getitem__` and the",
@@ -46,7 +46,7 @@
     "table. `F.softmax` spells itself `input.softmax(dim)`, so it would",
     "belong here -- but the parser-level key is `aten.softmax.int` while the",
     "key upstream's dispatcher actually sees is `aten._softmax.default`",
-    "(measured, docs/NN_SURFACE.md §6). Listing `softmax.int` would name a",
+    "(measured, docs/bindings/NN_SURFACE.md §6). Listing `softmax.int` would name a",
     "work item this shim will never implement, which is worse than naming",
     "none. Same reasoning as `to.dtype` versus `_to_copy` in",
     "`_install_tensor_conversions`. `Tensor.softmax` is still installed --",
@@ -68,9 +68,88 @@
     "also gets its own entry, because `Tensor.split_with_sizes` is a real",
     "method upstream too. This is unlike `softmax` above -- there the parser",
     "key and the dispatch key genuinely disagree and no table entry could ever",
-    "be right; here both keys are real and simply depend on the argument."
+    "be right; here both keys are real and simply depend on the argument.",
+    "",
+    "The seven entries added for Mixtral (docs/kernels/GROUPED_MM.md §6.4), and what",
+    "is worth knowing about each:",
+    "",
+    "  * `__idiv__` is not a typo for `__itruediv__`. `torch/_tensor.py:1115`",
+    "    assigns `Tensor.__itruediv__ = _C.TensorBase.__idiv__` -- the C name",
+    "    kept the Python 2 spelling. Measured: `x /= t` dispatches",
+    "    `aten.div_.Tensor`. MoE normalises router weights with `/=`.",
+    "  * `div_` carries the `_mode` overloads for the same reason `div` does:",
+    "    `str? rounding_mode` has no default, so those two only bind when the",
+    "    caller passes `rounding_mode=`. Neither `_mode` overload has a kernel",
+    "    here, so they name a work item rather than compute one.",
+    "  * `div_.Scalar` is listed and upstream never reaches it: measured,",
+    "    `x.div_(2.0)` dispatches `aten.div_.Tensor`, because torch's frontend",
+    "    wraps the number into a tensor before it picks an overload and this",
+    "    resolver does not. Exactly the divergence `div`/`add`/`sub` already",
+    "    have, and the one docs/kernels/GROUPED_MM.md §6.2 records for",
+    "    `floor_divide.Scalar`.",
+    "  * `ge`/`__ge__` complete the comparison set -- `le`, `lt`, `gt`, `eq`",
+    "    and `ne` all had both spellings and `ge` had neither. Both of `ge`'s",
+    "    overloads now have a kernel: `ge.Tensor` was the one missing member",
+    "    of the comparison family (`le.Tensor`, `lt.Tensor` and `gt.Tensor`",
+    "    all had one), so `x >= tensor` resolved here and then refused inside",
+    "    `_aten_dispatch`. Closed in docs/kernels/VIEWS.md §1.",
+    "  * `clamp_` follows the `.pyi` order -- Tensor overload first -- and the",
+    "    measurement agrees with it rather than contradicting it:",
+    "    `x.clamp_(max=6)` lands on `aten.clamp_.default` because an `int`",
+    "    does not bind `Tensor? max`, and `x.clamp_(max=tensor)` lands on",
+    "    `aten.clamp_.Tensor`. Same shape as `masked_fill`, whose Tensor-first",
+    "    order has held since this table was written. `clamp_.Tensor` has no",
+    "    kernel here.",
+    "  * `masked_fill_` is `masked_fill`'s in-place twin, same order, and its",
+    "    `.Tensor` overload is likewise kernel-less.",
+    "  * `add_`/`sub_`/`mul_`/`neg_`/`exp_`/`relu_` and the three `__i*__`",
+    "    dunders arrived together (docs/architectures/ARCH20.md §8), and the gap they",
+    "    closed is worth naming: `aten.add_.Tensor` had had a kernel since",
+    "    docs/kernels/TAIL.md and `aten.relu_.default` since docs/kernels/KERNELS.md, and",
+    "    neither name was reachable from Python -- `x += y` raised",
+    "    `NotImplementedError: TensorBase.__iadd__`, on a kernel that was",
+    "    there and golden-compared. These are the most common mutations in",
+    "    the language and every one of them refused.",
+    "  * The `__i*__` dunders list the same schemas as their named siblings",
+    "    because upstream's `.pyi` gives them the same one signature",
+    "    (`__iadd__(self, other: Tensor | Number | _complex)`). `x += y` and",
+    "    `x.add_(y)` are the same call, and `torch/_tensor.py` does not even",
+    "    define `__iadd__` -- it inherits `_C.TensorBase.__iadd__`, which is",
+    "    why a missing entry here made the operator raise rather than fall",
+    "    back to `__add__`.",
+    "  * `Scalar` overloads are listed for all three arithmetic families and",
+    "    upstream's *dispatcher* never names them: measured, `t.add_(2)`",
+    "    reports `aten.add_.Tensor`, because `add_.Scalar`'s",
+    "    CompositeExplicitAutograd body wraps the number and redispatches.",
+    "    The same divergence `div_.Scalar` records just above, and it is the",
+    "    parser this table reproduces, not the dispatcher. They have kernels",
+    "    here so that `x += 2` computes rather than refusing.",
+    "  * `clamp` joins `clamp_`, in the same Tensor-first `.pyi` order, and",
+    "    only its `default` overload has a kernel -- `clamp.Tensor` names a",
+    "    work item. `mamba` asked for the out-of-place spelling; the in-place",
+    "    one had been implemented since docs/kernels/OPS8.md.",
+    "",
+    "`chunk` and `__setitem__` were part of the same Mixtral batch and are",
+    "*not* here: both are Python-level members in bootstrap.py, for the",
+    "reasons given there. `chunk` is `CompositeImplicitAutograd` upstream and",
+    "lowers to `split.Tensor` or `split_with_sizes` depending on its",
+    "arguments, so no single key is right; `__setitem__` is a walk over the",
+    "index like `__getitem__`, not one call.",
+    "",
+    "docs/kernels/TRIL.md added `amax`, `tril` and `triu` here, mirroring",
+    "`overloads.json` schema-for-schema (its README carries the accounting).",
+    "`Tensor.amax` is the case worth remembering: the kernel behind it landed",
+    "a round earlier and was golden-compared from the day it landed, while",
+    "*both* Python spellings raised. The harness dispatches by key and cannot",
+    "see a missing name; what caught it was a smoke test written by the round",
+    "that created the gap, asserting the refusal by name so that adding the",
+    "entry would break it. It did, and updating it was the notification.",
+    "",
+    "The `min` entry's `.dim` and `.other` schemas are no longer kernel-less",
+    "-- docs/bindings/SPELLINGS.md §7.2 listed them here precisely so they would refuse",
+    "by name, and docs/kernels/TRIL.md §3 implemented both. `torch.min(x, dim=0)` and",
+    "`torch.min(x, y)` compute now."
   ],
-
   "mul": [
     "aten::mul.Tensor(Tensor self, Tensor other) -> Tensor",
     "aten::mul.Scalar(Tensor self, Scalar other) -> Tensor"
@@ -83,7 +162,6 @@
     "aten::mul.Tensor(Tensor self, Tensor other) -> Tensor",
     "aten::mul.Scalar(Tensor self, Scalar other) -> Tensor"
   ],
-
   "div": [
     "aten::div.Tensor_mode(Tensor self, Tensor other, *, str? rounding_mode) -> Tensor",
     "aten::div.Scalar_mode(Tensor self, Scalar other, *, str? rounding_mode) -> Tensor",
@@ -94,7 +172,16 @@
     "aten::div.Tensor(Tensor self, Tensor other) -> Tensor",
     "aten::div.Scalar(Tensor self, Scalar other) -> Tensor"
   ],
-
+  "div_": [
+    "aten::div_.Tensor_mode(Tensor(a!) self, Tensor other, *, str? rounding_mode) -> Tensor(a!)",
+    "aten::div_.Scalar_mode(Tensor(a!) self, Scalar other, *, str? rounding_mode) -> Tensor(a!)",
+    "aten::div_.Tensor(Tensor(a!) self, Tensor other) -> Tensor(a!)",
+    "aten::div_.Scalar(Tensor(a!) self, Scalar other) -> Tensor(a!)"
+  ],
+  "__idiv__": [
+    "aten::div_.Tensor(Tensor(a!) self, Tensor other) -> Tensor(a!)",
+    "aten::div_.Scalar(Tensor(a!) self, Scalar other) -> Tensor(a!)"
+  ],
   "add": [
     "aten::add.Tensor(Tensor self, Tensor other, *, Scalar alpha=1) -> Tensor",
     "aten::add.Scalar(Tensor self, Scalar other, Scalar alpha=1) -> Tensor"
@@ -107,7 +194,6 @@
     "aten::add.Tensor(Tensor self, Tensor other, *, Scalar alpha=1) -> Tensor",
     "aten::add.Scalar(Tensor self, Scalar other, Scalar alpha=1) -> Tensor"
   ],
-
   "sub": [
     "aten::sub.Tensor(Tensor self, Tensor other, *, Scalar alpha=1) -> Tensor",
     "aten::sub.Scalar(Tensor self, Scalar other, Scalar alpha=1) -> Tensor"
@@ -120,14 +206,12 @@
     "aten::rsub.Tensor(Tensor self, Tensor other, *, Scalar alpha=1) -> Tensor",
     "aten::rsub.Scalar(Tensor self, Scalar other, Scalar alpha=1) -> Tensor"
   ],
-
   "neg": [
     "aten::neg(Tensor self) -> Tensor"
   ],
   "__neg__": [
     "aten::neg(Tensor self) -> Tensor"
   ],
-
   "matmul": [
     "aten::matmul(Tensor self, Tensor other) -> Tensor"
   ],
@@ -143,10 +227,12 @@
   "addmm": [
     "aten::addmm(Tensor self, Tensor mat1, Tensor mat2, *, Scalar beta=1, Scalar alpha=1) -> Tensor"
   ],
+  "baddbmm": [
+    "aten::baddbmm(Tensor self, Tensor batch1, Tensor batch2, *, Scalar beta=1, Scalar alpha=1) -> Tensor"
+  ],
   "t": [
     "aten::t(Tensor(a) self) -> Tensor(a)"
   ],
-
   "eq": [
     "aten::eq.Tensor(Tensor self, Tensor other) -> Tensor",
     "aten::eq.Scalar(Tensor self, Scalar other) -> Tensor"
@@ -171,6 +257,14 @@
     "aten::lt.Tensor(Tensor self, Tensor other) -> Tensor",
     "aten::lt.Scalar(Tensor self, Scalar other) -> Tensor"
   ],
+  "gt": [
+    "aten::gt.Tensor(Tensor self, Tensor other) -> Tensor",
+    "aten::gt.Scalar(Tensor self, Scalar other) -> Tensor"
+  ],
+  "__gt__": [
+    "aten::gt.Tensor(Tensor self, Tensor other) -> Tensor",
+    "aten::gt.Scalar(Tensor self, Scalar other) -> Tensor"
+  ],
   "le": [
     "aten::le.Tensor(Tensor self, Tensor other) -> Tensor",
     "aten::le.Scalar(Tensor self, Scalar other) -> Tensor"
@@ -179,7 +273,14 @@
     "aten::le.Tensor(Tensor self, Tensor other) -> Tensor",
     "aten::le.Scalar(Tensor self, Scalar other) -> Tensor"
   ],
-
+  "ge": [
+    "aten::ge.Tensor(Tensor self, Tensor other) -> Tensor",
+    "aten::ge.Scalar(Tensor self, Scalar other) -> Tensor"
+  ],
+  "__ge__": [
+    "aten::ge.Tensor(Tensor self, Tensor other) -> Tensor",
+    "aten::ge.Scalar(Tensor self, Scalar other) -> Tensor"
+  ],
   "bitwise_and": [
     "aten::bitwise_and.Tensor(Tensor self, Tensor other) -> Tensor",
     "aten::bitwise_and.Scalar(Tensor self, Scalar other) -> Tensor"
@@ -192,6 +293,14 @@
     "aten::bitwise_or.Tensor(Tensor self, Tensor other) -> Tensor",
     "aten::bitwise_or.Scalar(Tensor self, Scalar other) -> Tensor"
   ],
+  "bitwise_xor": [
+    "aten::bitwise_xor.Tensor(Tensor self, Tensor other) -> Tensor",
+    "aten::bitwise_xor.Scalar(Tensor self, Scalar other) -> Tensor"
+  ],
+  "__xor__": [
+    "aten::bitwise_xor.Tensor(Tensor self, Tensor other) -> Tensor",
+    "aten::bitwise_xor.Scalar(Tensor self, Scalar other) -> Tensor"
+  ],
   "__or__": [
     "aten::bitwise_or.Tensor(Tensor self, Tensor other) -> Tensor",
     "aten::bitwise_or.Scalar(Tensor self, Scalar other) -> Tensor"
@@ -202,12 +311,10 @@
   "__invert__": [
     "aten::bitwise_not(Tensor self) -> Tensor"
   ],
-
   "pow": [
     "aten::pow.Tensor_Tensor(Tensor self, Tensor exponent) -> Tensor",
     "aten::pow.Tensor_Scalar(Tensor self, Scalar exponent) -> Tensor"
   ],
-
   "sum": [
     "aten::sum(Tensor self, *, ScalarType? dtype=None) -> Tensor",
     "aten::sum.dim_IntList(Tensor self, int[1]? dim, bool keepdim=False, *, ScalarType? dtype=None) -> Tensor"
@@ -221,38 +328,165 @@
     "aten::max.other(Tensor self, Tensor other) -> Tensor",
     "aten::max.dim(Tensor self, int dim, bool keepdim=False) -> (Tensor values, Tensor indices)"
   ],
+  "min": [
+    "aten::min(Tensor self) -> Tensor",
+    "aten::min.other(Tensor self, Tensor other) -> Tensor",
+    "aten::min.dim(Tensor self, int dim, bool keepdim=False) -> (Tensor values, Tensor indices)"
+  ],
+  "abs": [
+    "aten::abs(Tensor self) -> Tensor"
+  ],
+  "abs_": [
+    "aten::abs_(Tensor(a!) self) -> Tensor(a!)"
+  ],
+  "ceil": [
+    "aten::ceil(Tensor self) -> Tensor"
+  ],
+  "ceil_": [
+    "aten::ceil_(Tensor(a!) self) -> Tensor(a!)"
+  ],
+  "floor": [
+    "aten::floor(Tensor self) -> Tensor"
+  ],
+  "floor_": [
+    "aten::floor_(Tensor(a!) self) -> Tensor(a!)"
+  ],
+  "index_add_": [
+    "aten::index_add_(Tensor(a!) self, int dim, Tensor index, Tensor source, *, Scalar alpha=1) -> Tensor(a!)"
+  ],
+  "index_add": [
+    "aten::index_add(Tensor self, int dim, Tensor index, Tensor source, *, Scalar alpha=1) -> Tensor"
+  ],
+  "unbind": [
+    "aten::unbind.int(Tensor(a -> *) self, int dim=0) -> Tensor(a)[]"
+  ],
+  "masked_select": [
+    "aten::masked_select(Tensor self, Tensor mask) -> Tensor"
+  ],
   "any": [
     "aten::any(Tensor self) -> Tensor",
     "aten::any.dims(Tensor self, int[]? dim=None, bool keepdim=False) -> Tensor",
     "aten::any.dim(Tensor self, int dim, bool keepdim=False) -> Tensor"
   ],
+  "all": [
+    "aten::all(Tensor self) -> Tensor",
+    "aten::all.dims(Tensor self, int[]? dim=None, bool keepdim=False) -> Tensor",
+    "aten::all.dim(Tensor self, int dim, bool keepdim=False) -> Tensor"
+  ],
   "cumsum": [
     "aten::cumsum(Tensor self, int dim, *, ScalarType? dtype=None) -> Tensor"
   ],
-
   "cos": [
     "aten::cos(Tensor self) -> Tensor"
+  ],
+  "cos_": [
+    "aten::cos_(Tensor(a!) self) -> Tensor(a!)"
   ],
   "sin": [
     "aten::sin(Tensor self) -> Tensor"
   ],
+  "sin_": [
+    "aten::sin_(Tensor(a!) self) -> Tensor(a!)"
+  ],
   "reciprocal": [
     "aten::reciprocal(Tensor self) -> Tensor"
+  ],
+  "reciprocal_": [
+    "aten::reciprocal_(Tensor(a!) self) -> Tensor(a!)"
   ],
   "rsqrt": [
     "aten::rsqrt(Tensor self) -> Tensor"
   ],
+  "rsqrt_": [
+    "aten::rsqrt_(Tensor(a!) self) -> Tensor(a!)"
+  ],
+  "sqrt": [
+    "aten::sqrt(Tensor self) -> Tensor"
+  ],
+  "sqrt_": [
+    "aten::sqrt_(Tensor(a!) self) -> Tensor(a!)"
+  ],
+  "sigmoid": [
+    "aten::sigmoid(Tensor self) -> Tensor"
+  ],
+  "sigmoid_": [
+    "aten::sigmoid_(Tensor(a!) self) -> Tensor(a!)"
+  ],
+  "sign": [
+    "aten::sign(Tensor self) -> Tensor"
+  ],
+  "flip": [
+    "aten::flip(Tensor self, int[] dims) -> Tensor"
+  ],
+  "repeat": [
+    "aten::repeat(Tensor self, SymInt[] repeats) -> Tensor"
+  ],
+  "remainder": [
+    "aten::remainder.Tensor(Tensor self, Tensor other) -> Tensor",
+    "aten::remainder.Scalar(Tensor self, Scalar other) -> Tensor"
+  ],
+  "__mod__": [
+    "aten::remainder.Tensor(Tensor self, Tensor other) -> Tensor",
+    "aten::remainder.Scalar(Tensor self, Scalar other) -> Tensor"
+  ],
+  "log": [
+    "aten::log(Tensor self) -> Tensor"
+  ],
+  "log_": [
+    "aten::log_(Tensor(a!) self) -> Tensor(a!)"
+  ],
+  "exp": [
+    "aten::exp(Tensor self) -> Tensor"
+  ],
+  "erf": [
+    "aten::erf(Tensor self) -> Tensor"
+  ],
+  "erf_": [
+    "aten::erf_(Tensor(a!) self) -> Tensor(a!)"
+  ],
+  "erfinv": [
+    "aten::erfinv(Tensor self) -> Tensor"
+  ],
+  "log2": [
+    "aten::log2(Tensor self) -> Tensor"
+  ],
+  "log2_": [
+    "aten::log2_(Tensor(a!) self) -> Tensor(a!)"
+  ],
+  "expm1": [
+    "aten::expm1(Tensor self) -> Tensor"
+  ],
+  "expm1_": [
+    "aten::expm1_(Tensor(a!) self) -> Tensor(a!)"
+  ],
   "tanh": [
     "aten::tanh(Tensor self) -> Tensor"
   ],
-
+  "tanh_": [
+    "aten::tanh_(Tensor(a!) self) -> Tensor(a!)"
+  ],
+  "relu": [
+    "aten::relu(Tensor self) -> Tensor"
+  ],
   "masked_fill": [
     "aten::masked_fill.Tensor(Tensor self, Tensor mask, Tensor value) -> Tensor",
     "aten::masked_fill.Scalar(Tensor self, Tensor mask, Scalar value) -> Tensor"
   ],
-
+  "masked_fill_": [
+    "aten::masked_fill_.Tensor(Tensor(a!) self, Tensor mask, Tensor value) -> Tensor(a!)",
+    "aten::masked_fill_.Scalar(Tensor(a!) self, Tensor mask, Scalar value) -> Tensor(a!)"
+  ],
   "argmax": [
     "aten::argmax(Tensor self, int? dim=None, bool keepdim=False) -> Tensor"
+  ],
+  "amax": [
+    "aten::amax(Tensor self, int[1] dim=[], bool keepdim=False) -> Tensor"
+  ],
+  "tril": [
+    "aten::tril(Tensor self, SymInt diagonal=0) -> Tensor"
+  ],
+  "triu": [
+    "aten::triu(Tensor self, SymInt diagonal=0) -> Tensor"
   ],
   "topk": [
     "aten::topk(Tensor self, SymInt k, int dim=-1, bool largest=True, bool sorted=True) -> (Tensor values, Tensor indices)"
@@ -275,11 +509,28 @@
   "gather": [
     "aten::gather(Tensor self, int dim, Tensor index, *, bool sparse_grad=False) -> Tensor"
   ],
+  "scatter_reduce": [
+    "aten::scatter_reduce.two(Tensor self, int dim, Tensor index, Tensor src, str reduce, *, bool include_self=True) -> Tensor"
+  ],
+  "as_strided": [
+    "aten::as_strided(Tensor(a) self, SymInt[] size, SymInt[] stride, SymInt? storage_offset=None) -> Tensor(a)"
+  ],
   "scatter": [
     "aten::scatter.src(Tensor self, int dim, Tensor index, Tensor src) -> Tensor",
     "aten::scatter.reduce(Tensor self, int dim, Tensor index, Tensor src, *, str reduce) -> Tensor",
     "aten::scatter.value_reduce(Tensor self, int dim, Tensor index, Scalar value, *, str reduce) -> Tensor",
     "aten::scatter.value(Tensor self, int dim, Tensor index, Scalar value) -> Tensor"
+  ],
+  "scatter_": [
+    "aten::scatter_.src(Tensor(a!) self, int dim, Tensor index, Tensor src) -> Tensor(a!)",
+    "aten::scatter_.value(Tensor(a!) self, int dim, Tensor index, Scalar value) -> Tensor(a!)"
+  ],
+  "masked_scatter": [
+    "aten::masked_scatter(Tensor self, Tensor mask, Tensor source) -> Tensor"
+  ],
+  "prod": [
+    "aten::prod(Tensor self, *, ScalarType? dtype=None) -> Tensor",
+    "aten::prod.dim_int(Tensor self, int dim, bool keepdim=False, *, ScalarType? dtype=None) -> Tensor"
   ],
   "split": [
     "aten::split.Tensor(Tensor(a -> *) self, SymInt split_size, int dim=0) -> Tensor(a)[]",
@@ -288,7 +539,6 @@
   "split_with_sizes": [
     "aten::split_with_sizes(Tensor(a -> *) self, SymInt[] split_sizes, int dim=0) -> Tensor(a)[]"
   ],
-
   "expand": [
     "aten::expand(Tensor(a) self, SymInt[] size, *, bool implicit=False) -> Tensor(a)"
   ],
@@ -302,6 +552,9 @@
   "transpose": [
     "aten::transpose.int(Tensor(a) self, int dim0, int dim1) -> Tensor(a)"
   ],
+  "permute": [
+    "aten::permute(Tensor(a) self, int[] dims) -> Tensor(a)"
+  ],
   "unsqueeze": [
     "aten::unsqueeze(Tensor(a) self, int dim) -> Tensor(a)"
   ],
@@ -314,10 +567,21 @@
   "detach": [
     "aten::detach(Tensor(a) self) -> Tensor(a)"
   ],
+  "detach_": [
+    "aten::detach_(Tensor(a!) self) -> Tensor(a!)"
+  ],
+  "maximum": [
+    "aten::maximum(Tensor self, Tensor other) -> Tensor"
+  ],
+  "new_empty": [
+    "aten::new_empty(Tensor self, SymInt[] size, *, ScalarType? dtype=None, Layout? layout=None, Device? device=None, bool? pin_memory=None) -> Tensor"
+  ],
   "new_ones": [
     "aten::new_ones(Tensor self, SymInt[] size, *, ScalarType? dtype=None, Layout? layout=None, Device? device=None, bool? pin_memory=None) -> Tensor"
   ],
-
+  "new_zeros": [
+    "aten::new_zeros(Tensor self, SymInt[] size, *, ScalarType? dtype=None, Layout? layout=None, Device? device=None, bool? pin_memory=None) -> Tensor"
+  ],
   "fill_": [
     "aten::fill_.Tensor(Tensor(a!) self, Tensor value) -> Tensor(a!)",
     "aten::fill_.Scalar(Tensor(a!) self, Scalar value) -> Tensor(a!)"
@@ -331,7 +595,153 @@
   "normal_": [
     "aten::normal_(Tensor(a!) self, float mean=0., float std=1., *, Generator? generator=None) -> Tensor(a!)"
   ],
+  "bernoulli_": [
+    "aten::bernoulli_.Tensor(Tensor(a!) self, Tensor p, *, Generator? generator=None) -> Tensor(a!)",
+    "aten::bernoulli_.float(Tensor(a!) self, float p=0.5, *, Generator? generator=None) -> Tensor(a!)"
+  ],
   "zero_": [
     "aten::zero_(Tensor(a!) self) -> Tensor(a!)"
+  ],
+  "clamp_": [
+    "aten::clamp_.Tensor(Tensor(a!) self, Tensor? min=None, Tensor? max=None) -> Tensor(a!)",
+    "aten::clamp_(Tensor(a!) self, Scalar? min=None, Scalar? max=None) -> Tensor(a!)"
+  ],
+  "clamp": [
+    "aten::clamp.Tensor(Tensor self, Tensor? min=None, Tensor? max=None) -> Tensor",
+    "aten::clamp(Tensor self, Scalar? min=None, Scalar? max=None) -> Tensor"
+  ],
+  "clamp_min": [
+    "aten::clamp_min.Tensor(Tensor self, Tensor min) -> Tensor",
+    "aten::clamp_min(Tensor self, Scalar min) -> Tensor"
+  ],
+  "clamp_min_": [
+    "aten::clamp_min_.Tensor(Tensor(a!) self, Tensor min) -> Tensor(a!)",
+    "aten::clamp_min_(Tensor(a!) self, Scalar min) -> Tensor(a!)"
+  ],
+  "add_": [
+    "aten::add_.Tensor(Tensor(a!) self, Tensor other, *, Scalar alpha=1) -> Tensor(a!)",
+    "aten::add_.Scalar(Tensor(a!) self, Scalar other, Scalar alpha=1) -> Tensor(a!)"
+  ],
+  "__iadd__": [
+    "aten::add_.Tensor(Tensor(a!) self, Tensor other, *, Scalar alpha=1) -> Tensor(a!)",
+    "aten::add_.Scalar(Tensor(a!) self, Scalar other, Scalar alpha=1) -> Tensor(a!)"
+  ],
+  "sub_": [
+    "aten::sub_.Tensor(Tensor(a!) self, Tensor other, *, Scalar alpha=1) -> Tensor(a!)",
+    "aten::sub_.Scalar(Tensor(a!) self, Scalar other, Scalar alpha=1) -> Tensor(a!)"
+  ],
+  "__isub__": [
+    "aten::sub_.Tensor(Tensor(a!) self, Tensor other, *, Scalar alpha=1) -> Tensor(a!)",
+    "aten::sub_.Scalar(Tensor(a!) self, Scalar other, Scalar alpha=1) -> Tensor(a!)"
+  ],
+  "mul_": [
+    "aten::mul_.Tensor(Tensor(a!) self, Tensor other) -> Tensor(a!)",
+    "aten::mul_.Scalar(Tensor(a!) self, Scalar other) -> Tensor(a!)"
+  ],
+  "__imul__": [
+    "aten::mul_.Tensor(Tensor(a!) self, Tensor other) -> Tensor(a!)",
+    "aten::mul_.Scalar(Tensor(a!) self, Scalar other) -> Tensor(a!)"
+  ],
+  "neg_": [
+    "aten::neg_(Tensor(a!) self) -> Tensor(a!)"
+  ],
+  "exp_": [
+    "aten::exp_(Tensor(a!) self) -> Tensor(a!)"
+  ],
+  "relu_": [
+    "aten::relu_(Tensor(a!) self) -> Tensor(a!)"
+  ],
+  "greater": [
+    "aten::greater.Tensor(Tensor self, Tensor other) -> Tensor",
+    "aten::greater.Scalar(Tensor self, Scalar other) -> Tensor"
+  ],
+  "roll": [
+    "aten::roll(Tensor self, SymInt[1] shifts, int[1] dims=[]) -> Tensor"
+  ],
+  "floor_divide": [
+    "aten::floor_divide(Tensor self, Tensor other) -> Tensor",
+    "aten::floor_divide.Scalar(Tensor self, Scalar other) -> Tensor"
+  ],
+  "histc": [
+    "aten::histc(Tensor self, int bins=100, Scalar min=0, Scalar max=0) -> Tensor"
+  ],
+  "index_select": [
+    "aten::index_select(Tensor self, int dim, Tensor index) -> Tensor"
+  ],
+  "new_full": [
+    "aten::new_full(Tensor self, SymInt[] size, Scalar fill_value, *, ScalarType? dtype=None, Layout? layout=None, Device? device=None, bool? pin_memory=None) -> Tensor"
+  ],
+  "unflatten": [
+    "aten::unflatten.int(Tensor(a) self, int dim, SymInt[] sizes) -> Tensor(a)"
+  ],
+  "unfold": [
+    "aten::unfold(Tensor(a) self, int dimension, int size, int step) -> Tensor(a)"
+  ],
+  "argsort": [
+    "aten::argsort.stable(Tensor self, *, bool stable, int dim=-1, bool descending=False) -> Tensor",
+    "aten::argsort(Tensor self, int dim=-1, bool descending=False) -> Tensor"
+  ],
+  "reshape_as": [
+    "aten::reshape_as(Tensor(a) self, Tensor other) -> Tensor(a)"
+  ],
+  "view_as": [
+    "aten::view_as(Tensor(a) self, Tensor other) -> Tensor(a)"
+  ],
+  "acos": [
+    "aten::acos(Tensor self) -> Tensor"
+  ],
+  "logical_and": [
+    "aten::logical_and(Tensor self, Tensor other) -> Tensor"
+  ],
+  "_is_all_true": [
+    "aten::_is_all_true(Tensor self) -> Tensor"
+  ],
+  "clip": [
+    "aten::clip(Tensor self, Scalar? min=None, Scalar? max=None) -> Tensor"
+  ],
+  "sinc": [
+    "aten::sinc(Tensor self) -> Tensor"
+  ],
+  "cumprod": [
+    "aten::cumprod(Tensor self, int dim, *, ScalarType? dtype=None) -> Tensor"
+  ],
+  "diag": [
+    "aten::diag(Tensor self, int diagonal=0) -> Tensor"
+  ],
+  "i0": [
+    "aten::i0(Tensor self) -> Tensor"
+  ],
+  "var": [
+    "aten::var(Tensor self, bool unbiased=True) -> Tensor",
+    "aten::var.dim(Tensor self, int[1]? dim, bool unbiased=True, bool keepdim=False) -> Tensor",
+    "aten::var.correction(Tensor self, int[1]? dim=None, *, Scalar? correction=None, bool keepdim=False) -> Tensor"
+  ],
+  "std": [
+    "aten::std(Tensor self, bool unbiased=True) -> Tensor",
+    "aten::std.dim(Tensor self, int[1]? dim, bool unbiased=True, bool keepdim=False) -> Tensor",
+    "aten::std.correction(Tensor self, int[1]? dim=None, *, Scalar? correction=None, bool keepdim=False) -> Tensor"
+  ],
+  "round": [
+    "aten::round.decimals(Tensor self, *, int decimals) -> Tensor",
+    "aten::round(Tensor self) -> Tensor"
+  ],
+  "round_": [
+    "aten::round_.decimals(Tensor(a!) self, *, int decimals) -> Tensor(a!)",
+    "aten::round_(Tensor(a!) self) -> Tensor(a!)"
+  ],
+  "logsumexp": [
+    "aten::logsumexp(Tensor self, int[1] dim, bool keepdim=False) -> Tensor"
+  ],
+  "index_copy": [
+    "aten::index_copy(Tensor self, int dim, Tensor index, Tensor source) -> Tensor"
+  ],
+  "index_copy_": [
+    "aten::index_copy_(Tensor(a!) self, int dim, Tensor index, Tensor source) -> Tensor(a!)"
+  ],
+  "t_": [
+    "aten::t_(Tensor(a!) self) -> Tensor(a!)"
+  ],
+  "logical_not": [
+    "aten::logical_not(Tensor self) -> Tensor"
   ]
 }

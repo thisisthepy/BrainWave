@@ -136,9 +136,12 @@ impl PyFinfo {
     #[new]
     #[pyo3(signature = (dtype = None))]
     fn new(dtype: Option<PyDtype>) -> PyResult<Self> {
-        // torch defaults to the current default dtype, which this shim fixes
-        // at float32 (`set_default_dtype` is not implemented).
-        let tag = dtype.map(|d| d.tag()).unwrap_or(TorchDType::Float32);
+        // torch defaults to the current default dtype. That used to be fixed
+        // at float32 here because `set_default_dtype` was not implemented; it
+        // is now a process-global, and `torch.finfo()` follows it upstream --
+        // measured: under a float64 default, `torch.finfo()` reports
+        // `dtype=float64`, `max=1.79769e+308`.
+        let tag = dtype.map(|d| d.tag()).unwrap_or_else(crate::dtype::default_float);
         let (bits, eps, max, min, tiny, resolution, reported) =
             finfo_row(tag).ok_or_else(|| {
                 pyo3::exceptions::PyTypeError::new_err(format!(

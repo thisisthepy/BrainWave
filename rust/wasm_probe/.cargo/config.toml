@@ -1,0 +1,9 @@
+# Copied in shape from `rust/torch_c/.cargo/config.toml` so that the host build
+# is a valid *control* for the wasm builds. Without it the host cdylib fails to
+# link with undefined `_Py*` symbols too, and then "wasm fails to link" would be
+# indistinguishable from "the probe was miswired".
+#
+# The machine-specific half of `torch_c`'s wiring (the iOS framework path from
+# `build.rs`) is not reproduced -- iOS is not a target of this investigation.
+[target.aarch64-apple-darwin]
+rustflags = ["-C", "link-arg=-undefined", "-C", "link-arg=dynamic_lookup"]

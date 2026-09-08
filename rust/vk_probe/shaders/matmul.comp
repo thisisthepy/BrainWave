@@ -1,0 +1,28 @@
+#version 450
+
+// C[MxN] = A[MxK] * B[KxN], f32, row-major, naive. Each invocation owns one
+// output element and accumulates over k in order, which is the same order a
+// naive CPU loop uses -- so this is checked bit-for-bit too, and a difference
+// would mean the GPU contracted the multiply-add into an FMA (different
+// rounding) rather than that the plumbing is wrong. The report distinguishes
+// those two outcomes instead of hiding both under a tolerance.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(std430, set = 0, binding = 0) readonly  buffer A { float a[]; };
+layout(std430, set = 0, binding = 1) readonly  buffer B { float b[]; };
+layout(std430, set = 0, binding = 2) writeonly buffer C { float c[]; };
+
+layout(push_constant) uniform Push { uint m; uint n; uint k; } pc;
+
+void main() {
+    uint col = gl_GlobalInvocationID.x;
+    uint row = gl_GlobalInvocationID.y;
+    if (row >= pc.m || col >= pc.n) return;
+
+    float acc = 0.0;
+    for (uint t = 0u; t < pc.k; ++t) {
+        acc += a[row * pc.k + t] * b[t * pc.n + col];
+    }
+    c[row * pc.n + col] = acc;
+}

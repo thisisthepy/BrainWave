@@ -1,6 +1,6 @@
 //! torch's CPU random number generator, ported rather than approximated.
 //!
-//! docs/RNG.md settled the question this file answers. candle's CPU backend
+//! docs/numerics/RNG.md settled the question this file answers. candle's CPU backend
 //! *refuses* to be seeded -- `set_seed` and `get_current_seed` are both
 //! `bail!` -- so "use candle's RNG but line the seeds up" was never an option,
 //! and `rand_distr`'s Ziggurat normal consumes a data-dependent number of
@@ -23,7 +23,7 @@
 //! tensor has 16 or more contiguous elements, and when the size is not a
 //! multiple of 16 the kernel *redraws the last 16 elements over the top of
 //! values it already wrote*. Same seed, `n=15` and `n=16` share not one value.
-//! docs/RNG.md §1.3 measured all of that; this file transcribes it.
+//! docs/numerics/RNG.md §1.3 measured all of that; this file transcribes it.
 //!
 //! Everything here is deliberately arithmetic-for-arithmetic with the C++,
 //! down to `2.0f * c10::pi<double>` being evaluated in double and only then
@@ -43,7 +43,7 @@ const LMASK: u32 = 0x7fff_ffff;
 /// `at::mt19937_engine`.
 ///
 /// The field names are upstream's because the legacy `get_state()` blob is
-/// literally this struct (docs/RNG.md §1.1), so keeping them aligned is what
+/// literally this struct (docs/numerics/RNG.md §1.1), so keeping them aligned is what
 /// makes that format implementable later without re-deriving anything.
 pub struct Mt19937 {
     seed: u64,
@@ -79,7 +79,7 @@ impl Mt19937 {
         }
         // `left_ = 1`, not `MERSENNE_STATE_N`. Combined with the pre-decrement
         // in `next_u32`, this makes a twist run *before the first draw* --
-        // docs/RNG.md §1.1 records getting this backwards first, which
+        // docs/numerics/RNG.md §1.1 records getting this backwards first, which
         // produces a plausible-looking stream that matches numpy and not
         // torch.
         self.left = 1;
@@ -149,7 +149,7 @@ pub struct CpuGenerator {
     /// Unused today and kept anyway: it is the float half of upstream's pair
     /// cache. Nothing in the CPU kernels reaches it, because `normal_kernel`'s
     /// scalar path instantiates `normal_distribution<double>` regardless of
-    /// the tensor's dtype (docs/RNG.md §1.3) -- but that is a fact about the
+    /// the tensor's dtype (docs/numerics/RNG.md §1.3) -- but that is a fact about the
     /// *kernel*, not about the generator, and a future op that asks for a
     /// float normal would need this slot to stay in step with upstream.
     #[allow(dead_code)]
@@ -234,7 +234,7 @@ pub fn default_generator() -> MutexGuard<'static, CpuGenerator> {
 
 /// `transformation::uniform_real<float>`.
 ///
-/// The mask is on the *low* bits. docs/RNG.md §1.2 measured the obvious
+/// The mask is on the *low* bits. docs/numerics/RNG.md §1.2 measured the obvious
 /// alternative (`val >> 8`) against real torch and it disagreed on every seed.
 ///
 /// The affine step is `mul_add`, not `*` then `+`. Upstream's source says
@@ -291,7 +291,7 @@ pub fn uniform_fill_f64(gen: &mut CpuGenerator, size: usize, from: f64, to: f64)
 /// what upstream actually runs on the hosts this shim is built for. On a
 /// machine where the vector specialisation *is* live the last bits could
 /// differ, since `sincos256_ps`/`log256_ps` are not libm -- recorded as
-/// unmeasured in docs/RNG.md §6.
+/// unmeasured in docs/numerics/RNG.md §6.
 ///
 /// Two transcription traps here, both invisible in the output until they are
 /// wrong by a few ulp:
@@ -406,7 +406,7 @@ pub fn normal_fill_reduced(gen: &mut CpuGenerator, size: usize, mean: f32, std: 
 /// `normal_kernel`'s scalar branch instantiates this with `T = double` for
 /// *every* dtype, so a `float16` tensor of 5 elements consumes 64-bit uniforms
 /// and rounds at the very end. Assuming the accumulate type followed the
-/// tensor dtype was the first thing docs/RNG.md §1.3 got wrong, and it
+/// tensor dtype was the first thing docs/numerics/RNG.md §1.3 got wrong, and it
 /// disagreed with torch on all eighteen combinations it tried.
 #[inline]
 fn normal_sample_f64(gen: &mut CpuGenerator, mean: f64, stdv: f64) -> f64 {
@@ -429,6 +429,189 @@ fn normal_sample_f64(gen: &mut CpuGenerator, mean: f64, stdv: f64) -> f64 {
 /// Path B for a whole tensor: `size < 16`, or any non-contiguous tensor.
 pub fn normal_serial(gen: &mut CpuGenerator, size: usize, mean: f64, stdv: f64) -> Vec<f64> {
     (0..size).map(|_| normal_sample_f64(gen, mean, stdv)).collect()
+}
+
+// ---------------------------------------------------------------------------
+// Layer 3 -- the *integer* kernels (`random_from_to_kernel`, `randperm_cpu`)
+// ---------------------------------------------------------------------------
+
+/// The width at which one `randint` element stops costing one 32-bit word and
+/// starts costing two.
+///
+/// **2^28, and it is not what the header's first branch says.**
+/// `ATen/core/DistributionsHelper.h:44-57` has two of them:
+///
+/// ```text
+/// #ifdef FBCODE_CAFFE2
+///     if ((is_same_v<T,int64_t> || is_same_v<T,double> ||
+///          is_same_v<T,float>   || is_same_v<T,BFloat16>) && range_ >= 1ULL << 32)
+/// #else
+///     if (range_ >= 1ULL << 28) // allow approx 5% skew in uniform int generation using %
+/// #endif
+/// ```
+///
+/// The public wheel is the `#else` arm: **the threshold is 2^28 and the dtype
+/// does not enter into it.** Transcribing the first arm instead gives a
+/// generator that agrees with upstream below 2^28 and above 2^32 and consumes
+/// the stream at the wrong rate for everything between -- so the values are
+/// wrong *and* every later draw is displaced. docs/kernels/RANDINT.md §1.1 pins the
+/// boundary by measurement (width 2^28-1 -> six words for six elements, width
+/// 2^28 -> twelve) rather than by reading either arm.
+const RANDINT_WIDE_THRESHOLD: u64 = 1 << 28;
+
+/// `uniform_int_from_to_distribution<T>` over a whole tensor, in `int64_t`.
+///
+/// `transformation::uniform_int_from_to` is
+/// `static_cast<T>(static_cast<int64_t>((val % range) + base))` -- a **biased
+/// modulo**, not rejection sampling and not a scaled multiply. The header says
+/// so itself ("allow approx 5% skew"), and that is why the consumption is
+/// fixed at one draw per element instead of data-dependent: nothing is ever
+/// retried. The old kernel here scaled a `[0,1)` uniform and floored it, which
+/// is a different distribution *and* a different number of words.
+///
+/// The arithmetic is deliberately in `u64` up to the final cast, because
+/// upstream's is: `range` is `uint64_t`, `base` is `int64_t` and the `+`
+/// converts it to unsigned, so a negative `low` arrives by wraparound and only
+/// the closing `static_cast<int64_t>` turns it back. The caller applies the
+/// dtype's own cast, since only it knows the dtype.
+pub fn randint_from_to_fill(
+    gen: &mut CpuGenerator,
+    size: usize,
+    low: i64,
+    high: i64,
+) -> Vec<i64> {
+    // `static_cast<uint64_t>(to) - static_cast<uint64_t>(from)`. The caller has
+    // already refused `high <= low`, so this is at least 1 and cannot make the
+    // modulo below divide by zero.
+    let range = (high as u64).wrapping_sub(low as u64);
+    let wide = range >= RANDINT_WIDE_THRESHOLD;
+    (0..size)
+        .map(|_| {
+            let val = if wide {
+                gen.random64()
+            } else {
+                u64::from(gen.random())
+            };
+            (val % range).wrapping_add(low as u64) as i64
+        })
+        .collect()
+}
+
+/// `randperm_cpu` -- Fisher-Yates over `[0, n)`, in the order upstream walks it.
+///
+/// It draws from the same engine `randint` does, one 32-bit word per swap and
+/// `n - 1` of them, which is why docs/kernels/RANDINT.md §4 concludes `randperm` falls
+/// out of this work rather than being its own algorithm. There is no
+/// large-`n` alternative path: n = 0, 1, 2, 6, 17, 20, 100, 1000, 29999,
+/// 30000, 30001 and 50000 were all reproduced by exactly this loop.
+pub fn randperm_fill(gen: &mut CpuGenerator, n: usize) -> Vec<i64> {
+    let mut out: Vec<i64> = (0..n as i64).collect();
+    for i in 0..n.saturating_sub(1) {
+        let z = (gen.random() as usize) % (n - i);
+        out.swap(i, z + i);
+    }
+    out
+}
+
+/// How a float dtype rounds, for the two `update_*` functions.
+///
+/// `max_finite` is not decoration. `float16` tops out at 65504, so
+/// `static_cast<at::Half>(1000000001)` is **infinity**, and the `int64_t` cast
+/// that immediately follows it saturates rather than producing a large
+/// number. That path decides which of two different refusals upstream gives
+/// for `randint(10**9, 10**9 + 7, dtype=torch.float16)`, and an integer-only
+/// transcription of the rounding gets the other one -- measured, and it is
+/// the only disagreement the 2399-case sweep behind docs/kernels/RANDINT.md §5 found
+/// once the values matched.
+#[derive(Clone, Copy)]
+pub struct FloatFormat {
+    /// `std::numeric_limits<scalar_t>::digits`.
+    pub digits: u32,
+    /// `std::numeric_limits<scalar_t>::max()`, or `u128::MAX` when it is past
+    /// every `int64_t` and so can never be reached from here.
+    pub max_finite: u128,
+}
+
+/// `static_cast<int64_t>(static_cast<scalar_t>(v))`.
+///
+/// Done in integers rather than through a host float, because `digits` is 8
+/// for bfloat16 and 11 for float16 and Rust has neither type natively. Ties
+/// round to even, as IEEE and the C++ cast do, and the overflow-to-infinity
+/// case is handled after the rounding because that is when IEEE decides it
+/// (65520 rounds up to 65536, which is past `max_finite`, so it is infinity;
+/// 65519 rounds down to 65504, which is not).
+fn round_trip_through_float(v: i64, format: FloatFormat) -> i64 {
+    if v == 0 {
+        return 0;
+    }
+    let negative = v < 0;
+    let magnitude = (v as i128).unsigned_abs();
+    let bits = 128 - magnitude.leading_zeros();
+    let rounded: u128 = if bits <= format.digits {
+        magnitude
+    } else {
+        let shift = bits - format.digits;
+        let quotient = magnitude >> shift;
+        let remainder = magnitude & ((1u128 << shift) - 1);
+        let half = 1u128 << (shift - 1);
+        let quotient = if remainder > half || (remainder == half && quotient & 1 == 1) {
+            quotient + 1
+        } else {
+            quotient
+        };
+        quotient << shift
+    };
+    // Narrowing an infinity -- or any float out of `int64_t`'s range -- is
+    // undefined in C++; aarch64's `fcvtzs` saturates, and that is what this
+    // reproduces.
+    if rounded > format.max_finite {
+        return if negative { i64::MIN } else { i64::MAX };
+    }
+    let signed = if negative {
+        -(rounded as i128)
+    } else {
+        rounded as i128
+    };
+    signed.clamp(i64::MIN as i128, i64::MAX as i128) as i64
+}
+
+/// `floor(log2(v))`, matching C's `int n = 0; while (v >>= 1) ++n;`.
+fn log2_floor(v: u128) -> u32 {
+    if v == 0 { 0 } else { 127 - v.leading_zeros() }
+}
+
+/// `at::native::templates::update_from<scalar_t>`.
+///
+/// A float `randint` does not draw from the range it was asked for. When an
+/// endpoint is not representable in the dtype, upstream moves the endpoint to
+/// one that is -- and it moves it *before* the width is computed, so this
+/// changes both the modulus and which side of `RANDINT_WIDE_THRESHOLD` the
+/// call lands on. Getting the values right while skipping this would still
+/// desynchronise the stream.
+pub fn update_from(from: i64, format: FloatFormat) -> i64 {
+    let from_plus_1 = round_trip_through_float(from.saturating_add(1), format);
+    if from_plus_1 < from {
+        let n = log2_floor((from as i128 + 1).unsigned_abs());
+        // Upstream shifts by `n - digits + 1`; the guard is ours, for a case
+        // C++ leaves undefined and this branch cannot actually reach (the
+        // round trip only overflows for magnitudes well past `digits` bits).
+        if n + 1 >= format.digits {
+            return from_plus_1.saturating_add(1i64 << (n + 1 - format.digits));
+        }
+    }
+    from
+}
+
+/// `at::native::templates::update_to<scalar_t>`. The mirror of `update_from`.
+pub fn update_to(to: i64, format: FloatFormat) -> i64 {
+    let to_minus_1 = round_trip_through_float(to.saturating_sub(1), format);
+    if to_minus_1 >= to {
+        let n = log2_floor((to as i128 - 1).unsigned_abs());
+        if n + 1 >= format.digits {
+            return to_minus_1.saturating_sub(1i64 << (n + 1 - format.digits));
+        }
+    }
+    to
 }
 
 /// One `uniform_real_distribution<double>(from, to)` draw.
@@ -464,9 +647,9 @@ fn exponential_sample_f64(gen: &mut CpuGenerator, lambda: f64) -> f64 {
 ///
 /// This exists for `aten.multinomial.default`, whose fast path is
 /// `empty_like(self).exponential_(1)` followed by an argmax of `self / q`
-/// (docs/SAMPLING.md §2). `aten.exponential_` itself is deliberately not
+/// (docs/models/SAMPLING.md §2). `aten.exponential_` itself is deliberately not
 /// implemented: nothing measured calls it directly, and advertising an op this
-/// shim has never been asked for is the direction docs/TORCH_C.md §1 refuses.
+/// shim has never been asked for is the direction docs/design/TORCH_C.md §1 refuses.
 pub fn exponential_serial(gen: &mut CpuGenerator, size: usize, lambda: f64) -> Vec<f64> {
     (0..size)
         .map(|_| exponential_sample_f64(gen, lambda))
