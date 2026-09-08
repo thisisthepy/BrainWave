@@ -559,14 +559,14 @@ by name and say what replaces them.
 ```python
 - from transformers import AutoModelForCausalLM
 + from torchnative.transformers import AutoModelForCausalLM
-import torchnative
++ from torchnative import device
 
 model = AutoModelForCausalLM.from_pretrained("google/gemma-3-4b-it")
 
 loss = model(**batch, labels=labels).loss
 loss.backward()                          # a real nn.Module, so this works
 
-model.to(torchnative.device.npu)         # REFUSES: resolves the NPU, names the
+model.to(device.npu)                     # REFUSES: resolves the NPU, names the
                                          # unit, then says the recompile step
                                          # is not implemented
 ```

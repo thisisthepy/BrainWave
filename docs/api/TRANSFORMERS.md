@@ -16,11 +16,11 @@
 
     - from transformers import AutoModelForCausalLM
     + from torchnative.transformers import AutoModelForCausalLM
-      import torchnative
+    + from torchnative import device
 
       model = AutoModelForCausalLM.from_pretrained("google/gemma-3-4b-it")
       model(**batch, labels=labels).loss.backward()   # a real nn.Module
-      model.to(torchnative.device.npu)                # recompiles for the accelerator
+      model.to(device.npu)                            # recompiles for the accelerator
 
 One line. The class keeps transformers' own name and the module path
 disambiguates. `optimum` prefixes its classes (`OVModelForCausalLM`) because
