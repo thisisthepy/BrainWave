@@ -48,6 +48,14 @@ _VENDOR_DIR = os.path.join(_ROOT, "torchnative", "src", "main")
 if _VENDOR_DIR not in sys.path:
     sys.path.insert(0, _VENDOR_DIR)
 
+# Importing `torchnative.device` reaches `torch`, whose `_load_global_deps()`
+# dlopens `torch/lib/libtorch_global_deps.*`. That file is created by
+# tools/wheel/build.py for a wheel and does not exist in the source tree, so
+# without this the import raises OSError -- which is how these three tests
+# passed standalone (the variable happened to be set) and failed under
+# run.sh. Every other suite here sets it the same way, before importing torch.
+os.environ.setdefault("TORCH_USE_RTLD_GLOBAL", "1")
+
 
 def _device_ns():
     """`torchnative.device`, or `None` if the vendored tree is not here."""

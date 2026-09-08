@@ -321,8 +321,15 @@ def test_the_windows_and_android_success_branches_resolve_correctly():
         assert res.host == "windows", res
         assert "NPU" in res.detail["devices"], res.detail
 
+        # `htp_reachable` is what the resolver gates on now, and it is a
+        # separate fact from `htp_arch`: the arch is a part number looked up
+        # from an SoC name string, which a device with an unreachable compute
+        # DSP produces just as readily. This fake must supply BOTH, or it is
+        # asserting the success branch against an input the resolver is right
+        # to refuse. See test_qnnprobe.py.
         qnn_device.device_report = lambda *a, **k: {
-            "reachable": True, "htp_arch": "v75", "soc_model": "SM8550"
+            "reachable": True, "htp_arch": "v75", "soc_model": "SM8550",
+            "htp_reachable": True, "cdsp_fastrpc": ["/dev/cdsprpc-smd"],
         }
         res2 = _with_host("android", D.npu.resolve)
         assert res2.backend == "qnn", res2
