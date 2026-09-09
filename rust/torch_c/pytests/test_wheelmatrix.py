@@ -37,6 +37,7 @@ import pathlib
 import re
 import subprocess
 import sys
+import tempfile
 
 REPO = pathlib.Path(__file__).resolve().parents[3]
 BUILD_PY = REPO / "tools" / "wheel" / "build.py"
@@ -447,6 +448,116 @@ def test_build_pys_own_self_test_passes():
     assert proc.returncode == 0, (
         f"build.py --self-test failed:\n{proc.stdout[-3000:]}\n{proc.stderr[-2000:]}")
     assert "LINUX SELF-TEST: PASS" in proc.stdout
+
+
+def test_a_failed_build_leaves_no_wheel_in_outdir():
+    """A `verify()` failure (the shape a bad cross artefact or a bad override
+    takes) used to leave `run_pip_wheel`'s host-tagged intermediate sitting in
+    `--outdir` -- twice today, from failed `linux-x86_64` and
+    `wasm32-emscripten` runs, as a `...-macosx_11_0_universal2.whl` nobody
+    asked for. `main()` now stages through a `TemporaryDirectory` and only
+    moves the wheel into `--outdir` after `verify()` passes, so a failure
+    there must leave `--outdir` exactly as empty as it started.
+
+    Every stage but `run_pip_wheel`/`_repack`/`verify` is stubbed here: this
+    machine has no vendored torch tree, so `preflight()` and `check_host_shim()`
+    would refuse before ever reaching the code this test is about. The stub for
+    `run_pip_wheel` writes a real file into whatever directory it is handed --
+    that is the fact this test needs to observe -- and the stub for `verify`
+    is where the injected failure happens.
+
+    NULLIFICATION: run this same body against the pre-fix shape (`run_pip_wheel`
+    writing straight to `args.outdir`, no staging) and the assertion that
+    `outdir` is empty after the failure goes red -- confirmed by hand while
+    writing this fix (see PR/commit description); a hardcoded pre-fix `main`
+    is not duplicated here because it would drift from the real one silently.
+    """
+    calls = []
+
+    def fake_check_registry():
+        pass
+
+    def fake_preflight():
+        return {"version": "0.0.0", "py_modules": "0", "packages": ""}
+
+    def fake_check_host_shim():
+        pass
+
+    def fake_run_pip_wheel(python, outdir):
+        outdir = pathlib.Path(outdir)
+        w = outdir / "torchnative-0.1.0b1-cp313-abi3-macosx_11_0_universal2.whl"
+        w.write_bytes(b"fake host-tagged intermediate")
+        calls.append(("run_pip_wheel", str(outdir)))
+        return w
+
+    def fake_repack(wheel, extra, dist_info, plat=None, overrides=None, renames=None):
+        calls.append(("_repack", str(wheel)))
+        return wheel
+
+    def fake_verify(wheel, expected, target, extra, dist_info):
+        calls.append(("verify", str(wheel)))
+        raise RuntimeError("simulated verify() failure")
+
+    def fake_upstream_dist_info(version):
+        return {}
+
+    def fake_global_deps_stub(target=None):
+        return {}
+
+    def fake_tree_files(root):
+        return set()
+
+    patched = {
+        "check_registry": fake_check_registry,
+        "preflight": fake_preflight,
+        "check_host_shim": fake_check_host_shim,
+        "run_pip_wheel": fake_run_pip_wheel,
+        "_repack": fake_repack,
+        "verify": fake_verify,
+        "upstream_dist_info": fake_upstream_dist_info,
+        "global_deps_stub": fake_global_deps_stub,
+        "tree_files": fake_tree_files,
+    }
+    originals = {name: getattr(_build, name) for name in patched}
+    original_shim = _build.SHIM
+
+    with tempfile.TemporaryDirectory() as tmp:
+        outdir = pathlib.Path(tmp) / "dist"
+        shim_stub = pathlib.Path(tmp) / "_C.abi3.so"
+        shim_stub.write_bytes(b"stub")
+        for name, fn in patched.items():
+            setattr(_build, name, fn)
+        _build.SHIM = shim_stub
+        try:
+            old_argv = sys.argv
+            sys.argv = ["build.py", "--outdir", str(outdir), "--python", sys.executable]
+            raised = None
+            try:
+                _build.main()
+            except RuntimeError as e:
+                raised = e
+            finally:
+                sys.argv = old_argv
+        finally:
+            for name, fn in originals.items():
+                setattr(_build, name, fn)
+            _build.SHIM = original_shim
+
+        # Read before the TemporaryDirectory (which `outdir` lives inside) is
+        # removed on exit -- checking after it closes would make this assert
+        # vacuously true regardless of what main() actually did, since
+        # `outdir.exists()` would already be False for that reason alone.
+        outdir_leftovers = list(outdir.glob("*")) if outdir.exists() else None
+
+    assert raised is not None and "simulated verify" in str(raised), (
+        f"the injected verify() failure did not propagate as expected: {raised}"
+    )
+    assert [c[0] for c in calls] == ["run_pip_wheel", "_repack", "verify"], (
+        f"the build did not reach verify() by the expected path: {calls}"
+    )
+    assert not outdir_leftovers, (
+        f"a wheel was left in --outdir after verify() failed: {outdir_leftovers}"
+    )
 
 
 def test_the_document_exists_and_names_each_target_and_its_verdict():

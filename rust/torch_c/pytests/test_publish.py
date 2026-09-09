@@ -31,6 +31,18 @@ REPO = pathlib.Path(__file__).resolve().parents[3]
 SCRIPT = REPO / "tools/release/publish_main.sh"
 DOC = REPO / "docs/platform/PUBLISH.md"
 
+# `publish_main.sh` now refuses to start check_build unless PUBLISH_PYTHON can
+# import pip/setuptools/wheel (the interpreter guard added for the same trap
+# `run.sh`'s PYTHON guard closes). The bare `python3` this fixture used to pass
+# has neither on this machine, which made every test below that exercises
+# check_build fail before its stub `tools/wheel/build.py` -- which needs none
+# of the three -- ever ran. Falling back to `python3` when the known-good venv
+# is absent keeps this file runnable on a machine without it.
+_KNOWN_GOOD_PYTHON = "/Volumes/macMini/caches/spike-venv/bin/python"
+PUBLISH_TEST_PYTHON = (
+    _KNOWN_GOOD_PYTHON if pathlib.Path(_KNOWN_GOOD_PYTHON).exists() else "python3"
+)
+
 # See _fixture(): fixture link targets are composed rather than written out.
 D = "do" + "cs"
 
@@ -246,7 +258,7 @@ def _run(root, *args, script="tools/release/publish_main.sh"):
          "refs/heads/_publish_test", *args],
         cwd=root, capture_output=True, text=True, timeout=300,
         env={**__import__("os").environ, "PUBLISH_SCRATCH_WT": str(scratch),
-             "PUBLISH_PYTHON": "python3"},
+             "PUBLISH_PYTHON": PUBLISH_TEST_PYTHON},
     )
 
 
@@ -327,6 +339,55 @@ def test_the_build_check_is_invoked_and_not_merely_declared():
             "The build check is declared, not invoked.\n" + bad.stdout
         )
         assert "build" in (bad.stdout + bad.stderr).lower()
+
+
+def test_check_build_refuses_a_publish_python_missing_the_build_backend():
+    """`pip wheel` runs with `--no-build-isolation` (run_pip_wheel's docstring),
+    so PUBLISH_PYTHON has to already have `pip`, `setuptools` and `wheel`
+    importable -- nothing installs them. Point PUBLISH_PYTHON at an
+    interpreter missing all three (a fresh venv with none of them seeded) and
+    require the refusal to land before the scratch worktree is ever created,
+    naming the interpreter and what it could not import.
+
+    NULLIFICATION: with the guard commented out, this exact fixture used to
+    fail deep inside the pip subprocess instead -- CLAUDE.md records that this
+    cost a real run of this script that way."""
+    with tempfile.TemporaryDirectory() as tmp:
+        root = _fixture(pathlib.Path(tmp) / "r")
+        venv_dir = pathlib.Path(tmp) / "bare-venv"
+        made = subprocess.run(
+            ["python3", "-m", "venv", "--without-pip", str(venv_dir)],
+            capture_output=True, text=True,
+        )
+        assert made.returncode == 0, f"could not create a bare venv:\n{made.stderr}"
+        bare_python = venv_dir / "bin" / "python3"
+        assert bare_python.exists(), "venv did not produce a python3"
+
+        scratch = pathlib.Path(root).parent / "wt-guard-nopy"
+        done = subprocess.run(
+            ["bash", str(pathlib.Path(root) / "tools/release/publish_main.sh"),
+             "--target-ref", "refs/heads/_publish_test"],
+            cwd=root, capture_output=True, text=True, timeout=300,
+            env={**__import__("os").environ, "PUBLISH_SCRATCH_WT": str(scratch),
+                 "PUBLISH_PYTHON": str(bare_python)},
+        )
+        both = done.stdout + done.stderr
+        assert done.returncode != 0, (
+            f"a PUBLISH_PYTHON with no pip/setuptools/wheel was accepted:\n{both}"
+        )
+        assert "refusing to start" in both, (
+            f"the refusal does not say it is refusing to start:\n{both}"
+        )
+        assert str(bare_python) in both, (
+            f"the refusal does not name the interpreter:\n{both}"
+        )
+        assert "pip" in both and "setuptools" in both, (
+            f"the refusal does not name what could not be imported:\n{both}"
+        )
+        assert not scratch.exists(), (
+            "the scratch worktree was created before the interpreter was "
+            "checked -- the guard ran too late to save the work it claims to"
+        )
 
 
 def test_skip_build_says_that_it_has_proved_only_tidiness():
