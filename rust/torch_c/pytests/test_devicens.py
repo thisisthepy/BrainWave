@@ -6,12 +6,21 @@ See docs/devices/DEVICE_NS.md.
 Metal GPU, a Neural Engine, a Vulkan loader when the emulator's one is supplied,
 and no CUDA and no Intel NPU. So:
 
-* The **per-host npu resolution table** is exercised for every host, because
+* The **per-host npu candidate table** is exercised for every host, because
   `torchnative.device.host()` reads `TORCHNATIVE_DEVICE_HOST` and the tests
   move it. Without that a resolution that ignored the host entirely would pass
   --- it would answer "Apple Neural Engine" here and never be asked anything
   else. `test_npu_resolves_differently_per_host` is the one that fails if
   resolution is hardcoded.
+
+  That table is no longer one backend per host. `docs/devices/NPUVENDOR.md`
+  found that reading the vendor off `platform.system()` told every Windows
+  machine it had an *Intel* NPU, so a Ryzen AI owner was refused with the words
+  "no Intel NPU" on a machine that has an NPU. A host now maps to an ordered
+  list and a probe decides, and the tests below check the rule that replaced the
+  old one rather than the old one. The vendor half lives in
+  `test_npuvendor.py`; what stays here is that resolution still differs per
+  host, still never means the CPU, and still names its unit.
 * The **availability probes** are checked against an independent measurement
   rather than against themselves. `test_mps_availability_is_measured_not_declared`
   is the load-bearing one: it allocates on Metal itself and requires the
@@ -235,16 +244,27 @@ def test_cuda_keeps_its_five_named_reasons():
 # --------------------------------------------------------------------------
 
 
-def _with_host(value, fn):
-    old = os.environ.get("TORCHNATIVE_DEVICE_HOST")
+def _with_host(value, fn, machine="AMD64"):
+    """Move the host, and pin the machine while doing it.
+
+    The machine is pinned because Windows' candidate order depends on it
+    (docs/devices/NPUVENDOR.md section 4) and this is an arm64 Mac: without the
+    pin, "windows" here would silently mean win_arm64 and these tests would be
+    asserting an order nobody chose. `test_npuvendor.py` is where the order
+    itself is checked, on both values.
+    """
+    names = ("TORCHNATIVE_DEVICE_HOST", "TORCHNATIVE_DEVICE_MACHINE")
+    old = [os.environ.get(n) for n in names]
     os.environ["TORCHNATIVE_DEVICE_HOST"] = value
+    os.environ["TORCHNATIVE_DEVICE_MACHINE"] = machine
     try:
         return fn()
     finally:
-        if old is None:
-            os.environ.pop("TORCHNATIVE_DEVICE_HOST", None)
-        else:
-            os.environ["TORCHNATIVE_DEVICE_HOST"] = old
+        for name, was in zip(names, old):
+            if was is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = was
 
 
 def test_npu_resolves_differently_per_host():
@@ -255,6 +275,12 @@ def test_npu_resolves_differently_per_host():
     not allowed to do is give the same backend for all three. So this checks
     the backend named in the resolution or in the refusal, which is available
     either way.
+
+    `expected_backend` is now the **first** candidate for that host, not the
+    only one: Windows offers two (docs/devices/NPUVENDOR.md section 4) and the
+    machine is pinned to x86-64 so the order is the one being asserted rather
+    than this Mac's. A host that resolves must resolve to a backend on its own
+    list, which is the invariant that survived the change.
     """
     _shim()
     seen = {}
@@ -263,6 +289,9 @@ def test_npu_resolves_differently_per_host():
         ("windows", "openvino", "Intel NPU"),
         ("android", "qnn", "Qualcomm Hexagon NPU"),
     ):
+        assert D.npu_candidates(host, "AMD64")[0] == (expected_backend, expected_unit), (
+            host, D.npu_candidates(host, "AMD64")
+        )
         def probe(host=host):
             try:
                 res = D.npu.resolve()
