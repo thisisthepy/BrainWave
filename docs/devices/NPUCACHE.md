@@ -36,36 +36,45 @@ The module's own docstring already noted that the archived
 
 | platform | root |
 |---|---|
-| `win32` | `%LOCALAPPDATA%\torchnative\Cache\openvino` |
-| `darwin` | `~/Library/Caches/torchnative/openvino` |
-| `linux` | `$XDG_CACHE_HOME/torchnative/openvino`, default `~/.cache/torchnative/openvino` |
-| `android` | `$HOME/.cache/torchnative/openvino` — app-private, see below |
-| `ios` | `~/Library/Caches/torchnative/openvino` — app container, see below |
+| every platform with a filesystem | `$XDG_CACHE_HOME/torchnative/openvino`, default `~/.cache/torchnative/openvino` |
 | `emscripten`, `wasi` | **nothing.** No cache. |
 
-Per-platform notes, since "use the platform convention" hides three decisions:
+**One rule, not one per OS.** An earlier version used each platform's native
+convention — `%LOCALAPPDATA%\torchnative\Cache` on Windows, `~/Library/Caches`
+on macOS and iOS, XDG elsewhere. That is what a desktop application should do
+and it is wrong here, because it makes torchnative the only thing in a user's ML
+toolchain that does it. The two that matter ignore the OS:
 
-* **Windows is `%LOCALAPPDATA%`, never `%APPDATA%`.** A compiled NPU blob is
-  keyed on this machine's driver and device; roaming it to another host through
-  `%APPDATA%` would be shipping a cache entry to a machine it was not compiled
-  for. `XDG_CACHE_HOME` is deliberately not consulted on Windows either — a user
-  with git-bash or WSL interop in their environment must not silently get a
-  different answer than a user without.
-* **Android is the XDG shape and that is correct, not a fallback.** CPython on
-  Android (PEP 738, and Chaquopy before it) sets `HOME` to the application's own
-  files directory, so `$HOME/.cache` is inside app-private storage. There is no
-  world-writable location on Android and nothing here looks for one. CPython
-  3.13 reports `sys.platform == "android"`; older embeddings report `"linux"`
-  and are distinguished by `sys.getandroidapilevel`, which is why `cache_root`
-  takes an `android` argument as well as a platform string.
-* **iOS is the macOS rule and that is also correct, not laziness.** `HOME`
-  inside the iOS sandbox is the app container, so the result is
-  `<container>/Library/Caches/torchnative`. That directory is purgeable by the
-  OS under disk pressure, which is the right property for a cache and the reason
-  it is not `Application Support`.
-* **wasm caches nothing.** Neither `emscripten` nor `wasi` has a persistent
-  filesystem by default. Writing into a MEMFS that is discarded with the page is
-  not a cache; it is the work plus a directory. `cache_root` returns `None`.
+    torch/hub.py                  DEFAULT_CACHE_DIR = "~/.cache"
+    huggingface_hub/constants.py  ~/.cache, XDG_CACHE_HOME consulted first
+
+Neither reads `sys.platform`. On Windows a user's checkpoints are already in
+`C:\Users\<u>\.cache\huggingface` and torch's hub artefacts in
+`C:\Users\<u>\.cache\torch`; sending only the NPU blobs to `%LOCALAPPDATA%`
+splits one thing across two places for a tidiness nobody asked for. This
+distribution ships that torch, so its convention is not a foreign one.
+
+Roaming was the argument for `%LOCALAPPDATA%`, since a compiled NPU blob is
+keyed to this machine's driver. It is not a real risk: `~/.cache` resolves under
+`%USERPROFILE%`, which is not the roaming `%APPDATA%` tree, and
+`huggingface_hub` already keeps multi-gigabyte checkpoints there.
+
+**iOS and Android keep the same rule, and give something up to do it.** The
+correct directory on each is one only the host application knows —
+`Context.getCacheDir()` (`/data/data/<pkg>/cache`) and the sandbox container's
+`Library/Caches`. Both need a JNI Context or an Objective-C container URL, and a
+pure-Python process can compute neither. `$HOME/.cache` on those platforms is
+app-*private* but it is app *data*: Android will not reclaim it under storage
+pressure and "Clear cache" will not touch it; on iOS it is not OS-purgeable.
+
+The alternative was to cache nothing on mobile until an embedder says where.
+That is worse by a wide margin — it means recompiling every leaf on every
+launch, 504 driver compiles for a Qwen3-4B, on exactly the devices where compute
+is scarcest. **A cache in a less-reclaimable directory beats no cache.**
+
+So `TORCHNATIVE_CACHE_DIR` is the one thing a mobile host should configure. An
+embedder that sets it gets the correct directory; an embedder that does not
+still gets a working cache.
 
 **Hugging Face was the other candidate and was rejected.** These artefacts are
 derived from HF checkpoints, so sitting under `HF_HOME`/`HF_HUB_CACHE` has a

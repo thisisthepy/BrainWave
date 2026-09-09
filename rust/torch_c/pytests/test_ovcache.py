@@ -56,98 +56,74 @@ from torchnative.export import intelnpu  # noqa: E402
 # --------------------------------------------------------------------------
 
 
-def test_the_cache_root_is_each_platforms_own_convention_on_all_six_targets():
-    """One assertion per platform this project ships a wheel for.
+def test_every_platform_with_a_filesystem_answers_dot_cache_torchnative():
+    """One rule, not six, and that is the decision this test exists to pin.
 
-    Not one rule with five exceptions: the point of taking `platform` as an
-    argument is that the Windows answer is checkable from a Mac, and a rule
-    that is right on Linux and wrong on Windows is the failure mode this test
-    exists to make impossible to land.
+    The first version of this module used each OS's native convention:
+    `%LOCALAPPDATA%\\torchnative\\Cache` on Windows, `~/Library/Caches` on macOS
+    and iOS, XDG elsewhere. That is right for a desktop application and wrong
+    here, because it makes torchnative the only thing in a user's ML toolchain
+    that does it. The two that matter ignore the OS:
+
+        torch/hub.py                     DEFAULT_CACHE_DIR = "~/.cache"
+        huggingface_hub/constants.py     ~/.cache, XDG_CACHE_HOME first
+
+    Neither consults `sys.platform`. On Windows a user's checkpoints are already
+    in `C:\\Users\\<u>\\.cache\\huggingface`; sending only the NPU blobs to
+    `%LOCALAPPDATA%` splits one thing across two places for a tidiness nobody
+    asked for. We ship that torch, so its convention is not a foreign one.
+
+    The only exception is the platform with no filesystem, not the platform with
+    a nicer directory -- iOS keeps `~/.cache` too, and gives up
+    `Library/Caches`'s OS-purgeability to do it. See the module for why that
+    trade is taken and how an embedder undoes it.
     """
-    cases = [
-        # (platform, android, env, expected root)
-        (
-            "win32",
-            False,
-            {"LOCALAPPDATA": r"C:\Users\u\AppData\Local", "USERPROFILE": r"C:\Users\u"},
-            os.path.join(r"C:\Users\u\AppData\Local", "torchnative", "Cache"),
-        ),
-        (
-            "darwin",
-            False,
-            {"HOME": "/Users/u"},
-            os.path.join("/Users/u", "Library", "Caches", "torchnative"),
-        ),
-        (
-            "linux",
-            False,
-            {"HOME": "/home/u"},
-            os.path.join("/home/u", ".cache", "torchnative"),
-        ),
-        (
-            "linux",
-            False,
-            {"HOME": "/home/u", "XDG_CACHE_HOME": "/scratch/cache"},
-            os.path.join("/scratch/cache", "torchnative"),
-        ),
-        (
-            "android",
-            True,
-            {"HOME": "/data/user/0/com.example.app/files"},
-            os.path.join("/data/user/0/com.example.app/files", ".cache", "torchnative"),
-        ),
-        (
-            "ios",
-            False,
-            {"HOME": "/var/mobile/Containers/Data/Application/ABC"},
-            os.path.join(
-                "/var/mobile/Containers/Data/Application/ABC", "Library", "Caches", "torchnative"
-            ),
-        ),
-        ("emscripten", False, {"HOME": "/home/web_user"}, None),
-        ("wasi", False, {"HOME": "/"}, None),
-    ]
-    for platform, android, env, expected in cases:
-        got = _cachedir.cache_root(platform=platform, env=env, android=android)
-        assert got == expected, (platform, got, expected)
-    platforms = sorted({c[0] for c in cases})
+    env = {"HOME": "/home/u", "USERPROFILE": r"C:\Users\u",
+           "LOCALAPPDATA": r"C:\Users\u\AppData\Local"}
+    same = ("win32", "darwin", "linux", "android", "ios", "freebsd14")
+    got = {p: _cachedir.cache_root(platform=p, env=env) for p in same}
+    expected = os.path.join("/home/u", ".cache", "torchnative")
+    for platform, answer in got.items():
+        assert answer == expected, (platform, answer, expected)
+    for platform in ("emscripten", "wasi"):
+        assert _cachedir.cache_root(platform=platform, env=env) is None, platform
     print(
-        f"ok   ovcache: cache_root answers each of {len(platforms)} platform "
-        f"conventions by name -- {', '.join(platforms)} -- with wasm returning "
-        f"None because it has no persistent filesystem to cache into"
+        f"ok   ovcache: {len(same)} platforms all answer ~/.cache/torchnative -- "
+        f"the torch and huggingface_hub convention, not the per-OS one -- and "
+        f"only wasm, which has no filesystem, answers None"
     )
 
 
-def test_windows_does_not_roam_the_cache_and_does_not_read_xdg():
-    """`%LOCALAPPDATA%`, never `%APPDATA%`, and `XDG_CACHE_HOME` is not a Windows thing.
+def test_xdg_cache_home_is_honoured_everywhere_including_windows():
+    """`XDG_CACHE_HOME` moves the root on every platform, Windows included.
 
-    A compiled NPU blob is keyed on the driver and the device; roaming it to
-    another machine through `%APPDATA%` would be shipping a cache entry to a
-    host it was not compiled for. And a Windows user who happens to have
-    `XDG_CACHE_HOME` set (git-bash, WSL interop, a dotfile) must not have the
-    Windows answer silently change out from under them.
+    It was previously read on Linux and deliberately ignored on Windows, on the
+    reasoning that a git-bash or WSL-interop environment must not silently
+    change the answer. That reasoning is dropped, because `huggingface_hub`
+    reads it unconditionally: a user who sets it and finds their HF cache moved
+    but their torchnative cache not moved is worse off than one who set it on
+    purpose and got what they asked for.
+
+    Roaming was the other reason for `%LOCALAPPDATA%`, and it is not a real
+    risk: `~/.cache` resolves under `%USERPROFILE%`, which is not the roaming
+    `%APPDATA%` tree, and huggingface_hub already keeps multi-gigabyte
+    checkpoints there.
     """
-    env = {
-        "LOCALAPPDATA": r"C:\Users\u\AppData\Local",
-        "APPDATA": r"C:\Users\u\AppData\Roaming",
-        "XDG_CACHE_HOME": "/mnt/c/xdg",
-        "USERPROFILE": r"C:\Users\u",
-    }
-    root = _cachedir.cache_root(platform="win32", env=env)
-    assert root is not None
-    assert "Roaming" not in root, root
-    assert "xdg" not in root, root
-    assert root.startswith(r"C:\Users\u\AppData\Local"), root
-    # ...and with LOCALAPPDATA absent it is derived from the profile, not from HOME.
-    fallback = _cachedir.cache_root(
-        platform="win32", env={"USERPROFILE": r"C:\Users\u", "HOME": "/home/u"}
+    env = {"HOME": "/home/u", "USERPROFILE": r"C:\Users\u",
+           "LOCALAPPDATA": r"C:\Users\u\AppData\Local",
+           "XDG_CACHE_HOME": "/big/cache"}
+    for platform in ("win32", "darwin", "linux", "android", "ios"):
+        got = _cachedir.cache_root(platform=platform, env=env)
+        assert got == os.path.join("/big/cache", "torchnative"), (platform, got)
+
+    roaming = _cachedir.cache_root(platform="win32", env={k: v for k, v in env.items()
+                                                if k != "XDG_CACHE_HOME"})
+    assert "Roaming" not in roaming and "AppData" not in roaming, (
+        f"the Windows root went back into AppData: {roaming}"
     )
-    assert fallback is not None and "/home/u" not in fallback, fallback
-    assert "AppData" in fallback and "Local" in fallback, fallback
     print(
-        "ok   ovcache: the Windows root is under %LOCALAPPDATA% -- never %APPDATA%, "
-        "so a device-specific blob cannot roam to another machine -- and "
-        "XDG_CACHE_HOME does not reach the Windows answer"
+        "ok   ovcache: XDG_CACHE_HOME moves the root on every platform including "
+        "Windows, and no platform answers anywhere under AppData"
     )
 
 

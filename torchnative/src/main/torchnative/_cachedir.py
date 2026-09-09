@@ -143,40 +143,72 @@ def cache_root(
     if override is not None:
         return None if is_disabled(override) else os.path.abspath(override)
 
-    if platform == "win32":
-        # %LOCALAPPDATA%, and the `AppData\Local` reconstruction when it is
-        # absent -- a stripped-down service environment often has USERPROFILE
-        # and not LOCALAPPDATA. HOME is not consulted on Windows: an MSYS or
-        # Cygwin HOME points somewhere the native process should not cache.
-        local = env.get("LOCALAPPDATA")
-        if not local:
-            profile = env.get("USERPROFILE")
-            if not profile:
-                return None
-            local = os.path.join(profile, "AppData", "Local")
-        return os.path.join(local, "torchnative", "Cache")
-
-    if platform in ("darwin", "ios"):
-        home = _home(env)
-        return os.path.join(home, "Library", "Caches", "torchnative") if home else None
-
     if platform in ("emscripten", "wasi"):
         # No persistent filesystem by default. Writing into a MEMFS that is
         # discarded at the end of the page's life is not a cache; it is work
         # plus a directory. Say so with None instead.
         return None
 
-    if platform.startswith("linux") or platform == "android" or android:
-        xdg = env.get("XDG_CACHE_HOME")
-        if xdg and not is_disabled(xdg):
-            return os.path.join(os.path.abspath(xdg), "torchnative")
-        home = _home(env)
-        return os.path.join(home, ".cache", "torchnative") if home else None
+    # EVERY OTHER PLATFORM GETS `~/.cache/torchnative`, INCLUDING WINDOWS AND
+    # macOS, and that is deliberate rather than lazy.
+    #
+    # The first version of this function used each OS's native convention:
+    # %LOCALAPPDATA%\torchnative\Cache on Windows, ~/Library/Caches on macOS
+    # and iOS, XDG elsewhere. That is what a desktop application should do, and
+    # it is the wrong answer here, because it makes torchnative the odd one out
+    # among the caches a user of this library already has.
+    #
+    # The two that matter both ignore the OS convention:
+    #
+    #   torch/hub.py:91                     DEFAULT_CACHE_DIR = "~/.cache"
+    #   huggingface_hub/constants.py:157    ~/.cache, XDG_CACHE_HOME first
+    #
+    # Neither consults `sys.platform`. On Windows a user's checkpoints are
+    # already in C:\Users\<u>\.cache\huggingface and torch's hub artefacts in
+    # C:\Users\<u>\.cache\torch. Sending only the NPU blobs to
+    # %LOCALAPPDATA% splits one thing across two places for a tidiness nobody
+    # asked for. We ship that torch, so its convention is not a foreign one.
+    #
+    # iOS is not special-cased either. `~/Library/Caches` there is genuinely
+    # OS-purgeable, which is the right property for a cache -- but if that
+    # mattered enough to branch on, `huggingface_hub` would have to branch on it
+    # too, and it does not. `~/.cache` on iOS is inside the app container and
+    # works; it simply is not purgeable. One rule, and the exception is the
+    # platform with no filesystem, not the platform with a nicer directory.
+    #
+    # MOBILE. On Android and iOS the correct directory is one only the host app
+    # knows: `Context.getCacheDir()` (`/data/data/<pkg>/cache`) and the sandbox
+    # container's `Library/Caches`. Both need a JNI Context or an Objective-C
+    # container URL; a pure-Python process cannot compute either. `$HOME/.cache`
+    # there is app-PRIVATE but it is app DATA, not app cache -- Android will not
+    # reclaim it under storage pressure and "Clear cache" will not touch it.
+    #
+    # It is still the right fallback. The alternative considered was to return
+    # None on mobile so nothing is cached until an embedder says where -- and
+    # that is worse, by a lot: it means recompiling every leaf on every launch
+    # (504 driver compiles for a Qwen3-4B) on exactly the devices where compute
+    # is scarcest. A cache in a less-reclaimable directory beats no cache.
+    #
+    # So the embedder sets `TORCHNATIVE_CACHE_DIR` (it already exists; see
+    # above) and gets the correct directory; an embedder that does not still
+    # gets a working cache. docs/devices/NPUCACHE.md records this as the one
+    # thing a mobile host should configure.
+    #
+    # Android needs no branch beyond that: CPython there (PEP 738, Chaquopy)
+    # sets HOME to the app's own files directory, so `$HOME/.cache` is at least
+    # inside app-private storage rather than anywhere shared.
+    #
+    # Windows roaming was the stated reason for %LOCALAPPDATA%, since a compiled
+    # NPU blob is keyed to this machine's driver. It is not a real risk:
+    # `~/.cache` resolves under %USERPROFILE%, which is not the roaming
+    # `%APPDATA%` tree, and HF already keeps multi-gigabyte checkpoints there.
+    xdg = env.get("XDG_CACHE_HOME")
+    if xdg and not is_disabled(xdg):
+        return os.path.join(os.path.abspath(xdg), "torchnative")
+    home = _home(env)
+    return os.path.join(home, ".cache", "torchnative") if home else None
 
-    # An unrecognised platform. XDG is the most portable guess, but guessing is
-    # what produces the wrong-on-Windows answer this module exists to prevent,
-    # so it declines instead. A caller who knows better sets CACHE_ROOT_ENV.
-    return None
+
 
 
 def backend_cache_dir(
