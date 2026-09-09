@@ -267,11 +267,24 @@ def test_a_generate_style_loop_still_runs_after_to_device_npu():
 
     for i, got in enumerate(outs):
         assert got.shape == expected.shape, (i, got.shape, expected.shape)
-        assert torch.allclose(got, expected, atol=2e-2), (
-            f"forward {i} after to(npu) disagrees with the unlowered module:\n"
+        # Not `torch.allclose`: this shim has no table entry for it
+        # (rust/torch_c/src/overloads.json), so calling it raises
+        # NotImplementedError. That went unnoticed while this file lived in a
+        # worktree with no vendored tree, where `import torch` fell through to
+        # an upstream install that does have it. The subtraction below is the
+        # same claim in operators the shim does implement.
+        worst = float((got - expected).abs().max())
+        assert worst <= 2e-2, (
+            f"forward {i} after to(npu) disagrees with the unlowered module "
+            f"by {worst} (tolerance 2e-2):\n"
             f"  got      {got}\n  expected {expected}"
         )
-    assert torch.equal(outs[0], outs[1]), "the compiled leaf is not deterministic"
+    # `torch.equal` is absent from the shim's table for the same reason as
+    # `torch.allclose` above. Bit-identity is still the claim.
+    assert float((outs[0] - outs[1]).abs().max()) == 0.0, (
+        "the compiled leaf is not deterministic: two forwards on the same "
+        "input differ"
+    )
     print(f"ok   npuwire: {len(outs)} forwards run after to(device.npu) and agree "
           f"with the unlowered module to f16 (dispatch evidence; the NPU is faked)")
 
