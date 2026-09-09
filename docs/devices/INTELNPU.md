@@ -809,3 +809,122 @@ weight, an unsupported device string — and `verdict_execution_devices` still
 refuses a partial offload by name. The rule this module exists for is intact:
 **an unannounced CPU layer is the failure; the fix was to announce it, not to
 stop checking.**
+
+## The weights path — bytes, not Python floats
+
+<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/intelnpu.py f16_bytes present -->
+<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/intelnpu.py f16_tensor present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/src/tensor.rs shim_f16_bytes present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/src/tensor.rs py_float present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_npublob.py test_f16_bytes_is_byte_identical_to_pack_f16_of_tolist_for_every_dtype present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_npublob.py test_f16_bytes_does_not_build_one_python_object_per_element present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_npublob.py test_f16_bytes_refuses_rather_than_falling_back_to_the_route_that_crashed present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_npublob.py test_tolist_builds_its_scalars_through_the_fallible_pyo3_spelling present -->
+
+**The second report from the same field run.** With the granularity fix in place
+the same user's Qwen3-4B *did* lower — 252 Linears, `EXECUTION_DEVICES=['NPU']` —
+and then `generate()` died before OpenVINO saw a byte:
+
+    File "torchnative/export/intelnpu.py", line 1152, in _weights_blob
+        blob = pack_f16(self.weight.detach().flatten().tolist())
+    MemoryError:
+
+    thread '<unnamed>' panicked at pyo3-0.29.2/src/instance.rs:347:60:
+    PyObject pointer is null
+    pyo3_runtime.PanicException: PyObject pointer is null
+
+Two defects, and they are not the same defect.
+
+### Defect 1 — the weights went through a Python list
+
+`.tolist()` materialises **one `PyFloat` per element**: about 24 bytes of object
+plus an 8-byte list slot, so roughly 32 bytes per element. Qwen3's `down_proj` is
+9728 × 2560 = 24 903 680 elements, so producing a **49 MB** f16 blob first asked
+CPython for about **800 MB** of heap — for one layer. That is the `MemoryError`.
+
+The same round trip was in `_NPULinear.forward`, in **both** directions and on
+**every** call: `x.detach().to(torch.float16).flatten().tolist()` on the way in,
+`torch.tensor(unpack_f16(...))` on the way back. It is the smaller size and the
+larger cost, and it is why the NPU sat near 0 % utilisation between matmuls.
+
+**The route now.** `torch._C._shim_f16_bytes(t)` — new, `tensor.rs::shim_f16_bytes`
+— flattens, makes contiguous, converts through the same `reduced::to_dtype` funnel
+`x.to(torch.float16)` already takes, and returns one `bytes`. `intelnpu.f16_bytes`
+wraps it; `intelnpu.f16_tensor` is the way back, through `torch.frombuffer`.
+A 9728 × 2560 weight is now 49 MB of blob and no Python objects at all.
+
+**Why not the obvious alternatives.** `.numpy()` does not exist on this shim and
+that is the whole reason this module crosses in bytes (§1.5). `untyped_storage()`
+exists but hands back the **whole buffer a view sits inside**, so a sliced or
+transposed activation would blob its neighbours or the wrong order — right byte
+count, wrong function, no exception. `data_ptr()` + `nbytes` has the same problem
+plus a lifetime one. `flatten_all().contiguous()` on the Rust side resolves offset
+and stride first, which is what makes the bytes equal to `tolist()`'s.
+
+**The encoding is byte-identical, measured.** `pack_f16` is `struct.pack("<{n}e")`;
+the new route is `half::f16::to_bits().to_le_bytes()`. Both are IEEE-754 binary16
+little-endian, checked for `float32`, `float64`, `float16` and `bfloat16`, for
+contiguous tensors and for slices and transposes. The one place the two spellings
+*could* differ is a magnitude above half's range — `struct.pack("<e", 1e5)` raises
+`OverflowError` where `half::f16` saturates to infinity — and `f16_bytes` spells
+the `.to(torch.float16)` conversion out before the call, which makes that
+unreachable.
+
+**No `tolist` fallback.** Upstream torch is served by `.numpy().tobytes()`;
+anything else refuses by name. A silent fallback would put the `MemoryError` back
+without anyone noticing, which is the failure shape this whole document is about.
+
+### Defect 2 — the shim panicked where it should have raised
+
+`tolist` builds its scalars in `flat_objects` (`tensor.rs`). It used pyo3's
+conversion trait, and in pyo3 0.29 `f64 → PyFloat` is
+
+    PyFloat::new -> ffi::PyFloat_FromDouble(val).assume_owned(py)
+    (pyo3-0.29.2/src/types/float.rs:59-64)
+
+and `assume_owned` is documented as *"same as `assume_owned_or_err`, but panics
+on NULL"* (`ffi_ptr_ext.rs:17-18`), panicking at `instance.rs:347`.
+`PyFloat_FromDouble` returns NULL for exactly one reason: CPython could not
+allocate. So an out-of-memory condition crossed the FFI boundary as a Rust panic
+where Python code was waiting to catch a `MemoryError`. The integer arm had the
+same shape (`conversions/std/num.rs:105`).
+
+**Verdict: fixable here, not fixable in pyo3's trait.** pyo3 0.29 offers no
+fallible `PyFloat::new`, so the conversion trait cannot be made to raise. What it
+*does* offer is `assume_owned_or_err` / `Bound::from_owned_ptr_or_err`, which
+fetches the `MemoryError` CPython has already set. `tensor.rs::py_float` and
+`py_int` now call `PyFloat_FromDouble` / `PyLong_FromLongLong` and go through
+that, so the per-element allocation raises `MemoryError` instead of panicking.
+The `bool` arm is left alone: `True`/`False` are immortal singletons and allocate
+nothing.
+
+**One panic point survives, and is recorded rather than left silent.** `nest`
+builds the result lists with `PyList::new`, which reaches
+`ffi::PyList_New(len).assume_owned(py)` (`pyo3-0.29.2/src/types/list.rs:98`) and
+panics on NULL the same way. Hand-rolling it means `PyList_New` plus reference-
+stealing `PyList_SetItem` in unsafe code, for one allocation per dimension slice
+against `numel` per element — a much worse trade than the scalar arms. **On this
+tree that panic is upstream pyo3 behaviour we can only avoid by not building
+millions of objects**, which is what defect 1's fix does.
+
+### On refusing a large `tolist` outright
+
+Considered and **not done**. A named refusal above some element count would need
+a threshold, and there is no number here that is not invented: the cost that
+matters is ~32 bytes per element against *the caller's free memory*, which this
+process cannot know portably, and a fixed constant would refuse a tensor that
+fits on a large machine while still admitting one that does not fit on a small
+one. The thing that actually made 24.9 million objects get built was one call
+site, and that call site no longer builds them.
+
+### What was not measurable here
+
+There is no Intel NPU and no OpenVINO on the development machine, and
+`library_candidates` refuses darwin by design, so **the real device path was not
+run**. What was measured is the byte identity above and the Python-heap peak of
+each route (`test_npublob.py`), the latter at 2²⁰ elements so that it is decisive
+in a fraction of a second rather than only on a large machine. The NULL branch of
+`py_float` was **not** exercised either: this darwin kernel refuses both
+`setrlimit(RLIMIT_AS)` and `RLIMIT_DATA` with *"current limit exceeds maximum
+limit"*, so `PyFloat_FromDouble` cannot be made to return NULL here; that branch
+is held by the source-route assertion only.

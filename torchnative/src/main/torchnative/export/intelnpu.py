@@ -88,6 +88,8 @@ __all__ = [
     "linear_ir",
     "pack_f16",
     "unpack_f16",
+    "f16_bytes",
+    "f16_tensor",
     "load_openvino_c",
     "OpenVINO",
     "available_devices",
@@ -503,6 +505,101 @@ def unpack_f16(blob: bytes) -> list:
             f"reinterpret a buffer whose element type is not what was asked for."
         )
     return list(struct.unpack(f"<{len(blob) // 2}e", blob))
+
+
+def _f16_count(blob: bytes, where: str) -> int:
+    """How many halves are in `blob`, refusing a byte count that is not whole.
+
+    Split out of `unpack_f16` so that the refusal survives the routes that no
+    longer build a Python list on the way past it.
+    """
+    if len(blob) % 2:
+        raise IntelNPUExecutionError(
+            f"torchnative intelnpu: {where} returned {len(blob)} bytes for an f16 "
+            f"tensor, which is not a whole number of 2-byte halves. Refusing to "
+            f"reinterpret a buffer whose element type is not what was asked for."
+        )
+    return len(blob) // 2
+
+
+def f16_bytes(tensor) -> bytes:
+    """A tensor's elements as little-endian f16 bytes, **without Python floats**.
+
+    This is `pack_f16(tensor.flatten().tolist())`'s output and not its method,
+    and the difference is the whole point of docs/devices/INTELNPU.md, `The weights path`.
+    `tolist()` materialises one `PyFloat` per element -- about 24 bytes of
+    object plus an 8-byte list slot. For a Qwen3 `down_proj` weight, 9728 x 2560
+    = 24_903_680 elements, that is roughly 800 MB of CPython heap asked for in
+    order to produce a 49 MB blob, and a real user's `generate()` died with
+    `MemoryError` inside `_weights_blob` doing exactly that. The same round trip
+    ran on **every activation of every forward**, which is why the NPU sat idle
+    between matmuls.
+
+    The route is `torch._C._shim_f16_bytes`, added for this: it flattens, makes
+    contiguous, converts through the same funnel `.to(torch.float16)` uses, and
+    returns one `bytes` object. `tensor.rs::shim_f16_bytes` documents why its
+    encoding is byte-identical to `pack_f16`'s and where the two could differ.
+
+    The conversion to f16 is spelled here as well as there, deliberately: with
+    the tensor already f16 the Rust-side conversion is a no-op, and the one case
+    where `struct`'s `<e` and `half::f16` disagree -- a magnitude above f16's
+    range, where `struct` raises `OverflowError` and `half` saturates to
+    infinity -- becomes unreachable.
+
+    **There is no `tolist` fallback.** Upstream torch is served by `.numpy()`,
+    which the shim does not have (`test_the_shim_has_no_numpy_bridge_which_is_
+    why_this_packs_bytes` measures that). Anything else refuses by name, because
+    a silent fallback to the route this function exists to remove would put the
+    `MemoryError` back without anyone noticing.
+    """
+    torch = _torch()
+    half = tensor.detach().to(torch.float16)
+    reader = getattr(torch._C, "_shim_f16_bytes", None)
+    if reader is not None:
+        return reader(half)
+    to_numpy = getattr(half, "numpy", None)
+    if to_numpy is not None:
+        try:
+            return to_numpy().tobytes()
+        except NotImplementedError:
+            pass
+    raise IntelNPUUnsupported(
+        "torchnative intelnpu: this torch build offers neither "
+        "torch._C._shim_f16_bytes nor a working Tensor.numpy(), so there is no "
+        "way to reach a tensor's bytes without building one Python float per "
+        "element. Refusing rather than falling back to .tolist(): that fallback "
+        "is what raised MemoryError on a 24.9-million-element weight "
+        "(docs/devices/INTELNPU.md, `The weights path`)."
+    )
+
+
+def f16_tensor(blob: bytes, shape):
+    """`unpack_f16`'s inverse destination, reached without a Python list.
+
+    `torch.tensor(unpack_f16(blob))` is the same defect as `f16_bytes` replaces,
+    pointing the other way: it builds one `PyFloat` per returned element on
+    every forward. `torch.frombuffer` reads the bytes directly
+    (`lib.rs::_frombuffer`), so the result never passes through Python scalars.
+
+    `bytearray(blob)` because `frombuffer` wants a writable buffer; that is one
+    C-level copy, not `numel` objects.
+    """
+    torch = _torch()
+    count = _f16_count(blob, "OpenVINO")
+    expected = 1
+    for dim in shape:
+        expected *= int(dim)
+    if count != expected:
+        raise IntelNPUExecutionError(
+            f"torchnative intelnpu: expected {expected} output elements for a "
+            f"{tuple(int(d) for d in shape)} result, got {count}."
+        )
+    frombuffer = getattr(torch, "frombuffer", None)
+    if frombuffer is None:
+        flat = torch.tensor(unpack_f16(blob), dtype=torch.float16)
+    else:
+        flat = frombuffer(bytearray(blob), dtype=torch.float16)
+    return flat.reshape(*[int(d) for d in shape])
 
 
 # --------------------------------------------------------------------------
@@ -1149,9 +1246,16 @@ class _NPULinear:
 
     # -- the device layer -------------------------------------------------
     def _weights_blob(self) -> bytes:
-        blob = pack_f16(self.weight.detach().flatten().tolist())
+        """The Constant payload OpenVINO loads: weight then bias, f16, flat.
+
+        Through `f16_bytes`, not `pack_f16(...tolist())`. The old spelling asked
+        CPython for ~800 MB of `PyFloat` objects for one Qwen3 `down_proj` and
+        raised `MemoryError` before OpenVINO saw a byte
+        (docs/devices/INTELNPU.md, `The weights path`).
+        """
+        blob = f16_bytes(self.weight)
         if self.bias is not None:
-            blob += pack_f16(self.bias.detach().flatten().tolist())
+            blob += f16_bytes(self.bias)
         return blob
 
     def _compile_for(self, batch: int):
@@ -1190,15 +1294,13 @@ class _NPULinear:
         for dim in shape[:-1]:
             batch *= dim
         compiled = self._compile_for(batch)
-        flat = x.detach().to(torch.float16).flatten().tolist()
-        out = unpack_f16(self._ov.infer(compiled, pack_f16(flat)))
-        expected = batch * self.out_features
-        if len(out) != expected:
-            raise IntelNPUExecutionError(
-                f"torchnative intelnpu: expected {expected} output elements for a "
-                f"({batch}, {self.out_features}) result, got {len(out)}."
-            )
-        result = torch.tensor(out, dtype=torch.float32).reshape(*shape[:-1], self.out_features)
+        # Bytes in, bytes out. Neither direction builds Python scalars: the old
+        # spelling did `tolist()` on the way in and `torch.tensor(unpack_f16(...))`
+        # on the way back, on *every* call, which is the reason the device was
+        # idle between matmuls (docs/devices/INTELNPU.md, `The weights path`).
+        blob = self._ov.infer(compiled, f16_bytes(x))
+        result = f16_tensor(blob, (batch, self.out_features))
+        result = result.to(torch.float32).reshape(*shape[:-1], self.out_features)
         return result.to(x.dtype)
 
     def extra_repr(self) -> str:

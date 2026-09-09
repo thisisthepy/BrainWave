@@ -16,7 +16,7 @@ use std::sync::Arc;
 use candle_core::quantized::QTensor;
 use candle_core::{CpuStorage, DType, InplaceOp1, Layout, Tensor};
 use pyo3::prelude::*;
-use pyo3::types::{PyList, PyModule, PyTuple};
+use pyo3::types::{PyBytes, PyList, PyModule, PyTuple};
 use pyo3::IntoPyObjectExt;
 
 use crate::device::PyDevice;
@@ -1409,6 +1409,81 @@ pub fn to_le_bytes(op: &str, tensor: &Tensor) -> PyResult<Vec<u8>> {
             )))
         }
     })
+}
+
+/// **A tensor's view as little-endian IEEE-half bytes, without building a
+/// single Python object.**
+///
+/// `torch._C._shim_f16_bytes(t)`. This exists because the only route out of a
+/// shim tensor into a device buffer was `tolist()`, and `tolist()` is a route
+/// through *Python scalars*: one `PyFloat` per element, each about 24 bytes of
+/// object plus an 8-byte list slot. `torchnative/export/intelnpu.py` used it to
+/// build the weights blob for an OpenVINO Linear, so a Qwen3 `down_proj`
+/// (9728 x 2560 = 24_903_680 elements) asked CPython for roughly 800 MB of
+/// heap to produce a 49 MB blob, and a real user's `generate()` died with
+/// `MemoryError` inside `_weights_blob`. See docs/devices/INTELNPU.md, `The weights path`.
+///
+/// The bytes are the **view's**, not the storage's, and that is the difference
+/// from `untyped_storage()`: `flatten_all` + `contiguous` resolves offset and
+/// stride first, so a sliced or transposed activation gives the elements
+/// `tolist()` would have given, in the same order. `untyped_storage()._shim_bytes()`
+/// would have handed back the whole buffer a view happens to sit inside.
+///
+/// **The encoding is exactly `intelnpu.pack_f16`'s.** That function is
+/// `struct.pack("<{n}e", *values)`; here each element is `half::f16` and its
+/// `to_bits().to_le_bytes()`, which is the same IEEE-754 binary16 little-endian
+/// encoding. The conversion goes through `reduced::to_dtype`, the same funnel
+/// `x.to(torch.float16)` already takes, so a caller that converted in torch
+/// first reaches this with an f16 tensor and the conversion here is a no-op --
+/// which is why `_NPULinear` still spells the `.to(torch.float16)` out. The one
+/// place the two spellings could differ is a magnitude above f16's range:
+/// `struct.pack("<e", 1e5)` raises `OverflowError` where `half::f16` saturates
+/// to infinity. Converting in torch first makes that unreachable, because the
+/// tensor is already f16 before either encoder sees it.
+///
+/// Refuses a non-floating-point tensor by name rather than integer-converting
+/// it: an f16 blob built out of an int8 weight would load into OpenVINO and
+/// compute the wrong function, which is the silent shape this repository keeps
+/// refusing.
+#[pyfunction]
+#[pyo3(name = "_shim_f16_bytes")]
+pub fn shim_f16_bytes<'py>(
+    py: Python<'py>,
+    value: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyBytes>> {
+    const OP: &str = "torch._C._shim_f16_bytes";
+    let Ok(base) = value.extract::<PyRef<'_, PyTensorBase>>() else {
+        return Err(not_implemented(format!(
+            "{OP} in torch._C shim: expected a tensor, got {}",
+            value
+                .get_type()
+                .name()
+                .map(|n| n.to_string())
+                .unwrap_or_default()
+        )));
+    };
+    let tensor = base.tensor()?;
+    if !tensor.dtype().is_float() {
+        return Err(not_implemented(format!(
+            "{OP}: torch._C shim will not reinterpret a torch.{} tensor as \
+             float16 bytes. This is the encoder for an f16 device blob; an \
+             integer or boolean tensor has to be converted deliberately, by \
+             the caller, so that the conversion is visible where it is decided",
+            base.tag.name()
+        )));
+    }
+    let flat = tensor
+        .flatten_all()
+        .and_then(|t| t.contiguous())
+        .map_err(|e| candle_err(OP, e))?;
+    let halves = crate::reduced::to_dtype(&flat, DType::F16)
+        .and_then(|t| t.to_vec1::<half::f16>())
+        .map_err(|e| candle_err(OP, e))?;
+    let mut out = Vec::with_capacity(halves.len() * 2);
+    for v in halves {
+        out.extend_from_slice(&v.to_bits().to_le_bytes());
+    }
+    Ok(PyBytes::new(py, &out))
 }
 
 /// The contiguous (row-major) stride for a shape, in elements.
@@ -2823,7 +2898,7 @@ fn flat_objects(py: Python<'_>, tensor: &Tensor, tag: TorchDType) -> PyResult<Ve
             .map_err(|e| candle_err("tolist", e))?;
         values
             .into_iter()
-            .map(|v| v.into_py_any(py))
+            .map(|v| py_float(py, v))
             .collect::<PyResult<Vec<_>>>()
     } else if dtype.is_int() {
         let values = flat
@@ -2832,7 +2907,7 @@ fn flat_objects(py: Python<'_>, tensor: &Tensor, tag: TorchDType) -> PyResult<Ve
             .map_err(|e| candle_err("tolist", e))?;
         values
             .into_iter()
-            .map(|v| v.into_py_any(py))
+            .map(|v| py_int(py, v))
             .collect::<PyResult<Vec<_>>>()
     } else {
         Err(not_implemented(format!(
@@ -2840,6 +2915,42 @@ fn flat_objects(py: Python<'_>, tensor: &Tensor, tag: TorchDType) -> PyResult<Ve
             dtype.as_str()
         )))
     }
+}
+
+/// **A Python `float`, built so that a failed allocation raises instead of
+/// panicking.**
+///
+/// The spelling this replaces was `v.into_py_any(py)`. In pyo3 0.29 that goes
+/// `f64 -> PyFloat::new -> ffi::PyFloat_FromDouble(val).assume_owned(py)`
+/// (`types/float.rs:59-64`), and `assume_owned` is documented as "same as
+/// `assume_owned_or_err`, but **panics** on NULL" (`ffi_ptr_ext.rs:17-18`,
+/// panicking at `instance.rs:347`). `PyFloat_FromDouble` returns NULL for
+/// exactly one reason -- CPython could not allocate -- so the conversion pyo3
+/// offers turns an out-of-memory condition into a Rust panic crossing an FFI
+/// boundary, surfacing as `pyo3_runtime.PanicException: PyObject pointer is
+/// null` where Python code was waiting to catch a `MemoryError`. A real user
+/// saw exactly that, out of `tolist()` on a 24.9-million-element weight
+/// (docs/devices/INTELNPU.md, `The weights path`).
+///
+/// `assume_owned_or_err` is the fallible sibling pyo3 already has, and
+/// `Bound::from_owned_ptr_or_err` is its public spelling; it fetches the
+/// `MemoryError` CPython has already set. So this is fixable **here**, in the
+/// one function that builds millions of objects, by not going through the
+/// conversion trait. It is *not* fixable in the trait: `PyFloat::new` takes no
+/// fallible form, and `PyList::new` reaches `ffi::PyList_New(len).assume_owned`
+/// the same way (`types/list.rs:98`), so `nest` below still has an upstream
+/// panic point that this repository can only avoid by not building the objects.
+/// docs/devices/INTELNPU.md, `The weights path` records that rather than leaving it silent.
+fn py_float(py: Python<'_>, v: f64) -> PyResult<Py<PyAny>> {
+    let ptr = unsafe { pyo3::ffi::PyFloat_FromDouble(v) };
+    unsafe { Bound::from_owned_ptr_or_err(py, ptr) }.map(|b| b.unbind())
+}
+
+/// The integer half of `py_float`, for the same reason: `i64 -> PyLong` also
+/// ends at `.assume_owned(py)` in pyo3 0.29 (`conversions/std/num.rs:105`).
+fn py_int(py: Python<'_>, v: i64) -> PyResult<Py<PyAny>> {
+    let ptr = unsafe { pyo3::ffi::PyLong_FromLongLong(v) };
+    unsafe { Bound::from_owned_ptr_or_err(py, ptr) }.map(|b| b.unbind())
 }
 
 fn nest(py: Python<'_>, flat: &[Py<PyAny>], dims: &[usize]) -> PyResult<Py<PyAny>> {
@@ -4301,6 +4412,7 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(set_tensor_class, m)?)?;
     m.add_function(wrap_pyfunction!(set_size_class, m)?)?;
     m.add_function(wrap_pyfunction!(has_storage, m)?)?;
+    m.add_function(wrap_pyfunction!(shim_f16_bytes, m)?)?;
     m.add_function(wrap_pyfunction!(set_grad_enabled_flag, m)?)?;
     m.add_function(wrap_pyfunction!(set_throw_on_mutable_data_ptr, m)?)?;
     m.add_function(wrap_pyfunction!(throws_on_mutable_data_ptr, m)?)?;
