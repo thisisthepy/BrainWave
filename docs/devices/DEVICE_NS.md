@@ -6,7 +6,7 @@
 <!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/device/__init__.py CompiledDevice present -->
 <!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/device/__init__.py EagerUseRefused present -->
 <!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/device/__init__.py NpuUnresolved present -->
-<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/device/__init__.py NPU_BACKENDS present -->
+<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/device/__init__.py NPU_CANDIDATES present -->
 <!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/device/_module_to.py make present -->
 <!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/device/_module_to.py install present -->
 <!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_devicens.py test_mps_availability_is_measured_not_declared present -->
@@ -234,7 +234,8 @@ catches N5.
 follows, so the caller learns which NPU this host actually has rather than
 being handed a flat verdict about their machine. The dispatch key is then
 `resolution.backend`, **not** `host()`: the host chooses the backend
-(`NPU_BACKENDS`) and the backend is what has or has not been wired, so keying
+(`NPU_CANDIDATES`, an ordered list per host since docs/devices/NPUVENDOR.md)
+and the backend is what has or has not been wired, so keying
 on the host would be reading the wrong fact one step early.
 `test_the_openvino_branch_is_chosen_by_the_resolution_and_not_by_the_platform`
 is the test that says so.

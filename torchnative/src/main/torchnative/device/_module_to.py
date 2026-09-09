@@ -119,9 +119,11 @@ def _to_compiled(self, device, args, kwargs):
     learns which NPU this host actually has --- the question
     `docs/graph/NPU2.md` says a device must be able to answer --- rather than a
     flat verdict that tells them nothing about their machine. The dispatch key
-    below is `resolution.backend`, **not** `host()`: the host chooses the
-    backend (`NPU_BACKENDS`) and the backend is what has or has not been wired,
-    so keying on the host would be reading the wrong fact one step early.
+    below is `resolution.backend`, **not** `host()`: the host offers an ordered
+    list of candidate backends (`NPU_CANDIDATES`) and a probe picks one of them,
+    and the backend is what has or has not been wired --- so keying on the host
+    would be reading the wrong fact one step early, and now also the wrong
+    *number* of facts, since Windows offers two (docs/devices/NPUVENDOR.md).
 
     **`openvino` (Intel NPU) is wired.** It goes to
     `torchnative.export.intelnpu._compile_model`, which walks `named_children()`
