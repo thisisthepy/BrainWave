@@ -106,6 +106,12 @@ def _to_eager(original, self, device, position, args, kwargs):
     return original(self, *args, **kwargs)
 
 
+#: The compile step's own options, accepted by `to(device.npu, ...)` and
+#: passed through to `_compile_model`. Named rather than forwarded blindly:
+#: a typo'd kwarg must still be refused, not silently ignored.
+_COMPILE_OPTIONS = ("progress", "eager")
+
+
 def _to_compiled(self, device, args, kwargs):
     """A compiled target: resolve, then either lower for it or refuse by name.
 
@@ -161,18 +167,34 @@ def _to_compiled(self, device, args, kwargs):
     success. Their refusal is the same `NotImplementedError`, after the same
     real resolution, at the same quality of message it had before.
     """
+    # `progress` and `eager` are the compile step's own options, and they reach
+    # it ONLY through here. `_compile_model` grew both, and nothing plumbed
+    # them, so `to(device.npu, progress=...)` raised TypeError while the
+    # feature sat there unreachable -- the gate stayed green because the tests
+    # called `_compile_model` directly. A public path that cannot reach a
+    # feature is the same as not having it.
+    #
+    # A dtype or memory format is still refused, because a compiled target is
+    # not a conversion. What is accepted is exactly the compile step's own
+    # arguments, named.
+    options = {}
+    for name in ("progress", "eager"):
+        if name in kwargs:
+            options[name] = kwargs.pop(name)
+
     extra = [a for a in args if a is not device]
     if extra or kwargs:
         raise TypeError(
             f"nn.Module.to(torchnative.device.{device.type}) takes no other "
             f"arguments: a compiled target is not a dtype or memory-format "
-            f"conversion. Got extra {extra!r} {kwargs!r}."
+            f"conversion. It does take the compile step's own options "
+            f"({', '.join(_COMPILE_OPTIONS)}). Got extra {extra!r} {kwargs!r}."
         )
 
     resolution = device.resolve()  # raises NpuUnresolved, by name, if it cannot
 
     if resolution.backend == "openvino":
-        return _lower_for_openvino(self, device, resolution)
+        return _lower_for_openvino(self, device, resolution, **options)
 
     raise NotImplementedError(
         f"nn.Module.to(torchnative.device.{device.type}): this host's "
@@ -197,7 +219,7 @@ def _to_compiled(self, device, args, kwargs):
     )
 
 
-def _lower_for_openvino(model, device, resolution):
+def _lower_for_openvino(model, device, resolution, **options):
     """Lower `model` for the Intel NPU and hand back the same `nn.Module`.
 
     Separated from `_to_compiled` so that the dispatch --- which backend, and
@@ -209,7 +231,7 @@ def _lower_for_openvino(model, device, resolution):
 
     from ..export import intelnpu
 
-    model, report = intelnpu._compile_model(model, device="NPU")
+    model, report = intelnpu._compile_model(model, device="NPU", **options)
     # Attached only on success. `_compile_model` raises for zero leaves, so
     # this line is unreachable for a model that was not actually lowered.
     model.torchnative_offload = report

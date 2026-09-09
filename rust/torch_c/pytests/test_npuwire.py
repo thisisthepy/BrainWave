@@ -585,6 +585,71 @@ def test_ordinary_calls_still_reach_upstream_with_identical_arguments():
           f"byte-identically (spy, not effect)")
 
 
+def test_the_compile_options_are_reachable_through_to_and_a_typo_still_refuses():
+    """`progress=` and `eager=` must work through `to()`, the only public spelling.
+
+    They did not. `_compile_model` grew both, `_to_compiled` forwarded neither
+    and refused every extra kwarg, so `model.to(device.npu, progress=...)`
+    raised TypeError on a real Intel NPU while the feature sat unreachable. The
+    gate stayed green because every test that exercised them called
+    `_compile_model` DIRECTLY -- including this file's neighbours. A feature the
+    public path cannot reach is the same as not having the feature, and a test
+    that reaches past the public path cannot notice.
+
+    So this one goes through `to()` and nothing else.
+
+    It also pins the other half: a dtype, a memory format or a misspelled
+    option must still be refused. Accepting the compile step's options is not
+    the same as accepting anything, and forwarding **kwargs blindly would turn
+    `progres=` into silence.
+
+    DISPATCH evidence. The NPU is faked.
+    """
+    seen = []
+    model = _fresh_block()
+    with _on_a_faked_intel_npu_host():
+        result = model.to(
+            D.npu, progress=lambda done, total, name: seen.append((done, total, name)))
+    assert result is model
+    assert seen, "progress= reached to() but no callback arrived"
+    assert seen[-1][0] == seen[-1][1], f"progress never reported completion: {seen[-1]}"
+    assert all(isinstance(n, str) and n for _, _, n in seen), seen
+
+    # eager=False takes the other branch and must also survive the trip.
+    lazy = _fresh_block()
+    with _on_a_faked_intel_npu_host():
+        lazy.to(D.npu, eager=False)
+    lowered = [m for m in lazy.modules() if type(m).__name__ == "_NPULinear"]
+    assert lowered, "eager=False lowered nothing at all"
+
+    # A typo must not be swallowed.
+    typo = _fresh_block()
+    with _on_a_faked_intel_npu_host():
+        try:
+            typo.to(D.npu, progres=lambda *a: None)
+            raised = False
+        except TypeError as exc:
+            raised = True
+            assert "progres" in str(exc), exc
+    assert raised, "a misspelled option was accepted and silently dropped"
+
+    # And a dtype is still not a thing a compiled target accepts.
+    dt = _fresh_block()
+    with _on_a_faked_intel_npu_host():
+        try:
+            dt.to(D.npu, torch.float16)
+            raised = False
+        except TypeError:
+            raised = True
+    assert raised, "to(device.npu, dtype) stopped refusing"
+
+    print(
+        f"ok   npuwire: progress= and eager= reach the compile step through "
+        f"to(device.npu) ({len(seen)} progress calls), while a typo and a dtype "
+        f"still refuse (dispatch evidence; the NPU is faked)"
+    )
+
+
 if __name__ == "__main__":
     failures = 0
     for name, fn in sorted(list(globals().items())):
