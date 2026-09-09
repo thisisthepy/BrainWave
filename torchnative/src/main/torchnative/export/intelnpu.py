@@ -70,15 +70,23 @@ import importlib.util
 import struct
 import os
 import sys
+import warnings
+
+from .. import _cachedir
 
 __all__ = [
     "IntelNPUUnavailable",
     "IntelNPUExecutionError",
     "IntelNPUUnsupported",
     "IntelNPUWithdrawn",
+    "IntelNPUCacheWarning",
     "OV_STATUS",
     "EXECUTION_DEVICES",
     "MAX_DIM",
+    "OPENVINO_CACHE_ENV",
+    "CACHE_DIR_PROPERTY",
+    "openvino_cache_dir",
+    "ensure_cache_dir",
     "plan_lowering",
     "openvino_package_libs_dir",
     "library_candidates",
@@ -132,6 +140,24 @@ class IntelNPUWithdrawn(IntelNPUUnsupported):
     itself, gives the reason, and names what to use instead (CLAUDE.md §6).
     """
 
+class IntelNPUCacheWarning(UserWarning):
+    """The compiled-model cache could not be used. Compilation still happened.
+
+    A warning and not an exception, because a cache that cannot be written is a
+    slower run and not a wrong one -- and refusing to compile because a
+    directory is read-only would be worse than the problem. But it is a warning
+    and not silence: `docs/graph/NPU2.md`'s position, arrived at the hard way on
+    CoreML, is that the silently degraded path is the defect. A user who thinks
+    compilation is cached and is paying for it on every process start should be
+    told once.
+
+    Once. `_NPULinear` compiles per leaf per shape -- 252 leaves x 2 shapes on a
+    Qwen3-4B -- so a warning per compile would be 504 identical lines. The
+    directory is resolved once per `OpenVINO`, and `_CACHE_ANNOUNCED` holds the
+    number down even across several of those.
+    """
+
+
 
 # --------------------------------------------------------------------------
 # Pure helpers. Everything in this section is testable without an NPU, without
@@ -184,6 +210,114 @@ LIBRARY_ENV = "TORCHNATIVE_OPENVINO_C"
 #: so. Here it refuses by name instead, for the reason this whole module
 #: exists: a layer that quietly did not move is a silent CPU fallback.
 MAX_DIM = 2 ** 17
+
+
+#: Backend-specific cache override, and the way to switch this backend's cache
+#: off on its own. Wins over `torchnative._cachedir.CACHE_ROOT_ENV`; used
+#: verbatim as the directory. Spelled like `TORCHNATIVE_OPENVINO_C` above, which
+#: is this module's naming precedent: `TORCHNATIVE_` + the thing + what it is.
+#: `TORCHNATIVE_OPENVINO_CACHE_DIR=0` (or off/no/none/false/empty) disables it.
+OPENVINO_CACHE_ENV = "TORCHNATIVE_OPENVINO_CACHE_DIR"
+
+#: `ov::cache_dir`'s C spelling. Declared as an exported *variable*,
+#: `OPENVINO_C_VAR(const char*) ov_property_key_cache_dir;` at
+#: openvino/c/ov_property.h:97-98, whose definition is the string below. We read
+#: the exported symbol when the loaded runtime surfaces it and fall back to this
+#: literal otherwise -- see `_cache_dir_property_key`.
+CACHE_DIR_PROPERTY = "CACHE_DIR"
+
+#: Directories already announced as unusable, so the announcement is once per
+#: process per directory rather than once per compile.
+_CACHE_ANNOUNCED = set()
+
+
+def _reset_cache_announcements() -> None:
+    """Forget what has been announced. For tests, which need to hear it again."""
+    _CACHE_ANNOUNCED.clear()
+
+
+def openvino_cache_dir(
+    platform: "str | None" = None,
+    env: "dict[str, str] | None" = None,
+    android: "bool | None" = None,
+) -> "str | None":
+    """Where OpenVINO should keep compiled blobs, or `None` for "do not cache".
+
+    Pure, and injectable per platform for the same reason `library_candidates`
+    is: the Windows answer has to be checkable from the machine this was written
+    on. `torchnative._cachedir` holds the platform table and the reasoning for
+    each entry, including why this does not sit under `HF_HOME`.
+
+    Nothing is created here. `ensure_cache_dir` does that, and announces.
+    """
+    return _cachedir.backend_cache_dir(
+        "openvino",
+        backend_env=OPENVINO_CACHE_ENV,
+        platform=platform,
+        env=env,
+        android=android,
+    )
+
+
+def ensure_cache_dir(path: "str | None") -> "str | None":
+    """Create `path` and confirm it is writable, or degrade to `None` with a warning.
+
+    Degraded, not broken: a read-only or unwritable cache directory must not
+    stop a model compiling. `None` comes back and the caller passes no
+    properties, which is exactly the call this module made before caching
+    existed -- so "off" is the shipped path and not a third one.
+
+    The writability *probe* is a real file, created and removed, not
+    `os.access`. `os.access` answers with the real uid's permission bits and
+    gets network filesystems, read-only mounts, ACLs, full disks and container
+    overlays wrong in both directions; the failure it misses here would surface
+    later as an OpenVINO error from inside the plugin, which is the worst place
+    for it.
+    """
+    if path is None:
+        return None
+    try:
+        os.makedirs(path, exist_ok=True)
+        probe = os.path.join(path, ".torchnative-write-probe")
+        with open(probe, "wb") as handle:
+            handle.write(b"")
+        os.remove(probe)
+        return path
+    except OSError as exc:
+        if path not in _CACHE_ANNOUNCED:
+            _CACHE_ANNOUNCED.add(path)
+            warnings.warn(
+                f"torchnative intelnpu: could not use {path!r} as OpenVINO's "
+                f"compiled-model cache ({type(exc).__name__}: {exc}). Compiling "
+                f"anyway, WITHOUT a cache -- every model will be recompiled on "
+                f"every process start, and a Qwen3-4B is 252 leaves x 2 shapes "
+                f"of driver compilation. Point {OPENVINO_CACHE_ENV} at a writable "
+                f"directory, or set it to 0 to turn caching off on purpose and "
+                f"silence this.",
+                IntelNPUCacheWarning,
+                stacklevel=2,
+            )
+        return None
+
+
+def _cache_dir_property_key(lib) -> bytes:
+    """The `CACHE_DIR` key, preferring the one the loaded runtime exports.
+
+    `ov_property_key_cache_dir` is a `const char*` **data** export, so it is read
+    with `ctypes.c_char_p.in_dll` rather than called. Reading it means the key
+    comes from the same binary that will consume it. The literal fallback covers
+    a runtime that does not surface data symbols and an older release that does
+    not have this one; both spellings are `"CACHE_DIR"`, which is the only
+    reason the fallback is safe to take silently.
+    """
+    exported = getattr(lib, "_torchnative_exported_cache_key", None)
+    if exported:
+        return exported
+    try:
+        value = ctypes.c_char_p.in_dll(lib, "ov_property_key_cache_dir").value
+    except (ValueError, AttributeError, TypeError):
+        value = None
+    return value or CACHE_DIR_PROPERTY.encode()
 
 
 def openvino_package_libs_dir(search_locations: "list[str] | tuple[str, ...] | None" = None) -> str | None:
@@ -751,6 +885,10 @@ def load_openvino_c(path: str | None = None) -> ctypes.CDLL:
     return lib
 
 
+#: Distinguishes "the caller said nothing" from "the caller said do not cache".
+_UNSET = object()
+
+
 class OpenVINO:
     """A borrowed `ov_core_t` with the few operations this stage needs.
 
@@ -760,11 +898,27 @@ class OpenVINO:
     on the user's machine reports OpenVINO's account of itself rather than ours.
     """
 
-    def __init__(self, path: str | None = None):
+    def __init__(self, path: str | None = None, cache_dir: "str | None" = _UNSET):
         self._lib = load_openvino_c(path)
         core = ctypes.c_void_p()
         self._check(self._lib.ov_core_create(ctypes.byref(core)), "ov_core_create")
         self._core = core
+        # Resolved and created **once, here**, not per compile. That is not a
+        # micro-optimisation: `_NPULinear` compiles once per leaf per input
+        # shape, which is 252 x 2 = 504 compiles on a Qwen3-4B before the second
+        # generated token, and a `makedirs` + write probe on each of those is 504
+        # filesystem round trips -- and, when the directory is unusable, 504
+        # warnings. Doing it at construction makes both numbers 1.
+        #
+        # `_UNSET` rather than `None` as the default because `None` is a
+        # meaningful argument here: it means "do not cache", and a caller must be
+        # able to say that without being given the environment's answer instead.
+        if cache_dir is _UNSET:
+            cache_dir = openvino_cache_dir()
+        self.cache_dir = ensure_cache_dir(cache_dir)
+        self._cache_key = (
+            _cache_dir_property_key(self._lib) if self.cache_dir is not None else None
+        )
 
     # -- plumbing ---------------------------------------------------------
     def _check(self, status: int, what: str) -> None:
@@ -867,13 +1021,33 @@ class OpenVINO:
             )
             try:
                 compiled = ctypes.c_void_p()
+                # The properties, and the count. `ov_core.h:204` defines
+                # `property_args_size` as "How many properties args will be
+                # passed, each property contains 2 args: key and value" -- it is
+                # the ARG count, not the pair count, and the C side rejects an
+                # odd one. So one property is 2, and `len(props)` is the count by
+                # construction rather than a number written twice.
+                #
+                # Still the variadic `ov_core_compile_model`, and still not
+                # `ov_core_compile_model_props`: that entry point is on OpenVINO
+                # master but not in every release a user has installed, and
+                # passing properties does not change that. The reasoning in
+                # `load_openvino_c` survives this round intact; only the count
+                # went from 0 to 2.
+                props = ()
+                if self.cache_dir is not None:
+                    props = (
+                        ctypes.c_char_p(self._cache_key),
+                        ctypes.c_char_p(self.cache_dir.encode("utf-8")),
+                    )
                 self._check(
                     self._lib.ov_core_compile_model(
                         self._core,
                         model,
                         device.encode(),
-                        ctypes.c_size_t(0),
+                        ctypes.c_size_t(len(props)),
                         ctypes.byref(compiled),
+                        *props,
                     ),
                     f"ov_core_compile_model(device={device})",
                 )
