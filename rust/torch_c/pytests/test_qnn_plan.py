@@ -12,9 +12,21 @@ against) rather than importing the real one -- which is also what proves
 `plan_lowering`'s logic does not secretly depend on anything else the real
 module might supply.
 
-Real upstream `torch` is enough here -- no `torchnative` shim `_C` is touched,
-so this needs neither `TORCH_USE_RTLD_GLOBAL` nor the vendored `torch/`
-tree's `_C.abi3.so`. `_real_torch()` below asks only for `torch.nn`.
+This file asks only for `torch.nn` (`_real_torch()` below) and touches no
+shim `_C`. That is NOT the same as needing nothing from the environment, and
+an earlier version of this note said it was.
+
+It puts the vendored tree first on `sys.path` so `torchnative.export.qnn_plan`
+resolves, which also makes `import torch` resolve to the VENDORED torch --
+whose `_load_global_deps()` dlopens `torch/lib/libtorch_global_deps.*`, a file
+`tools/wheel/build.py` creates for a wheel and which does not exist in the
+source tree. So `TORCH_USE_RTLD_GLOBAL` is required after all, and is set
+below the way every other suite here sets it.
+
+The claim survived review because this file was run from a worktree with no
+vendored tree, where `import torch` fell through to an upstream install and
+the vendored path was never taken. Under `run.sh` it raised OSError eleven
+times.
 
 **The trap this file is checking for is silence, not error.** ExecuTorch's QNN
 partitioner declines a node it does not accept *silently* -- the exported
@@ -34,6 +46,9 @@ import sys
 _ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 _VENDOR_DIR = os.path.join(_ROOT, "torchnative", "src", "main")
 sys.path.insert(0, _VENDOR_DIR)
+
+# Before anything can reach `torch`. See the module docstring.
+os.environ.setdefault("TORCH_USE_RTLD_GLOBAL", "1")
 
 from torchnative.export.qnn_plan import (  # noqa: E402
     QnnPlanUnavailable,
@@ -343,35 +358,71 @@ def test_an_ops_object_with_no_check_leaf_is_refused_by_name():
 # ---------------------------------------------------------------- missing sibling file
 
 
+#: Sentinel for "this key was not in sys.modules", distinct from a stored None.
+_ABSENT = object()
+
+
 def test_missing_qnn_ops_module_is_refused_by_name_not_a_bare_import_error():
-    """Until the sibling round lands `torchnative.export.qnn_ops`, calling
-    `plan_lowering` with no `ops=` must fail identifiably, not with a bare
-    `ImportError` a caller has to recognise as this particular missing piece."""
+    """With no `ops=` and no importable `qnn_ops`, the refusal must name it.
+
+    A caller who gets a bare `ImportError` has to recognise it as this
+    particular missing piece; a named `QnnPlanUnavailable` says which piece.
+
+    This used to rely on `qnn_ops` genuinely not existing, and asserted its own
+    premise would go stale once the sibling round landed. It has landed, so the
+    absence is SIMULATED here -- blocking the import rather than waiting for a
+    tree that no longer occurs. A test that retires itself the moment its
+    neighbour ships is a test that stops guarding the path it was written for.
+    """
     torch = _real_torch()
+    if torch is None:
+        print("   (skipped: torch.nn not importable)")
+        return
     model = torch.nn.Sequential()
     model.add_module("a", torch.nn.Linear(4, 4))
 
-    import torchnative.export.qnn_plan as qnn_plan_mod
+    import importlib
 
-    assert not hasattr(qnn_plan_mod, "qnn_ops"), (
-        "this test assumes torchnative.export.qnn_ops is not importable in "
-        "this tree yet; if it has landed, this test's premise is stale"
-    )
+    saved = sys.modules.get("torchnative.export.qnn_ops", _ABSENT)
 
+    class _RefuseQnnOps:
+        """Import hook that makes exactly one module unimportable."""
+
+        def find_module(self, name, path=None):
+            return self if name == "torchnative.export.qnn_ops" else None
+
+        def find_spec(self, name, path=None, target=None):
+            if name == "torchnative.export.qnn_ops":
+                raise ImportError("blocked by test_qnn_plan")
+            return None
+
+    hook = _RefuseQnnOps()
+    sys.modules.pop("torchnative.export.qnn_ops", None)
+    sys.meta_path.insert(0, hook)
     try:
-        plan_lowering(model)
-        raised = False
-    except QnnPlanUnavailable as exc:
-        raised = True
-        assert "qnn_ops" in str(exc), exc
-    assert raised, "plan_lowering() with no ops= and no qnn_ops module must raise QnnPlanUnavailable"
-    print(
-        "ok   qnn_plan: calling plan_lowering with no ops= and no qnn_ops "
-        "module raises QnnPlanUnavailable by name, not a bare ImportError"
+        importlib.invalidate_caches()
+        try:
+            plan_lowering(model)
+            raised = False
+        except QnnPlanUnavailable as exc:
+            raised = True
+            assert "qnn_ops" in str(exc), exc
+    finally:
+        sys.meta_path.remove(hook)
+        if saved is _ABSENT:
+            sys.modules.pop("torchnative.export.qnn_ops", None)
+        else:
+            sys.modules["torchnative.export.qnn_ops"] = saved
+        importlib.invalidate_caches()
+
+    assert raised, (
+        "plan_lowering() with no ops= and no importable qnn_ops must raise "
+        "QnnPlanUnavailable, naming it"
     )
-
-
-# ---------------------------------------------------------------- nested modules
+    print(
+        "ok   qnn_plan: with qnn_ops made unimportable, plan_lowering raises "
+        "QnnPlanUnavailable naming it, not a bare ImportError"
+    )
 
 
 def test_walk_descends_into_nested_containers_and_still_asks_every_leaf():
@@ -397,6 +448,70 @@ def test_walk_descends_into_nested_containers_and_still_asks_every_leaf():
     assert plan["eligible"] == ["pre"], plan["eligible"]
     assert plan["skipped"] == [("inner.proj", "declined")], plan["skipped"]
     print("ok   qnn_plan: the walk descends into nested containers with dotted names")
+
+
+def test_the_real_qnn_ops_table_drives_the_real_plan():
+    """The two modules must agree on `check_leaf`'s return, not merely each on a fake.
+
+    Every other test here injects an `ops` object, which is what makes
+    `plan_lowering` testable without `qnn_ops` -- and is exactly why a
+    mismatch survived: `qnn_ops.check_leaf` returns
+    `{"accepted": ..., "reason": ...}`, `qnn_plan` accepted only a tuple or a
+    `.taken`/`.reason` object, and each round was green against its own idea
+    of the contract. They met on develop and `plan_lowering` raised TypeError
+    on the first real leaf.
+
+    So this one passes NO `ops` and lets the real table answer. It asserts the
+    handshake, not a coverage number: which ops QNN takes is
+    `test_qnn_ops.py`'s subject, and pinning a count here would go stale
+    against that table rather than catch a real defect.
+    """
+    torch = _real_torch()
+    if torch is None:
+        print("   (skipped: torch.nn not importable)")
+        return
+    try:
+        from torchnative.export import qnn_ops  # noqa: F401
+    except ImportError:
+        print("   (skipped: torchnative.export.qnn_ops is not present)")
+        return
+
+    model = torch.nn.Sequential(
+        torch.nn.Linear(8, 8),
+        torch.nn.LayerNorm(8),
+        torch.nn.Linear(8, 4),
+    )
+    plan = plan_lowering(model)          # no ops= -- the real table
+
+    for key in ("eligible", "skipped", "left_on_cpu", "fully_offloaded",
+                "parameters_moved", "parameters_total", "fraction_moved"):
+        assert key in plan, f"the real table produced a plan with no {key!r}: {plan}"
+    assert isinstance(plan["fraction_moved"], float), plan["fraction_moved"]
+    for name, reason in plan["skipped"]:
+        assert reason, f"leaf {name} was declined without a reason"
+
+    # The assertion that would have caught the original defect. `nn.Linear`
+    # decomposes to `aten.linear.default`, which IS in the table
+    # (test_qnn_ops.py pins that), so a plan in which no Linear lowers is not a
+    # coverage fact -- it means the two modules are not composing. The first
+    # version of this pairing declined all three leaves here, because the
+    # module PATH was being put to a table keyed on ATen op names.
+    assert "aten.linear.default" in qnn_ops.supported_ops(), (
+        "this test's premise is gone: the table no longer lists linear"
+    )
+    assert plan["eligible"], (
+        "the real qnn_ops table declined EVERY leaf of a model that is mostly "
+        f"nn.Linear -- the two modules are not composing: {plan['skipped']}"
+    )
+    assert len(plan["eligible"]) >= 2, (
+        f"both Linears should lower; got {plan['eligible']}"
+    )
+    assert 0.0 < plan["fraction_moved"] <= 1.0, plan["fraction_moved"]
+    print(
+        f"ok   qnn_plan: the real qnn_ops table drives plan_lowering with no "
+        f"ops= injected ({len(plan['eligible'])} eligible, "
+        f"{len(plan['skipped'])} declined)"
+    )
 
 
 if __name__ == "__main__":

@@ -105,6 +105,24 @@ def _read_verdict(name, module, verdict):
     exactly the kind of bug this module exists to surface, so it raises
     instead of guessing.
     """
+    # The mapping shape is what `qnn_ops.check_leaf` actually returns:
+    # `{"accepted": bool, "reason": str}`. It is listed first because it is the
+    # only shape the SHIPPED table uses -- the tuple and attribute forms below
+    # exist so this module is testable without `qnn_ops`, and that injectable
+    # fake is precisely why the mismatch went unseen: the two were written in
+    # parallel worktrees, each green against its own idea of the contract, and
+    # only meeting on develop raised TypeError on every real leaf.
+    if isinstance(verdict, dict) or hasattr(verdict, "keys"):
+        for key in ("accepted", "taken", "lowered"):
+            if key in verdict:
+                return bool(verdict[key]), str(verdict.get("reason", ""))
+        raise TypeError(
+            f"torchnative qnn_plan: check_leaf({name!r}, ...) returned the "
+            f"mapping {verdict!r}, which carries none of 'accepted', 'taken' "
+            "or 'lowered'. plan_lowering will not guess a verdict it was not "
+            "given."
+        )
+
     if isinstance(verdict, tuple):
         if len(verdict) != 2:
             raise TypeError(
@@ -128,6 +146,56 @@ def _read_verdict(name, module, verdict):
     return bool(taken), str(reason)
 
 
+#: The ATen operator each `nn.Module` leaf decomposes to, which is what the op
+#: table is keyed on. `qnn_ops.check_leaf` takes an ATen op name -- it is built
+#: from the `target = [...]` lists of ExecuTorch's QNN node-visitor builders,
+#: and those name operators, not module classes.
+#:
+#: This map is the reason the first version of this module reported ZERO
+#: eligible leaves on a model of nothing but `nn.Linear`. It passed the module
+#: PATH ("fc1") where an op name belonged, the table correctly answered "no
+#: node visitor is registered for fc1", and every test was green because every
+#: test injected a stand-in that also keyed on the path. Two rounds, each
+#: internally consistent, composing into a plan that declined everything.
+#:
+#: Absent from this map means unmapped, not unsupported: an unmapped leaf is
+#: declined with a reason saying which is which, so a missing entry reads as
+#: work to do rather than as a hardware limit.
+_MODULE_TO_ATEN = {
+    "Linear": "aten.linear.default",
+    "Conv1d": "aten.convolution.default",
+    "Conv2d": "aten.convolution.default",
+    "Embedding": "aten.embedding.default",
+    "LayerNorm": "aten.native_layer_norm.default",
+    "GroupNorm": "aten.native_group_norm.default",
+    "RMSNorm": "aten.rms_norm.default",
+    "BatchNorm2d": "aten._native_batch_norm_legit_no_training.default",
+    "ReLU": "aten.relu.default",
+    "GELU": "aten.gelu.default",
+    "SiLU": "aten.mul.Tensor",
+    "SiLUActivation": "aten.mul.Tensor",
+    "Sigmoid": "aten.sigmoid.default",
+    "Tanh": "aten.tanh.default",
+    "Softmax": "aten._softmax.default",
+    "Hardswish": "aten.hardswish.default",
+    "Hardsigmoid": "aten.hardsigmoid.default",
+    "Hardtanh": "aten.hardtanh.default",
+    "ELU": "aten.elu.default",
+    "PReLU": "aten.prelu.default",
+    "MaxPool2d": "aten.max_pool2d_with_indices.default",
+    "AvgPool2d": "aten.avg_pool2d.default",
+    "AdaptiveAvgPool2d": "aten.adaptive_avg_pool2d.default",
+    "Dropout": "aten._to_copy.default",
+    "Identity": "aten._to_copy.default",
+    "Flatten": "aten.view_copy.default",
+}
+
+
+def aten_op_for(module) -> "str | None":
+    """The ATen operator name `module` decomposes to, or None if unmapped."""
+    return _MODULE_TO_ATEN.get(type(module).__name__)
+
+
 def _check_leaf(ops, name, module):
     if not hasattr(ops, "check_leaf"):
         raise QnnPlanUnavailable(
@@ -136,8 +204,43 @@ def _check_leaf(ops, name, module):
             "affirmatively say a leaf would be taken, and it will not assume "
             "one by default."
         )
-    verdict = ops.check_leaf(name, module)
+    # A table keyed on ATen op names (`qnn_ops.check_leaf(op_name, ...)`) gets
+    # the op name; a stand-in keyed on (name, module) gets those. Which one
+    # this is, is decided by the callable's own signature rather than by
+    # catching TypeError, because a TypeError raised INSIDE a correct table
+    # would then be misread as "wrong arity" and the leaf silently retried.
+    verdict = None
+    if getattr(ops, "__name__", "") == "torchnative.export.qnn_ops" or (
+            _takes_op_name(ops.check_leaf)):
+        op = aten_op_for(module)
+        if op is None:
+            return False, (
+                f"torchnative qnn_plan: {type(module).__name__} has no entry in "
+                f"qnn_plan's module-to-ATen map, so no op name could be put to "
+                f"the QNN table. This is UNMAPPED, not unsupported -- add it to "
+                f"_MODULE_TO_ATEN once its decomposition is known."
+            )
+        verdict = ops.check_leaf(op)
+    else:
+        verdict = ops.check_leaf(name, module)
     return _read_verdict(name, module, verdict)
+
+
+def _takes_op_name(fn) -> bool:
+    """True when `fn` looks like `check_leaf(op_name, shapes=None, dtype=None)`.
+
+    Decided from the signature, not from a failed call: see `_check_leaf`.
+    """
+    import inspect
+
+    try:
+        params = list(inspect.signature(fn).parameters.values())
+    except (TypeError, ValueError):
+        return False
+    required = [p for p in params
+                if p.default is inspect.Parameter.empty
+                and p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)]
+    return len(required) == 1
 
 
 def plan_lowering(model, predicate=None, ops=None):
