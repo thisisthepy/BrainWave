@@ -65,6 +65,8 @@ section 3.3 draws that line precisely and section 4 is the Windows procedure.
 from __future__ import annotations
 
 import ctypes
+import glob as _glob
+import importlib.util
 import struct
 import os
 import sys
@@ -78,6 +80,7 @@ __all__ = [
     "EXECUTION_DEVICES",
     "MAX_DIM",
     "plan_lowering",
+    "openvino_package_libs_dir",
     "library_candidates",
     "parse_execution_devices",
     "verdict_execution_devices",
@@ -181,11 +184,61 @@ LIBRARY_ENV = "TORCHNATIVE_OPENVINO_C"
 MAX_DIM = 2 ** 17
 
 
-def library_candidates(platform: str | None = None) -> tuple[str, ...]:
-    """Shared-library filenames to try for the OpenVINO C API, newest naming first.
+def openvino_package_libs_dir(search_locations: "list[str] | tuple[str, ...] | None" = None) -> str | None:
+    """Return the `libs` directory of an installed `openvino` pip package, or `None`.
+
+    `pip install openvino` ships the *entire* runtime -- `openvino_c` and every
+    plugin, including `openvino_intel_npu_plugin` -- inside the package's `libs/`
+    directory. This finds that directory without importing `openvino` (importing
+    would load its native extension, `_pyopenvino`, for no reason we need here;
+    `importlib.util.find_spec` walks the import machinery far enough to get the
+    package's `submodule_search_locations` without executing `openvino/__init__.py`).
+
+    `search_locations` is the injection point for tests: pass a fake package
+    root (or several) directly and the `find_spec` lookup is skipped entirely,
+    so this is checkable against a directory tree that mirrors the real wheel
+    layout without an actual OpenVINO install.
+
+    Returns `None` if no `openvino` package is found, or if it has no `libs`
+    directory (e.g. an sdist/editable install, or a future layout change) --
+    callers fall back to bare filenames and the OS loader path in that case.
+    """
+    if search_locations is None:
+        try:
+            spec = importlib.util.find_spec("openvino")
+        except (ImportError, ValueError):
+            spec = None
+        search_locations = list(spec.submodule_search_locations) if spec and spec.submodule_search_locations else []
+    for location in search_locations:
+        candidate = os.path.join(location, "libs")
+        if os.path.isdir(candidate):
+            return candidate
+    return None
+
+
+#: Fallback filenames, tried only when no pip-installed `openvino` package's
+#: `libs/` directory could be found -- i.e. for a system-wide OpenVINO install
+#: that ctypes must locate through the OS loader path. This list rots (the
+#: real Linux wheel ships `libopenvino_c.so.2541`, a version this list never
+#: had), which is exactly why `library_candidates` prefers globbing a real
+#: directory over trusting this when it can.
+_SYSTEM_LIBRARY_NAMES = {
+    "win32": ("openvino_c.dll", "openvino_c_d.dll"),
+    "linux": ("libopenvino_c.so", "libopenvino_c.so.2025", "libopenvino_c.so.2024"),
+}
+
+
+def library_candidates(platform: str | None = None, libs_dir: str | None = None) -> tuple[str, ...]:
+    """Shared-library paths to try for the OpenVINO C API, newest naming first.
 
     Pure: takes the platform string rather than reading `sys.platform`, so the
-    Windows and Linux answers are both checkable from a Mac.
+    Windows and Linux answers are both checkable from a Mac. `libs_dir`, if
+    given, is globbed for the real filename OpenVINO shipped there instead of
+    guessing -- the pip wheel's Linux `.so` carries a build-number suffix
+    (`libopenvino_c.so.2541`) that no hardcoded list keeps up with. When
+    `libs_dir` is `None` or the glob finds nothing, this falls back to
+    `_SYSTEM_LIBRARY_NAMES`, which is what a system-wide (non-pip) install
+    needs, since there is no directory to glob in that case.
 
     Raises:
         IntelNPUUnavailable: on any platform where the OpenVINO NPU plugin does
@@ -194,17 +247,27 @@ def library_candidates(platform: str | None = None) -> tuple[str, ...]:
     """
     platform = sys.platform if platform is None else platform
     if platform == "win32":
-        return ("openvino_c.dll", "openvino_c_d.dll")
-    if platform.startswith("linux"):
-        return ("libopenvino_c.so", "libopenvino_c.so.2025", "libopenvino_c.so.2024")
-    raise IntelNPUUnavailable(
-        f"torchnative intelnpu: platform {platform!r} has no Intel NPU path. The NPU "
-        f"is reached through OpenVINO's NPU plugin, which Intel ships for Windows and "
-        f"Linux on x86-64 only -- see docs/devices/INTELNPU.md section 1.3. The archived "
-        f"intel_npu_acceleration_library draws the same line explicitly at "
-        f"backend/bindings.py:56-59, refusing every sys.platform that is not 'win32' or "
-        f"'linux'. This is not a missing feature; there is no such hardware here."
-    )
+        key = "win32"
+        globs = ("openvino_c.dll", "openvino_c_d.dll")
+    elif platform.startswith("linux"):
+        key = "linux"
+        globs = ("libopenvino_c.so*",)
+    else:
+        raise IntelNPUUnavailable(
+            f"torchnative intelnpu: platform {platform!r} has no Intel NPU path. The NPU "
+            f"is reached through OpenVINO's NPU plugin, which Intel ships for Windows and "
+            f"Linux on x86-64 only -- see docs/devices/INTELNPU.md section 1.3. The archived "
+            f"intel_npu_acceleration_library draws the same line explicitly at "
+            f"backend/bindings.py:56-59, refusing every sys.platform that is not 'win32' or "
+            f"'linux'. This is not a missing feature; there is no such hardware here."
+        )
+    if libs_dir:
+        found = []
+        for pattern in globs:
+            found.extend(sorted(_glob.glob(os.path.join(libs_dir, pattern))))
+        if found:
+            return tuple(found)
+    return _SYSTEM_LIBRARY_NAMES[key]
 
 
 def parse_execution_devices(value: str) -> tuple[str, ...]:
@@ -482,6 +545,7 @@ def load_openvino_c(path: str | None = None) -> ctypes.CDLL:
         IntelNPUUnavailable: if the library cannot be found or loaded.
     """
     tried = []
+    libs_dir = None
     if path:
         names = [path]
     elif os.environ.get(LIBRARY_ENV):
@@ -492,8 +556,21 @@ def load_openvino_c(path: str | None = None) -> ctypes.CDLL:
         # `names.insert(0, ...)` that used to follow it never ran.
         names = [os.environ[LIBRARY_ENV]]
     else:
-        names = list(library_candidates())
+        # An explicit path or LIBRARY_ENV names a specific file and wins outright --
+        # a user who names a library gets that one. Otherwise prefer the OpenVINO
+        # pip package: `pip install openvino` (or `torchnative[npu]`) ships the
+        # entire runtime, including the NPU plugin, in its `libs/` directory, so
+        # a user should never have to hunt down a system-wide install or set PATH.
+        libs_dir = openvino_package_libs_dir()
+        names = list(library_candidates(libs_dir=libs_dir))
     lib = None
+    # On Windows, `openvino_c.dll` pulls in sibling DLLs (`openvino.dll`, the
+    # plugin DLLs) by bare name at load time. `os.add_dll_directory` is the
+    # supported mechanism for making a specific directory resolvable for that --
+    # unlike mutating PATH, it is scoped to this process and this call, and it
+    # does not exist on non-Windows platforms, hence the guard.
+    if libs_dir and hasattr(os, "add_dll_directory"):
+        os.add_dll_directory(libs_dir)
     for name in names:
         tried.append(name)
         try:
@@ -504,11 +581,15 @@ def load_openvino_c(path: str | None = None) -> ctypes.CDLL:
     if lib is None:
         raise IntelNPUUnavailable(
             f"torchnative intelnpu: could not load the OpenVINO C runtime. Tried "
-            f"{tried!r}. Install the OpenVINO runtime (the archived Intel library "
-            f"pinned 2024.4; any release with an NPU plugin will do) and either put "
-            f"its bin directory on PATH / LD_LIBRARY_PATH, or set {LIBRARY_ENV} to the "
-            f"full path of openvino_c.dll / libopenvino_c.so. On Windows the runtime "
-            f"also needs its sibling DLLs resolvable -- see docs/devices/INTELNPU.md section 4."
+            f"{tried!r}. Easiest fix: `pip install torchnative[npu]` (or plain "
+            f"`pip install openvino`) -- the wheel ships the whole runtime, including "
+            f"the NPU plugin, with no system install and no PATH changes required. "
+            f"If you have a system-wide OpenVINO install instead, either put its bin "
+            f"directory on PATH / LD_LIBRARY_PATH, or set {LIBRARY_ENV} to the full "
+            f"path of openvino_c.dll / libopenvino_c.so -- the env var is the escape "
+            f"hatch for installs this cannot find on its own. On Windows a system "
+            f"install also needs its sibling DLLs resolvable -- see "
+            f"docs/devices/INTELNPU.md section 4."
         )
 
     c_char_pp = ctypes.POINTER(ctypes.c_char_p)

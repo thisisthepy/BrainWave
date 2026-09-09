@@ -36,6 +36,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 
 # Resolved from __file__, not from the cwd: run.sh invokes each test file
 # directly and the cwd it uses is not this file's business.
@@ -46,6 +47,7 @@ sys.path.insert(0, _VENDOR_DIR)
 import torchnative.export.intelnpu as intelnpu  # noqa: E402
 from torchnative.export.intelnpu import (  # noqa: E402
     EXECUTION_DEVICES,
+    LIBRARY_ENV,
     MAX_DIM,
     OV_STATUS,
     SUPPORTED_MODULES,
@@ -57,6 +59,7 @@ from torchnative.export.intelnpu import (  # noqa: E402
     library_candidates,
     linear_ir,
     minimal_ir,
+    openvino_package_libs_dir,
     pack_f16,
     parse_execution_devices,
     supported_ops,
@@ -77,6 +80,112 @@ def test_library_candidates_windows_and_linux():
     assert lin[0] == "libopenvino_c.so", lin
     assert all(n.startswith("libopenvino_c.so") for n in lin), lin
     print("ok   intelnpu: library candidates named for win32 and linux")
+
+
+def _fake_openvino_libs_dir(root, files):
+    """Build a fake `<pkg>/libs/` directory mirroring the real pip wheel layout."""
+    libs = os.path.join(root, "openvino", "libs")
+    os.makedirs(libs, exist_ok=True)
+    for name in files:
+        with open(os.path.join(libs, name), "wb"):
+            pass
+    return libs
+
+
+def test_library_candidates_globs_the_real_linux_wheel_suffix():
+    """The real pip wheel ships `libopenvino_c.so.2541` -- a version number no
+    hardcoded list ever had. `library_candidates` must find it by globbing the
+    package directory, not by growing the hardcoded fallback list, since that
+    list rots the same way every time OpenVINO ships a new build number."""
+    with tempfile.TemporaryDirectory() as root:
+        libs_dir = _fake_openvino_libs_dir(
+            root,
+            ["libopenvino_c.so.2541", "libopenvino.so.2541", "libopenvino_intel_npu_plugin.so"],
+        )
+        found = library_candidates("linux", libs_dir=libs_dir)
+        assert found == (os.path.join(libs_dir, "libopenvino_c.so.2541"),), found
+    print("ok   intelnpu: library_candidates globs the real libopenvino_c.so.NNNN suffix")
+
+
+def test_library_candidates_globs_the_real_windows_wheel_name():
+    with tempfile.TemporaryDirectory() as root:
+        libs_dir = _fake_openvino_libs_dir(
+            root, ["openvino_c.dll", "openvino.dll", "openvino_intel_npu_plugin.dll"]
+        )
+        found = library_candidates("win32", libs_dir=libs_dir)
+        assert found == (os.path.join(libs_dir, "openvino_c.dll"),), found
+    print("ok   intelnpu: library_candidates globs the real openvino_c.dll in a pip libs dir")
+
+
+def test_library_candidates_falls_back_to_system_names_when_libs_dir_has_nothing():
+    """A `libs_dir` that exists but has no matching file (or is `None`) must fall
+    back to the hardcoded system-install names rather than returning empty --
+    an empty candidate list would make `load_openvino_c` fail with an unhelpful
+    "tried []" instead of trying the OS loader path."""
+    assert library_candidates("linux", libs_dir=None) == library_candidates("linux")
+    print("ok   intelnpu: no libs_dir falls back to the system-install candidate names")
+
+
+def test_openvino_package_libs_dir_finds_the_injected_fake_layout():
+    with tempfile.TemporaryDirectory() as root:
+        libs_dir = _fake_openvino_libs_dir(root, ["libopenvino_c.so.2541"])
+        pkg_root = os.path.dirname(libs_dir)
+        found = openvino_package_libs_dir(search_locations=[pkg_root])
+        assert found == libs_dir, (found, libs_dir)
+    print("ok   intelnpu: openvino_package_libs_dir finds libs/ under an injected package root")
+
+
+def test_openvino_package_libs_dir_returns_none_without_a_libs_directory():
+    with tempfile.TemporaryDirectory() as root:
+        pkg_root = os.path.join(root, "openvino")
+        os.makedirs(pkg_root)
+        with open(os.path.join(pkg_root, "__init__.py"), "wb"):
+            pass
+        found = openvino_package_libs_dir(search_locations=[pkg_root])
+        assert found is None, found
+    print("ok   intelnpu: openvino_package_libs_dir returns None when there is no libs/")
+
+
+def test_openvino_package_libs_dir_returns_none_when_package_not_installed():
+    """`search_locations=[]` stands in for `importlib.util.find_spec` returning
+    nothing -- an environment with no `openvino` package installed at all."""
+    assert openvino_package_libs_dir(search_locations=[]) is None
+    print("ok   intelnpu: openvino_package_libs_dir returns None when nothing is found")
+
+
+def test_explicit_path_and_env_var_still_win_over_package_discovery():
+    """A user who names a library by hand must still get that one -- pip package
+    discovery is a fallback source of candidates, not a source of truth that
+    overrides an explicit choice. This is a load-bearing ordering claim about
+    `load_openvino_c`, checked here without touching hardware: it loads a name
+    that cannot possibly resolve and asserts the refusal names exactly that
+    tried name, proving the explicit path reached `ctypes.CDLL` unchanged."""
+    bogus = "definitely-not-a-real-openvino-c-library-name"
+    try:
+        intelnpu.load_openvino_c(path=bogus)
+    except IntelNPUUnavailable as exc:
+        assert repr([bogus]) in str(exc) or bogus in str(exc), str(exc)
+        print("ok   intelnpu: an explicit path is tried as-is, ahead of package discovery")
+        return
+    raise AssertionError("load_openvino_c(path=bogus) unexpectedly loaded something")
+
+
+def test_env_var_still_wins_over_package_discovery():
+    bogus = "definitely-not-a-real-openvino-c-library-name-either"
+    old = os.environ.get(LIBRARY_ENV)
+    os.environ[LIBRARY_ENV] = bogus
+    try:
+        intelnpu.load_openvino_c()
+    except IntelNPUUnavailable as exc:
+        assert bogus in str(exc), str(exc)
+        print("ok   intelnpu: TORCHNATIVE_OPENVINO_C still wins over package discovery")
+        return
+    finally:
+        if old is None:
+            os.environ.pop(LIBRARY_ENV, None)
+        else:
+            os.environ[LIBRARY_ENV] = old
+    raise AssertionError(f"load_openvino_c() with {LIBRARY_ENV} set unexpectedly loaded something")
 
 
 def test_library_candidates_refuses_darwin_by_name():

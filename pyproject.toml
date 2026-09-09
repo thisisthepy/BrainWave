@@ -55,12 +55,21 @@ Source = "https://github.com/thisisthepy/torchnative"
 
 [project.optional-dependencies]
 federated = []
-# cpu/gpu/npu install the SAME wheel and are empty deliberately: a wheel
-# filename has no backend axis, so one binary carries all three and selects at
-# runtime. PROJECT.md.
+# cpu/gpu are empty deliberately: the wheel carries all backends and selects
+# at runtime, and neither has a Python-side runtime dependency (yet). PROJECT.md.
 cpu = []
 gpu = []
-npu = []
+# npu is not empty: the Intel NPU path (torchnative/export/intelnpu.py) reaches
+# the device through OpenVINO's C API, and `pip install openvino` ships the
+# ENTIRE runtime -- openvino_c plus every plugin, including the NPU plugin --
+# inside the package, so no system-wide OpenVINO install is required. The
+# marker restricts this to the two platforms the NPU plugin actually ships
+# for (Windows and Linux, x86-64 only, per docs/devices/INTELNPU.md section
+# 1.3) so it is never dragged onto macOS or an ARM host that has no Intel NPU
+# to reach. PROJECT.md.
+npu = [
+    "openvino; (sys_platform == 'win32' and platform_machine == 'AMD64') or (sys_platform == 'linux' and platform_machine == 'x86_64')",
+]
 # Upstream torch as the golden harness's comparison baseline, not a runtime
 # dependency. Conflicts with the platform wheels by design. PROJECT.md.
 test = ["torch>=2.13,<2.14"]

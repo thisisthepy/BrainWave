@@ -137,22 +137,25 @@ not local execution — the README's platform table is the precise record.
 
 ---
 
-## `[project.optional-dependencies]` — the three backend extras install the same wheel
+## `[project.optional-dependencies]` — the three backend extras install the same wheel, except npu
 
 ```toml
 cpu = []
 gpu = []
-npu = []
+npu = [
+    "openvino; (sys_platform == 'win32' and platform_machine == 'AMD64') or (sys_platform == 'linux' and platform_machine == 'x86_64')",
+]
 ```
 
-**They are empty deliberately, not accidentally**, and the shape is forced by
-packaging rather than chosen ([`docs/platform/WHEEL.md`](docs/platform/WHEEL.md) §13).
-A wheel filename carries no backend axis — pip selects on the python, abi and
-platform tags alone, and the `build tag` slot it does have is a tie-breaker it
-never selects on — so CPU, GPU and NPU builds cannot sit side by side under one
-platform tag. Upstream torch hits exactly this and answers it by leaving PyPI:
-its 24 files for one version are 4 platforms × 6 pythons, and the CUDA builds
-live on a separate index.
+**`cpu` and `gpu` are empty deliberately, not accidentally**, and the shape is
+forced by packaging rather than chosen
+([`docs/platform/WHEEL.md`](docs/platform/WHEEL.md) §13). A wheel filename
+carries no backend axis — pip selects on the python, abi and platform tags
+alone, and the `build tag` slot it does have is a tie-breaker it never selects
+on — so CPU, GPU and NPU builds cannot sit side by side under one platform
+tag. Upstream torch hits exactly this and answers it by leaving PyPI: its 24
+files for one version are 4 platforms × 6 pythons, and the CUDA builds live on
+a separate index.
 
 So one binary carries all three and chooses at runtime. That is possible because
 the accelerator paths are **dlopened rather than linked**:
@@ -161,9 +164,24 @@ from `NEEDED`, so a device with no driver loses the GPU path and not
 `import torch`; NNAPI and CoreML compile at runtime with the same property.
 
 An extra cannot change what is in a wheel — only add dependencies. What belongs
-here is whatever a backend needs on the *Python* side at runtime, and nothing
-does yet. The names are declared so `torchnative[gpu]` resolves rather than
-errors, and so the eventual contents have somewhere to land.
+here is whatever a backend needs on the *Python* side at runtime. Nothing does
+for CPU or GPU, so those two stay empty; the names are declared so
+`torchnative[gpu]` resolves rather than errors, and so eventual contents have
+somewhere to land.
+
+**`npu` is no longer empty.** The Intel NPU path
+(`torchnative/export/intelnpu.py`) reaches the device through OpenVINO's C
+API over `ctypes`, loaded from a shared library that has to come from
+somewhere — previously the user's own system-wide OpenVINO install, found by
+hand and put on `PATH` or named in `TORCHNATIVE_OPENVINO_C`. `pip install
+openvino` ships the *entire* runtime inside the Python package (`openvino_c`
+plus every plugin, including `openvino_intel_npu_plugin`), so it is exactly
+the kind of Python-side runtime dependency this section describes, not a
+wheel-shape workaround. `load_openvino_c` finds and loads it automatically
+once installed; an explicit path or `TORCHNATIVE_OPENVINO_C` still wins over
+it, so naming a library by hand is unaffected. The marker keeps it off
+platforms with no Intel NPU to reach — macOS and non-x86-64 hosts — matching
+the refusal `library_candidates` already makes by platform name.
 
 **`federated = []`** exists so that using adaptation alone does not pull in the
 federated stack ([`docs/design/DESIGN.md`](docs/design/DESIGN.md) §10).
