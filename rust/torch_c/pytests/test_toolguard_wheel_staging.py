@@ -113,16 +113,24 @@ def test_a_failed_cross_build_leaves_no_wheel_in_outdir():
     # CARGO_TARGET_DIR is deliberately the *real* one: `check_host_shim`
     # looks for the host `lib_C.dylib`/`lib_C.so` there regardless of
     # `--target`, and that is where `vendor/install_shim.sh` actually put it.
-    # Only the linux-x86_64 subdirectory (which does not exist on this host)
-    # is faked, and it is removed in `finally` below.
+    # Only the linux-x86_64 subdirectory is faked, and it is removed in
+    # `finally` below.
     cargo_target_dir_env = os.environ.get(
         "CARGO_TARGET_DIR", str(REPO_ROOT / "rust" / "torch_c" / "target"))
     rel_dir = (Path(cargo_target_dir_env) / "x86_64-unknown-linux-gnu"
                / "release")
-    assert not rel_dir.exists(), (
-        f"{rel_dir} already exists -- refusing to fake an artefact where a "
-        "real one (or a leftover from another run) might be"
-    )
+    if rel_dir.exists():
+        # SKIP, not fail. This was an assertion, on the belief that the
+        # directory "does not exist on this host" -- it does on any checkout
+        # where `build.py --target linux-x86_64` has been run, which is every
+        # checkout that has cut a release. Failing there turns a green gate red
+        # for a reason that is about the machine and not about the code, and a
+        # gate that goes red after a wheel build is a gate people stop reading.
+        # Refusing to overwrite a real artefact is still right; announcing it as
+        # a defect is not.
+        print(f"   (skipped: {rel_dir} already exists -- refusing to fake an "
+              "artefact over a real cross build. Remove it to run this case.)")
+        return
 
     with tempfile.TemporaryDirectory(prefix="toolguard-wheelstage-") as tmpdir:
         tmp = Path(tmpdir)
