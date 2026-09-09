@@ -25,6 +25,105 @@ target_dir=${CARGO_TARGET_DIR:-$crate_dir/target}
 # in the same worktree still reuse theirs.
 stage=${TORCH_C_STAGE:-${TMPDIR:-/tmp}/torch-c-stage-$(printf '%s' "$repo_root" | cksum | cut -d' ' -f1)}
 
+# Fail closed on the interpreter *before* building or running anything.
+#
+# `${PYTHON:-python3}` below picks whatever `python3` resolves to on $PATH if
+# PYTHON is unset, and on this machine that is a bare framework interpreter
+# with neither `numpy` nor `typing_extensions` -- running the suite against it
+# produced 473 FAIL out of 1311 with nothing actually broken. The same trap
+# in the other direction is silent: an interpreter that imports everything but
+# is the wrong build, or a partial environment where only some suites fail and
+# get misread as real regressions. Refusing before any suite runs turns both
+# into one loud, named error instead of a pile of misleading FAILs.
+#
+# The package list is not guessed. It is every third-party (non-stdlib,
+# non-local) top-level import actually reached by the suites under the *same*
+# interpreter that runs them, derived by inspecting rust/torch_c/pytests/*.py:
+#
+#   grep -hoE '^(import [A-Za-z0-9_.]+|from [A-Za-z0-9_.]+ import)' \
+#       rust/torch_c/pytests/test_*.py rust/torch_c/pytests/test_shim.py \
+#       | sed -E 's/^(import|from) //; s/ import$//; s/\..*$//' | sort -u
+#
+# and then reading each non-stdlib hit in context to exclude the ones that are
+# not actually required of $PYTHON:
+#   - `_C`, `test_shim`, `agree_sweep`, `ggml_ref`, `test_collect2`: local
+#     files on PYTHONPATH, not packages.
+#   - `torchnative`: this repo's own package.
+#   - `executorch` (test_qnn.py): imported only inside a script handed to a
+#     *separate* interpreter, $TORCHNATIVE_QNN_PYTHON, by design (ExecuTorch
+#     pulls its own torch and must not replace the oracle build).
+#   - `vsbig` (test_voice4.py): imported only inside a subprocess script that
+#     runs when TORCH_C_VOICE4_ASSETS is set; the test skips by name otherwise.
+#   - `build` (test_wheelmatrix.py, `import build as _build`): shadowed by
+#     `tools/wheel/build.py` via an explicit `sys.path.insert(0, ...)` right
+#     above the import -- it is this repo's script, not the PyPI `build`
+#     package.
+#   - `torch`, `torchgen`, `functorch`: this is the line the first version of
+#     this guard got wrong. `torch` LOOKS like a third-party import every
+#     suite needs, but it is not one thing -- it is either the oracle
+#     (upstream, pip-installed, importable stand-alone) or *this repo's own
+#     build product* (the vendored tree at torchnative/src/main/torch, laid
+#     down by vendor/vendor_torch.sh and gitignored, absent in a fresh
+#     worktree, on PYTHONPATH only because run.sh puts it there for the
+#     capture/checkpoint/device/meta subprocess tests -- see the vendor_shim
+#     staleness check above). A preflight that requires `import torch` to
+#     succeed under a bare interpreter answers a question about the oracle
+#     half by accident and is silent about the vendored half, and either way
+#     it is checking a build *output* before the build has run -- the same
+#     inversion CLAUDE.md records for `publish_main.sh`'s PUBLISH_PYTHON
+#     guard, just with "vendor" in place of "install". Its absence in a fresh
+#     checkout is normal pre-build state, not a wrong interpreter, so it does
+#     not belong here.
+# What is left -- numpy, safetensors, transformers, typing_extensions -- is
+# imported either at module scope or inside a script the suite hands to
+# `sys.executable` (i.e. the *same* interpreter), unconditionally or on a
+# path the gate always takes, and every one of the four is a package this
+# repository consumes from the environment rather than one it produces, so
+# all four are required of $PYTHON. `typing_extensions` is not imported by
+# name anywhere in pytests/ -- it is `transformers`' and (the oracle) torch's
+# own hard runtime dependency (torch's METADATA lists `typing-extensions>=
+# 4.10.0`; `import torch` with it hidden fails with exactly ModuleNotFoundError:
+# typing_extensions, confirmed by hand), so a $PYTHON that has transformers
+# but not typing_extensions still fails deep inside a suite's own `import
+# transformers` in a way this preflight would otherwise miss.
+#
+# `env -u PYTHONPATH` on the check itself: a PYTHONPATH inherited from
+# whoever invoked this script (a caller's shell, a wrapper, a test harness
+# passing one through to isolate itself) can shadow or add to what the bare
+# interpreter sees, making the preflight's verdict depend on the caller
+# rather than on the interpreter named by $PYTHON. The suites' own PYTHONPATH
+# is set explicitly, below, when they actually run; the preflight should see
+# what $PYTHON gets on its own, not what happened to be lying around.
+_run_py=${PYTHON:-python3}
+_run_py_missing=$(env -u PYTHONPATH "$_run_py" - <<'PYEOF' 2>&1 || true
+import importlib
+missing = []
+for mod in ("numpy", "safetensors", "transformers", "typing_extensions"):
+    try:
+        importlib.import_module(mod)
+    except ImportError as exc:
+        missing.append(mod + " (" + str(exc) + ")")
+if missing:
+    print("\n".join(missing))
+PYEOF
+)
+if [ -n "$_run_py_missing" ]; then
+    cat >&2 <<EOF
+run.sh: refusing to start -- $_run_py cannot import what the suites need.
+
+Interpreter: $_run_py
+Could not import:
+$_run_py_missing
+
+This is not a test failure; it means the wrong interpreter is about to run
+the gate. Nothing has been built or run yet.
+
+Fix: set PYTHON to this repo's known-good interpreter and re-run:
+    PYTHON=/Volumes/macMini/caches/spike-venv/bin/python $0
+EOF
+    exit 1
+fi
+
 # `cd` rather than `--manifest-path`: cargo discovers `.cargo/config.toml` from
 # the *working directory*, not from the manifest. Building this crate from
 # elsewhere silently drops `-undefined dynamic_lookup` and the link fails with

@@ -111,6 +111,7 @@ import shutil
 import struct
 import subprocess
 import sys
+import tempfile
 import zipfile
 from pathlib import Path
 
@@ -3213,19 +3214,43 @@ def main() -> None:
               "(this interpreter's dynload table\n"
               "      has no .abi3.so in it)")
 
+    # Everything through `verify()` happens in a staging directory, not
+    # `args.outdir` (normally `dist/`). `run_pip_wheel` produces an
+    # intermediate that still carries the *host's* platform tag even for a
+    # cross build -- `_repack` only patches and retags it afterwards -- and if
+    # `_repack` or `verify` then fails, that intermediate is a publishable-
+    # looking artefact with the wrong tag sitting in `dist/`. Twice: a failed
+    # `linux-x86_64` and a failed `wasm32-emscripten` run each left a
+    # `...-macosx_11_0_universal2.whl` behind this way, and `dist/` also holds
+    # the released artefacts this script must not disturb.
+    #
+    # Staging beats cleanup-on-failure here because staging only has to get
+    # the *success* path right -- the intermediate lives in a
+    # `TemporaryDirectory` and is gone when this block exits, success or not,
+    # with no exit path to enumerate. Cleanup-on-failure has to catch every
+    # one of those paths (an exception, `_fail`'s `sys.exit`, a signal) to
+    # give the same guarantee, and missing one reproduces exactly the bug
+    # being fixed. The move into `args.outdir` below is the only step that can
+    # still put a wheel there, and it only runs after `verify()` has passed.
     args.outdir.mkdir(parents=True, exist_ok=True)
-    wheel = run_pip_wheel(args.python, args.outdir)
+    with tempfile.TemporaryDirectory(prefix="torchnative-wheel-build-") as staging_dir:
+        staging = Path(staging_dir)
+        wheel = run_pip_wheel(args.python, staging)
 
-    version = wheel.name.split("-")[1]
-    extra = {**upstream_dist_info(version), **global_deps_stub(target)}
-    wheel = _repack(wheel, extra, f"torchnative-{version}.dist-info",
-                    plat=plat, overrides=overrides, renames=renames)
+        version = wheel.name.split("-")[1]
+        extra = {**upstream_dist_info(version), **global_deps_stub(target)}
+        wheel = _repack(wheel, extra, f"torchnative-{version}.dist-info",
+                        plat=plat, overrides=overrides, renames=renames)
 
-    expected: set[str] = set()
-    for pkg in ("torch", *stamp.get("packages", "").split(","), "torchnative"):
-        if pkg and (SRC / pkg).is_dir():
-            expected |= tree_files(SRC / pkg)
-    verify(wheel, expected, target, extra, f"torchnative-{version}.dist-info")
+        expected: set[str] = set()
+        for pkg in ("torch", *stamp.get("packages", "").split(","), "torchnative"):
+            if pkg and (SRC / pkg).is_dir():
+                expected |= tree_files(SRC / pkg)
+        verify(wheel, expected, target, extra, f"torchnative-{version}.dist-info")
+
+        final_wheel = args.outdir / wheel.name
+        shutil.move(str(wheel), str(final_wheel))
+    wheel = final_wheel
 
     with zipfile.ZipFile(wheel) as zf:
         entries = zf.namelist()
