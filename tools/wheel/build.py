@@ -110,6 +110,7 @@ import re
 import shutil
 import struct
 import subprocess
+import time
 import sys
 import tempfile
 import zipfile
@@ -2413,6 +2414,23 @@ def self_test() -> None:
         _fail(f"self-test needs source files under {CRATE / 'src'}; found {real}")
     hour = 3600 * 10**9
 
+    # The `stale` case needs a prerequisite NEWER than the backdated artefact,
+    # and it used `real[:2]` -- the alphabetically first two -- with a fixed
+    # 48-hour backdate. That is a claim about this checkout's file ages, not
+    # about the code: right after a cross-build round rebuilt every artefact,
+    # neither of those two had been touched inside 48 hours and the case
+    # silently became `fresh`, so the self-test failed with "the cases do not
+    # reach all three verdicts". The verdict logic was never wrong.
+    #
+    # So the backdate is computed from the newest real source instead of
+    # assumed. Real files are still used, because the containment rule (a
+    # prerequisite from another checkout) is one of the things under test and a
+    # synthetic path would not exercise it.
+    newest = max(real, key=lambda f: os.stat(f).st_mtime_ns)
+    newest_age_h = (time.time_ns() - os.stat(newest).st_mtime_ns) / hour
+    stale_age_h = newest_age_h + 1.0
+    stale_inputs = " ".join([newest] + [f for f in real if f != newest][:1])
+
     cases: list[tuple[str, str, str]] = []   # (label, expected, fragment)
     with tempfile.TemporaryDirectory() as tmp:
         tmpdir = Path(tmp)
@@ -2433,7 +2451,7 @@ def self_test() -> None:
             ("current artefact", FRESH, "recorded inputs",
              "@ART@: " + " ".join(real[:2]), 0.0),
             ("a prerequisite modified after the build", STALE,
-             "was modified", "@ART@: " + " ".join(real[:2]), 48.0),
+             "was modified", "@ART@: " + stale_inputs, stale_age_h),
             ("no dep-info at all", UNKNOWN, "does not exist", None, 0.0),
             ("dep-info with no rule in it", UNKNOWN, "no Makefile rule",
              "not a makefile\njust prose\n", 0.0),
