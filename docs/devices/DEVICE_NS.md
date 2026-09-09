@@ -228,25 +228,69 @@ assert the arguments upstream actually received are identical to those passed.
 forms including `non_blocking=True` and `non_blocking=False`, and it is what
 catches N5.
 
-### 5.5 `to(npu)` refuses, and resolves first
+### 5.5 `to(npu)` resolves first, then lowers or refuses — per backend
 
-Recompiling an `nn.Module` for an accelerator is **not implemented in this
-build**. `to(torchnative.device.npu)` therefore:
+`to(torchnative.device.npu)` **always resolves first**, whichever branch
+follows, so the caller learns which NPU this host actually has rather than
+being handed a flat verdict about their machine. The dispatch key is then
+`resolution.backend`, **not** `host()`: the host chooses the backend
+(`NPU_BACKENDS`) and the backend is what has or has not been wired, so keying
+on the host would be reading the wrong fact one step early.
+`test_the_openvino_branch_is_chosen_by_the_resolution_and_not_by_the_platform`
+is the test that says so.
 
-1. resolves the NPU for this host, so the caller learns they have an Apple
-   Neural Engine (or is told by name that they have none), and
-2. raises `NotImplementedError` naming the resolved unit, the backend, the
-   probe, what exists (the capture layer; the per-vendor execution-device
-   evidence: `intelnpu.probe`, `assert_execution_device`,
-   `verdict_execution_devices`) and what is missing (the step that turns a
-   captured graph into a module leaf).
+**`openvino` (Intel NPU) is wired.** It calls
+`torchnative.export.intelnpu._compile_model`, which walks `named_children()`
+and swaps each eligible `torch.nn.Linear` for a leaf whose forward runs on the
+OpenVINO device. That call is in place and returns the same object, so `to()`
+returns `self`: still an `nn.Module`, with its `parameters()`, `state_dict()`
+and `named_children()` intact, so `generate()` keeps working and never learns
+anything about the NPU. No library path is passed — the OpenVINO runtime is
+discovered from the pip package (`pip install torchnative[npu]`).
 
-It does **not** return `self`. Returning the model unchanged would be an
-argument accepted and dropped: the caller would hold a model they believe is on
-the Neural Engine and which is in fact on the CPU — [`../graph/NPU2.md`](../graph/NPU2.md)
-§1 exactly, and CLAUDE.md §6 on promised refusals that never happen.
+**The partial-offload report is delivered twice, and that is the point.**
+`_compile_model` names every leaf left behind, because "the model is on the
+NPU" is false for any model with a `LayerNorm` in it. So:
+
+* `model.torchnative_offload` — the report as a dict, for a caller who asks.
+  An attribute rather than a return value because the return value is fixed by
+  upstream's contract; a value rather than prose because `fraction_moved` is
+  what makes "90% offloaded" impossible to mistake for "offloaded".
+* a `UserWarning`, **only** when `fully_offloaded` is False, for a caller who
+  does not ask. This is the load-bearing half:
+  [`../graph/NPU2.md`](../graph/NPU2.md) is an entire document about a partial
+  offload that went unnoticed *because the answers were right*, and an
+  attribute nobody reads reproduces it exactly. A full offload is silent, which
+  is what keeps the warning informative when it fires.
+
+**Zero leaves lowered is a refusal.** `_compile_model`'s `IntelNPUUnsupported`
+propagates unchanged and no report is attached — returning an untouched model
+with a success message is the silent CPU fallback this path exists to prevent,
+and a report on a model that was never lowered is the same lie with a receipt.
+
+**`coreml` and `qnn` still refuse**, at the same quality of message and after
+the same real resolution: `NotImplementedError` naming the resolved unit, the
+backend, the probe, what exists (the capture layer; the per-vendor
+execution-device evidence: `intelnpu.probe`, `assert_execution_device`,
+`verdict_execution_devices`) and what is missing (the equivalent leaf). They
+are **not** stubbed into a fake success. Returning the model unchanged would be
+an argument accepted and dropped: the caller would hold a model they believe is
+on the Neural Engine and which is in fact on the CPU —
+[`../graph/NPU2.md`](../graph/NPU2.md) §1 exactly, and CLAUDE.md §6 on promised
+refusals that never happen.
 `test_to_the_compiled_target_refuses_and_names_what_it_resolved_to` fails if
-`self` comes back (N7).
+`self` comes back on this host (N7).
+
+**What the Intel branch is and is not evidence of.** No machine in this
+repository has an Intel NPU, and `library_candidates` refuses on darwin by
+design. `rust/torch_c/pytests/test_npuwire.py` therefore fakes exactly two
+boundaries and nothing above them — the probe (`TORCHNATIVE_DEVICE_HOST=windows`
+plus `intelnpu.npu_available` / `available_devices`, the shape §8 established)
+and the OpenVINO runtime (`intelnpu.OpenVINO`, four methods). The resolver,
+`_compile_model`, `linear_ir`, `verdict_execution_devices`, the report and the
+`_module_to` wrapper are all real. Every test in that file says so in its name
+and its docstring: it is evidence about **dispatch**, not about hardware.
+Nothing there shows a number was computed on an Intel NPU.
 
 ## 6. The one deliberate disagreement: `_mps_is_available` is not a probe
 

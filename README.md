@@ -566,9 +566,14 @@ model = AutoModelForCausalLM.from_pretrained("google/gemma-3-4b-it")
 loss = model(**batch, labels=labels).loss
 loss.backward()                          # a real nn.Module, so this works
 
-model.to(device.npu)                     # REFUSES: resolves the NPU, names the
-                                         # unit, then says the recompile step
-                                         # is not implemented
+model.to(device.npu)                     # Intel NPU: resolves the unit, lowers the
+                                         # Linear leaves through OpenVINO, and hands
+                                         # back the SAME nn.Module -- with the
+                                         # partial-offload report on
+                                         # .torchnative_offload, and a UserWarning
+                                         # if anything stayed on the CPU.
+                                         # Apple ANE / Hexagon: still REFUSES by
+                                         # name, after the same real resolution.
 ```
 
 | | what is measured today |
@@ -576,7 +581,7 @@ model.to(device.npu)                     # REFUSES: resolves the NPU, names the
 | `torchnative.device` | **Done.** `cpu` · `mps` · `vulkan` · `cuda` · `npu`. Availability is measured through the existing probes, and every answer names the probe that produced it. `npu` **resolves per host** — Apple Neural Engine / Intel NPU / Hexagon — and refuses by name where there is none, never falling back to the CPU. Eager and compiled are different *types*, so `torch.empty(..., device=npu)` cannot be spelled. |
 | `nn.Module.to()` | **Done.** Intercepted ahead of `_parse_to`, since `to()` descends to tensors and an npu is not a tensor destination. An eager torchnative device moves parameters through upstream's own path; the model is never wrapped. Upstream semantics are held by two tests — one differential against the unpatched `to`, one asserting byte-identical passthrough of the arguments. |
 | `torchnative.transformers` | **Done.** All **49** `Auto*` classes, enumerated from `transformers` rather than hand-listed. `from_pretrained` returns the real model — `loss.backward()` populated 16/16 grads on a GPT-2 built through it. `export=` and `load_in_4bit=` **refuse by name** rather than being silently dropped. |
-| recompiling for the accelerator | **Not implemented.** `model.to(torchnative.device.npu)` resolves the NPU and then refuses at the compile step rather than returning the model unchanged. The capture layer exists; the step that turns a captured graph into a module leaf does not. |
+| recompiling for the accelerator | **Intel NPU: wired. Apple ANE and Hexagon: not implemented.** `model.to(torchnative.device.npu)` always resolves first, then dispatches on the resolved *backend*. `openvino` lowers every eligible `torch.nn.Linear` in place and returns the same `nn.Module`, so `generate()` and `backward()` still work; the partial-offload report lands on `model.torchnative_offload` **and** a `UserWarning` fires whenever anything stayed on the CPU, because [`docs/graph/NPU2.md`](docs/graph/NPU2.md) is about a partial offload that went unnoticed while every answer was right. Zero leaves lowered is a refusal, not a success. `coreml` and `qnn` still refuse by name rather than returning the model unchanged. **No machine here has an Intel NPU**, so `rust/torch_c/pytests/test_npuwire.py` fakes the probe and the OpenVINO runtime and nothing above them: it is evidence about dispatch, not about hardware. |
 
 [`docs/devices/DEVICE_NS.md`](docs/devices/DEVICE_NS.md) and
 [`docs/api/TRANSFORMERS.md`](docs/api/TRANSFORMERS.md) record what was measured,

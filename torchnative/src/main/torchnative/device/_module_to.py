@@ -45,6 +45,15 @@ upstream does. `optimum` returns an inference object and that is why it cannot
 backprop; this project ships its own `torch`, so it does not have to. If this
 file ever returns something that is not `self`, the thing that distinguishes
 this project from `optimum` is gone.
+
+That holds for the compiled targets too. `to(torchnative.device.npu)` on an
+Intel NPU lowers the model's `torch.nn.Linear` leaves **in place** --- the
+object that comes back is the object that went in, and `generate()`,
+`state_dict()` and `backward()` all still work because nothing was wrapped.
+The lowering's partial-offload report is carried out on
+`model.torchnative_offload`, and as a `UserWarning` when anything stayed on the
+CPU; `_to_compiled` explains why both. See section 5.5 of
+`docs/devices/DEVICE_NS.md`.
 """
 
 import functools
@@ -98,12 +107,59 @@ def _to_eager(original, self, device, position, args, kwargs):
 
 
 def _to_compiled(self, device, args, kwargs):
-    """A compiled target: resolve first, then say exactly what is missing.
+    """A compiled target: resolve, then either lower for it or refuse by name.
 
-    Resolution happens **before** the refusal on purpose. The caller learns
-    which NPU this host actually has --- which is the question
-    `docs/graph/NPU2.md` says a device must be able to answer --- rather than
-    a flat "not implemented" that tells them nothing about their machine.
+    Resolution happens **first, always**, whichever branch follows. The caller
+    learns which NPU this host actually has --- the question
+    `docs/graph/NPU2.md` says a device must be able to answer --- rather than a
+    flat verdict that tells them nothing about their machine. The dispatch key
+    below is `resolution.backend`, **not** `host()`: the host chooses the
+    backend (`NPU_BACKENDS`) and the backend is what has or has not been wired,
+    so keying on the host would be reading the wrong fact one step early.
+
+    **`openvino` (Intel NPU) is wired.** It goes to
+    `torchnative.export.intelnpu._compile_model`, which walks `named_children()`
+    and swaps each eligible `torch.nn.Linear` for a leaf whose forward runs on
+    the OpenVINO device. That call is **in place** and returns the same object,
+    so what comes back here is `self`: still an `nn.Module`, still with its
+    `parameters()`, `state_dict()` and `named_children()`, so `generate()`
+    keeps working and does not learn anything about the NPU. This module's
+    docstring says "no wrapping, ever", and lowering does not break that
+    promise --- it is the reason the mechanism was chosen over an inference
+    object in the first place.
+
+    No library path is passed. The OpenVINO runtime is discovered from the pip
+    package (`pip install torchnative[npu]`), and a path argument here would put
+    a filename back into the user's path for no gain.
+
+    **Where the partial-offload report goes, and why there.** `_compile_model`
+    returns `(model, report)`; the report names every leaf left behind, because
+    "the model is on the NPU" is false for any model with a `LayerNorm` in it.
+    That report must not stop here. It is delivered **twice**, deliberately:
+
+    * as `model.torchnative_offload`, a plain dict, for a caller who asks. An
+      attribute rather than a return value because the return value is fixed:
+      `to()` returns `self` and upstream's contract is not negotiable. An
+      attribute rather than a log line alone because a caller who wants to
+      assert on the offload needs a value --- `fraction_moved` is a number for
+      exactly that reason.
+    * as a `UserWarning` when `fully_offloaded` is False, for a caller who does
+      **not** ask. This is the load-bearing half. docs/graph/NPU2.md is a whole
+      document about a partial offload that went unnoticed *because the answers
+      were right*; an attribute nobody reads reproduces it exactly. Silence is
+      the defect, so the only silent case is the complete one --- which also
+      keeps the warning meaningful when it does fire.
+
+    **Zero leaves lowered is a refusal, not a success.** That refusal is
+    `_compile_model`'s own `IntelNPUUnsupported` and it is allowed to propagate
+    unchanged: returning an untouched model with a success message is the
+    silent CPU fallback this whole path exists to prevent. Nothing is attached
+    to the model in that case either --- a report on a model that was never
+    lowered is the same lie with a receipt.
+
+    **`coreml` and `qnn` still refuse.** They are not stubbed into a fake
+    success. Their refusal is the same `NotImplementedError`, after the same
+    real resolution, at the same quality of message it had before.
     """
     extra = [a for a in args if a is not device]
     if extra or kwargs:
@@ -114,6 +170,9 @@ def _to_compiled(self, device, args, kwargs):
         )
 
     resolution = device.resolve()  # raises NpuUnresolved, by name, if it cannot
+
+    if resolution.backend == "openvino":
+        return _lower_for_openvino(self, device, resolution)
 
     raise NotImplementedError(
         f"nn.Module.to(torchnative.device.{device.type}): this host's "
@@ -127,13 +186,55 @@ def _to_compiled(self, device, args, kwargs):
         f"which is in fact running on the CPU -- docs/graph/NPU2.md section 1 "
         f"is that exact failure, found only by reading MLComputePlan.\n"
         f"\n"
-        f"What does exist today: the capture layer "
-        f"(torchnative.export.decompose / refold) and the per-vendor "
-        f"execution-device evidence (torchnative.export.intelnpu.probe, "
-        f"assert_execution_device, verdict_execution_devices). What is "
-        f"missing is the step that turns a captured graph into a leaf this "
-        f"module can carry. See docs/devices/DEVICE_NS.md section 5."
+        f"The Intel NPU path (the openvino backend) IS wired: it lowers "
+        f"torch.nn.Linear leaves through "
+        f"torchnative.export.intelnpu. What the {resolution.backend} backend "
+        f"still lacks is the equivalent leaf. What does exist for it today: "
+        f"the capture layer (torchnative.export.decompose / refold) and the "
+        f"per-vendor execution-device evidence (probe, "
+        f"assert_execution_device, verdict_execution_devices). See "
+        f"docs/devices/DEVICE_NS.md section 5."
     )
+
+
+def _lower_for_openvino(model, device, resolution):
+    """Lower `model` for the Intel NPU and hand back the same `nn.Module`.
+
+    Separated from `_to_compiled` so that the dispatch --- which backend, and
+    what happens to everything that is not it --- reads as five lines, and so
+    that a test can point at the branch by name. See `_to_compiled` for why the
+    report is delivered both as an attribute and as a warning.
+    """
+    import warnings
+
+    from ..export import intelnpu
+
+    model, report = intelnpu._compile_model(model, device="NPU")
+    # Attached only on success. `_compile_model` raises for zero leaves, so
+    # this line is unreachable for a model that was not actually lowered.
+    model.torchnative_offload = report
+
+    if not report["fully_offloaded"]:
+        left = ", ".join(
+            f"{name} x{count}" for name, count in report["left_on_cpu"].items()
+        ) or "none"
+        skipped = "; ".join(f"{name}: {why}" for name, why in report["skipped"][:4])
+        warnings.warn(
+            f"nn.Module.to(torchnative.device.{device.type}): a PARTIAL offload. "
+            f"{len(report['swapped'])} Linear(s) now run on the {resolution.unit}, "
+            f"which is fraction_moved="
+            f"{report['fraction_moved']:.4f} "
+            f"({report['parameters_moved']} of {report['parameters_total']} "
+            f"parameters). Left on the CPU -- leaf module types: {left}."
+            + (f" Skipped Linear(s): {skipped}." if skipped else "")
+            + f" The full report is on the model as `.torchnative_offload`. "
+            f"This warning exists because docs/graph/NPU2.md is about a partial "
+            f"offload that went unnoticed while every answer it produced was "
+            f"right.",
+            UserWarning,
+            stacklevel=4,
+        )
+    return model
 
 
 def make(original):
