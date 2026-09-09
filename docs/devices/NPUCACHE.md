@@ -194,8 +194,38 @@ the fallback for a runtime that does not surface data symbols; both spellings
 are the same string, which is the only reason taking the fallback silently is
 safe.
 
-## 7. Not done
+## 7. Done in a later round: eager compilation, and one Core
 
-`to(device.npu)` could pre-compile the batch=1 decode shape for every leaf, so
-those 252 compiles happen during `to()` rather than stalling the first generated
-token. It is not done in this round and nothing here depends on it.
+This section used to read "Not done": `to(device.npu)` *could* pre-compile the
+batch=1 decode shape for every leaf, so those 252 compiles happen during `to()`
+rather than stalling the first generated token. That landed, together with the
+larger defect underneath it -- `_NPULinear` was building **one `ov::Core` per
+leaf**, so a 252-leaf model constructed 252 of them, each resolving and creating
+the cache directory this document is about. It now constructs one.
+
+`docs/devices/NPUPAR.md` is the record, including why the compiles are still
+**serial**.
+
+## 8. Concurrency, and what this cache directory does and does not promise
+
+Nothing above changed, but the parallel-compilation question forced the cache
+path to be read under concurrency, and two facts belong here rather than only in
+NPUPAR.md:
+
+* **Within one process and one `ov::Core`, concurrent writes are guarded.**
+  `CacheGuard` (`src/inference/src/cache_guard.hpp`) is a per-hash mutex --
+  "protect multiple threads to modify the same cached network". Different models
+  hash differently, take different locks, and write different `<hash>.blob`
+  files. This is another reason the one-Core-per-leaf shape was wrong: 252 cores
+  have 252 unrelated guards.
+* **Across processes there is no guard, and the write is not atomic.**
+  `FileStorageCacheManager::write_cache_entry`
+  (`src/inference/src/cache_manager.hpp`) opens the final `<hash>.blob` path
+  directly -- no temporary file, no rename. Two scripts running at once, or a
+  kill mid-write, can leave a truncated file where a cache entry should be. The
+  read side parses a header and discards the entry on any exception, so
+  truncation is normally *detected*; there is no checksum over the body.
+
+This is why the directory is **per user** and not shared. A shared cache
+directory would widen exactly that window, across users who cannot see each
+other's runs.

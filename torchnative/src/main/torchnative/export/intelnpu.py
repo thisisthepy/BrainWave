@@ -1052,6 +1052,18 @@ class OpenVINO:
                     f"ov_core_compile_model(device={device})",
                 )
                 compiled._torchnative_weights = keepalive
+                # The lifetime anchor. `close()` calls `ov_core_free`, and a
+                # compiled model whose core has been freed is a use-after-free
+                # that presents as wrong numbers rather than as a crash -- the
+                # same failure shape the weights keepalive above prevents, one
+                # level up. A strong reference from the handle to the owning
+                # Python object means no reachable compiled model can have a
+                # collected core underneath it. It does not (and must not) make
+                # an explicit `close()` safe: `probe()` closes deliberately, at
+                # the end of a `with` block, after its compiled models are gone.
+                # What this rules out is the accidental version -- the shared
+                # core `_compile_model` builds having no other name.
+                compiled._torchnative_core = self
                 return compiled
             finally:
                 self._lib.ov_model_free(model)
@@ -1348,6 +1360,50 @@ def _torch():
     return torch
 
 
+def open_core(library: str | None, device: str) -> "OpenVINO":
+    """One `ov::Core`, with the device-presence assertion done once on it.
+
+    **Why this is a function and not two lines inside `_compile_for`.** It used
+    to be those two lines, and the cost of that was 252 -- a Qwen3-4B lowers 252
+    `nn.Linear` leaves, and each one built its own `ov::Core` on its first
+    forward. `ov_core_create` dlopens and initialises OpenVINO's whole plugin
+    registry; `ov_core_get_available_devices` then enumerates and initialises
+    every plugin it found (the NPU plugin, which talks to the Level Zero driver,
+    and the GPU plugin included); and `OpenVINO.__init__` resolves and creates
+    the compile-cache directory. All of that ran 252 times for one model.
+
+    It is not only waste. OpenVINO's model-cache serialisation is a per-hash
+    mutex held *inside one* `CoreImpl` (`src/inference/src/dev/core_impl.cpp`,
+    `m_cache_guard.get_hash_lock(...)`), so 252 separate cores do not share it
+    at all -- the one-core-per-leaf shape had opted out of the only concurrency
+    protection OpenVINO offers before any thread existed. That is why the shared
+    core had to land before the parallelism question could even be asked;
+    docs/devices/NPUPAR.md section 1 is the record.
+
+    The core is **returned**, not stored on a module global. A process-wide
+    singleton would outlive every model, could never be closed, and would freeze
+    the cache-directory decision that docs/devices/NPUCACHE.md deliberately
+    leaves per-core and overridable.
+
+    Refusing here, when `device` is not among what OpenVINO reports, rather than
+    compiling anyway: `intel_npu_acceleration_library` only warns at this spot
+    (`backend/utils.py:56-60`) and then silently uses the CPU, which is
+    docs/graph/NPU2.md's failure exactly.
+    """
+    core = OpenVINO(library)
+    found = core.devices()
+    if device not in found:
+        raise IntelNPUUnavailable(
+            f"torchnative intelnpu: OpenVINO loaded but does not list "
+            f"{device!r} among its devices {list(found)!r}. Either "
+            f"the machine has no Intel NPU, or the NPU driver / OpenVINO NPU "
+            f"plugin is not installed. Refusing here rather than compiling "
+            f"anyway -- intel_npu_acceleration_library only warns at this "
+            f"point (backend/utils.py:56-60) and then silently uses the CPU."
+        )
+    return core
+
+
 class _NPULinear:
     """A `torch.nn.Linear` replacement whose forward runs on the OpenVINO device.
 
@@ -1382,7 +1438,8 @@ class _NPULinear:
             return obj
         return super().__new__(cls)
 
-    def __init__(self, weight, bias=None, device: str = "NPU", library: str | None = None):
+    def __init__(self, weight, bias=None, device: str = "NPU", library: str | None = None,
+                 core: "OpenVINO | None" = None):
         torch = _torch()
         torch.nn.Module.__init__(self)
         if weight.dim() != 2:
@@ -1409,14 +1466,26 @@ class _NPULinear:
         self.device_name = device
         self.library = library
         self._compiled = {}
-        self._ov = None
+        # The shared `ov::Core`, when there is one. `_compile_model` builds
+        # exactly one and hands it to every leaf; a leaf built on its own
+        # through `from_torch` gets None and makes its own at first compile, so
+        # sharing did not make a core mandatory. See `_ensure_core`.
+        self._ov = core
         self.execution_devices = None
 
     # -- construction -----------------------------------------------------
     @classmethod
-    def from_torch(cls, layer, device: str = "NPU", library: str | None = None):
-        """The `lower_linear` substitution (`compiler.py:144-160`), one layer."""
-        return cls(layer.weight, getattr(layer, "bias", None), device=device, library=library)
+    def from_torch(cls, layer, device: str = "NPU", library: str | None = None,
+                   core: "OpenVINO | None" = None):
+        """The `lower_linear` substitution (`compiler.py:144-160`), one layer.
+
+        `core` is the shared `ov::Core` when the caller has one. `_compile_model`
+        always does; a caller lowering a single layer need not, and passing None
+        keeps the old behaviour exactly -- a core built lazily, by this leaf, at
+        its first compile.
+        """
+        return cls(layer.weight, getattr(layer, "bias", None), device=device,
+                   library=library, core=core)
 
     # -- the device layer -------------------------------------------------
     def _weights_blob(self) -> bytes:
@@ -1436,17 +1505,7 @@ class _NPULinear:
         if batch in self._compiled:
             return self._compiled[batch]
         if self._ov is None:
-            self._ov = OpenVINO(self.library)
-            found = self._ov.devices()
-            if self.device_name not in found:
-                raise IntelNPUUnavailable(
-                    f"torchnative intelnpu: OpenVINO loaded but does not list "
-                    f"{self.device_name!r} among its devices {list(found)!r}. Either "
-                    f"the machine has no Intel NPU, or the NPU driver / OpenVINO NPU "
-                    f"plugin is not installed. Refusing here rather than compiling "
-                    f"anyway -- intel_npu_acceleration_library only warns at this "
-                    f"point (backend/utils.py:56-60) and then silently uses the CPU."
-                )
+            self._ov = open_core(self.library, self.device_name)
         xml = linear_ir(self.in_features, self.out_features, batch, self.bias is not None)
         compiled = self._ov.compile_ir(xml, self.device_name, self._weights_blob())
         devices = self._ov.execution_devices(compiled)
@@ -1560,7 +1619,7 @@ def plan_lowering(model, predicate=None):
 
 
 def _compile_model(model, device: str = "NPU", library: str | None = None,
-                   predicate=None):
+                   predicate=None, eager: bool = True, progress=None):
     """Swap every `torch.nn.Linear` in `model` for an `_NPULinear`. In place.
 
     `predicate(name, module) -> bool` narrows which leaves are lowered; the
@@ -1607,10 +1666,33 @@ def _compile_model(model, device: str = "NPU", library: str | None = None,
     about 10% of the parameters, and a number says that where a list of names
     does not.
 
+    **One `ov::Core` for the whole model.** `_NPULinear._compile_for` used to
+    build its own on first forward, so a 252-leaf Qwen3-4B constructed 252 of
+    them -- 252 dlopens of OpenVINO's plugin set, 252 device enumerations, 252
+    cache-directory resolutions, and 252 model caches that could not share
+    OpenVINO's per-hash write guard with each other. `open_core` is built once
+    here and handed to every leaf.
+
+    **`eager=True` compiles the batch=1 decode shape for every leaf before
+    returning**, and `progress(done, total, name)` reports it. That is not a
+    speed-up -- the same compiles happen either way -- it is a change of
+    *placement*: `generate()` uses the prompt-length shape once and then batch=1
+    per token, so lazily those 252 compiles land inside the second generated
+    token and look like a hang. A leaf that will not compile eagerly is reported
+    in `eager_failed` by name and keeps its lazy path; only the first leaf's
+    failure is fatal, because that one is the assertion that the device exists.
+
+    **These compiles are serial and stay serial.** docs/devices/NPUPAR.md is the
+    record of why: two of the four things that would have to hold before running
+    them concurrently are UNVERIFIED, and one of the two fails as a corrupted
+    cache entry rather than as slowness.
+
     Raises:
         IntelNPUUnsupported: if `device` is not NPU or CPU, or if no
             `torch.nn.Linear` was lowered at all -- returning an untouched model
             and calling it compiled is the silent fallback wearing a bow tie.
+        IntelNPUUnavailable: if OpenVINO does not list `device`, or if the first
+            lowered leaf will not compile.
     """
     torch = _torch()
     if device not in ("NPU", "CPU"):
@@ -1624,6 +1706,13 @@ def _compile_model(model, device: str = "NPU", library: str | None = None,
         )
     swapped, left, skipped = [], {}, []
     moved_parameters = 0
+    # None during the walk, deliberately. The walk needs no OpenVINO -- it is
+    # `named_children()` plus the pure `linear_ir` eligibility check -- and
+    # building the core first would move the "OpenVINO is not installed here"
+    # failure ahead of the "nothing was lowered" refusal below, reordering two
+    # errors that say different things. The core is built once, after the walk,
+    # and handed to every leaf then.
+    core = None
 
     def walk(parent, prefix):
         nonlocal moved_parameters
@@ -1639,7 +1728,7 @@ def _compile_model(model, device: str = "NPU", library: str | None = None,
                     child.bias.numel() if child.bias is not None else 0
                 )
                 try:
-                    lowered = _NPULinear.from_torch(child, device, library)
+                    lowered = _NPULinear.from_torch(child, device, library, core=core)
                 except IntelNPUUnsupported as exc:
                     # Left behind and NAMED. Not fatal: one oversized leaf must
                     # not make the whole model unreachable. See this function's
@@ -1678,6 +1767,29 @@ def _compile_model(model, device: str = "NPU", library: str | None = None,
             f"starts at the same place (compiler.py:144-160)."
         )
 
+    # ONE ov::Core for the whole model, built here and shared by every leaf.
+    # Not 252 of them, which is what one-per-leaf meant for a Qwen3-4B; see
+    # `open_core` for what each of those 252 was actually doing. The
+    # device-presence assertion runs once, on this core, rather than once per
+    # leaf.
+    #
+    # LIFETIME. Nothing else holds this name after the function returns, and
+    # that is fine: every leaf holds a strong reference in `_ov`, and every
+    # compiled model holds one through `_torchnative_core`, so the core is
+    # reachable exactly as long as anything made from it is. `close()` is never
+    # called here -- a shared core has no single owner who could know when.
+    core = open_core(library, device)
+
+    def _leaf(path):
+        node = model
+        for part in path.split("."):
+            node = getattr(node, part) if not part.isdigit() else node[int(part)]
+        return node
+
+    leaves = [_leaf(path) for path in swapped]
+    for leaf in leaves:
+        leaf._ov = core
+
     # Compile the first swapped layer here, eagerly, rather than at first
     # forward. It is what makes `device="NPU"` on a machine with no NPU a
     # failure of *this call* instead of a model that looks offloaded and only
@@ -1685,10 +1797,57 @@ def _compile_model(model, device: str = "NPU", library: str | None = None,
     # point the answers are correct and nothing draws attention. The
     # EXECUTION_DEVICES assertion happens inside `_compile_for`, so the report
     # below carries OpenVINO's own answer rather than our intention.
-    first = model
-    for part in swapped[0].split("."):
-        first = getattr(first, part) if not part.isdigit() else first[int(part)]
+    #
+    # **This one is not caught by name**, unlike every compile after it. It is
+    # different in kind: it is the assertion that the device is real. Absorbing
+    # it into a report would turn "there is no NPU on this machine" into 252
+    # named warnings attached to a model the caller believes is offloaded --
+    # the silent CPU fallback wearing a report.
+    first = leaves[0]
     first._compile_for(1)
+
+    # The rest of the decode-shape compiles, up front.
+    #
+    # The complaint this answers is not that compilation is slow in total; it is
+    # that it happens *inside* `generate()`. `generate()` uses two shapes -- the
+    # prompt length once, then batch=1 per token with a KV cache -- so with lazy
+    # compilation the batch=1 IR for all 252 leaves is compiled during the
+    # SECOND generated token, one leaf at a time, and the model appears to hang
+    # after producing one word. Compiling batch=1 here moves that cost to the
+    # moment the caller asked for it, which is also the only moment at which it
+    # can be reported: `progress(done, total, name)`.
+    #
+    # batch=1 only. The prompt-length shape is not knowable until there is a
+    # prompt, and guessing one would compile an IR nothing uses.
+    #
+    # `eager=False` keeps the old lazy behaviour, for a caller who wants to
+    # lower and inspect a model without paying minutes of compile.
+    #
+    # Serially. Whether these could run concurrently is a separate question with
+    # four parts, and docs/devices/NPUPAR.md answers two of them UNVERIFIED --
+    # so no thread pool ships. `test_ovpar.py` holds that as a standing check.
+    eager_failed = []
+    eager_compiled = 1
+    if eager:
+        total = len(leaves)
+        if progress is not None:
+            progress(1, total, swapped[0])
+        for index, (path, leaf) in enumerate(zip(swapped[1:], leaves[1:]), start=2):
+            try:
+                leaf._compile_for(1)
+                eager_compiled += 1
+            except Exception as exc:  # noqa: BLE001
+                # Named, not raised and not swallowed. Raising would mean one
+                # leaf OpenVINO happens to refuse makes a model that would
+                # otherwise run unreachable -- eager compilation turning a
+                # working lazy path into a hard failure, which is the one thing
+                # it must not do. Swallowing would mean the caller is told the
+                # model is fully offloaded when it is not. The leaf keeps its
+                # lazy path, so it still compiles at first forward if the
+                # refusal was transient.
+                eager_failed.append((path, f"{type(exc).__name__}: {exc}"))
+            if progress is not None:
+                progress(index, total, path)
 
     total_parameters = sum(p.numel() for p in model.parameters())
     return model, {
@@ -1700,9 +1859,10 @@ def _compile_model(model, device: str = "NPU", library: str | None = None,
         # here, and each reason distinguishes which it was.
         "skipped": skipped,
         # False if ANYTHING stayed behind -- a non-Linear leaf, a predicate
-        # exclusion, or an oversized Linear. A caller who reads only this flag
-        # must not be told a partially offloaded model is complete.
-        "fully_offloaded": not left and not skipped,
+        # exclusion, an oversized Linear, or a leaf whose eager compile failed.
+        # A caller who reads only this flag must not be told a partially
+        # offloaded model is complete.
+        "fully_offloaded": not left and not skipped and not eager_failed,
         # "How much actually moved", as a value rather than prose, so that a
         # caller who skims the report still cannot mistake a 90% offload for a
         # whole one.
@@ -1712,6 +1872,17 @@ def _compile_model(model, device: str = "NPU", library: str | None = None,
             moved_parameters / total_parameters if total_parameters else 0.0
         ),
         "execution_devices": list(first.execution_devices),
+        # How many leaves have their batch=1 decode shape already compiled when
+        # this returns. 1 with `eager=False` -- the device assertion -- and
+        # `len(swapped) - len(eager_failed)` with it on.
+        "eager_compiled": eager_compiled,
+        # `(name, reason)`, the same shape as `skipped`, and for the same
+        # reason: a leaf that did not compile has to be nameable. These are NOT
+        # `skipped` entries -- they were lowered, they are on the NPU path, and
+        # they will try again at first forward. An oversized leaf never reaches
+        # here; it was refused at `from_torch` and is in `skipped` with its
+        # shape and MAX_DIM (docs/graph/NPU2.md).
+        "eager_failed": eager_failed,
     }
 
 

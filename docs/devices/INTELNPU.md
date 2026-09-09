@@ -928,3 +928,31 @@ in a fraction of a second rather than only on a large machine. The NULL branch o
 `setrlimit(RLIMIT_AS)` and `RLIMIT_DATA` with *"current limit exceeds maximum
 limit"*, so `PyFloat_FromDouble` cannot be made to return NULL here; that branch
 is held by the source-route assertion only.
+
+## The compile path — one `ov::Core`, and the compiles moved out of `generate()`
+
+A user on a real Windows Intel NPU reported that `generate()` stalls mid-flight.
+Two things were behind it, and only one of them was the obvious one.
+
+`_NPULinear._compile_for` built its own `OpenVINO` on first use, **per leaf**, so
+a 252-leaf Qwen3-4B constructed **252 `ov::Core` objects** — 252 dlopens of the
+plugin registry, 252 device enumerations (each of which initialises every plugin
+found), 252 cache-directory resolutions, and 252 model caches that could not
+share OpenVINO's per-hash write guard with each other. `_compile_model` now
+builds exactly one and hands it to every leaf; a leaf built alone through
+`from_torch` still makes its own, so nothing became mandatory.
+
+The stall itself was *placement*. `generate()` uses the prompt-length shape once
+and batch=1 for every token after, so lazily the 252 decode-shape compiles land
+inside the **second** generated token: one word, then an apparent hang.
+`_compile_model(..., eager=True)` — the default — compiles batch=1 for every leaf
+before returning, with `progress(done, total, name)`. A leaf that will not
+compile is named in `report["eager_failed"]` and keeps its lazy path; only the
+first leaf's failure is fatal, because that one is the assertion that the device
+is real.
+
+**The compiles are serial, deliberately.** `docs/devices/NPUPAR.md` records the
+four things that would have to hold before running them concurrently, with
+sources — two are UNVERIFIED, `torch._C._shim_f16_bytes` holds the GIL for the
+whole weights blob, and the compile cache is unguarded across processes. No
+thread pool ships, and there is a standing test that none appeared since.
