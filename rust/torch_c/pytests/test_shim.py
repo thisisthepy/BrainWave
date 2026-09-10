@@ -11135,7 +11135,14 @@ def test_schema_text_survives_the_round_trip_through_the_transcribed_tables():
     # door that had no method spelling to double with. Getting +1 would mean
     # the `.out` row had been dropped; getting +3 would mean a method spelling
     # was invented for a door upstream does not have.
-    assert len(keys) == 366, len(keys)
+    # 368 with `equal` and `allclose` (rust/torch_c/pytests/test_equal_allclose.py).
+    # **+2**, one per name: both are `overloads.json`-only, because this round
+    # only gave `torch.equal`/`torch.allclose` a door -- `Tensor.equal`/
+    # `Tensor.allclose` exist upstream too but are not wired here, so there is
+    # no `methods.json` row to double with. Getting +4 would mean a method
+    # spelling had been added for a door this round does not open; getting +1
+    # would mean one of the two schemas was dropped.
+    assert len(keys) == 368, len(keys)
     from_tables = sorted(
         k for k in keys
         if report["table"][f"{k[0]}|{k[1]}"]["from"] == "tables"

@@ -700,7 +700,7 @@ fn shim_same_device(left: PyDevice, right: PyDevice) -> bool {
 /// SDPA path does not go through `_softmax` (docs/devices/MPSFWD.md measured that on
 /// SmolLM2 and it still holds), but an **eager** attention block does, twice a
 /// layer, and a BERT with `attn_implementation="eager"` stopped there.
-pub const MPS_HOST_READBACK_OPS: [&str; 85] = [
+pub const MPS_HOST_READBACK_OPS: [&str; 87] = [
     "aten._fft_c2c.default",
     "aten._fft_c2r.default",
     "aten._fft_r2c.default",
@@ -712,6 +712,7 @@ pub const MPS_HOST_READBACK_OPS: [&str; 85] = [
     "aten.acos.default",
     "aten.adaptive_avg_pool1d.default",
     "aten.adaptive_avg_pool2d.default",
+    "aten.allclose.default",
     "aten.argmax.default",
     "aten.avg_pool2d.default",
     "aten.bitwise_and.Scalar",
@@ -727,6 +728,7 @@ pub const MPS_HOST_READBACK_OPS: [&str; 85] = [
     "aten.diag.default",
     "aten.div.Scalar_mode",
     "aten.div.Tensor_mode",
+    "aten.equal.default",
     "aten.erfinv.default",
     "aten.expm1.default",
     "aten.expm1_.default",
@@ -793,6 +795,22 @@ pub const MPS_HOST_READBACK_OPS: [&str; 85] = [
 ///
 /// The scan finds these too, so leaving them out of `MPS_HOST_READBACK_OPS`
 /// without saying why would look like an oversight rather than a decision.
+///
+/// **This list stays at exactly two** (docs/devices/MPS.md §3.3), and a
+/// regression test (`test_mpsattn.py::
+/// test_the_refusal_list_shrank_and_grew_no_exemption`) pins the set so a
+/// later kernel cannot grow it quietly. `equal.default`/`allclose.default`
+/// were considered for it -- both reduce to a Python `bool` rather than a
+/// `Tensor`, the same shape `_local_scalar_dense` has -- and rejected: unlike
+/// `.item()`, which has no other way to leave the device at all, an
+/// equality/closeness reduction *could* stay on-device (candle already
+/// computes `all`/`any` that way), and only does not here because this
+/// shim's `equal`/`allclose` kernels are a host-side elementwise loop rather
+/// than a candle reduction. That is this build's limitation, not an
+/// irreducible property of the op the way `.item()`'s readback is -- so both
+/// went into `MPS_HOST_READBACK_OPS` above instead, refused on mps/cuda by
+/// name until a device-resident implementation lands, exactly like
+/// `aten.nonzero.default`.
 ///
 /// * `aten._local_scalar_dense.default` is `.item()`. The readback *is* what
 ///   the caller asked for, exactly as `.cpu()` is; refusing it would refuse
