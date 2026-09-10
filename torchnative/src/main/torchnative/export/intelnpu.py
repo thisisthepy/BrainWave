@@ -209,6 +209,30 @@ LIBRARY_ENV = "TORCHNATIVE_OPENVINO_C"
 #: torch layer back*, so an oversized layer stays on the CPU and nothing says
 #: so. Here it refuses by name instead, for the reason this whole module
 #: exists: a layer that quietly did not move is a silent CPU fallback.
+#:
+#: **This number is not sourced to OpenVINO, and `docs/devices/NPUDIM.md` is
+#: the investigation that says so.** `131072`/`2**17` occurs nowhere in the
+#: OpenVINO NPU plugin source, the NPU compiler source, the Level Zero graph
+#: extension header, or the shipped NPU binaries of the 2025.4.1 and 2026.3.1
+#: wheels. The only per-dimension limit the NPU compiler names is
+#: `VPU_DIMENSION_LIMIT = 8192` (`nce_invariant.hpp:40`) -- a different number,
+#: sixteen times smaller -- and the compiler *tiles* an operation that exceeds
+#: it rather than refusing (`ensure_nce_ops_size_requirements.cpp:255-267`).
+#: The archived library's own history gives no reason either: `2**17` arrives
+#: in its squashed initial commit with no message, issue or comment
+#: (NPUDIM.md section 2.6).
+#:
+#: It is nonetheless **left at `2**17`**, deliberately. Showing that a number
+#: is unsourced is not showing that a larger one works: no dimension above 8192
+#: has been compiled for `NPU` anywhere in this project. Raising it would be
+#: inferring a permissive fact from the absence of a restrictive one, which is
+#: the move `docs/devices/QNNOPS.md` section 5 exists to keep out.
+#: `tools/devices/intelnpu_dimsweep.py` is the experiment that would settle it,
+#: and NPUDIM.md section 5 says what each of its three outcomes would mean.
+#:
+#: There is also no runtime discovery to fall back on: no OpenVINO property and
+#: no Level Zero descriptor reports a maximum tensor dimension (NPUDIM.md
+#: section 2.4). The only discovery available is trial compilation.
 MAX_DIM = 2 ** 17
 
 
@@ -549,7 +573,11 @@ def linear_ir(in_features: int, out_features: int, batch: int = 1, bias: bool = 
                 f"the same line at nn/linear.py:66 but *returns the torch layer "
                 f"unchanged*, which leaves it running on the CPU inside a model the "
                 f"caller believes is on the NPU. Refusing by name instead -- an "
-                f"unannounced CPU layer is the failure docs/graph/NPU2.md is about."
+                f"unannounced CPU layer is the failure docs/graph/NPU2.md is about. "
+                f"MAX_DIM itself is an unsourced constant: docs/devices/NPUDIM.md "
+                f"records that it appears nowhere in OpenVINO, and names the "
+                f"experiment (tools/devices/intelnpu_dimsweep.py) that would say "
+                f"what the real ceiling is."
             )
         if int(value) < 1:
             raise IntelNPUUnsupported(
