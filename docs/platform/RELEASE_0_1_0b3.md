@@ -110,11 +110,18 @@ generate with Qwen3-4B at all**; if you have that version, this replaces it.
   stitched together by Python. The per-call marshalling is fixed; the
   call structure is not.
 
-- **`MAX_DIM = 2**17` is still an unexplained constant**, copied from the
+- **`MAX_DIM = 2**17` is an unsourced constant**, copied from the
   archived `intel_npu_acceleration_library`, which gives no reason
   either. Qwen3-4B's `lm_head` exceeds it, so 252 leaves lower and one
-  does not (`fraction_moved` 0.9033). Whether that is a hardware limit,
-  a driver limit or a safety margin is under investigation and unsettled.
+  does not (`fraction_moved` 0.9033). [`../devices/NPUDIM.md`](../devices/NPUDIM.md)
+  now records where it is *not* from: `131072` occurs nowhere in the
+  OpenVINO NPU plugin, the NPU compiler, the Level Zero graph extension
+  or the shipped NPU binaries, and the one per-dimension limit the
+  compiler names is `VPU_DIMENSION_LIMIT = 8192`, which it tiles past
+  rather than refusing. **The real ceiling is still unmeasured** — no
+  dimension above 8192 has been compiled for `NPU` here — so the
+  constant is unchanged and `tools/devices/intelnpu_dimsweep.py` is the
+  experiment that would settle it.
 
 - **Qualcomm and Apple remain refusals.** `torch.compile` remains a
   permanent one, for the structural reason in
