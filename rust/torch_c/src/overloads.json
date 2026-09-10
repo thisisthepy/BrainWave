@@ -582,6 +582,12 @@
     "aten::all.dims(Tensor self, int[]? dim=None, bool keepdim=False) -> Tensor",
     "aten::all.dim(Tensor self, int dim, bool keepdim=False) -> Tensor"
   ],
+  "equal": [
+    "aten::equal(Tensor self, Tensor other) -> bool"
+  ],
+  "allclose": [
+    "aten::allclose(Tensor self, Tensor other, float rtol=1.0000000000000001e-05, float atol=1e-08, bool equal_nan=False) -> bool"
+  ],
   "mean": [
     "aten::mean.dtype_out(Tensor self, *, ScalarType? dtype=None, Tensor(a!) out) -> Tensor(a!)",
     "aten::mean.out(Tensor self, int[1]? dim, bool keepdim=False, *, ScalarType? dtype=None, Tensor(a!) out) -> Tensor(a!)",

@@ -6583,6 +6583,163 @@ def local_scalar_dense_cases(torch_module, c_module, torch_call) -> list[Case]:
     return cases
 
 
+# --- aten.equal.default / aten.allclose.default -----------------------------
+# `torch.equal` / `torch.allclose` -- both leaf ops (a `TorchDispatchMode`
+# logger fires exactly `aten.equal.default`/`aten.allclose.default` and
+# nothing decomposed under either), both reduce to a plain Python `bool`
+# rather than a `Tensor`, so both reuse `_scalar_match_check` exactly the way
+# `local_scalar_dense_cases` above does for `item()`/`__bool__`.
+
+
+def equal_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.equal.default"
+    cases: list[Case] = []
+    for dtype_name in _CMP_DTYPES:
+        for a_flat, a_shape, b_flat, b_shape, note in [
+            ([1, 2, 3, 4], (2, 2), [1, 2, 3, 4], (2, 2), "identical values -- True"),
+            ([1, 2, 3, 4], (2, 2), [1, 2, 3, 5], (2, 2), "one differing element -- False"),
+            ([1, 2], (2,), [1, 2, 3], (3,), "shape mismatch -- False, not a raise"),
+            ([], (0,), [], (0,), "both empty, matching shape -- True"),
+        ]:
+            a_t, a_c = pair_from_flat(torch_module, c_module, a_flat, a_shape, dtype_name)
+            b_t, b_c = pair_from_flat(torch_module, c_module, b_flat, b_shape, dtype_name)
+            cases.append(
+                Case(
+                    name=f"equal(dtype={dtype_name}, a={a_flat}{a_shape}, b={b_flat}{b_shape})",
+                    op=op,
+                    run_torch=lambda a_t=a_t, b_t=b_t: torch_call(a_t, b_t),
+                    run_c=lambda a_c=a_c, b_c=b_c: c_module._aten_dispatch(op, a_c, b_c),
+                    value_check=_scalar_match_check,
+                    note=note,
+                )
+            )
+    # dtype mismatch: upstream compares promoted values, not a raise.
+    a_t, a_c = pair_from_flat(torch_module, c_module, [1, 2, 3], (3,), "int64")
+    b_t, b_c = pair_from_flat(torch_module, c_module, [1, 2, 3], (3,), "int32")
+    cases.append(
+        Case(
+            name="equal(int64 vs int32, same values)",
+            op=op,
+            run_torch=lambda a_t=a_t, b_t=b_t: torch_call(a_t, b_t),
+            run_c=lambda a_c=a_c, b_c=b_c: c_module._aten_dispatch(op, a_c, b_c),
+            value_check=_scalar_match_check,
+            note="dtype is not part of the check -- True, measured on 2.13.0",
+        )
+    )
+    # NaN never equals itself.
+    a_t, a_c = pair_from_flat(torch_module, c_module, [float("nan")], (1,), "float32")
+    b_t, b_c = pair_from_flat(torch_module, c_module, [float("nan")], (1,), "float32")
+    cases.append(
+        Case(
+            name="equal(nan, nan)",
+            op=op,
+            run_torch=lambda a_t=a_t, b_t=b_t: torch_call(a_t, b_t),
+            run_c=lambda a_c=a_c, b_c=b_c: c_module._aten_dispatch(op, a_c, b_c),
+            value_check=_scalar_match_check,
+            note="NaN != NaN falls out of eq.Tensor's own comparison -- False",
+        )
+    )
+    return cases
+
+
+_ALLCLOSE_DTYPES = ["float64", "float32", "int64", "int32", "int16", "uint8"]
+
+
+def allclose_cases(torch_module, c_module, torch_call) -> list[Case]:
+    op = "aten.allclose.default"
+    cases: list[Case] = []
+    for dtype_name in _ALLCLOSE_DTYPES:
+        for a_flat, b_flat, rtol, atol, equal_nan, note in [
+            ([1, 2, 3, 4], [1, 2, 3, 4], 1e-05, 1e-08, False, "identical -- True"),
+            ([1, 2, 3, 4], [1, 2, 3, 5], 1e-05, 1e-08, False, "one differing element, default tol -- False"),
+        ]:
+            a_t, a_c = pair_from_flat(torch_module, c_module, a_flat, (2, 2), dtype_name)
+            b_t, b_c = pair_from_flat(torch_module, c_module, b_flat, (2, 2), dtype_name)
+            cases.append(
+                Case(
+                    name=f"allclose(dtype={dtype_name}, a={a_flat}, b={b_flat}, rtol={rtol}, atol={atol})",
+                    op=op,
+                    run_torch=lambda a_t=a_t, b_t=b_t, rtol=rtol, atol=atol, equal_nan=equal_nan: torch_call(
+                        a_t, b_t, rtol, atol, equal_nan
+                    ),
+                    run_c=lambda a_c=a_c, b_c=b_c, rtol=rtol, atol=atol, equal_nan=equal_nan: c_module._aten_dispatch(
+                        op, a_c, b_c, rtol, atol, equal_nan
+                    ),
+                    value_check=_scalar_match_check,
+                    note=note,
+                )
+            )
+    # Tight float boundary, asymmetry, equal_nan, and infinities -- all on
+    # float32, all measured against upstream 2.13.0 rather than assumed.
+    for a_flat, b_flat, rtol, atol, equal_nan, note in [
+        ([2.0], [2.5], 0.0, 0.5, False, "boundary inclusive: |diff|==atol -- True"),
+        ([2.0], [2.5], 0.0, 0.4999999, False, "boundary exclusive: |diff|>atol -- False"),
+        ([1.0], [100.0], 1.0, 0.0, False, "asymmetric tolerance, a close to b -- True"),
+        ([100.0], [1.0], 1.0, 0.0, False, "asymmetric tolerance, b close to a -- False"),
+        ([float("nan")], [float("nan")], 1e-05, 1e-08, False, "nan vs nan, equal_nan=False -- False"),
+        ([float("nan")], [float("nan")], 1e-05, 1e-08, True, "nan vs nan, equal_nan=True -- True"),
+        ([float("inf")], [float("inf")], 1e-05, 1e-08, False, "same-signed inf -- True"),
+        ([float("inf")], [float("-inf")], 1e-05, 1e-08, False, "opposite-signed inf -- False"),
+        ([float("inf")], [1.0], 1e-05, 1e-08, False, "inf vs finite -- False"),
+    ]:
+        a_t, a_c = pair_from_flat(torch_module, c_module, a_flat, (1,), "float32")
+        b_t, b_c = pair_from_flat(torch_module, c_module, b_flat, (1,), "float32")
+        cases.append(
+            Case(
+                name=f"allclose(a={a_flat}, b={b_flat}, rtol={rtol}, atol={atol}, equal_nan={equal_nan})",
+                op=op,
+                run_torch=lambda a_t=a_t, b_t=b_t, rtol=rtol, atol=atol, equal_nan=equal_nan: torch_call(
+                    a_t, b_t, rtol, atol, equal_nan
+                ),
+                run_c=lambda a_c=a_c, b_c=b_c, rtol=rtol, atol=atol, equal_nan=equal_nan: c_module._aten_dispatch(
+                    op, a_c, b_c, rtol, atol, equal_nan
+                ),
+                value_check=_scalar_match_check,
+                note=note,
+            )
+        )
+    # dtype mismatch: both sides raise (RuntimeError), expect="both_error".
+    a_t, a_c = pair_from_flat(torch_module, c_module, [1.0], (1,), "float32")
+    b_t, b_c = pair_from_flat(torch_module, c_module, [1.0], (1,), "float64")
+    cases.append(
+        Case(
+            name="allclose(float32 vs float64) [dtype mismatch]",
+            op=op,
+            run_torch=lambda a_t=a_t, b_t=b_t: torch_call(a_t, b_t),
+            run_c=lambda a_c=a_c, b_c=b_c: c_module._aten_dispatch(op, a_c, b_c),
+            expect="both_error",
+            note="dtype mismatch raises on both sides -- 'Float did not match Double' upstream",
+        )
+    )
+    # shape mismatch that cannot broadcast: both sides raise.
+    a_t, a_c = pair_from_flat(torch_module, c_module, [1.0, 1.0], (2,), "float32")
+    b_t, b_c = pair_from_flat(torch_module, c_module, [1.0, 1.0, 1.0], (3,), "float32")
+    cases.append(
+        Case(
+            name="allclose(shape (2,) vs (3,)) [non-broadcastable]",
+            op=op,
+            run_torch=lambda a_t=a_t, b_t=b_t: torch_call(a_t, b_t),
+            run_c=lambda a_c=a_c, b_c=b_c: c_module._aten_dispatch(op, a_c, b_c),
+            expect="both_error",
+            note="shape mismatch that cannot broadcast raises on both sides",
+        )
+    )
+    # broadcast shape: 0-d against a vector -- both sides succeed.
+    a_t, a_c = pair_from_flat(torch_module, c_module, [1.0, 1.0, 1.0], (3,), "float32")
+    b_t, b_c = pair_from_flat(torch_module, c_module, [1.0], (), "float32")
+    cases.append(
+        Case(
+            name="allclose(shape (3,) vs 0-d) [broadcasts]",
+            op=op,
+            run_torch=lambda a_t=a_t, b_t=b_t: torch_call(a_t, b_t),
+            run_c=lambda a_c=a_c, b_c=b_c: c_module._aten_dispatch(op, a_c, b_c),
+            value_check=_scalar_match_check,
+            note="0-d operand broadcasts against the vector -- True",
+        )
+    )
+    return cases
+
+
 # --- aten.select.int / aten.slice.Tensor / aten.index.Tensor ---------------
 # `__getitem__` -- probe found three distinct overloads depending on the
 # index expression's shape: an int index -> select.int, a slice -> slice.
@@ -30319,6 +30476,8 @@ CASE_BUILDERS: dict[str, Callable[[Any, Any, Callable], list[Case]]] = {
     "aten.ne.Tensor": ne_tensor_cases,
     "aten.ne.Scalar": ne_scalar_cases,
     "aten._local_scalar_dense.default": local_scalar_dense_cases,
+    "aten.equal.default": equal_cases,
+    "aten.allclose.default": allclose_cases,
     "aten.select.int": select_cases,
     "aten.slice.Tensor": slice_cases,
     "aten.index.Tensor": index_tensor_cases,
