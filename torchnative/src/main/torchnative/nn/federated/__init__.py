@@ -1058,7 +1058,11 @@ class Engine:
     here rather than silently decided (DESIGN.md §6).
     """
 
-    #: The dropout policies this Engine knows. Only the first is implemented.
+    #: The dropout policies this Engine knows. **Both are implemented.** This
+    #: line said "only the first is" until 2026-09-12, and had been wrong since
+    #: docs/distributed/FEDERATED4.md section 6 built `'average_arrived'`:
+    #: `participate` serves it with `min_participants=k` and refuses only below
+    #: a world of three, which is a different statement from not existing.
     ON_MISSING = ("refuse", "average_arrived")
 
     def __init__(self, model, method=None, aggregator=None, rounds=1,

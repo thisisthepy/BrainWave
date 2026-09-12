@@ -1,5 +1,14 @@
 # FEDERATED3 — the four things FEDERATED2 scoped out
 
+> **Superseded in part by [`FEDERATED4.md`](FEDERATED4.md), 2026-09-12.** This
+> document is the round record of 2026-09-06 and is left as written. Two of its
+> conclusions have since been overtaken and are flagged inline below: the
+> transport was a world of two, and `on_missing='average_arrived'` and a
+> proper-subset cohort were refused *because of that*. The transport now
+> carries a world of three or more, and both are **built**. Section 4.1's
+> measurement is unaffected — it is why they refuse below a world of three
+> rather than why they do not exist.
+
 `docs/distributed/FEDERATED.md` landed one round of `FedAvg` between two OS processes;
 `docs/distributed/FEDERATED2.md` landed N rounds of it over `Delta.re_snapshot`. Both
 closed with the same four names in the "scoped out" table: **participant
@@ -182,7 +191,8 @@ Three parts, and the third is the policy:
    collective, and the fact that no partial average exists. All three mean the
    same thing at this layer and none of them says so; they name the socket.
 2. **Policy.** `Engine(on_missing='refuse')` is the default and is
-   implemented. `on_missing='average_arrived'` refuses.
+   implemented. `on_missing='average_arrived'` refuses. (**Overtaken**: it is
+   implemented since `FEDERATED4.md` §6, and refuses only below a world of three.)
    `allow_missing=True` now points at `on_missing`.
 3. **The round is undone.** The local epochs had already moved the model.
    Leaving them would keep an update no other rank has, and **the two ranks
@@ -207,6 +217,12 @@ degenerate answer `world_size = 1` gives, arrived at by a socket close instead
 of by a decision. That is why `on_missing='average_arrived'` cannot be honestly
 served here even as an experiment: at two ranks its output is the operand, and a
 test of it would pass with no aggregation at all.
+
+> **Overtaken.** "Here" was a world of two, which was the only world this
+> transport had. `FEDERATED4.md` section 6 built the policy on a world of three
+> or more, with `min_participants=k` as the divisor the caller chooses; the
+> measurement above is now the *reason it refuses below three*, not the reason
+> it is absent.
 
 One thing fell out of writing that control. `x * 3 / 3` **is not `x`** in
 float32 — 6.0e-8 on `norm2.weight`. The first draft asserted `torch.equal` and
@@ -304,8 +320,8 @@ different weights with nothing raised.
 
 | | why it refuses rather than approximates |
 |---|---|
-| a cohort that is a **proper subset** | needs `new_group` over a world larger than 2; at two ranks every subset is a world of one, where FedAvg is the identity (§5) |
-| `on_missing='average_arrived'` | the divisor is chosen by a socket timeout; and at two ranks the survivor set is one, so its output is the operand (§4.1) |
+| a cohort that is a **proper subset** | ~~needs `new_group` over a world larger than 2; at two ranks every subset is a world of one, where FedAvg is the identity (§5)~~ — **built since, `FEDERATED4.md`**: the transport carries a world of three, and `cohort()` serves a proper subset there |
+| `on_missing='average_arrived'` | ~~the divisor is chosen by a socket timeout; and at two ranks the survivor set is one, so its output is the operand (§4.1)~~ — **built since, `FEDERATED4.md` §6**: the divisor is `min_participants=k`, named by the caller, and it refuses below a world of three |
 | secure aggregation | needs point-to-point send/recv (refused by the transport), key agreement, threshold sharing, an unmasking round (§6) |
 | differential privacy | needs per-example gradients (this backward is per-batch), a clipping norm, an accountant over a sampling rate selection defines (§6) |
 | `FedAdam`, `FedYogi`, `SCAFFOLD` | **not built, and not refused by name** — `Engine` takes any object with `.aggregate`, so each is a class and not a change here. The adaptive three would also need `sqrt` on the server path, where `torch.equal` against a central computation is a claim about one more kernel; nobody has checked that |
