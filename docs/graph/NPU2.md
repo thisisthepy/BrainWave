@@ -547,3 +547,171 @@ empty bytes and the dtype test fails with a reshape error, (3) remove the
 | **coverage added** | one leaf type (two, from one). `supported_ops()` is unchanged: `aten.convolution.default` already had a MIL lowering |
 | **rejections recorded** | eight types, each with the measurement or the missing lowering that decided it (§7.2) |
 | **tests added** | 7, in `rust/torch_c/pytests/test_coremlops.py`; five nullifications, each red on the test it targets |
+
+## 8. The first real model: bfloat16, and what a decode step actually gets
+
+<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/coreml.py _WIDENED_DTYPES present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_bf16ane.py test_a_bfloat16_tensor_reaches_numpy_as_an_exact_float32_array present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_bf16ane.py test_float16_is_in_the_map_too_and_is_not_a_second_refusal present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_bf16ane.py test_the_widening_keeps_bfloat16s_range_which_a_float16_route_would_lose present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_bf16ane.py test_no_smollm2_weight_leaves_float16s_range_so_the_cast_loses_no_value present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_bf16ane.py test_a_real_smollm2_checkpoint_lowers_and_names_everything_it_did_not present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_bf16ane.py test_a_decode_step_reaches_the_neural_engine_on_none_of_its_linears present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_bf16ane.py test_the_whole_model_runs_through_coreml_and_picks_the_same_next_token present -->
+
+§7 landed two leaf types and measured the Neural Engine running them. Every
+module it was measured on was built here, in float32. The obvious next thing
+was a real one:
+
+```python
+m = AutoModelForCausalLM.from_pretrained("HuggingFaceTB/SmolLM2-135M",
+                                         dtype="auto")
+m.to(torchnative.device.npu)
+#  CoreMLRefused: torchnative coreml: no numpy dtype mapped for torch.bfloat16
+```
+
+**The path worked on everything it was built against and refused the first
+real model it met.** Modern Hugging Face checkpoints are overwhelmingly
+bfloat16 and `dtype="auto"` is the spelling the documentation teaches, so this
+is not an edge case; it is the first line every user writes. `float16` was
+missing from the same map, for no reason at all.
+
+### 8.1 The conversion: widen to float32, and let `ct.convert` keep the narrowing
+
+numpy has no bfloat16 (`hasattr(np, "bfloat16")` is False) and `ml_dtypes` is
+not a dependency here, so a bf16 numpy array cannot be produced at all.
+Something has to change dtype. The candidate answer was float16, since that is
+what the Neural Engine runs and what `compile_model(float32=False)` already
+casts to. It is the wrong one, and the reason is measurable rather than
+stylistic.
+
+| | bf16 | f16 | f32 |
+|---|---|---|---|
+| exponent bits | 8 | **5** | 8 |
+| mantissa bits | 7 | **10** | 23 |
+| largest finite | ~3.4e38 | **65504** | ~3.4e38 |
+
+f16 *gains* mantissa over bf16 and *loses* range. So bf16 -> f16 is exact for
+every value inside f16's normal range and the entire error is at the two ends:
+above 65504 to `inf`, below 5.96e-08 to zero. bf16 -> **f32**, by contrast, is
+exact everywhere — same radix, fewer mantissa bits, same exponent width.
+
+`_WIDENED_DTYPES` therefore widens both half-width floats to float32 before
+`_np` reads any bytes, and three things fall out of that:
+
+1. **It cannot move a number**, so it cannot move either agreement grade. The
+   array `_np` returns for a half-width tensor is bit-identical to the array
+   it returns for that tensor's float32 widening; the program handed to CoreML
+   is the same program.
+2. **The float16 narrowing stays where it already was** — in
+   `ct.convert(compute_precision=FLOAT16)`, the same cast a float32 checkpoint
+   has always gone through. Narrowing in `_np` would round twice.
+3. **`precision="float32"` keeps meaning what it says.** A `_np` that rounded
+   to f16 would have thrown the range away before the spelling was consulted.
+
+There is a second, non-obvious reason the widening has to happen anyway:
+`torch._C._shim_tensor_bytes` **refuses both half-width floats by name** —
+reaching their bit pattern means naming the `half` crate's types, which
+`rust/torch_c/src/tensor.rs` deliberately does not depend on. So even float16,
+which numpy *does* have, cannot cross as its own bytes. Widening first is what
+keeps the byte route, and with it the shutdown segfault §7.3 removed.
+
+What the f16 cast then costs was measured on the checkpoint rather than
+argued, over all 134,515,008 SmolLM2-135M weights read straight out of the
+safetensors file:
+
+| | |
+|---|---|
+| largest weight magnitude | **9.31** (f16's largest finite is 65504) |
+| elements that would overflow to `inf` | **0** |
+| nonzero elements landing in f16 subnormals | 43,020 |
+| nonzero elements flushing to zero | **60** (all below 5.97e-08) |
+| worst absolute elementwise error | **2.98e-08** |
+| worst per-tensor relative Frobenius error | 7.4e-09 |
+
+2.98e-08 is under `verify`'s float32 bar of 2e-05, let alone the float16 one.
+**The bf16 source moves neither grade**, measured through `coreml.verify` at
+SmolLM2's 576->1536 projection and no second comparator: float32 **0.0**,
+float16 **1.2e-03** — exactly where §1.1 and §7.2 left them.
+
+### 8.2 It lowers, it runs, and a decode step reaches the unit on nothing
+
+`from_pretrained(dtype="auto").to(device.npu)` now completes on SmolLM2-135M.
+
+| | |
+|---|---|
+| `Linear` leaves swapped | **211 of 211**, none skipped, none deferred |
+| parameters moved | 134,479,872 of 162,826,560 (`fraction_moved` 0.826) |
+| left on the CPU, **named** | `Embedding` 1, `LlamaRMSNorm` 61, `SiLUActivation` 30, `LlamaRotaryEmbedding` 1 |
+| `fully_offloaded` | False, and it warns |
+
+`fraction_moved` is 0.826 rather than 0.9997 because of weight tying: before
+the swap `parameters()` deduplicates `lm_head` against the embedding, and
+after it the lowered leaf holds its own copy, so the denominator grows.
+
+And it executes. All 211 leaves, the prompt "The capital of France is",
+compared against the same model's own eager forward: same next token (`" the"`,
+id 260), max absolute logit difference **0.6875** on logits whose own scale is
+tens. That is a 30-layer float16 accumulation and it is not offered as an
+`agrees`; it is offered as *the same answer*.
+
+Then the part that matters more than either. `MLComputePlan`, read per distinct
+Linear shape in the model, at a decode-shaped batch and a prefill-shaped one:
+
+| shape | example leaf | batch 1 (decode) | batch 128 (prefill) |
+|---|---|---|---|
+| 576 -> 192 | `layers.0.self_attn.k_proj` | **CPU** | NeuralEngine |
+| 576 -> 576 | `layers.0.self_attn.q_proj` | **CPU** | NeuralEngine |
+| 576 -> 1536 | `layers.0.mlp.gate_proj` | **CPU** | NeuralEngine |
+| 1536 -> 576 | `layers.0.mlp.down_proj` | **CPU** | NeuralEngine |
+| 576 -> 49152 | `lm_head` | **CPU** | **CPU** |
+
+**A decode step reaches the Neural Engine on none of its 211 Linears.** The
+unit is in the *supported* column for every one of them; CoreML prefers the CPU
+at every one. That is §2.1's crossover at model scale — CoreML weighs dispatch
+cost against work, and one token through a 576-wide projection is not enough
+work — and it is the reason this section exists rather than a defect to fix.
+A finer sweep puts the crossover between batch 1 and 16 for three of the
+shapes, at 128 for 576->1536, and at 256 for `lm_head`, which is GPU-preferred
+again by 512.
+
+The existing per-shape warning is what a caller sees: at batch 1 every leaf
+says `MLComputePlan says ['CPU']`, so "`to(device.npu)` succeeded" is never
+mistaken for "the Neural Engine ran it". That is §1's failure, refused.
+
+**So the honest summary is: generation on this arm is a prefill story, not a
+decode story.** Nothing measured here reaches the unit one token at a time.
+
+### 8.3 Found, not fixed: `ct.convert` inside a forward segfaults
+
+`_CoreMLLinear` compiles lazily, on first use, keyed by the shape that
+arrived — and a real forward is the first thing that supplies a real shape.
+Calling `coremltools.convert` from **inside** the model's forward pass
+**segfaults the interpreter**, reproducibly, at the seventh leaf, with about
+1 GB resident (so not memory) and with the faulthandler traceback inside
+`_converters_entry.convert`. The same seven leaves, same shapes, same dtypes,
+compiled and run *outside* a forward are fine, with or without the model
+resident and with or without `no_grad`.
+
+The `to()`-time eager probe does not cover it: it compiles at batch 1, and a
+transformer's forward is never batch 1. The fixture in
+`rust/torch_c/pytests/test_bf16ane.py` therefore compiles every leaf at the
+real shape before forwarding, and says where it does it and why. Deferring
+compilation out of `forward` properly is a design change and is left named
+rather than guessed at.
+
+A second fixture-level symptom of the same fragility: the marshalling checks,
+a compiled leaf and two `verify` calls in one process, *followed by*
+`from_pretrained`, segfault inside `convert` — three stages that each pass
+alone. The real model therefore gets a clean interpreter.
+
+### 8.4 Split the way CLAUDE.md §5.3 asks
+
+| | |
+|---|---|
+| **feature added** | `_WIDENED_DTYPES` — `bfloat16` and `float16` checkpoints lower; `from_pretrained(dtype="auto").to(device.npu)` works |
+| **defect fixed** | `_np` refused every real Hugging Face checkpoint |
+| **defect found, not fixed** | `ct.convert` called from inside a forward segfaults (§8.3) |
+| **claim added** | a decode-shaped batch reaches the Neural Engine on **none** of SmolLM2's Linears; prefill reaches it on four of five shapes |
+| **claim unchanged** | both agreement grades — float32 0.0, float16 1.2e-03 — measured through `coreml.verify` and no second comparator |
+| **tests added** | 15, in `rust/torch_c/pytests/test_bf16ane.py`; five nullifications, each red on the tests it targets |

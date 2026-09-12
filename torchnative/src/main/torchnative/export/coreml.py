@@ -116,6 +116,60 @@ _NUMPY_DTYPES = {
     "torch.bool": "bool",
 }
 
+#: torch dtype -> the dtype `_np` widens it to **before** reading any bytes.
+#:
+#: This exists because of the first real checkpoint this arm met. Modern
+#: Hugging Face weights are overwhelmingly `bfloat16` and `dtype="auto"` is
+#: what the documentation tells people to write, so
+#: `AutoModelForCausalLM.from_pretrained(..., dtype="auto").to(device.npu)`
+#: was refused by `_np` with "no numpy dtype mapped for torch.bfloat16" ---
+#: every hand-built module lowered and the first real model did not.
+#:
+#: **Widen, do not narrow, and let coremltools do the narrowing it already
+#: does.** Three facts decide it and none of them is a preference:
+#:
+#: 1. numpy has no bfloat16 at all (`hasattr(np, "bfloat16")` is False) and
+#:    `ml_dtypes` is not a dependency of this project, so a bf16 numpy array
+#:    is not available to be produced here. Something has to change dtype.
+#: 2. `torch._C._shim_tensor_bytes` **refuses both half-width floats** by
+#:    name --- reaching their bit pattern means naming the `half` crate's
+#:    types, which `rust/torch_c/src/tensor.rs` deliberately does not depend
+#:    on. So even `float16`, which numpy *does* have, cannot come across as
+#:    its own bytes. Widening first is what keeps the byte route (and the
+#:    shutdown segfault docs/graph/NPU2.md §7.3 fixed) rather than falling
+#:    back to `tolist()`.
+#: 3. **bfloat16 -> float32 and float16 -> float32 are exact.** Both are
+#:    strict subsets of float32: same radix, fewer mantissa bits, narrower
+#:    exponent. No value moves. So this widening cannot change what any
+#:    spelling computes, which is the whole reason it is the conversion
+#:    chosen here rather than bf16 -> f16.
+#:
+#: The narrowing that the float16 spelling needs still happens --- in
+#: `ct.convert(compute_precision=FLOAT16)`, exactly as it already did for a
+#: float32 checkpoint. Doing it here instead would round twice for no gain,
+#: and would be simply *wrong* for `precision="float32"`, where bf16's extra
+#: range is representable and there is nothing to lose.
+#:
+#: What bf16 -> (f32) -> f16 costs was measured on this arm's motivating
+#: checkpoint rather than reasoned about, because the two formats are the same
+#: width and split it differently: bf16 has 8 exponent bits and 7 of mantissa,
+#: f16 has 5 and 10. **f16 therefore gains mantissa and loses range**, so a
+#: bf16 value inside f16's normal range converts with *no* error at all and
+#: the only cost is at the two ends. Over all 134,515,008 weights of
+#: `HuggingFaceTB/SmolLM2-135M`: largest `|w|` is 9.31 against f16's 65504, so
+#: **zero elements overflow to inf**; 43,020 land in f16's subnormal range and
+#: 60 flush to zero, each of them smaller than 5.97e-08. Worst absolute
+#: elementwise error 2.98e-08, worst per-tensor relative Frobenius error
+#: 7.4e-09. That is below the float32 tolerance `verify` grades at, let alone
+#: the float16 one, so the bf16 source does not move either grade.
+#:
+#: A checkpoint whose weights *do* leave f16's range would be a different
+#: story, and it would be the `ct.convert` cast that lost them, not this map.
+_WIDENED_DTYPES = {
+    "torch.bfloat16": "float32",
+    "torch.float16": "float32",
+}
+
 
 def _np(value):
     """A shim tensor as a numpy array.
@@ -133,6 +187,15 @@ def _np(value):
     both, and bool is a single byte. ``verify()``'s claims are therefore
     unaffected -- neither widened nor narrowed.
 
+    **The half-width floats are widened to float32 first**, per
+    ``_WIDENED_DTYPES`` -- because numpy has no bfloat16 and because
+    ``_shim_tensor_bytes`` refuses to hand over the bytes of either half-width
+    float. Both widenings are exact, so this is still a marshalling function
+    and not a conversion with an opinion; read ``_WIDENED_DTYPES`` for what
+    that costs and where the float16 narrowing actually happens. Widening
+    before the read is also what keeps the byte route for a bfloat16
+    checkpoint: after it, the tensor is float32 like any other.
+
     Falls back to `tolist()` only when `torch._C._shim_tensor_bytes` is
     absent, which means upstream torch rather than this shim.
     """
@@ -140,10 +203,15 @@ def _np(value):
     import torch
 
     if isinstance(value, torch.Tensor):
+        widened = _WIDENED_DTYPES.get(str(value.dtype))
+        if widened is not None:
+            value = value.detach().to(getattr(torch, widened))
         dtype = _NUMPY_DTYPES.get(str(value.dtype))
         if dtype is None:
             raise CoreMLRefused(
-                f"torchnative coreml: no numpy dtype mapped for {value.dtype}"
+                f"torchnative coreml: no numpy dtype mapped for {value.dtype}. "
+                f"Mapped: {sorted(_NUMPY_DTYPES)}; widened to float32 first: "
+                f"{sorted(_WIDENED_DTYPES)}"
             )
         reader = getattr(torch._C, "_shim_tensor_bytes", None)
         if reader is not None:
