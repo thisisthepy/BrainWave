@@ -15,6 +15,17 @@ updating affine parameters by a loss does. See DESIGN.md §3.
     model.adapted.norm()            # how far the weights have moved
     model.revert()                  # the base weights are back, byte for byte
 
+**Both stages of DESIGN.md §3 that target a device are here.** :class:`Tent` is
+stage 1 -- descend a loss on the affine parameters, which needs a narrow
+backward -- and :class:`BatchNormStats` is stage 0, which recomputes the running
+statistics and needs no backward at all. The two open different state: a stage-1
+wrapper opens a ``delta.Delta`` over parameters, a stage-0 wrapper opens a
+``delta.BufferSnapshot`` over buffers, and ``revert`` puts back whichever is
+open. That a delta covers parameters and *not* buffers is a decision with an
+argument behind it, written out in DESIGN.md §3 -- a running statistic is a
+re-estimate rather than an additive offset, so ``apply`` and ``publish`` are not
+defined on it.
+
 **A method is not the central type; the delta is.** DESIGN.md §3 says every
 adaptation method reduces to a weight delta over base weights, methods differing
 only in lifetime and destination. So :class:`Method` declares three things and
@@ -40,9 +51,11 @@ from __future__ import annotations
 
 import torch
 
-from torchnative.delta import Delta
+from torchnative.delta import BufferSnapshot, Delta
 
-__all__ = ["Method", "Tent", "Adapted", "wrap"]
+__all__ = [
+    "Method", "StatisticsMethod", "Tent", "BatchNormStats", "Adapted", "wrap",
+]
 
 
 # DESIGN.md §3 axis 1. Stated as a module constant rather than a bare integer at
@@ -108,6 +121,103 @@ def _is_normalisation(module):
         return False
     own = dict(module.named_parameters(recurse=False))
     return "weight" in own or "bias" in own
+
+
+def _has_running_statistics(module):
+    """Does this module keep running statistics of its own?
+
+    By the buffers it carries, not by its class name. That is the opposite of
+    :func:`_is_normalisation`'s decision and the difference is deliberate: the
+    affine parameters of a normalisation layer are only *recognisable* by name,
+    because ``nn.LayerNorm``, ``LlamaRMSNorm`` and ``BatchNorm1d`` share no base
+    class -- but running statistics are not a naming question at all. A module
+    either registered a ``running_mean`` and a ``running_var`` or it did not,
+    and that is the whole of what stage 0 needs to know.
+
+    So this reaches ``InstanceNorm``, ``SyncBatchNorm`` and a third-party layer
+    that registered the same two buffers, and does not reach a
+    ``BatchNorm(track_running_stats=False)`` -- which registers both names as
+    ``None`` and computes batch statistics on every forward, so there is
+    nothing for stage 0 to recalibrate and no state for it to revert.
+    """
+    own = dict(module.named_buffers(recurse=False))
+    return own.get("running_mean") is not None and own.get("running_var") is not None
+
+
+class StatisticsMethod(Method):
+    """A stage-0 method: recompute the normalisation statistics, no backward.
+
+    DESIGN.md §3's survey table puts normalisation calibration on both sides of
+    the differentiation line. This is the row above :class:`Tent` -- "테스트
+    배치에서 통계(mu, sigma)만 다시 계산" -- and it is the cheap half of the two
+    on a device, because it needs no capture, no tape, no optimiser and no
+    gradient at all.
+
+    **It declares a different thing from :class:`Method`, and says so with a
+    different name.** ``Method.select`` returns *parameter* names, because a
+    stage-1 delta is keyed on them. A stage-0 method moves no parameters; what
+    it names is the **modules** whose statistics it recalibrates, so it declares
+    :meth:`select_modules` and leaves ``select``/``objective`` alone. Reusing
+    ``select`` for both would put two meanings behind one name, which is how
+    this project's worst defects have started.
+
+    :class:`Adapted` reads this at ``wrap`` time: a method declaring stage 0
+    without a ``select_modules`` is refused there, before a forward, the same
+    way a method declaring no stage at all is.
+    """
+
+    stage = STAGE_FORWARD_ONLY
+
+    def select_modules(self, model):
+        """The names of the modules whose running statistics this recalibrates.
+
+        Names, not modules, for the reason :meth:`Method.select` gives: a name
+        outlives an object identity, and the snapshot the wrapper opens is
+        keyed on the buffer names those modules own.
+        """
+        raise NotImplementedError
+
+
+class BatchNormStats(StatisticsMethod):
+    """Recalibrate the running statistics of every normalisation layer that has them.
+
+    DESIGN.md §3's stage 0. This is the *other* half of what Wang et al.'s Tent
+    does on a BatchNorm model: the paper both puts the normalisation layers into
+    batch-statistic mode and descends the entropy of the predictions on the
+    affine parameters. :class:`Tent` here does the second; this does the first,
+    and does it with no backward at all.
+
+        model = adapt.wrap(model, method=adapt.BatchNormStats())
+        model.online()
+        out = model(x)             # predicts, then recalibrates on what it saw
+
+        model.adapted.drift(model.model)   # how far the statistics moved
+        model.revert()                     # the base statistics are back
+
+    **Selection is by buffer, not by name** -- see :func:`_has_running_statistics`.
+    On a model whose normalisation keeps no running statistics (LayerNorm,
+    RMSNorm, so every transformer) this selects nothing, and ``online()``
+    refuses rather than running a method that would change nothing and report
+    every step as having happened. That is not a shortcoming of this class: a
+    layer that computes its statistics from the batch on every forward is
+    *already* calibrated to the test distribution, so there is nothing stage 0
+    could add.
+
+    **It is source-free and label-free**, which is what makes it TTA under the
+    survey's definition (DESIGN.md §3): nothing but the test batches is read,
+    and no target is required.
+    """
+
+    def __init__(self, select=None):
+        self._select = select
+
+    def select_modules(self, model):
+        if self._select is not None:
+            return list(self._select(model) if callable(self._select) else self._select)
+        return [
+            name for name, module in model.named_modules()
+            if _has_running_statistics(module)
+        ]
 
 
 class Tent(Method):
@@ -248,13 +358,16 @@ class Adapted(torch.nn.Module):
                 "without a backward has to be able to refuse at wrap time "
                 "rather than at the first step" % (type(method).__name__,)
             )
-        if method.stage == STAGE_FORWARD_ONLY:
+        if method.stage == STAGE_FORWARD_ONLY and not hasattr(method, "select_modules"):
             raise NotImplementedError(
-                "torchnative.adapt: %r declares stage 0 (forward only), and the "
-                "step implemented here is stage 1 -- it captures a region and "
-                "walks a tape. A stage-0 method updates statistics inside the "
-                "forward and needs no step at all; nothing here provides that "
-                "path yet." % (type(method).__name__,)
+                "torchnative.adapt: %r declares stage 0 (forward only) but does "
+                "not declare select_modules(model). A stage-0 method does not "
+                "move parameters -- it recalibrates the running statistics of "
+                "named modules -- so Method.select, which returns parameter "
+                "names, is not its contract.\n"
+                "Check: subclass torchnative.adapt.StatisticsMethod (or use "
+                "BatchNormStats), which declares select_modules."
+                % (type(method).__name__,)
             )
         if method.stage == STAGE_FULL_AUTOGRAD:
             raise NotImplementedError(
@@ -273,6 +386,10 @@ class Adapted(torch.nn.Module):
         self._optimizer_kwargs = optimizer_kwargs
         self._optimizer = None
         self._delta = None
+        # Stage 0's state. A second attribute rather than a second meaning for
+        # `_delta`: the two are different types answering different questions
+        # (DESIGN.md §3), and exactly one of them is ever open.
+        self._snapshot = None
         self._online = False
         self._history = []
         self._steps = 0
@@ -287,6 +404,13 @@ class Adapted(torch.nn.Module):
         make the base whatever the first round of adaptation left behind, and
         then ``revert`` would restore an adapted model and report success.
         """
+        if self.stage == STAGE_FORWARD_ONLY:
+            if self._snapshot is None:
+                self._snapshot = BufferSnapshot.over(
+                    self.model, self._statistic_buffers()
+                )
+            self._online = True
+            return self
         if self._delta is None:
             names = self.method.select(self.model)
             if not names:
@@ -324,12 +448,34 @@ class Adapted(torch.nn.Module):
         Recorded up to the last step, so ``.norm()`` answers "how far has this
         model moved" without a second walk of the weights.
         """
-        return self._delta
+        return self._delta if self._snapshot is None else self._snapshot
+
+    @property
+    def stage(self):
+        """Which of DESIGN.md §3's differentiation stages this wrapper is running."""
+        return self.method.stage
 
     @property
     def online_parameters(self):
-        """The names being adapted -- what the method selected, not what it meant."""
+        """The names being adapted -- what the method selected, not what it meant.
+
+        Empty for a stage-0 wrapper, and that is the truth rather than a hole:
+        stage 0 moves no parameters at all. :attr:`online_buffers` is where its
+        selection shows.
+        """
         return () if self._delta is None else self._delta.covers
+
+    @property
+    def online_buffers(self):
+        """The buffer names a stage-0 wrapper is recalibrating.
+
+        Empty for a stage-1 wrapper, symmetrically: `Tent` moves parameters and
+        touches no buffer. Kept as a second property rather than as a
+        stage-dependent meaning for :attr:`online_parameters`, because a caller
+        that printed "adapting: [...]" would otherwise be printing two different
+        kinds of name under one heading.
+        """
+        return () if self._snapshot is None else self._snapshot.covers
 
     @property
     def history(self):
@@ -380,9 +526,20 @@ class Adapted(torch.nn.Module):
         return tuple(self._grad_hooks)
 
     def revert(self):
-        """Put the base weights back byte for byte, keeping the delta."""
+        """Put the base state back byte for byte, keeping it.
+
+        **Whichever state is open**, which for a stage-0 wrapper is the buffer
+        snapshot and not a delta. That distinction is the reason this method is
+        not one line: a stage-0 run mutates ``running_mean``, ``running_var``
+        and ``num_batches_tracked``, and a revert that only knew about
+        ``named_parameters()`` would return, report success, and leave the model
+        carrying the test distribution's statistics. Held by
+        `rust/torch_c/pytests/test_stage0.py`.
+        """
         if self._delta is not None:
             self._delta.revert(self.model)
+        if self._snapshot is not None:
+            self._snapshot.revert(self.model)
         return self
 
     # -- the step ----------------------------------------------------------
@@ -400,6 +557,8 @@ class Adapted(torch.nn.Module):
         *before* the update, which is the prediction an online serving loop has
         already had to emit.
         """
+        if self.stage == STAGE_FORWARD_ONLY:
+            return self._forward_only_step(*args, **kwargs)
         if self._delta is None:
             raise RuntimeError(
                 "torchnative.adapt: step() before online() -- there is no delta "
@@ -476,6 +635,106 @@ class Adapted(torch.nn.Module):
         self._history.append(value)
         return outputs, value
 
+    # -- stage 0 -----------------------------------------------------------
+
+    def _statistic_modules(self):
+        """The modules the stage-0 method named, resolved and checked.
+
+        Resolved here rather than in the method, so that a name the model does
+        not have is refused by the wrapper that is about to put it into training
+        mode -- a stage-0 step over a mis-named module would otherwise recompute
+        nothing and still report a step.
+        """
+        by_name = dict(self.model.named_modules())
+        names = list(self.method.select_modules(self.model))
+        absent = [n for n in names if n not in by_name]
+        if absent:
+            raise KeyError(
+                "torchnative.adapt: %d of %d names %s selected are not modules "
+                "of this model, first is %r"
+                % (len(absent), len(names), type(self.method).__name__, absent[0])
+            )
+        return [(n, by_name[n]) for n in names]
+
+    def _statistic_buffers(self):
+        """The buffer names a stage-0 run will move, and the refusal if there are none.
+
+        ``running_mean``/``running_var``/``num_batches_tracked`` where the module
+        registered them, by walking the module's own buffers rather than by
+        assuming the three names -- a layer that keeps a fourth statistic would
+        otherwise have it moved by the run and left behind by the revert.
+        """
+        selected = self._statistic_modules()
+        names = []
+        for mod_name, module in selected:
+            for own_name, buf in module.named_buffers(recurse=False):
+                if buf is None:
+                    continue
+                names.append(f"{mod_name}.{own_name}" if mod_name else own_name)
+        if not names:
+            raise ValueError(
+                "torchnative.adapt: %r selected %d module(s) of this model and "
+                "none of them keeps running statistics, so every step would run "
+                "and recalibrate nothing.\n"
+                "Check: [n for n, m in model.named_modules() "
+                "if getattr(m, 'running_mean', None) is not None] -- LayerNorm "
+                "and RMSNorm keep none, so on a transformer there is nothing "
+                "for stage 0 to do and Tent (stage 1) is the whole method."
+                % (type(self.method).__name__, len(selected))
+            )
+        return names
+
+    def _forward_only_step(self, *args, **kwargs):
+        """DESIGN.md §3's stage 0. Returns ``(outputs, None)``.
+
+        No capture, no tape, no optimiser and no gradient: the whole method is
+        that the selected modules see the batch in training mode, so their
+        running statistics take it in. So none of stage 1's refusals apply here
+        -- a model that capture turns away (``.item()``, in-place ops, unseeded
+        randomness -- docs/graph/CAPTURE.md §4) can still be adapted at stage 0.
+
+        **Predict first, then adapt**, the same order and for the same reason as
+        the stage-1 step: the caller gets the prediction the model made with the
+        statistics it had going in, which is the one an online serving loop has
+        already had to emit. So the forward runs twice -- once in whatever mode
+        the model is in, for the answer, and once with the selected modules in
+        training mode, for the update. A single training-mode forward would be
+        one forward cheaper and would return a prediction normalised by the
+        batch's own statistics, which is a different method.
+
+        **The second element is ``None``, not ``0.0``.** A stage-0 method
+        descends nothing, so there is no objective; a zero would go into
+        :attr:`history` and draw a flat curve that looked like a method that had
+        converged. :attr:`history` stays empty for the same reason, and what
+        this run *does* have a number for is ``adapted.drift(model)``.
+        """
+        if self._snapshot is None:
+            raise RuntimeError(
+                "torchnative.adapt: step() before online() -- there is no "
+                "snapshot of the statistics this would move, so revert() would "
+                "have nothing to put back"
+            )
+        outputs = self.model(*args, **kwargs)
+
+        modules = [m for _, m in self._statistic_modules()]
+        was = [m.training for m in modules]
+        for m in modules:
+            m.train()
+        try:
+            # No gradient: stage 0 has no objective, so a graph built here
+            # would be built and dropped once per batch for nothing.
+            with torch.no_grad():
+                self.model(*args, **kwargs)
+        finally:
+            # Restored even if the forward raised. Leaving a module in training
+            # mode would turn its statistic update on for every later call --
+            # including the plain forwards of a wrapper that had gone back
+            # offline, which docs/models/ADAPT.md §7 asserts are the model's own.
+            for m, mode in zip(modules, was):
+                m.train(mode) if mode else m.eval()
+        self._steps += 1
+        return outputs, None
+
     def _slots(self, trace):
         """Map each selected parameter to its slot among the trace's constants.
 
@@ -511,7 +770,7 @@ class Adapted(torch.nn.Module):
             type(self.method).__name__,
             "online" if self._online else "offline",
             self._steps,
-            len(self._delta) if self._delta is not None else 0,
+            len(self.adapted) if self.adapted is not None else 0,
         )
 
 

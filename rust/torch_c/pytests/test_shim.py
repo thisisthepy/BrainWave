@@ -17599,6 +17599,10 @@ class Stage2(Stage0):
 class NoStage(Stage0):
     stage = None
 
+out["stage0_protocol_exists"] = sorted(
+    n for n in ("StatisticsMethod", "BatchNormStats") if hasattr(adapt, n)
+)
+
 for name, cls in (("stage0", Stage0), ("stage2", Stage2), ("nostage", NoStage)):
     try:
         adapt.wrap(build(), method=cls(), lr=LR)
@@ -18004,12 +18008,28 @@ def test_a_method_declares_its_differentiation_stage_and_wrap_reads_it():
     All three arms are refusals at `wrap` time -- before a forward, before a
     capture -- which is the property that lets a build without a backward turn
     a stage-1 method away instead of exploding at the first step.
+
+    **The stage-0 arm's refusal changed on 2026-09-13 and is now about the
+    method's contract rather than about the library's.** `Stage0` above declares
+    stage 0 and supplies `select`/`objective`, which is a *stage-1* method's
+    contract: a stage-0 method moves no parameters and names the modules whose
+    statistics it recalibrates. So what refuses is the mismatch, and the message
+    points at `StatisticsMethod`. Until that date the refusal said "nothing here
+    provides that path yet" -- docs/design/GAPS.md section 3.4, now closed, with
+    `rust/torch_c/pytests/test_stage0.py` holding the path that exists.
     """
     if not _ckpt_shim_available():
         return
     r = _adapt_road_fixture()
     assert "stage 0" in r["stage0"], r["stage0"]
     assert r["stage0"].startswith("NotImplementedError:"), r["stage0"]
+    # The refusal must name what to do instead, and the thing it names must
+    # exist -- otherwise this arm would stay green over a repo where stage 0
+    # had been withdrawn again.
+    assert "select_modules" in r["stage0"], r["stage0"]
+    assert "StatisticsMethod" in r["stage0"], r["stage0"]
+    assert r["stage0_protocol_exists"] == ["BatchNormStats", "StatisticsMethod"], \
+        r["stage0_protocol_exists"]
     assert "stage 2" in r["stage2"], r["stage2"]
     assert "Check: torch.ones(1, requires_grad=True)" in r["stage2"], r["stage2"]
     assert r["nostage"].startswith("ValueError:"), r["nostage"]

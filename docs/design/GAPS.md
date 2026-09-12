@@ -12,9 +12,9 @@ This document exists because counting refusals is not a measurement. A count of
 and reads like "adaptation and federated learning are stubs" — the two things
 `torchnative/__init__.py`'s first line names as the package's purpose. Both
 numbers are almost entirely **abstract bases and deliberate refusals of
-degenerate cases**. Of the fifteen, **one** is a gap a user can walk into, and
-it is not in either subpackage's arithmetic: it is `adapt`'s stage-0 road,
-which nothing supplies. The gaps that matter were found somewhere else
+degenerate cases**. Of the fifteen, **one** was a gap a user could walk into, and
+it is not in either subpackage's arithmetic: it was `adapt`'s stage-0 road,
+which nothing supplied. **It is closed** (§3.4, 2026-09-13). The gaps that matter were found somewhere else
 entirely — the *public surface*, where a name that exists and does nothing
 costs more than a name that is absent.
 
@@ -195,35 +195,95 @@ would have to move with it. That is a design change to the capability surface,
 not a one-line fix, and it belongs to a round that can decide what
 `_has_mps`/`_mps_is_available` are each supposed to mean.
 
-### 3.4 OPEN — `adapt`'s stage 0 has no implementation and no method
+### 3.4 CLOSED — `adapt`'s stage 0 had no implementation and no method
 
-**What a user calls:** a `Method` subclass declaring `stage =
+**What a user called:** a `Method` subclass declaring `stage =
 STAGE_FORWARD_ONLY`, wrapped by `adapt.wrap`.
 
-**What they get:** `NotImplementedError` from `adapt/__init__.py:252`: "A
+**What they got:** `NotImplementedError` from `adapt/__init__.py:252`: "A
 stage-0 method updates statistics inside the forward and needs no step at all;
 nothing here provides that path yet."
 
-**Why it is a gap rather than a refusal.** `DESIGN.md` §3's survey table puts
+**Why it was a gap rather than a refusal.** `DESIGN.md` §3's survey table puts
 normalisation calibration on *both* sides of the differentiation line, and the
 module docstring makes that the reason the stage is declared per method rather
-than by directory. Stage 1 is built (`Tent`). The row above it — recompute the
-statistics, no backward — is named as in scope by the design and is absent, and
-it is the cheap half of the two on a device. `Tent`'s own docstring documents
-the hole from the other side: it "is implementing half of Tent" on a BatchNorm
-model, because it moves the affine parameters and never puts the layer into
-batch-statistic mode.
+than by directory. Stage 1 was built (`Tent`). The row above it — recompute the
+statistics, no backward — was named as in scope by the design and absent, and
+it is the cheap half of the two on a device.
 
-**What it would take.** A forward-only path in `Adapted`: no capture, no tape,
-no optimiser — set the selected normalisation modules to training mode for the
-forward so their running statistics update, and account for that in `Delta`
-(running statistics are buffers, not parameters, so `Delta`'s named-parameter
-keying does not currently cover them). **What is already there:** the method
-protocol, `select`, the delta lifetime, revert and persist, and
-`Adapted.online()`'s arming — all of it is stage-agnostic except `step`.
-Estimate: one method class plus a buffer road through `Delta`. Not attempted
-this round because the buffer question is a design decision about what a delta
-covers, which §5 records as undecided.
+**The design question it was blocked on, and the answer.** §5 recorded
+*"whether a delta covers buffers"* as undecided, because running statistics are
+buffers and `Delta` is keyed on `named_parameters()`. **Answered: a delta covers
+parameters, not buffers**, and stage 0 is built on a second type rather than on
+a widened `Delta`. The argument is written out in `DESIGN.md` §3 under
+"델타는 버퍼를 덮지 않는다"; in short, all three of `Delta`'s operations mean
+something different for a statistic than for a parameter — `record` stores an
+*additive offset an optimiser produced* where a statistic is a *re-estimate*,
+`apply`'s `base + value` can drive `running_var` negative, and `persist` and
+`publish` already refuse a non-floating table (`delta:306`,
+`federated:652`) while `num_batches_tracked` is `int64`. Widening the key would
+make those two refusals fire after a round had been arranged, or force an
+exception list — and an exception list is the evidence that two kinds of thing
+are wearing one name.
+
+What stage 0 needed was the **first** of `DESIGN.md` §3's three lifetime
+questions and neither of the other two: snapshot the base, and restore it.
+
+**Closed** with three additions, and no change to `Delta` at all:
+
+| | |
+|---|---|
+| `delta.BufferSnapshot` | `over` / `covers` / `nbytes` / `drift` / `revert`. **No** `record`, `apply`, `persist`, `publish` — absent rather than raising |
+| `adapt.StatisticsMethod` | the stage-0 protocol. Declares `select_modules(model)` — *module* names, not parameter names, because reusing `Method.select` would put two meanings behind one name |
+| `adapt.BatchNormStats` | the method. Selects by buffer (`running_mean`/`running_var` present), not by class name |
+
+`Adapted` branches on the stage: a stage-0 `online()` opens a `BufferSnapshot`
+and **no optimiser**, and `step` takes no capture and no tape — it runs the
+forward for the prediction, then runs it again with the selected modules in
+training mode so their statistics take the batch in, and restores the mode it
+found. It returns `(outputs, None)`, not `(outputs, 0.0)`: a stage-0 method
+descends nothing, and a zero in `history` would draw a flat curve that looked
+like convergence.
+
+**Measured at grade `agrees`.** `rust/torch_c/pytests/test_stage0.py` runs the
+same `nn.BatchNorm1d` model source on both sides — this stack in a vendored-tree
+subprocess, upstream torch 2.13 from the spike venv in-process — over three
+batches drawn from three different distributions, and compares the buffers
+element by element:
+
+    running_mean   7.45e-09      running_var   0 (exact)
+    num_batches_tracked  3 == 3  predict-then-adapt logits  2.98e-08
+
+with a non-vacuity check on the same numbers: the statistics moved 6.92e-02
+over the run, so "agrees" is not two untouched buffers.
+
+**`revert` was the specific trap, and is tested directly.** A stage-0 run
+mutates buffers; `Adapted.revert` reverting only `self._delta` would have
+returned, reported success, and left the model carrying the test distribution's
+statistics. It now reverts whichever state is open, and the test asserts
+`running_mean`, `running_var` **and** `num_batches_tracked` are back at base —
+the counter too, because `momentum=None` makes the running estimate a cumulative
+average over it, so a restore that missed it would leave the next EMA weighting
+wrong on a model that reported itself reverted.
+
+Nullified four ways, each made and watched go red: the step not entering
+training mode (agreement + revert + prediction tests red), `Adapted.revert`
+reverting only the delta (revert test red), `BufferSnapshot.revert` restoring
+nothing (revert test red), and `select_modules` returning every module
+(selection test red, naming `['', 'fc', 'norm', 'head']`).
+
+**`Tent`'s documented half-implementation is NOT made whole, and that is
+deliberate.** `Tent`'s docstring says that on a BatchNorm model it "is
+implementing half of Tent", because it moves the affine parameters and never
+puts the layer into batch-statistic mode. The *other* half now exists — it is
+`BatchNormStats` — but it is a second method and not part of `Tent`, so a caller
+writing `adapt.wrap(m, method=Tent())` still gets exactly what that docstring
+says they get. Folding it in would change the numbers every existing BatchNorm
+caller gets from an unchanged call, including `nn.federated.Engine`'s local
+step, and it would put a `BufferSnapshot` inside a stage-1 wrapper — which is a
+decision about whether a *method* may span two stages, and that question is not
+this round's. The docstring is therefore left exactly as written. Listed in §5
+as the next thing this makes answerable.
 
 ### 3.5 OPEN (small) — `torchnative.api.TorchNativeAPI.deploy` accepts a model and does nothing
 
@@ -294,12 +354,25 @@ README and understated the count.
 
 ## 5. UNDECIDED — what this round could not settle, and what would settle it
 
-* **Whether `adapt`'s stage-0 road should cover buffers.** §3.4's method needs
-  running statistics to travel, and `Delta` is keyed on `named_parameters()`.
-  Extending it to buffers changes what "a delta" means — what `persist`,
-  `revert` and `FedAvg.aggregate` each cover — and that is a design decision,
-  not an implementation. **Settled by:** a decision on whether a delta covers
-  buffers, recorded in `DESIGN.md` §3.
+* ~~**Whether `adapt`'s stage-0 road should cover buffers.**~~ **SETTLED
+  2026-09-13: it does not.** A delta covers parameters; stage 0 is built on
+  `delta.BufferSnapshot`, a second and smaller type. The argument — that
+  `record`, `apply`, `persist` and `publish` each mean something different for
+  a re-estimated statistic than for an optimiser-produced offset, and that
+  `num_batches_tracked` being `int64` would make two existing refusals fire
+  late — is written out in `DESIGN.md` §3 ("델타는 버퍼를 덮지 않는다") and
+  summarised in §3.4 above. No existing caller changes: `Delta`'s signature,
+  behaviour and coverage are untouched.
+* **Whether a single method may span two stages** — specifically, whether `Tent`
+  should fold `BatchNormStats` in and stop being half of the paper on a
+  BatchNorm model. Newly answerable: until 2026-09-13 the other half did not
+  exist, and now it does. Folding it in would change the numbers an unchanged
+  `adapt.wrap(m, method=Tent())` returns for every existing BatchNorm caller
+  (including `nn.federated.Engine`'s local step), and would put a
+  `BufferSnapshot` inside a stage-1 wrapper — so it is a decision about the
+  stage axis, not a fix. `Tent`'s docstring is left stating the hole, which is
+  still the truth for that call. **Settled by:** a decision on whether `stage`
+  stays a single value per method.
 * **Whether `adapt`'s stage-2 refusal should keep its falsifier.** The message
   tells the reader to run
   `torch.ones(1, requires_grad=True).sum().backward()` and says an autograd
@@ -351,12 +424,13 @@ are classified above:
 | abstract base (§1) | **3** — `adapt:79`, `adapt:88`, `device:303` |
 | deliberate refusal (§2) | **16** — `federated` ×10, `delta:306`, `_module_to:201`, `target:158`, `transformers` ×2, `adapt:260` |
 | diagnostic, data-dependent (§2.3) | **1** — `adapt:436` |
-| **real gap** (§3.4) | **1** — `adapt:252`, the stage-0 road |
+| **real gap** (§3.4) | **1** — `adapt:252`, the stage-0 road. **Closed 2026-09-13**; the site still raises, but now it refuses a stage-0 method that supplies a *stage-1* contract (no `select_modules`) and names `StatisticsMethod`, so it has moved from §3 to §1's shape — an abstract protocol a subclass in this repo supplies (`BatchNormStats`) |
 
 **Of the fifteen** the original count named (`nn/federated` 10 + `adapt` 5):
 2 abstract bases, 11 deliberate refusals, 1 diagnostic, **1 real gap**.
 
-Two further real gaps were found outside that count entirely and are closed
-(§3.1, §3.2); two more are open by decision (§3.3, §3.5). Five exception
+That one is now closed too (§3.4, 2026-09-13). Two further real gaps were found
+outside that count entirely and are closed (§3.1, §3.2); two more are open by
+decision (§3.3, §3.5). Five exception
 *classes* deriving from `NotImplementedError` are counted nowhere here — they
 are the mechanism of a refusal, listed at the end of §1.

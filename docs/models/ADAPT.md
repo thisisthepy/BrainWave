@@ -638,7 +638,7 @@ nothing in this document's tests is entitled to claim it.
 | a second adaptation method | The abstraction is built for one; §9.1's second bullet is honest that one method does not prove it |
 | `native_layer_norm`'s derivative rule | §8.1. It is one arm in `tape.rs`, which was out of scope this round |
 | momentum, Adam, a learning-rate schedule | `torch.optim.SGD` was enough for a curve, and `docs/training/LOSS.md` §6.4's four missing ops still gate Adam |
-| a stage-0 method | `wrap` refuses one by name. A method that recomputes statistics needs no capture and no tape, so it is a different step function, not a flag on this one |
+| a stage-0 method | `wrap` refuses one by name. A method that recomputes statistics needs no capture and no tape, so it is a different step function, not a flag on this one. *(2026-09-13: built — `adapt.BatchNormStats` on `delta.BufferSnapshot`, and it is exactly that: a different step function. `docs/design/GAPS.md` §3.4.)* |
 | lifetime **names** | §2.2. This integration needed three answers and no names, and inventing a fourth set after §3 discarded two would be the same mistake a third time |
 | adapting on a stream | The loop adapts on one batch and is scored on a held-out one. A real device sees a stream, and nothing here says what happens after a thousand steps |
 | anything on device | Desktop macOS only, as with `docs/training/BACKWARD.md` |
