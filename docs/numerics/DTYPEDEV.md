@@ -18,6 +18,7 @@ inventory is a sibling round (`work/gaps`) and is not repeated here.
 > | `torch.backends.mps.is_available()` | **`True`** on this host — a live `resolve()` of an `mps` device. Was a hardcoded `False`. |
 > | Cell closed this round | `float64` on `mps` now refuses by name with upstream's own sentence, on all three roads onto the device. It used to *succeed* and produce a tensor that could only be cloned. |
 > | Largest cell left open | `int16` and `int32` on `mps` reach **2 of 23** operators where `int64` reaches 15. §4.2. |
+> | Largest cell left open, **after the round that went at it** | still `int16` / `int32` on `mps`, still **2 of 23**. §4.2.1 is why it cannot be closed without a candle fork, and what was delivered instead: a refusal that names the dtype, the device and the reason rather than a candle shader symbol. |
 
 ---
 
@@ -357,6 +358,147 @@ exactly the shape this document spends §1 warning about: it would have to be
 provably wrap-identical to the narrow computation (it is, for `+`/`-`/`*` in
 two's complement; it is not, for anything that saturates) and it would have to
 be refused rather than applied wherever it is not. **Not started this round.**
+
+> **Followed up in a later round on `work/intmps`, which did write the argument
+> and then could not apply it. §4.2.1 below is that round.** The paragraph above
+> stands as written — including its guess that promotion would be "the cheaper"
+> road, which turned out to be unbuyable at any price. What it did not know is
+> in the first line of §4.2.1.
+
+#### 4.2.1 The wrap-identity argument, and why it cannot be spent here
+
+**The thing the paragraph above did not know: an `int16`/`int32` buffer on Metal
+is *sealed*.** Not "a tensor missing some operators" — there is no cast **off**
+it in any direction. Measured on this machine, same host, same artefact:
+
+```
+int16 -> int64   candle: Metal contiguous to_dtype I16 I64 not implemented
+int16 -> int32   candle: Metal contiguous to_dtype I16 I32 not implemented
+int16 -> float32 candle: Metal contiguous to_dtype I16 F32 not implemented
+int32 -> int64   candle: Metal contiguous to_dtype I32 I64 not implemented
+int32 -> int16   candle: Metal contiguous to_dtype I32 I16 not implemented
+int32 -> float32 candle: Metal contiguous to_dtype I32 F32 not implemented
+```
+
+So the promotion rule §4.2 proposed **opens with a call that does not exist**.
+`widen to int64, dispatch, narrow` cannot be performed on the device at all; the
+only way to obtain the widening is to read the tensor back to the host, and that
+is exactly what `mps_host_readback_gate` exists to refuse — a correct value the
+GPU did not compute, returned under an `mps` label. The argument was written
+anyway, because it is what a later round patching candle will need, and because
+writing it is what surfaced the second half of the answer (the reductions).
+
+**The verdict, per operator.** Reduction mod `2**N` is a ring homomorphism, and
+`2**16` and `2**32` both divide `2**64`, so `Z -> Z/2**64 -> Z/2**N` is a
+*composition* of ring homomorphisms. Any expression built only from `+`, `-`,
+`*` and constants therefore has the same image whether it is evaluated at width
+N throughout or at width 64 and reduced at the end — **including when the
+width-64 evaluation itself overflows**, because `2**N` divides `2**64`. That
+last clause is what makes the answer unconditional rather than bounded by
+element count, and it is the clause the obvious version of this argument drops.
+
+The identity also needs the narrowing step to be a **truncation**, not a
+saturation, and that is measured rather than assumed — upstream and this build
+both give `int64(32768) -> int16` as `-32768` and `int64(2**31) -> int16` as `0`.
+
+| operator | promote through `int64`? | why |
+|---|---|---|
+| `add`, `sub`, `mul`, `neg` | **provably safe** | ring operations (`neg` is `0 - x`); wrap survives the round trip at every boundary, `iinfo.max` and `iinfo.min` included. `-iinfo.min == iinfo.min` at both widths. |
+| `sum`, `prod`, `cumsum` | **safe, and must never be narrowed** | upstream returns **`int64`** for these on an `int16`/`int32` input and does **not** wrap: `sum([32767, 32767, -32768])` is `32766`, the exact sum, in `int64`. There is no narrowing step, so there is nothing to prove — and a promotion that helpfully narrowed back to the input dtype would be wrong for every reduction that leaves the range. |
+| `mean` | **not applicable** | refuses on both sides for integer dtypes: `mean(): could not infer output dtype … Got: Short`. |
+| `div` | **not claimed** | integer division is not a ring operation. A different argument (value-preserving widening) may well work; it was not written, so it is not asserted. |
+| `abs`, `max`, `argmax`, comparisons | **not claimed, and not a dtype gap** | order- and sign-based rather than ring. All of them are *already* refused on `mps` for `int64` too, by the host-readback gate — so `int16` reaching them is not what is missing. |
+
+The `add`/`sub`/`mul`/`neg` row and the reduction row are both **checked**, not
+merely argued, in `rust/torch_c/pytests/test_intmps.py`: the promote–compute–
+narrow round trip is run on the **cpu**, where both widths have kernels, at
+`iinfo.max`, `iinfo.min` and values that overflow mid-reduction, and compared
+against upstream 2.13.0.
+
+**The alternatives, and why the third was chosen.**
+
+| road | verdict |
+|---|---|
+| 1. promotion with a proven wrap identity | **identity proven; road impassable.** The widening cast is itself a missing Metal kernel (above). Doing it via the host is the failure mode this document's §1 ranks worst. |
+| 2. real Metal kernels for `i16`/`i32` | **fork only — there is no extension point.** `candle_metal_kernels::DType` (`lib.rs`) has exactly six variants, `F32 F16 BF16 I64 U32 U8`; `binary.metal`'s `init_binary` macro instantiates over the same six; the shaders are `include_str!`'d compile-time constants and `Kernels::load_library` takes a closed `Source` enum. Adding `I16`/`I32` means patching `candle-metal-kernels` **and** `candle-core`'s Metal dispatch — a shader patch in the shape of `vendor/int8-candle-0.11.0-cpu.patch`, but larger, and not something this round could grade across the matrix. Left for a round that owns it. |
+| 3. **refuse by name, close nothing** | **taken.** |
+
+**What was delivered instead, and it is a deliverable on its own.** The refusal
+was this, for the whole family:
+
+```
+aten.add.Tensor: candle: Metal error Error while loading function: badd_i16
+aten.mul.Tensor: candle: Metal error Error while loading function: bmul_i32
+aten.sum.default: candle: Metal contiguous to_dtype I16 I64 not implemented
+aten.contiguous.default: candle: Metal copy_strided I32 not implemented
+aten.matmul.default: candle: Metal error mlx matmul doesn't support I32
+```
+
+`badd_i16` is a candle-internal Metal function name. It names neither the dtype,
+nor the device, nor what to do instead, and it sends the reader into candle's
+shader sources to rediscover a fact about **this build's** dtype support. It is
+now:
+
+```
+aten.add.Tensor: not implemented for int16 tensors on the mps device. candle's
+Metal backend in this build instantiates its kernels for float32, float16,
+bfloat16, uint8, uint32 and int64 only, so an int16 tensor on mps is storage no
+Metal kernel can read -- not arithmetic, not reductions, and not even a cast off
+it. Move it with .cpu() to compute on the host with the dtype kept, or cast with
+.to(torch.int64) before .to("mps") to keep the computation on the GPU with the
+dtype widened. The shim does not widen to int64 for you: the widening cast is
+itself one of the missing Metal kernels, so performing it would mean reading the
+tensor back to the host and returning a value the GPU did not compute under an
+mps label (docs/numerics/DTYPEDEV.md §4.2).
+```
+
+Both roads out are named because they are **not interchangeable** — `.cpu()`
+keeps the dtype and gives up the device, `.to(torch.int64)` keeps the device and
+changes the dtype — and the `int64` road is *run* in the test rather than merely
+spelled, because a refusal recommending an unwalked road is worse than one
+recommending nothing.
+
+**It is a translation of candle's error, not a gate in front of the kernel, and
+that is the safety property.** A gate would have to decide per op whether the op
+needs a kernel, and being wrong in the expensive direction would *remove* a
+capability in order to reword a message: `clone`, `index`, `cat`, `view` and
+`.cpu()` are buffer moves, they work today on a sealed buffer, and they are the
+whole reason such a tensor is worth having. Translating on the error path cannot
+do that — the success path is never entered. §3's frozen `mps` column is the
+proof rather than the promise: it is **unchanged**, `int16` and `int32` still at
+`clone`, `index0`, `cat`, and `test_the_dtype_device_matrix_agrees_with_upstream`
+still grades every computing cell.
+
+The match is on the dtype token candle puts in its **own** message, in both
+spellings it uses — lowercase and suffixed (`badd_i16`) for a failed function
+load, uppercase and spaced (`to_dtype I16`, `copy_strided I32`, `matmul doesn't
+support I32`) for the "not implemented" family. Matching one spelling only
+leaves half the family leaking, and that is a verified nullification below, not
+a worry.
+
+**And this is why `int16`/`int32` were *not* gated at construction the way
+`float64` was in §4.1.** The two cases look alike and are not. `float64` on
+Metal had its escape hatch closed too — `.to(torch.float32)` refused — so the
+object could be made and could not be converted back, and that is a capability
+claim by construction succeeding. An `int16` Metal tensor can be put down and
+picked back up: `.cpu()` is a device move, not a cast, needs no Metal kernel,
+and works. It is legitimately useful as staging. Gating construction would have
+removed a real capability to punish a missing one.
+
+**Nullifications verified for this round**, each by making the break and
+watching it go red:
+
+| nullified | what was seen |
+|---|---|
+| `name_mps_int_refusal` returns the error unchanged | 3 red — `add` back to `candle: Metal error Error while loading function: badd_i16` |
+| `candle_message_names` matches the lowercase spelling only | 3 red — `add` stayed named, `cumsum` leaked `to_dtype I16` and `neg` came back in candle's words. The half-family case, caught. |
+| `_wrap` in the test saturates instead of wrapping | 2 red — `test_the_narrowing_integer_cast_truncates_rather_than_saturating` and `test_the_ring_operators_survive_a_promotion_round_trip`, i.e. the wrap argument is compared against arithmetic and is not tautological |
+
+**What `int16` and `int32` reach on `mps` after this round: still 2 of 23, and
+0 of the six `add mul sum neg abs max`.** Nothing was closed, and saying so is
+the point. Note the ceiling those six have here is **4**, not 6: `abs` and `max`
+are refused on `mps` for `int64` as well, by the host-readback gate, so they are
+not part of this dtype gap at all.
 
 ### 4.3 Left — `torch.randn(..., device="mps")`
 

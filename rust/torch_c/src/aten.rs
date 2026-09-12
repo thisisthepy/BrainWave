@@ -1370,7 +1370,33 @@ pub fn aten_dispatch(
         // before the kernel runs.
         Some(Where::Dense(ref device)) if crate::device::is_metal(device) => {
             crate::device::mps_host_readback_gate(op)?;
-            aten_dispatch_inner(py, op, args, kwargs)?
+            // And the second `mps` door, which is a *translator* rather than a
+            // gate. candle has no Metal kernels for `I16`/`I32` -- not
+            // arithmetic, not reductions, not even a cast off the buffer -- and
+            // every one of those refusals arrived in candle's own words, naming
+            // an internal shader symbol (`badd_i16`) rather than the dtype, the
+            // device or a way out. `device::name_mps_int_refusal` rewords
+            // exactly those and nothing else; see the long comment above it in
+            // `device.rs` for why this is on the error path rather than in
+            // front of the kernel, and docs/numerics/DTYPEDEV.md §4.2 for why
+            // the obvious promotion to `int64` cannot be performed on-device.
+            //
+            // The argument scan is *inside* the `Err` arm, so a computation
+            // that succeeds pays nothing for it -- and paying nothing is what
+            // makes it safe to leave on for every op rather than a list.
+            match aten_dispatch_inner(py, op, args, kwargs) {
+                Ok(out) => out,
+                Err(err) => {
+                    let dtypes = mps_int_dtypes_among(args, kwargs);
+                    if dtypes.is_empty() {
+                        return Err(err);
+                    }
+                    let message = err.to_string();
+                    return Err(crate::device::name_mps_int_refusal(
+                        op, &dtypes, err, &message,
+                    ));
+                }
+            }
         }
         // The cuda half, and it is the mps half twice over: same table, same
         // gate, one shared body in `device.rs`. A cuda tensor is a
@@ -1567,6 +1593,64 @@ fn check_devices_agree(
         }
     }
     Ok(first)
+}
+
+/// The `I16`/`I32` candle dtypes among this call's tensor arguments.
+///
+/// Only ever called on the error path of the `mps` arm, so it is allowed to be
+/// the straightforward scan that `scan_for_device` above is careful not to be:
+/// nothing is about to compute, and a refusal that has to be worded can afford
+/// a second pass over half a dozen arguments.
+///
+/// It descends one level into lists and tuples for the reason
+/// `check_devices_agree` does -- `torch.cat([a, b])` arrives with its tensors
+/// one level down, and `cat` on a sealed `int16` buffer is exactly the sort of
+/// call whose refusal would otherwise keep candle's words.
+fn mps_int_dtypes_among(
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> Vec<candle_core::DType> {
+    let mut found: Vec<candle_core::DType> = Vec::new();
+    let mut visit = |value: &Bound<'_, PyAny>| {
+        let Ok(tensor) = value.cast::<PyTensorBase>() else {
+            return false;
+        };
+        let borrowed = tensor.borrow();
+        if let crate::tensor::Repr::Dense(inner) = borrowed.repr() {
+            let dtype = inner.dtype();
+            if crate::device::is_mps_unsupported_int(dtype) && !found.contains(&dtype) {
+                found.push(dtype);
+            }
+        }
+        true
+    };
+    let mut scan = |value: &Bound<'_, PyAny>| {
+        if visit(value) {
+            return;
+        }
+        if let Ok(sequence) = value.cast::<PyList>() {
+            for item in sequence.iter() {
+                if !visit(&item) {
+                    break;
+                }
+            }
+        } else if let Ok(sequence) = value.cast::<PyTuple>() {
+            for item in sequence.iter() {
+                if !visit(&item) {
+                    break;
+                }
+            }
+        }
+    };
+    for value in args.iter() {
+        scan(&value);
+    }
+    if let Some(kwargs) = kwargs {
+        for (_, value) in kwargs.iter() {
+            scan(&value);
+        }
+    }
+    found
 }
 
 /// One dispatched argument, and the sequences one level under it.

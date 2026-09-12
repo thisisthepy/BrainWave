@@ -1671,6 +1671,7 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyDevice>()?;
     m.add_function(wrap_pyfunction!(shim_same_device, m)?)?;
     m.add_function(wrap_pyfunction!(shim_mps_host_readback_ops, m)?)?;
+    m.add_function(wrap_pyfunction!(shim_mps_unsupported_int_dtypes, m)?)?;
     m.add_function(wrap_pyfunction!(shim_mps_readback_but_allowed, m)?)?;
     m.add_function(wrap_pyfunction!(shim_cuda_host_readback_ops, m)?)?;
     m.add_function(wrap_pyfunction!(shim_cuda_classify_refusal, m)?)?;
@@ -1679,4 +1680,153 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(cuda_counters, m)?)?;
     m.add_function(wrap_pyfunction!(mps_probe, m)?)?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// int16 / int32 on Metal -- the sealed buffer, and a refusal that is not a
+// shader symbol
+// ---------------------------------------------------------------------------
+//
+// docs/numerics/DTYPEDEV.md §4.2 is the argument; this comment says only what a
+// reader of this file needs.
+//
+// **The fact.** `candle-metal-kernels` 0.11.0 instantiates every one of its
+// kernels for six element types and no others -- `binary.metal`'s `init_binary`
+// macro expands to `f32 f16 bf16 u8 u32 i64`, and `candle_metal_kernels::DType`
+// (`lib.rs`) has exactly those six variants. `I16` and `I32` are not among
+// them, which is a fact about candle's Metal backend and not about Metal: MSL
+// has `short` and `int` and would compile the shaders fine.
+//
+// **What that makes an int16/int32 tensor on Metal.** Not "a tensor missing
+// some operators" -- a *sealed buffer*. Measured on this machine, every cast
+// off one refuses, in every direction:
+//
+//     int16 -> int64  Metal contiguous to_dtype I16 I64 not implemented
+//     int16 -> int32  Metal contiguous to_dtype I16 I32 not implemented
+//     int16 -> f32    Metal contiguous to_dtype I16 F32 not implemented
+//     int32 -> int16  Metal contiguous to_dtype I32 I16 not implemented
+//
+// That is the finding that decided this round, because it kills the obvious
+// fix. Promoting to `i64`, computing and narrowing back is **wrap-identical**
+// for `add`, `sub`, `mul` and `neg` -- reduction mod `2**N` is a ring
+// homomorphism and `2**16` and `2**32` both divide `2**64`, so `Z -> Z/2**64 ->
+// Z/2**N` composes and the identity survives overflow at *either* width -- and
+// `sum`/`prod`/`cumsum` need no identity at all, because upstream returns
+// `int64` for those on an `int16` input and never narrows. The argument holds.
+// It is just not performable: **the widening cast it opens with is itself one
+// of the missing kernels.** The only way to obtain it is to read the tensor
+// back to the host, which is precisely what `mps_host_readback_gate` above
+// exists to refuse -- a correct value the GPU did not compute, under an `mps`
+// label.
+//
+// **So this is a refusal, and the job is to make it a good one.** It was not:
+//
+//     aten.add.Tensor: candle: Metal error Error while loading function: badd_i16
+//
+// `badd_i16` is a candle-internal Metal function name. It names neither the
+// dtype, nor the device, nor what to do instead, and it sends a reader into
+// candle's shader sources to rediscover a fact about *this build's* dtype
+// support -- which this build is the thing that knows.
+//
+// **Why this is a translation of candle's error rather than a gate in front of
+// it.** A gate would have to decide, per op, whether the op needs a kernel, and
+// it would be wrong in the expensive direction: `clone`, `index`, `cat`, `view`
+// and `.cpu()` are buffer moves, they work today on a sealed buffer, and they
+// are the whole reason such a tensor is worth having. Guessing that list wrong
+// *removes* a capability in order to reword a message. Translating the error
+// cannot: the success path is never entered, so no cell that computes today can
+// stop computing, and `test_dtypedev.py`'s frozen `mps` column is the proof of
+// that rather than a promise.
+//
+// The match is on the dtype token candle puts in its own message (`_i16`,
+// ` I16`, ...), not on "any candle error": a shape mismatch on an int16 mps
+// tensor is a real and different error and must keep its own words.
+
+/// The candle element types Metal has no kernels for in this build.
+///
+/// A list rather than a `matches!`, so `_shim_mps_unsupported_int_dtypes()`
+/// can hand the same answer to a test and the artefact is what gets checked.
+pub const MPS_UNSUPPORTED_INT_DTYPES: [DType; 2] = [DType::I16, DType::I32];
+
+/// The six candle instantiates, named in the refusal so the reader learns the
+/// rule and not just this one case.
+const MPS_SUPPORTED_DTYPE_NAMES: &str = "float32, float16, bfloat16, uint8, uint32 and int64";
+
+pub fn is_mps_unsupported_int(dtype: DType) -> bool {
+    MPS_UNSUPPORTED_INT_DTYPES.contains(&dtype)
+}
+
+/// Does this candle message name `dtype` in one of candle's own spellings?
+///
+/// Candle writes the element type two ways and this has to know both: the
+/// Metal function name it failed to load carries it lowercase and suffixed
+/// (`badd_i16`, `bmul_i32`), while the "not implemented" messages carry it
+/// uppercase and spaced (`to_dtype I16 I64`, `copy_strided I32`, `matmul
+/// doesn't support I32`). Matching on one spelling only is how half a family
+/// keeps leaking.
+fn candle_message_names(message: &str, dtype: DType) -> bool {
+    let (lower, upper) = match dtype {
+        DType::I16 => ("_i16", "I16"),
+        DType::I32 => ("_i32", "I32"),
+        _ => return false,
+    };
+    message.contains(lower)
+        || message.split(|c: char| !c.is_ascii_alphanumeric()).any(|w| w == upper)
+}
+
+/// The refusal, in this build's words.
+///
+/// Names the dtype, names the device, gives the reason, and gives **both**
+/// roads out -- they are not interchangeable, which is why both are here:
+/// `.cpu()` keeps the dtype and gives up the device, `.to(torch.int64)` before
+/// the move keeps the device and changes the dtype. A refusal that offered one
+/// would be quietly recommending a behaviour change.
+///
+/// The last sentence says why the promotion is not done *for* the caller. It is
+/// the question every reader of this message will ask next, and leaving it to be
+/// re-derived is how `docs/numerics/DTYPEDEV.md` §4.2 came to be written twice.
+pub fn mps_int_dtype_refusal(op: &str, dtype: DType) -> PyErr {
+    let name = crate::dtype::TorchDType::from_storage(dtype)
+        .map(|d| d.name())
+        .unwrap_or("this integer dtype");
+    not_implemented(format!(
+        "{op}: not implemented for {name} tensors on the mps device. candle's \
+         Metal backend in this build instantiates its kernels for \
+         {MPS_SUPPORTED_DTYPE_NAMES} only, so an {name} tensor on mps is \
+         storage no Metal kernel can read -- not arithmetic, not reductions, \
+         and not even a cast off it. Move it with .cpu() to compute on the \
+         host with the dtype kept, or cast with .to(torch.int64) before \
+         .to(\"mps\") to keep the computation on the GPU with the dtype \
+         widened. The shim does not widen to int64 for you: the widening cast \
+         is itself one of the missing Metal kernels, so performing it would \
+         mean reading the tensor back to the host and returning a value the \
+         GPU did not compute under an mps label \
+         (docs/numerics/DTYPEDEV.md §4.2)."
+    ))
+}
+
+/// Translate a candle kernel-absence error on an `int16`/`int32` Metal tensor
+/// into this build's own refusal, or leave it exactly as it was.
+///
+/// `dtypes` is what the dispatcher found among the arguments. Returning the
+/// original error unchanged when nothing matches is the whole safety property:
+/// this function can only ever reword, never decide.
+pub fn name_mps_int_refusal(op: &str, dtypes: &[DType], err: PyErr, message: &str) -> PyErr {
+    for &dtype in dtypes {
+        if is_mps_unsupported_int(dtype) && candle_message_names(message, dtype) {
+            return mps_int_dtype_refusal(op, dtype);
+        }
+    }
+    err
+}
+
+/// The table, readable from Python, for the reason
+/// `_shim_mps_host_readback_ops` is: a test must check the *artefact*.
+#[pyfunction]
+#[pyo3(name = "_shim_mps_unsupported_int_dtypes")]
+fn shim_mps_unsupported_int_dtypes() -> Vec<&'static str> {
+    MPS_UNSUPPORTED_INT_DTYPES
+        .iter()
+        .filter_map(|&d| crate::dtype::TorchDType::from_storage(d).map(|d| d.name()))
+        .collect()
 }
