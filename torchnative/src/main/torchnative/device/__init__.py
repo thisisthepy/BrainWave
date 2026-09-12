@@ -44,19 +44,30 @@ what `_pcivendor` found in the machine --- or says plainly that it could not
 look, which is a different sentence. `docs/devices/NPUVENDOR.md` is that round,
 including the source trace for why OpenVINO cannot reach an AMD NPU.
 
-**The one place that disagrees with its own probe, on purpose.**
-`torch._C._mps_is_available()` is not a probe --- `bootstrap.py` installs it as
-`_constant_function(..., False)`, justified by a comment saying candle's
-`metal` feature is off in `Cargo.toml`. That comment is stale: `Cargo.toml`
+**The place that used to disagree with its own probe, and no longer does.**
+`torch._C._mps_is_available()` was not a probe --- `bootstrap.py` installed it
+as `_constant_function(..., False)`, justified by a comment saying candle's
+`metal` feature was off in `Cargo.toml`. That comment was stale: `Cargo.toml`
 enables `metal` for Apple targets, and on this host `torch.empty(2, 2,
 device="mps")` succeeds and `a + a` on an `mps` tensor returns the right
-numbers. So the constant is a **false negative**, and reporting it as
-availability would say "no Metal" on a machine that is computing on Metal.
+numbers. So the constant was a **false negative**, and reporting it as
+availability would have said "no Metal" on a machine that was computing on
+Metal.
 
-`mps.availability()` therefore reports `kind="measured"` from an actual
-allocation, and carries the constant alongside as `detail["declared"]` with
-`detail["declared_disagrees"]`. The constant is reused, as required; it is just
-not allowed to be the answer. See `docs/devices/DEVICE_NS.md` section 3.
+That constant is gone (`docs/numerics/DTYPEDEV.md` section 2).
+`torch._C._mps_is_available()` now resolves an `mps` device and reports whether
+that succeeded, and `torch._C._has_mps` is `cfg!(target_vendor = "apple")` ---
+two names for two different questions, which is what upstream's own docstrings
+say they are.
+
+**`mps.availability()` is unchanged, and that is the point of it.** It still
+reports `kind="measured"` from an actual allocation and still carries the
+constant alongside as `detail["declared"]` with `detail["declared_disagrees"]`
+--- which is now `False` on this host, because the two agree. Nothing here was
+rewritten to depend on them agreeing: a probe that trusted the declared value
+would be a probe that could go stale again the same way, and the field exists
+precisely so that the next disagreement is visible rather than inferred. See
+`docs/devices/DEVICE_NS.md` section 3.
 """
 
 import os
@@ -377,10 +388,16 @@ class CpuDevice(EagerDevice):
 
 
 class MpsDevice(EagerDevice):
-    """Metal. Measured by allocation, because the declared constant is wrong.
+    """Metal. Measured by allocation, and it stays that way now that the
+    declared value has stopped being wrong.
 
-    See this module's docstring: `torch._C._mps_is_available()` is a
-    build-time `False` whose justifying comment is stale.
+    See this module's docstring. `torch._C._mps_is_available()` was a
+    build-time `False` whose justifying comment was stale; it is a live probe
+    as of docs/numerics/DTYPEDEV.md section 2. This class was not rewritten to
+    read it, because "the declared value happens to be right today" is not a
+    reason to stop measuring -- it is how the stale constant survived in the
+    first place. `detail["declared_disagrees"]` is now `False` here, and that
+    is the field doing its job rather than the field being unnecessary.
     """
 
     __slots__ = ()

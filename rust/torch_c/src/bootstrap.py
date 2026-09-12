@@ -7524,6 +7524,15 @@ _DISCOVERED_RETURNS = {
 #                    being answered with a *class*.
 _BUILD_FLAGS = {
     # Reached through `torch.backends.<name>.is_available()`, one per line.
+    #
+    # `_has_mps` is the one entry this table does **not** get the last word on.
+    # It is kept here because `install` requires an answer for every `_bool` in
+    # `surface.json` and that requirement is worth more than the exception, and
+    # `False` is the right value for the target this table can speak for -- a
+    # non-Apple build, where candle's `metal` feature is off and `resolve()`
+    # has no `mps` arm. `_install_mps_backend` overwrites it with
+    # `_mps_probe()["built"]`, which is that same fact asked of the artefact
+    # instead of asserted about it. docs/numerics/DTYPEDEV.md section 2.
     "_has_mps": False,
     "_has_cuda": False,
     "_has_xpu": False,
@@ -11585,6 +11594,7 @@ def _install_behaviour(module, dispatch, transcribed) -> None:
 
     _install_autocast(module)
     _install_default_generator(module)
+    _install_mps_backend(module)
     _install_backend_flag_toggles(module)
     _install_functionality_to_backend_keys(module)
     _install_dispatch_key_set(module)
@@ -13022,12 +13032,10 @@ def _install_device(module, varfns, tensorbase) -> None:
     module._accelerator_getAccelerator = _constant_function(
         "torch._C._accelerator_getAccelerator", None
     )
-    # `torch.backends.mps.is_available()`. `False` is the honest answer and it
-    # is a *different* claim from `_has_mps` (the build flag): candle's `metal`
-    # feature is off in Cargo.toml, so there is no Metal backend linked in,
-    # which is why `PyDevice::resolve` refuses an `mps` label. DESIGN.md §11.1
-    # records that this is a reversible decision, not a capability gap.
-    module._mps_is_available = _constant_function("torch._C._mps_is_available", False)
+    # `torch.backends.mps.is_available()` -- see `_install_mps_backend`, which
+    # installs it from a probe. It is *not* installed here any more, and the
+    # constant that used to be is the defect that round was about: it said
+    # `False` on a machine whose `(a @ b).device` was `mps:0`.
 
     # -- `torch._has_compatible_shallow_copy_type` -------------------------
     #
@@ -16147,6 +16155,118 @@ def _install_distributed_c10d(module, spec) -> None:
         return True
 
     module._c10d_init = _c10d_init
+
+
+def _install_mps_backend(module) -> None:
+    """`torch.backends.mps.is_built()`, `is_available()`, and the one call
+    that flipping them breaks.
+
+    **The defect.** On this machine, with this shim:
+
+        >>> a = torch.randn(64, 64).to("mps"); b = torch.randn(64, 64).to("mps")
+        >>> (a @ b).device
+        device(type='mps', index=0)
+        >>> torch.backends.mps.is_available()
+        False
+
+    It computed on Metal and told the world it could not. That is not cosmetic:
+    `torch.backends.mps.is_available()` is the standard gate -- transformers,
+    accelerate and most user code branch on it -- so nothing built on top of
+    this shim would ever *select* the device it was already using. Both halves
+    were constants: `_mps_is_available` a `_constant_function(..., False)` and
+    `_has_mps` a `False` in `_BUILD_FLAGS`, each justified by a comment saying
+    candle's `metal` feature was off in `Cargo.toml`. It is not off; it is
+    enabled for `target_vendor = "apple"`, and `PyDevice::resolve` has carried
+    an `mps` arm under that same `#[cfg]` for several rounds. The comment
+    outlived the fact it named.
+
+    **They are two questions and they get two answers.** Upstream's own
+    docstring for `is_built()` says it "doesn't necessarily mean MPS is
+    available", so conflating them would be wrong even where they agree here:
+
+      `is_built()`      reads `_has_mps`, which is now `_mps_probe()["built"]`
+                        -- `cfg!(target_vendor = "apple")`, a compile-time
+                        constant. True on this artefact, false on the Android,
+                        Linux and wasm ones, where the `mps` arm of `resolve()`
+                        does not exist and the label falls through to a
+                        refusal naming it.
+
+      `is_available()`  reads `_mps_is_available()`, which now *resolves an
+                        `mps` device* and reports whether that succeeded. It
+                        can be `False` on a build where `is_built()` is `True`
+                        -- a Mac VM with no GPU passthrough is the case that
+                        makes the distinction real -- and it is `False` on
+                        every non-Apple build for the prior reason.
+
+    It is a live probe on each call rather than a constant captured at import,
+    because a constant is exactly what was wrong before. It costs nothing to
+    repeat: `metal_device` caches the `MetalDevice` per index for the process,
+    so every call after the first is a lookup in a one-entry table.
+
+    **What flipping `_has_mps` breaks, and why this function has to fix it in
+    the same breath.** `torch/mps/__init__.py:67` is
+
+        def manual_seed(seed):
+            if not torch._C._has_mps:
+                return
+            _get_default_mps_generator().manual_seed(seed)
+
+    and `torch.manual_seed` reaches it unconditionally through
+    `torch/random.py`. While `_has_mps` was `False` that guard was the only
+    thing keeping `torch.manual_seed(0)` -- which every model script calls --
+    off `_mps_get_default_generator`, which is an `_Unimplemented`. Measured:
+    setting `_has_mps = True` and nothing else turns `torch.manual_seed(0)`
+    into `NotImplementedError: not implemented in torch._C shim:
+    torch._C._mps_get_default_generator`. So the honest flag is only honest
+    together with a generator behind it.
+
+    **And the generator is `torch.default_generator` itself, which is a claim
+    about this build rather than a shortcut.** There is one RNG stream here
+    (`rng.rs`, one process-wide `CpuGenerator`) and every `mps` tensor with
+    random contents is filled from it: `torch.randn(4).to("mps")` draws on the
+    host and moves the bytes, and `torch.randn(4, device="mps")` does not work
+    at all yet (`aten.normal_.default: Metal contiguous to_dtype F64 F32 not
+    implemented`). There is no second stream for a separate object to own, so
+    returning a distinct `Generator` here would be inventing a state nothing
+    advances. The divergence this leaves is named rather than hidden:
+    `torch.mps.manual_seed(k)` on its own reseeds the CPU stream too, where
+    upstream would leave it alone. `torch.manual_seed(k)`, the call that
+    actually matters, passes the same seed to both and is unaffected.
+    docs/numerics/DTYPEDEV.md section 2.
+    """
+    probe = module._mps_probe()
+
+    # Overwrites the `_BUILD_FLAGS` entry installed above; see the note on that
+    # entry for why the table still carries one.
+    module._has_mps = bool(probe["built"])
+
+    def _mps_is_available():
+        return bool(module._mps_probe()["available"])
+
+    _mps_is_available.__name__ = "_mps_is_available"
+    _mps_is_available.__qualname__ = "_mps_is_available"
+    _mps_is_available.__module__ = "torch._C"
+    module._mps_is_available = _mps_is_available
+
+    def _mps_get_default_generator(index=0):
+        if not module._has_mps:
+            raise NotImplementedError(
+                "torch._C shim: _mps_get_default_generator on a build with no "
+                "Metal -- torch._C._has_mps is False, so there is no mps "
+                "device to have a generator for"
+            )
+        if index != 0:
+            raise NotImplementedError(
+                f"torch._C shim: _mps_get_default_generator(index={index}) -- "
+                "this build has one RNG stream (rng.rs) and it is not indexed "
+                "by device, so there is no per-device generator to return"
+            )
+        return module.default_generator
+
+    _mps_get_default_generator.__name__ = "_mps_get_default_generator"
+    _mps_get_default_generator.__qualname__ = "_mps_get_default_generator"
+    _mps_get_default_generator.__module__ = "torch._C"
+    module._mps_get_default_generator = _mps_get_default_generator
 
 
 def _install_default_generator(module) -> None:

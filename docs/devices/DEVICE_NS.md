@@ -293,9 +293,21 @@ and the OpenVINO runtime (`intelnpu.OpenVINO`, four methods). The resolver,
 and its docstring: it is evidence about **dispatch**, not about hardware.
 Nothing there shows a number was computed on an Intel NPU.
 
-## 6. The one deliberate disagreement: `_mps_is_available` is not a probe
+## 6. The one deliberate disagreement: `_mps_is_available` was not a probe
 
-`bootstrap.py` installs it as a constant:
+> **Closed 2026-09-12.** This section is kept as written because it is the
+> measurement that led to the fix, and because the last paragraph — "recorded,
+> measured, and left" — is the state it was left in, not the state it is in
+> now. What changed: `_mps_is_available` is a live probe and `_has_mps` is
+> `cfg!(target_vendor = "apple")`, so the two numbers in the table below now
+> agree. See [`../numerics/DTYPEDEV.md`](../numerics/DTYPEDEV.md) section 2 for
+> what each of the two names answers and what flipping them cost.
+>
+> `mps.availability()` is unchanged and still measures by allocation.
+> `detail["declared_disagrees"]` is `False` here now — the field doing its job,
+> not the field becoming unnecessary.
+
+`bootstrap.py` installed it as a constant:
 
     module._mps_is_available = _constant_function("torch._C._mps_is_available", False)
 
@@ -322,10 +334,12 @@ to be the answer. Reporting it as availability would tell a user there is no
 Metal on a machine that is computing on Metal, which is the same class of error
 as [`../graph/NPU2.md`](../graph/NPU2.md)'s, pointing the other way.
 
-**This is a defect in `bootstrap.py`, not in this namespace, and it is not
-fixed here.** Fixing it means deciding what `torch.backends.mps.is_available()`
-should return, which changes behaviour for every existing caller and reaches
-past this round's request (CLAUDE.md §5.7). It is recorded, measured, and left.
+**This is a defect in `bootstrap.py`, not in this namespace, and it was not
+fixed here.** Fixing it meant deciding what `torch.backends.mps.is_available()`
+should return, which changes behaviour for every existing caller and reached
+past that round's request (CLAUDE.md §5.7). It was recorded, measured, and left
+— and picked up by [`../numerics/DTYPEDEV.md`](../numerics/DTYPEDEV.md), which
+is the round that decided it.
 
 ## 7. Nullification — what was broken, and whether the tests noticed
 

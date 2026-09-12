@@ -271,7 +271,21 @@ def test_the_two_accelerator_questions_get_two_different_answers():
     assert _C._accelerator_getAccelerator() is None
     # Upstream returns the *string* 'cpu' here, not a device.
     assert _C._get_default_device() == "cpu"
-    assert _C._mps_is_available() is False
+    # `_mps_is_available()` was pinned `False` here, which pinned the defect:
+    # it was a `_constant_function(..., False)` on a build that computes on
+    # Metal (docs/numerics/DTYPEDEV.md §2). It is a probe now, so the pin is on
+    # the probe agreeing with itself resolving a device -- and *not* on the
+    # accelerator answers above moving with it, which is the property this test
+    # is actually about. `_get_accelerator()` is still `cpu`: this shim has no
+    # dispatch key for Metal and nothing routes to it by default, so promoting
+    # `mps` to "the accelerator" would be a second, larger claim
+    # (docs/devices/DEVICE_ABS.md §3.2) and is deliberately not made here.
+    try:
+        _C._aten_dispatch("aten.ones.default", [1], device=_C.device("mps"))
+    except (NotImplementedError, RuntimeError):
+        assert _C._mps_is_available() is False
+    else:
+        assert _C._mps_is_available() is True
 
 
 def test_mixed_device_gate_lets_agreeing_tensors_through():
@@ -4533,6 +4547,14 @@ out["accelerator_available"] = torch.accelerator.is_available()
 out["default_device"] = repr(torch.get_default_device())
 out["cuda_available"] = torch.cuda.is_available()
 out["mps_available"] = torch.backends.mps.is_available()
+out["mps_built"] = torch.backends.mps.is_built()
+# The independent measurement `mps_available` has to agree with. Deliberately
+# an allocation and not another spelling of the same call -- a probe checked
+# against itself is not checked (docs/numerics/DTYPEDEV.md §2).
+try:
+    out["mps_really"] = torch.empty(2, 2, device="mps").device.type == "mps"
+except BaseException:
+    out["mps_really"] = False
 out["generator_device"] = str(torch.default_generator.device)
 
 # An unavailable device is refused at use, by name, wherever it is asked for.
@@ -4627,7 +4649,20 @@ def test_device_road_through_the_vendored_tree():
     assert r["accelerator_available"] is False
     assert r["default_device"] == "device(type='cpu')", r["default_device"]
     assert r["cuda_available"] is False
-    assert r["mps_available"] is False
+    # `mps_available` was pinned `False` here. That pinned the defect rather
+    # than a property: it was a build-time constant on a machine that computes
+    # on Metal (docs/numerics/DTYPEDEV.md §2). It is a probe now, and what this
+    # asserts is that it agrees with an actual allocation -- in both
+    # directions, so a runner with no Metal still checks something.
+    assert r["mps_available"] == r["mps_really"], (r["mps_available"], r["mps_really"])
+    if r["mps_available"]:
+        assert r["mps_built"] is True, r["mps_built"]
+    # And that `accelerator_available` did **not** move with it, three lines
+    # above: `_accelerator_getAccelerator()` still answers `None`, because
+    # promoting `mps` to "the accelerator" is a second and larger claim than
+    # "Metal is reachable" (docs/devices/DEVICE_ABS.md §3.2). If that ever
+    # changes it should change because somebody decided it, not because this
+    # round made `mps` visible.
     assert r["generator_device"] == "cpu"
 
     # An unavailable device is refused at *use*; a typo is refused at

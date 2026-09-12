@@ -28,7 +28,7 @@
 //! docs/devices/DEVICE_ABS.md §3.2.
 use std::sync::atomic::AtomicU64;
 
-use candle_core::Device;
+use candle_core::{DType, Device};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyModule, PyTuple};
 use pyo3::IntoPyObjectExt;
@@ -914,6 +914,123 @@ fn shim_mps_readback_but_allowed() -> Vec<&'static str> {
 }
 
 // ---------------------------------------------------------------------------
+// mps -- built, available, and the dtype Metal does not have
+// ---------------------------------------------------------------------------
+
+/// `_C._mps_probe()` -- `_cuda_probe()`'s twin, and the fact behind
+/// `torch.backends.mps.is_built()` and `torch.backends.mps.is_available()`.
+///
+/// **It exists because those two answered `False` on a machine that was
+/// computing on Metal.** `bootstrap.py` installed `_mps_is_available` as a
+/// `_constant_function(..., False)` and `_has_mps` as a `False` entry in
+/// `_BUILD_FLAGS`, both justified by a comment saying candle's `metal` feature
+/// is off in `Cargo.toml`. That comment was stale -- `Cargo.toml` enables
+/// `metal` for Apple targets, `PyDevice::resolve` has had an `mps` arm for
+/// several rounds, and `(a @ b).device` on two `mps` tensors is `mps:0` with
+/// upstream's numbers. `torch.backends.mps.is_available()` is the gate
+/// transformers and accelerate branch on, so a false `False` there means
+/// nothing on top of this shim will ever *select* the device it is already
+/// able to use. docs/numerics/DTYPEDEV.md section 2.
+///
+/// **The two questions are different and this answers both separately.**
+///
+///   `built`      Was Metal compiled into this artefact? That is
+///                `cfg!(target_vendor = "apple")` and nothing else: the `mps`
+///                arm of `resolve()` carries exactly that `#[cfg]`, and
+///                `Cargo.toml` gates candle's `metal` feature on exactly that
+///                target predicate. It is a compile-time constant, it cannot
+///                be probed, and on Android/Linux/wasm it is `false`.
+///
+///   `available`  Did a Metal device actually open, here, now? That is a
+///                probe -- `resolve()` -- and it can be `false` on an Apple
+///                build: a Mac VM with no GPU passthrough, or a
+///                `target_vendor = "apple"` build running where
+///                `MTLCreateSystemDefaultDevice` returns nil. `built` is
+///                necessary and not sufficient, which is why upstream's own
+///                docstring for `is_built()` says it "doesn't necessarily mean
+///                MPS is available".
+///
+/// Like `_cuda_probe` it never raises: a caller asking "is there a GPU here"
+/// should not have to catch anything, so a refusal becomes `available: false`
+/// with `reason` and `error` carrying what was refused.
+#[pyfunction]
+#[pyo3(name = "_mps_probe")]
+#[pyo3(signature = (index = 0))]
+fn mps_probe(py: Python<'_>, index: usize) -> PyResult<Py<PyAny>> {
+    let d = PyDict::new(py);
+    let built = cfg!(target_vendor = "apple");
+    d.set_item("built", built)?;
+    if !built {
+        d.set_item("available", false)?;
+        d.set_item("reason", "not_built")?;
+        d.set_item("error", py.None())?;
+        return Ok(d.into_any().unbind());
+    }
+    let resolved = PyDevice {
+        kind: "mps".to_string(),
+        index: Some(index as i64),
+    }
+    .resolve();
+    match resolved {
+        Ok(_) => {
+            d.set_item("available", true)?;
+            d.set_item("reason", py.None())?;
+            d.set_item("error", py.None())?;
+        }
+        Err(e) => {
+            d.set_item("available", false)?;
+            d.set_item("reason", "no_device")?;
+            d.set_item("error", e.value(py).to_string())?;
+        }
+    }
+    Ok(d.into_any().unbind())
+}
+
+/// Refuse a float64 tensor on a Metal device, by name, at the moment it would
+/// be wrapped -- rather than letting it exist and fail op by op.
+///
+/// **Metal has no `double`.** That is a property of the API, not of candle and
+/// not of this build: MSL has no 64-bit floating type at all. Upstream says so
+/// at the boundary --
+///
+/// ```text
+/// TypeError: Cannot convert a MPS Tensor to float64 dtype as the MPS
+/// framework doesn't support float64. Please use float32 instead.
+/// ```
+///
+/// -- and refuses `torch.zeros(2, dtype=torch.float64).to("mps")` outright.
+///
+/// This build did not. `x.double().to("mps")` *succeeded*, because candle will
+/// allocate an `F64` Metal buffer, and the result was a tensor that could be
+/// cloned and nothing else: `add` died with `Error while loading function:
+/// badd_f64`, `sum` with `Metal contiguous reduce op Sum F64 not implemented`,
+/// `matmul` with `mlx matmul doesn't support F64` and even `.to(torch.float32)`
+/// -- the documented escape hatch -- with `Metal contiguous to_dtype F64 F32
+/// not implemented`. So the object could be made and could not be converted
+/// back, and every message named an internal candle kernel rather than the
+/// fact.
+///
+/// That is the failure mode docs/graph/NPU2.md is about, in its quieter form:
+/// not a wrong number, but a capability claim made by construction succeeding.
+/// A caller that writes `.double()` before `.to(device)` gets a tensor the
+/// device cannot use and learns why only later, in a message about a symbol.
+///
+/// The gate is here, on the one constructor every dense tensor passes through,
+/// rather than on `_to_copy` -- there are 106 call sites that turn a dtype into
+/// candle storage, and a gate on one of them is a gate with 105 ways round it.
+/// Nullifying this function (returning `Ok(())` unconditionally) has to make
+/// the test red, and that is what it checks.
+pub fn metal_dtype_gate(device: &Device, dtype: DType) -> PyResult<()> {
+    if dtype == DType::F64 && is_metal(device) {
+        return Err(pyo3::exceptions::PyTypeError::new_err(
+            "Cannot convert a MPS Tensor to float64 dtype as the MPS framework \
+             doesn't support float64. Please use float32 instead.",
+        ));
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // cuda -- the named refusals, the gate, and the runtime evidence
 // ---------------------------------------------------------------------------
 //
@@ -1560,5 +1677,6 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(shim_cuda_refusal_reasons, m)?)?;
     m.add_function(wrap_pyfunction!(cuda_probe, m)?)?;
     m.add_function(wrap_pyfunction!(cuda_counters, m)?)?;
+    m.add_function(wrap_pyfunction!(mps_probe, m)?)?;
     Ok(())
 }

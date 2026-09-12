@@ -15360,6 +15360,13 @@ fn to_copy_default(
         return finish(py, out, tag);
     }
     let storage = PyDtype::new(tag).storage(OP)?;
+    // Before the conversion rather than after: `PyTensorBase::new` carries the
+    // same gate and is the one nothing can get round, but reaching it means
+    // going through candle first, and candle refuses `F32 -> F64` on Metal
+    // with `Metal contiguous to_dtype F32 F64 not implemented` -- a message
+    // about a missing kernel, for a dtype the API does not have. Asking here
+    // costs one comparison and answers with the fact instead.
+    crate::device::metal_dtype_gate(&device, storage)?;
     let (had_dtype, stayed_put) = {
         let t = input.tensor()?;
         (t.dtype(), t.device().same_device(&device))

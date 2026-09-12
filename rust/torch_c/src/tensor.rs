@@ -420,7 +420,14 @@ impl PyTensorBase {
     }
 
     /// A tensor whose torch dtype is whatever candle is already storing.
+    ///
+    /// The `metal_dtype_gate` call is here rather than at any of the 106 sites
+    /// that turn a dtype into candle storage, because this is the one
+    /// constructor every dense tensor passes through -- see that function for
+    /// what an `F64` tensor on Metal did before it existed. `boolean` below
+    /// needs no such call: it refuses anything that is not `U8`.
     pub fn new(inner: Tensor) -> PyResult<Self> {
+        crate::device::metal_dtype_gate(inner.device(), inner.dtype())?;
         let tag = TorchDType::from_storage(inner.dtype()).ok_or_else(|| {
             not_implemented(format!(
                 "torch._C shim has no torch dtype for candle dtype: {}",
