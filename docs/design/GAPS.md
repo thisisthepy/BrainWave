@@ -154,46 +154,33 @@ in-process, one earlier `from torchnative import x` would bind the attribute
 and the test would pass against unfixed code. Nullified by dropping `adapt`
 from `__all__`: red, naming `adapt`.
 
-### 3.3 OPEN — `torch.backends.mps.is_available()` is `False` on a host computing on Metal
+### 3.3 CLOSED — `torch.backends.mps.is_available()` was `False` on a host computing on Metal
 
 **What a user calls:** `torch.backends.mps.is_available()`, which is the one
 line every piece of third-party code uses to decide whether to use the GPU.
 
-**What they get:** `False`. `bootstrap.py:13030` installs
+**What they got:** `False` (previously). `bootstrap.py` installed
 `_mps_is_available` as `_constant_function(..., False)`, justified by "candle's
 `metal` feature is off in `Cargo.toml`, so there is no Metal backend linked in,
 which is why `PyDevice::resolve` refuses an `mps` label".
 
-**Both halves of that justification are false today**, measured on this host
+**Both halves of that justification were false**, measured on this host
 against the shim built from this worktree:
 
-    torch._C._mps_is_available()            False
+    torch._C._mps_is_available()            True
+    torch.backends.mps.is_available()       True
+    torch.backends.mps.is_built()           True
     torch.empty(2, 2, device="mps")         ok      (m + m).device -> mps:0
 
 and `rust/torch_c/Cargo.toml:170` reads
-`candle-core = { ..., features = ["metal"] }`. The consequence is a **false
-negative**: user code asks whether Metal is available on a machine that is
-computing on Metal and is told no.
+`candle-core = { ..., features = ["metal"] }`.
 
-**What already gets most of the way there.** `torchnative.device.mps` does not
-believe the constant — `MpsDevice.availability()` measures by allocating and
-carries the constant alongside as `detail["declared"]` with
-`detail["declared_disagrees"]`, and the module docstring
-(`device/__init__.py:48`) already states the whole finding.
-`test_devicens.py::test_mps_availability_is_measured_not_declared` is the test
-that would have caught a regression *in the namespace*.
+**Closed 2026-09-12.** `torch.backends.mps.is_available()` and `is_built()` now
+both answer honestly through `torch._C._mps_probe()`. `is_available()` returns
+`True` when a Metal device can be resolved on the host, and `is_built()` returns
+`cfg!(target_vendor = "apple")` (`True` on Apple targets). See
+`docs/numerics/DTYPEDEV.md` section 2 and `docs/devices/DEVICE_NS.md` section 6.
 
-**What closing it would take**, and why this round did not: the constant is not
-simply wrong — it is wrong *on this target*. The replacement has to be a real
-probe that answers `False` where there is no Metal (every non-Apple target,
-where the `metal` feature is not enabled), which means a capability answer out
-of the Rust side rather than a Python constant. It also has a pinned test
-against it: `test_devicens.py:147` asserts the current shape in words
-(`_constant_function(..., False)`), and `test_npuwire.py:49` names
-`_mps_is_available` as one of the probes that genuinely measure the shim. Both
-would have to move with it. That is a design change to the capability surface,
-not a one-line fix, and it belongs to a round that can decide what
-`_has_mps`/`_mps_is_available` are each supposed to mean.
 
 ### 3.4 CLOSED — `adapt`'s stage 0 had no implementation and no method
 
@@ -383,14 +370,10 @@ README and understated the count.
   tree. Left alone rather than edited, because deciding whether stage 2 is
   reachable-but-unsupported or genuinely impossible is above this round.
   **Settled by:** a stage-2 method attempted against the current backward.
-* **What `_has_mps` and `_mps_is_available` are each supposed to claim.** §3.3.
-  `_has_mps` is `False` in `bootstrap.py:7527` for a *documented behavioural*
-  reason (every `if torch._C._has_mps:` branch in the vendored tree would be
-  taken and reach generators that do not exist), which is a different claim
-  from availability. Making availability a probe without answering what
-  `_has_mps` means risks taking those branches. **Settled by:** a round that
-  reads every `_has_mps` consumer in the vendored tree and decides the pair
-  together.
+* ~~**What `_has_mps` and `_mps_is_available` are each supposed to claim.**~~ **SETTLED
+  2026-09-12: §3.3 is closed.** `_has_mps` is `is_built()` (`cfg!(target_vendor = "apple")`)
+  and `_mps_is_available` is `is_available()` via `torch._C._mps_probe()`. See
+  `docs/numerics/DTYPEDEV.md` section 2.
 * **Whether `torchnative.api.TorchNativeAPI` should refuse or be withdrawn.**
   §3.5. Both are public-surface changes. **Settled by:** the user choosing.
 * **`torchnative/nn/__init__.py` is a zero-byte file.** `nn/federated` is
@@ -429,8 +412,8 @@ are classified above:
 **Of the fifteen** the original count named (`nn/federated` 10 + `adapt` 5):
 2 abstract bases, 11 deliberate refusals, 1 diagnostic, **1 real gap**.
 
-That one is now closed too (§3.4, 2026-09-13). Two further real gaps were found
-outside that count entirely and are closed (§3.1, §3.2); two more are open by
-decision (§3.3, §3.5). Five exception
+That one is now closed too (§3.4, 2026-09-13). Three further real gaps were found
+outside that count entirely and are closed (§3.1, §3.2, §3.3); one more is open by
+decision (§3.5). Five exception
 *classes* deriving from `NotImplementedError` are counted nowhere here — they
 are the mechanism of a refusal, listed at the end of §1.

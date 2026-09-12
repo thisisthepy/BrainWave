@@ -585,8 +585,9 @@ model.to(device.npu)                     # Intel NPU: resolves the unit, lowers 
 
 [`docs/devices/DEVICE_NS.md`](docs/devices/DEVICE_NS.md) and
 [`docs/api/TRANSFORMERS.md`](docs/api/TRANSFORMERS.md) record what was measured,
-including a defect this work found: `torch._C._mps_is_available()` is a
-build-time constant returning `False` on a host where Metal computes.
+including a defect this work found and fixed: `torch._C._mps_is_available()` was a
+build-time constant returning `False` on a host where Metal computes (now closed;
+see [`docs/numerics/DTYPEDEV.md`](docs/numerics/DTYPEDEV.md) section 2).
 
 Three decisions, each with its reason:
 

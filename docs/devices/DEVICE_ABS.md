@@ -348,6 +348,8 @@ MPS 가 있는 이 호스트에서 상류를 직접 쟀습니다.
 `torch.backends.mps.is_available()` 도 `False` 로 채웠습니다 — candle 의 `metal` feature 가
 꺼져 있다는 사실의 파이썬 쪽 표현입니다.
 
+> **(2026-09-12 추기) closed.** `torch.backends.mps.is_available()` 과 `is_built()` 는 이제 둘 다 `torch._C._mps_probe()` 를 통해 `True` 를 반환합니다 (`docs/numerics/DTYPEDEV.md` §2).
+
 `Generator.device` 는 **클래스 속성**을 덮어썼습니다. `_install_default_generator` 의 기존 주석이
 "장치는 인스턴스별 값이므로 클래스 속성을 덮는 것은 틀린 모양" 이라고 반대하고 있었는데, 그 논증은
 상류에 대해서는 맞고 여기에 대해서는 틀립니다 — `resolve()` 가 `cpu` 외의 라벨을 전부 거부하므로
