@@ -66,11 +66,30 @@ float32 accumulation over depth. §3 of `AGREE.md` is a ranking of depth, not of
   cases where **upstream does not reproduce itself**: `vit_mae` re-draws its patch mask and
   `vits` samples a duration, so there is no fixed answer to match and any number about them
   measures a sampler. 288 of 290 were bit-identical to themselves across two upstream runs.
-* **22 MoE models have no float64 oracle at all**, so only the fixed tolerance applies to them
-  and the ratio rule cannot. The reason is upstream's own and not ours: `qwen3_moe`,
+* **22 architectures have no float64 oracle in this sweep**, so only the fixed tolerance applies
+  to them and the ratio rule cannot. The reason is upstream's own and not ours: `qwen3_moe`,
   `qwen2_moe`, `glm4_moe`, `nemotron_h`, `zaya` and the rest **refuse `Double` at their grouped
   matmul**. All 22 land in `agree` and none sits near the tolerance, but they are held to a
   weaker test than the other 263 and that has to be said.
+
+  > **Corrected 2026-09-12** (`docs/numerics/AGREE2.md` §4). This bullet originally read
+  > *"22 **MoE** models have no float64 oracle **at all**"*, and both of those words were wrong
+  > when it was written. Three of the 22 are not MoE and fail for unrelated reasons —
+  > `xglm` overflows building its mask sentinel at the default dtype and `mra` hard-casts to
+  > `.float()` inside its attention kernel, which `docs/numerics/AGREE.md` §2 said and this note
+  > flattened. And "at all" is false: **21 of the now-23 can be given an oracle** — the 20
+  > grouped-matmul models through `set_experts_implementation("eager")`, which moves their
+  > float32 answer by at most 2 ulp, and `xglm` under `torch.set_default_dtype(torch.float64)`.
+  > Only `mra` and `fastspeech2_conformer` are genuinely oracle-less, both because of a literal
+  > `float32` in upstream's own module source. The harness does not yet take the available
+  > oracles; that is a gap in it, not a fact about MoE.
+> **Re-measured 2026-09-12 in `docs/numerics/AGREE2.md`.** All seven architectures that forwarded
+> upstream but not under the shim now replay, so the population is **297/297** and the judgeable
+> denominator 290: **288 of 290 agree**, 7 cannot be judged (the 5 below plus `univnet` and
+> `vilt`, both newly replaying and both non-deterministic upstream), and there are **2 diverges**.
+> Nothing that agreed in this round disagrees there — the second diverge is
+> `fastspeech2_conformer`, which this round could not measure at all.
+
 * **`chinese_clip` is left flagged**, as the one `DIVERGE`, even though the round that measured
   it believed the flag spurious — its absolute difference is 1.4e-06 on a tensor of scale 0.49
   (twelve ulp), no operator in the whole model exceeds 2.5 ulp, and it crossed the 4× rule only
@@ -170,7 +189,9 @@ would otherwise count these as features.
   recording walls (`torch.floor`, `upsample_bicubic2d`, `index_add_`,
   `ndimension`) without closing them.
 
-- **`docs/numerics/AGREE.md`** — the reachability sweep's own closing sentence, acted on for the first
+- **`docs/numerics/AGREE.md`** (re-measured 2026-09-12 as `docs/numerics/AGREE2.md`: **288 of 290**,
+  on a population of 297 rather than 290) — the reachability sweep's own closing sentence, acted on
+  for the first
   time: of the architectures that forward, **284 of 285 judgeable ones agree with upstream
   numerically**, at a tolerance derived from upstream's own float32-vs-float64 error
   distribution rather than chosen. §0 above is the summary and §0.1 the caveats. It changed

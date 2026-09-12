@@ -1,5 +1,11 @@
 # ARCH300 — the sweep taken a third time: 290 of 297 forward, 7 blocked
 
+> **Superseded by `docs/numerics/AGREE2.md` (2026-09-12).** All seven of the architectures this
+> document lists as blocked now forward AND replay under the shim: **297 of 297**. The headline
+> below (290/297, 7 blocked) is the record of what was true at `b33e2ee` and is left unedited as
+> the baseline AGREE2 §2 compares against. AGREE2 also answers the question this sweep could not —
+> of the ones that forward, how many *agree* numerically — at 288 of 290 judgeable.
+
 Worktree `work/arch300` on develop `b33e2ee` (vendored tree assembled fresh). torch 2.13.0,
 `transformers` 5.15.1, upstream (`/Volumes/macMini/caches/spike-venv/bin/python`) — same venv
 ARCH100 and ARCH200 used, unmodified since 2026-08-23. No Rust, `bootstrap.py`, `aten.rs`, or

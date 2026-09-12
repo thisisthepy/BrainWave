@@ -175,6 +175,7 @@ class LiveFacts:
         self._schema_cache: dict | None = None
         self._smoke_cache: int | None = None
         self._decomp_cache: dict | None = None
+        self._agree_cache: dict | None = None
         self._requested_attrs: set[str] = set()
 
     def preload_attrs(self, attrs: set[str]) -> None:
@@ -338,6 +339,62 @@ class LiveFacts:
             }
         return self._decomp_cache
 
+    # -- the agreement sweep, re-derived from its recorded per-architecture
+    # scores rather than re-run. `agree_sweep.py` needs both interpreters and
+    # takes hours (docs/numerics/AGREE2.md §7), so DOCWATCH cannot re-measure
+    # it the way it re-runs `decomp_sweep.py`. What it CAN do is refuse to let
+    # the document and the measurement drift apart: the raw per-architecture
+    # numbers are committed, and the verdict is recomputed here by calling
+    # `agree_sweep.verdict` itself, so a change to the rule moves these counts
+    # rather than leaving a stored number looking right.
+    #
+    # Only in one direction, and the asymmetry is the `ge`/`le` rule's, not an
+    # oversight: deleting a refusal branch or dropping architectures from the
+    # recording lowers the counts and fires (measured). *Widening* the rule --
+    # ORACLE_FACTOR 4 -> 40 -- only moves architectures into `agree`, which
+    # `ge 288` and `le 2` both accept. That direction is pinned by
+    # `test_agree.py::test_the_oracle_factor_is_stated_and_is_not_a_free_parameter`
+    # instead, where it belongs: an `eq` marker here would forbid a later round
+    # from legitimately raising the count. What neither can see is the tree
+    # moving under a measurement nobody retook; the date in the artefact is the
+    # only guard against that, and AGREE2.md §7 says so.
+    def agree(self) -> dict:
+        if self._agree_cache is None:
+            path = REPO_ROOT / "rust" / "torch_c" / "pytests" / "agree2_scores.json"
+            if not path.exists():
+                raise LiveFactsError(f"no recorded agreement sweep at {path}")
+            sys.path.insert(0, str(REPO_ROOT / "rust" / "torch_c" / "pytests"))
+            try:
+                import agree_sweep
+            except Exception as exc:                      # noqa: BLE001
+                raise LiveFactsError(f"cannot import agree_sweep.py: {exc}") from exc
+            rec = json.loads(path.read_text())
+            tol = rec["tol"]
+            tally: dict[str, int] = {}
+            for s in rec["scores"]:
+                v = agree_sweep.verdict(s["rel"], s["scale"], s["oracle_rel"], tol,
+                                        s["self_repeat_rel"])
+                tally[v] = tally.get(v, 0) + 1
+            agree = tally.get("exact", 0) + tally.get("agree", 0) + \
+                tally.get("agree_within_float32", 0)
+            unjudgeable = tally.get("degenerate", 0) + tally.get("nondeterministic", 0)
+            self._agree_cache = {
+                "agree_scored": len(rec["scores"]),
+                "agree_produced_upstream": rec["produced_upstream"],
+                "agree_replayed_shim": rec["replayed_shim"],
+                "agree_agree": agree,
+                "agree_judgeable": len(rec["scores"]) - unjudgeable,
+                "agree_diverge": tally.get("diverge", 0),
+                "agree_unjudgeable": unjudgeable,
+                "agree_degenerate": tally.get("degenerate", 0),
+                "agree_nondeterministic": tally.get("nondeterministic", 0),
+                "agree_no_oracle": sum(1 for s in rec["scores"] if s.get("oracle") != "ok"),
+                "agree_state_dict_clean": sum(
+                    1 for s in rec["scores"]
+                    if not s["load"].get("missing") and not s["load"].get("unexpected")),
+            }
+        return self._agree_cache
+
 
 COUNT_SOURCES = {
     "smoke_ok": lambda lf: lf.smoke_ok(),
@@ -351,6 +408,17 @@ COUNT_SOURCES = {
     "decomp_implemented": lambda lf: lf.decomp()["decomp_implemented"],
     "decomp_population": lambda lf: lf.decomp()["decomp_population"],
     "decomp_lowered": lambda lf: lf.decomp()["decomp_lowered"],
+    "agree_scored": lambda lf: lf.agree()["agree_scored"],
+    "agree_produced_upstream": lambda lf: lf.agree()["agree_produced_upstream"],
+    "agree_replayed_shim": lambda lf: lf.agree()["agree_replayed_shim"],
+    "agree_agree": lambda lf: lf.agree()["agree_agree"],
+    "agree_judgeable": lambda lf: lf.agree()["agree_judgeable"],
+    "agree_diverge": lambda lf: lf.agree()["agree_diverge"],
+    "agree_unjudgeable": lambda lf: lf.agree()["agree_unjudgeable"],
+    "agree_degenerate": lambda lf: lf.agree()["agree_degenerate"],
+    "agree_nondeterministic": lambda lf: lf.agree()["agree_nondeterministic"],
+    "agree_no_oracle": lambda lf: lf.agree()["agree_no_oracle"],
+    "agree_state_dict_clean": lambda lf: lf.agree()["agree_state_dict_clean"],
 }
 
 COUNT_OPS = {

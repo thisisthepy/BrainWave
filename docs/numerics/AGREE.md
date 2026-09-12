@@ -1,5 +1,12 @@
 # AGREE — the caveat, measured: 284 of 285 architectures that forward also match
 
+> **Re-measured in `docs/numerics/AGREE2.md` (2026-09-12).** The seven architectures §7 lists as
+> forwarding upstream but not under the shim all replay now, so the population grew from 290 to
+> 297 and the judgeable denominator from 285 to 290. AGREE2 measures **288 of 290 agreeing**, with
+> a second `diverge` (`fastspeech2_conformer`, newly judgeable — nothing that agreed here
+> disagrees there) and two more `nondeterministic` (`univnet`, `vilt`). The tolerance is
+> unchanged at 1.186e-06. This document is left unedited as the baseline that comparison needs.
+
 Worktree `work/agree` on develop `b33e2ee` (vendored tree assembled fresh). torch 2.13.0 upstream
 (`/Volumes/macMini/caches/spike-venv/bin/python`) is the oracle throughout. No Rust,
 `bootstrap.py` or `aten.rs` was changed in this round: it adds

@@ -7,6 +7,8 @@
 > the current tree: ARCH300 measures **290/297 (98%), 7 blocked**. This document is left in place
 > as the record of what was true at `2498122` — the comparison ARCH300 exists to make depends on
 > this baseline staying unedited.
+> `docs/numerics/AGREE2.md` (2026-09-12) then measures **297/297 forwarding**, so ARCH300's
+> 290/297 is itself superseded.
 
 Worktree `work/sweep2` on develop `2498122` (vendored tree assembled fresh). torch 2.13.0
 upstream (`/Volumes/macMini/caches/spike-venv/bin/python`). No Rust, `bootstrap.py`, or `aten.rs`

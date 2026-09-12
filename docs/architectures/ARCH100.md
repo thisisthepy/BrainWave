@@ -7,6 +7,8 @@
 > 31 operators) no longer describes the current tree: ARCH200 measures **270/297 (91%), 16
 > operators**. This document is left in place as the record of what was true at `6d016f0` — the
 > comparison ARCH200 exists to make depends on this baseline staying unedited.
+> ARCH300 then measured 290/297, and `docs/numerics/AGREE2.md` (2026-09-12) measures
+> **297/297 forwarding**. A reader arriving at the 82 below is three rounds behind.
 
 Worktree `work/arch` on develop `6d016f0`. torch 2.13.0 upstream
 (`/Volumes/macMini/caches/spike-venv/bin/python`), `transformers` 5.15.1.
