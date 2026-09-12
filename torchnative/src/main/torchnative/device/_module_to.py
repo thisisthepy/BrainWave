@@ -173,7 +173,8 @@ def _to_compiled(self, device, args, kwargs):
     **`coreml` (Apple Neural Engine) is wired too, and it takes a
     `precision`.** It goes to `torchnative.export.coreml._compile_model`, which
     does the same `named_children()` walk and swaps each `torch.nn.Linear` for
-    a `_CoreMLLinear`. Same mechanism, same in-place contract, same report.
+    a `_CoreMLLinear`, and every `Conv2d` for a `_CoreMLConv2d`. Same
+    mechanism, same in-place contract, same report.
 
     What is **not** the same is that CoreML's precision is a real choice with a
     measured cost on each side, so this backend takes two spellings:
@@ -290,7 +291,7 @@ def _lower_for_openvino(model, device, resolution, **options):
             f"{report['fraction_moved']:.4f} "
             f"({report['parameters_moved']} of {report['parameters_total']} "
             f"parameters). Left on the CPU -- leaf module types: {left}."
-            + (f" Skipped Linear(s): {skipped}." if skipped else "")
+            + (f" Skipped lowerable leaves: {skipped}." if skipped else "")
             + f" The full report is on the model as `.torchnative_offload`. "
             f"This warning exists because docs/graph/NPU2.md is about a partial "
             f"offload that went unnoticed while every answer it produced was "
@@ -331,7 +332,9 @@ def _lower_for_coreml(model, device, resolution, *, precision="float16",
         skipped = "; ".join(f"{name}: {why}" for name, why in report["skipped"][:4])
         warnings.warn(
             f"nn.Module.to(torchnative.device.{device.type}): a PARTIAL offload. "
-            f"{len(report['swapped'])} Linear(s) now go through CoreML at "
+            f"{len(report['swapped'])} leaf module(s) "
+            f"({', '.join(sorted(set(report['kinds'].values()))) or 'none'}) "
+            f"now go through CoreML at "
             f"precision={report['precision']!r}, which is fraction_moved="
             f"{report['fraction_moved']:.4f} "
             f"({report['parameters_moved']} of {report['parameters_total']} "

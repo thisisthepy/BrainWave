@@ -23,6 +23,12 @@
 <!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_anepath.py test_the_neural_engine_is_supported_at_float16_and_absent_at_float32 present -->
 <!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_anepath.py test_a_lowered_leaf_records_which_unit_coreml_actually_preferred present -->
 <!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_anepath.py test_the_float32_spelling_agrees_and_the_float16_one_only_nearly_does present -->
+<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/coreml.py _CoreMLConv2d present -->
+<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/coreml.py _eligible_conv2d present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_coremlops.py test_conv2d_lowers_to_coreml_instead_of_being_left_on_the_cpu present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_coremlops.py test_the_neural_engine_runs_the_conv_at_float16_and_cannot_at_float32 present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_coremlops.py test_a_conv_leaf_is_deferred_because_its_shape_is_not_known_at_to_time present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_coremlops.py test_the_rejected_types_are_rejected_by_a_number_and_not_by_omission present -->
 
 ## 1. The headline: the CoreML models docs/graph/NPU.md executed ran on the **CPU**
 
@@ -411,3 +417,112 @@ The emulators here are shared with other projects. This round wrote only inside
 `/data/local/tmp/bw_device`, removed every file it pushed, and **installed no
 app** — docs/devices/VULKAN3.md §4's precedent for using what is already on disk
 without modifying it.
+
+## 7. Which module types are worth lowering, measured per type
+
+§4 left `Linear` as the only lowered leaf and named the obstacle for the next
+one: a conv's MIL program needs spatial dimensions that are not knowable at
+`to()` time. This section answers that, and it answers a question §4 did not
+ask — **which types reach the unit at all**. An op lowered to CoreML that
+CoreML then runs on the CPU is a tensor round trip bought for nothing.
+
+### 7.1 The sweep: `MLComputePlan` per candidate op, both precisions
+
+One MIL program per op, converted at each precision, compiled by the OS, and
+read through `MLComputePlan` with `ComputeUnit.ALL`. Boundary `cast`s dropped.
+
+| op | shape | float32 supported | float16 supported | float16 preferred |
+|---|---|---|---|---|
+| `linear` | 128x1024 | CPU, GPU | CPU, GPU, **NE** | **NeuralEngine** |
+| `conv` | 1x64x32x32 -> 128 | CPU, GPU | CPU, GPU, **NE** | CPU |
+| `conv` | 1x128x32x32 -> 256 | CPU, GPU | CPU, GPU, **NE** | **NeuralEngine** |
+| `conv` | 1x64x64x64 -> 64 | CPU, GPU | CPU, GPU, **NE** | **NeuralEngine** |
+| `conv` | 1x3x224x224 -> 64, s2 | CPU, GPU | CPU, GPU, **NE** | **NeuralEngine** |
+| `conv` | depthwise, groups=64 | CPU, GPU | CPU, GPU, **NE** | CPU |
+| `layer_norm` | up to 1024x4096 | CPU, GPU | CPU, GPU, **NE** | CPU |
+| `batch_norm` | 1x64x32x32 | CPU, GPU | CPU, GPU, **NE** | CPU |
+| `batch_norm` | 32x256x64x64 | CPU, GPU | CPU, GPU, **NE** | GPU |
+| `relu`, `gelu` | up to 1024x4096 | CPU, GPU | CPU, GPU, **NE** | CPU / GPU |
+| `softmax` | up to 1x32x512x512 | CPU, GPU | CPU, GPU, **NE** | CPU |
+| `max_pool` | up to 32x256x64x64 | CPU, GPU | CPU, GPU, **NE** | CPU / GPU |
+| `matmul` | 1x8x128x64 | CPU, GPU | CPU, GPU, **NE** | CPU |
+| `matmul` | 1x32x512x64 | CPU, GPU | CPU, GPU, **NE** | **NeuralEngine** |
+| `gather` (embedding) | 1000x256 | CPU, GPU | **CPU, GPU** | CPU |
+
+Three things fall out of it, and none of them is visible from "it compiled":
+
+1. **float32 never reaches the unit, for any op.** §1.1 measured that for
+   `linear`; it holds for every op in the table. The two spellings stay two
+   products.
+2. **Only the compute-bound ops are ever *preferred* on the unit.** `conv`,
+   `linear` and a large enough `matmul` cross over with size; the
+   memory-bound ones — norms, activations, softmax, pooling — list the unit as
+   supported at every size tried and CoreML picks the CPU or the GPU anyway.
+3. **`gather` does not list the unit at all**, at either precision. An
+   embedding table is not an ANE candidate here, and no amount of size changes
+   that.
+
+### 7.2 What that bought: `Conv2d` lowers, and the rest are refused by a number
+
+`nn.Conv2d` is now a second lowered leaf type (`_CoreMLConv2d`). Measured on
+`Conv2d(128, 256, 3, padding=1)` at `(1, 128, 32, 32)`, through
+`to(torchnative.device.npu)` and the report it attaches:
+
+| precision | `ios16.conv` preferred | supported | `coreml.verify` vs `replay` | tolerance |
+|---|---|---|---|---|
+| float16 | **NeuralEngine** | CPU, GPU, NeuralEngine | 1.26e-03 | float16 grade |
+| float32 | CPU | CPU, GPU | **4.5e-06** | meets verify's 2e-05 |
+
+The float32 number is `verify`'s own default bar and no tolerance was widened
+to reach it. The float16 number is a 576-term sum in half precision and is
+given its own, weaker, named grade — the same two-grade split §1.1 introduced.
+
+The shape obstacle turned out to **generalise rather than block**. A Linear is
+already compiled per shape and cached, because a MIL input spec is static; a
+conv needs the same cache with a wider key, and nothing else changes. What
+does not generalise is the **eager probe**: batch 1 is a shape this library
+may choose and a spatial size is not, so a conv leaf is *deferred* —
+`report["deferred"]` names it at `to()` time, no plan exists for it until the
+first forward, and the plan that then appears is keyed by the shape that
+actually ran. The float32 "this precision cannot reach the unit" warning
+therefore lands at the first forward for a conv and at `to()` for a Linear;
+one flag on the report keeps it from being said twice.
+
+**Not lowered, each with its obstacle:**
+
+| type | obstacle |
+|---|---|
+| `LayerNorm` | no MIL lowering here for `aten.native_layer_norm.default` at all, and its three outputs are not the shape `_BUILDERS` takes. Even with one, 7.1 says CPU. |
+| `ReLU`, `GELU`, `SiLU`, `Sigmoid`, `Tanh` | lowerings exist and the unit is supported — and never preferred. A leaf swap buys a tensor round trip and does not reach the unit. |
+| `Softmax`, `MaxPool2d`, `AvgPool2d` | same as above, measured. |
+| `BatchNorm2d` | same, and in `eval()` it is normally folded into the conv in front of it (docs/graph/REFOLD.md), so a leaf for it is the wrong granularity. |
+| `Embedding` | `gather` does not list the Neural Engine as supported at either precision. |
+| `ConvTranspose2d` | `conv_transpose` is a different MIL op with its own padding convention; unmapped rather than approximated. |
+| `Conv2d` with `padding_mode != "zeros"` | `pad_type="custom"` is *zero* padding; a reflect/replicate pad is a separate `mb.pad`, and emitting zeros would be wrong only at the border — the worst kind of wrong. Skipped **by name**, not silently. |
+| `Conv2d` with a string `padding` | `"same"`/`"valid"` resolve against the input's spatial size, and the selection runs where there is no input. |
+| `Conv1d`, `Conv3d` | this leaf emits a 2-D convolution; a 4-D weight is required and anything else is refused. |
+
+Everything in that table is still **named** in `left_on_cpu` or `skipped`, a
+partial offload still warns, and zero leaves lowered is still a refusal.
+
+### 7.3 One thing that broke, recorded rather than worked around
+
+The test fixture reproducibly **segfaulted at interpreter shutdown** — after
+its whole JSON was printed and every claim in it made — once it had marshalled
+a 1024x4096 tensor through `coreml._np`, which goes via `tolist()` and so
+builds four million Python floats. It is a shutdown crash in the fixture
+process, not in the lowering: the same work at 256x1024 exits 0, and the
+measurement does not depend on the size. The suite therefore asks the
+elementwise question at 256x1024 and this paragraph is why. `_np`'s `tolist()`
+route is the suspect; it is already documented there as "slow, not lossy", and
+this adds a second cost to it.
+
+### 7.4 Split the way CLAUDE.md §5.3 asks
+
+| | |
+|---|---|
+| **feature added** | `_CoreMLConv2d` — `nn.Conv2d` lowers, compiled per input shape, deferred until the first forward |
+| **claim corrected** | "conv cannot be lowered because its shape is unknown at `to()` time" — the shape is unknown, and per-shape compilation already answered that for `Linear` |
+| **coverage added** | one leaf type (two, from one). `supported_ops()` is unchanged: `aten.convolution.default` already had a MIL lowering |
+| **rejections recorded** | eight types, each with the measurement or the missing lowering that decided it (§7.2) |
+| **tests added** | 7, in `rust/torch_c/pytests/test_coremlops.py`; five nullifications, each red on the test it targets |

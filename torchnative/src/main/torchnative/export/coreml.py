@@ -633,6 +633,91 @@ def _eligible_linear(module) -> None:
         )
 
 
+def _eligible_conv2d(module) -> None:
+    """Raise `CoreMLUnsupported` if this `Conv2d` has no MIL lowering here.
+
+    Pure, for `_eligible_linear`'s reason: `plan_lowering` answers "what would
+    happen" on a machine with no coremltools, and it must answer it with the
+    same function the real lowering uses or the two drift.
+
+    What it refuses it refuses **by name**, because each refusal is a thing
+    `mb.conv` would have had to be told to invent:
+
+    * a non-4-D weight -- this stage emits a 2-D convolution and nothing else;
+    * a non-float weight -- the quantized path, which has no MIL lowering here;
+    * `padding_mode` other than `"zeros"` -- `pad_type="custom"` is *zero*
+      padding, and reflect/replicate/circular are a separate `mb.pad` in front
+      of the conv that this stage does not emit;
+    * a string `padding` (`"same"`, `"valid"`) -- those are resolved against
+      the input's spatial size, and this check runs where there is no input.
+      `"valid"` happens to be zero and would be easy; accepting one string and
+      refusing the other is how a caller learns the wrong rule.
+    """
+    weight = module.weight
+    if weight.dim() != 4:
+        raise CoreMLUnsupported(
+            f"torchnative coreml: a Conv2d's weight must be 4-D for mb.conv "
+            f"as emitted here; got shape {tuple(weight.shape)}"
+        )
+    if not weight.dtype.is_floating_point:
+        raise CoreMLUnsupported(
+            f"torchnative coreml: will not lower a {weight.dtype} weight. "
+            f"This stage emits float weights into MIL; an integer weight is "
+            f"the quantized path and there is no MIL lowering for it here"
+        )
+    mode = getattr(module, "padding_mode", "zeros")
+    if mode != "zeros":
+        raise CoreMLUnsupported(
+            f"torchnative coreml: padding_mode={mode!r} is not lowered. "
+            f"mb.conv's pad_type='custom' is zero padding; a reflect, "
+            f"replicate or circular pad is a separate mb.pad in front of the "
+            f"conv, and emitting a zero pad here instead would be a wrong "
+            f"answer that agrees everywhere except at the border"
+        )
+    padding = getattr(module, "padding", 0)
+    if isinstance(padding, str):
+        raise CoreMLUnsupported(
+            f"torchnative coreml: padding={padding!r} is a string, which torch "
+            f"resolves against the input's spatial size. This selection runs "
+            f"with no input, so there is nothing to resolve it against"
+        )
+
+
+#: The leaf types this arm lowers, and how each is described when it is not.
+#:
+#: Two, not one, and the second was chosen by measurement rather than by what
+#: was easiest to add. docs/graph/NPU2.md §7 read `MLComputePlan` at float16
+#: for every candidate: `conv` is preferred on the Neural Engine from
+#: 128->256 at 32x32 upward, while `layer_norm`, `relu`, `gelu`, `softmax` and
+#: `max_pool` list the unit as *supported* and are preferred on the CPU or the
+#: GPU at every size tried, and `gather` does not list it at all. A leaf
+#: swapped for one of those would buy a tensor round trip through CoreML and
+#: would not reach the unit, which is the outcome docs/graph/NPU2.md §1 is
+#: about.
+
+
+def _leaf_kind(torch, child):
+    """`"linear"`, `"conv2d"`, or `None` for a leaf this arm does not lower."""
+    if isinstance(child, torch.nn.Conv2d):
+        return "conv2d"
+    if isinstance(child, torch.nn.Linear):
+        return "linear"
+    return None
+
+
+def _check_leaf(kind, child) -> None:
+    (_eligible_linear if kind == "linear" else _eligible_conv2d)(child)
+
+
+def _describe(kind, child) -> str:
+    if kind == "linear":
+        return (f"Linear(out_features={child.out_features}, "
+                f"in_features={child.in_features})")
+    return (f"Conv2d(out_channels={child.out_channels}, "
+            f"in_channels={child.in_channels}, "
+            f"kernel_size={tuple(child.kernel_size)})")
+
+
 def plan_lowering(model, predicate=None) -> dict:
     """What `_compile_model` would lower and what it would leave. No CoreML.
 
@@ -656,17 +741,17 @@ def plan_lowering(model, predicate=None) -> dict:
         nonlocal moved
         for name, child in list(parent.named_children()):
             path = f"{prefix}{name}"
-            if isinstance(child, torch.nn.Linear):
+            kind = _leaf_kind(torch, child)
+            if kind is not None:
                 if predicate is not None and not predicate(path, child):
                     skipped.append((path, "excluded by predicate"))
                     continue
                 try:
-                    _eligible_linear(child)
+                    _check_leaf(kind, child)
                 except CoreMLUnsupported as exc:
                     skipped.append((
                         path,
-                        f"Linear(out_features={child.out_features}, "
-                        f"in_features={child.in_features}) stays on the CPU: "
+                        f"{_describe(kind, child)} stays on the CPU: "
                         f"{str(exc).split(chr(10))[0]}",
                     ))
                     continue
@@ -693,6 +778,84 @@ def plan_lowering(model, predicate=None) -> dict:
         "parameters_total": total,
         "fraction_moved": moved / total if total else 0.0,
     }
+
+
+def _say_what_ran(report, precision, shape, rows) -> None:
+    """Warn when CoreML did not put this shape on the Neural Engine.
+
+    Two different sentences, and which one is said is decided by
+    `MLComputePlan` rather than by the caller's argument:
+
+    * the unit is **supported** for this program and was not **preferred** --
+      CoreML weighs dispatch cost against work and below some amount of work
+      the CPU wins (docs/graph/NPU2.md §2.1), so this is a property of the
+      model's size and not a defect;
+    * the unit is **not in the supported column at all** -- decided by the
+      precision, so it is said once and not per shape. `_compile_model` says
+      it at `to()` time when it has a probe to say it from; a deferred leaf
+      (a conv, whose shape nobody knows yet) has none, so the first real
+      forward says it instead. `report["_precision_warned"]` is what keeps
+      those two from both firing.
+
+    Module-level because there are two leaf types now and a warning that lives
+    on one of them is a warning the other silently does not have.
+    """
+    import warnings
+
+    compute = computes(rows)
+    if not compute:
+        return
+    if not any("NeuralEngine" in row["supported"] for row in compute):
+        if report.get("_precision_warned"):
+            return
+        report["_precision_warned"] = True
+        warnings.warn(
+            _UNREACHABLE_PRECISION.format(
+                precision=precision,
+                offered=sorted({d for row in compute for d in row["supported"]}),
+            ),
+            UserWarning,
+            stacklevel=3,
+        )
+        return
+    preferred = sorted({row["preferred"] for row in compute})
+    if preferred == ["NeuralEngine"]:
+        return
+    key = ("preferred", tuple(shape), tuple(preferred))
+    said = report.setdefault("_said", [])
+    if key in said:
+        return
+    said.append(key)
+    warnings.warn(
+        f"torchnative coreml: at input shape {list(shape)} the Neural Engine "
+        f"is in CoreML's supported set for this program and is NOT what it "
+        f"preferred -- MLComputePlan says {preferred}. Nothing is wrong "
+        f"with the lowering; CoreML weighs dispatch cost against work and "
+        f"below some amount of work the CPU wins (docs/graph/NPU2.md "
+        f"\u00a72.1), so reaching the unit is a property of the model's size. "
+        f"This is said rather than left silent because "
+        f"`to(torchnative.device.npu)` succeeded and a caller would "
+        f"otherwise believe the Neural Engine ran it. The per-operation "
+        f"plan is on the model as `.torchnative_offload['plans']`.",
+        UserWarning,
+        stacklevel=3,
+    )
+
+
+#: Said once per model, by whoever gets there first. Held as one string
+#: because `_compile_model` says it at `to()` time for a leaf it could probe
+#: and `_say_what_ran` says it at the first forward for one it could not, and
+#: two copies of the sentence would drift.
+_UNREACHABLE_PRECISION = (
+    "torchnative coreml: lowered at precision={precision!r}, and at that "
+    "precision the Neural Engine is NOT in CoreML's supported column for this "
+    "program -- MLComputePlan offers {offered}, so no compute_units setting "
+    "can reach the unit. This model runs through CoreML on the CPU or GPU. "
+    "That is the trade this precision buys: it agrees with "
+    "DecomposedTrace.replay at 2e-05, where float16 agrees at about 1e-03. "
+    "Use `to(torchnative.device.npu)` (float16) to reach the unit, and see "
+    "docs/graph/NPU2.md \u00a71.1."
+)
 
 
 class _CoreMLLinear:
@@ -804,58 +967,15 @@ class _CoreMLLinear:
         )
         rows = compute_plan(model, compute_units=units)
         self._report.setdefault("plans", []).append({
-            "batch": batch, "probe": bool(probe), "rows": rows,
+            "leaf": "linear", "batch": batch,
+            "shape": [batch, self.in_features],
+            "probe": bool(probe), "rows": rows,
         })
         self._compiled[batch] = model
         if not probe:
-            self._say_what_ran(batch, rows)
+            _say_what_ran(self._report, self.precision,
+                          [batch, self.in_features], rows)
         return model
-
-    def _say_what_ran(self, batch, rows):
-        """Warn when CoreML did not put this shape on the Neural Engine.
-
-        Only for a shape the **caller** asked for. `_compile_model`'s eager
-        compile uses batch 1 because that is the shape it can know without a
-        prompt, and warning that CoreML preferred the CPU for a shape nobody
-        requested is noise -- docs/graph/NPU2.md §2.1 measured that a small
-        program legitimately goes to the CPU at float16. That probe's plan is
-        still recorded; it is only the warning that waits for a real shape.
-
-        The unreachable case -- `precision="float32"`, where the unit is not in
-        the supported column at all -- is warned at `to()` time instead, by
-        `_compile_model`, because it is decided by the precision and not by the
-        shape.
-        """
-        import warnings
-
-        compute = computes(rows)
-        if not compute:
-            return
-        preferred = sorted({row["preferred"] for row in compute})
-        if preferred == ["NeuralEngine"]:
-            return
-        if not any("NeuralEngine" in row["supported"] for row in compute):
-            # Already said once, at `to()`, and it does not change with shape.
-            return
-        key = ("preferred", batch, tuple(preferred))
-        said = self._report.setdefault("_said", [])
-        if key in said:
-            return
-        said.append(key)
-        warnings.warn(
-            f"torchnative coreml: at batch {batch} the Neural Engine is in "
-            f"CoreML's supported set for this program and is NOT what it "
-            f"preferred -- MLComputePlan says {preferred}. Nothing is wrong "
-            f"with the lowering; CoreML weighs dispatch cost against work and "
-            f"below some amount of work the CPU wins (docs/graph/NPU2.md "
-            f"§2.1), so reaching the unit is a property of the model's size. "
-            f"This is said rather than left silent because "
-            f"`to(torchnative.device.npu)` succeeded and a caller would "
-            f"otherwise believe the Neural Engine ran it. The per-operation "
-            f"plan is on the model as `.torchnative_offload['plans']`.",
-            UserWarning,
-            stacklevel=3,
-        )
 
     def forward(self, x):
         import numpy as np
@@ -888,6 +1008,195 @@ class _CoreMLLinear:
         )
 
 
+class _CoreMLConv2d:
+    """A `torch.nn.Conv2d` replacement whose forward runs through CoreML.
+
+    `_CoreMLLinear`'s shape, with the one difference that kept conv out of
+    docs/graph/NPU2.md: **the free dimensions are `(N, H, W)` and not `(N,)`.**
+
+    That turned out to generalise rather than block. A Linear is already
+    compiled *per shape* and cached, because a MIL input spec is static and a
+    different batch is a different program; a conv needs the same thing with a
+    wider key, so the cache is keyed on the whole input shape and the lowering
+    itself is unchanged.
+
+    What does not generalise is the **eager probe**. `_compile_model` compiles
+    a Linear at batch 1 before returning, so "coremltools cannot build this"
+    is a failure of `to()` rather than a surprise inside a loop. Batch 1 is a
+    shape this library may choose; a spatial size is not -- 32x32 and 224x224
+    are different programs and CoreML's answer for one says nothing about the
+    other. So a conv leaf is **deferred**: it is named in
+    `report["deferred"]`, no plan exists for it until the first forward, and
+    the plan that then appears is keyed by the shape that actually ran.
+
+    Which is worth doing, because the unit answers for conv. Measured on this
+    machine at float16 (docs/graph/NPU2.md \u00a77): `ios16.conv` at
+    (1, 128, 32, 32) is *preferred* on the Neural Engine, as is every larger
+    size tried, while `layer_norm`, `relu`, `gelu`, `softmax` and `max_pool`
+    list the unit as supported and are preferred on the CPU or the GPU at
+    every size tried.
+    """
+
+    def __new__(cls, *args, **kwargs):
+        torch = _torch()
+        if not issubclass(cls, torch.nn.Module):
+            cls = type("_CoreMLConv2d", (_CoreMLConv2d, torch.nn.Module), {})
+            return torch.nn.Module.__new__(cls)
+        return super().__new__(cls)
+
+    def __init__(self, weight, bias=None, *, stride=(1, 1), padding=(0, 0),
+                 dilation=(1, 1), groups=1, precision: str = "float16",
+                 compute_units=None, report=None):
+        torch = _torch()
+        torch.nn.Module.__init__(self)
+        self.precision = _check_precision(precision)
+        self.weight = torch.nn.Parameter(weight.detach())
+        self.bias = (
+            torch.nn.Parameter(bias.detach()) if bias is not None else None
+        )
+        self.stride = tuple(int(v) for v in _pair(stride))
+        self.padding = tuple(int(v) for v in _pair(padding))
+        self.dilation = tuple(int(v) for v in _pair(dilation))
+        self.groups = int(groups)
+        self.kernel_size = tuple(int(v) for v in weight.shape[2:])
+        self.out_channels = int(weight.shape[0])
+        self.in_channels = (
+            int(weight.shape[1]) * self.groups if weight.dim() == 4 else 0
+        )
+        #: There is no other value: `_eligible_conv2d` refuses anything else,
+        #: and it is held as an attribute so that check reads the same on a
+        #: lowered leaf as on the `nn.Conv2d` it replaced.
+        self.padding_mode = "zeros"
+        _eligible_conv2d(self)
+        self._compute_units = compute_units
+        self._compiled = {}
+        self._report = report if report is not None else {
+            "plans": [], "_said": []}
+        self._weight_np = None
+        self._bias_np = None
+
+    @classmethod
+    def from_torch(cls, layer, *, precision="float16", compute_units=None,
+                   report=None):
+        # Checked on the *original* layer, not on the replacement: a string
+        # `padding` or a `padding_mode` this stage cannot express has to be
+        # refused before it is quietly normalised away by `__init__`.
+        _eligible_conv2d(layer)
+        return cls(layer.weight, getattr(layer, "bias", None),
+                   stride=layer.stride, padding=layer.padding,
+                   dilation=layer.dilation, groups=layer.groups,
+                   precision=precision, compute_units=compute_units,
+                   report=report)
+
+    def _units(self):
+        import coremltools as ct
+
+        return ct.ComputeUnit.ALL if self._compute_units is None \
+            else self._compute_units
+
+    def _arrays(self):
+        if self._weight_np is None:
+            self._weight_np = _np(self.weight)
+            self._bias_np = _np(self.bias) if self.bias is not None else None
+        return self._weight_np, self._bias_np
+
+    def _compile_for(self, shape, *, probe: bool = False):
+        shape = tuple(int(d) for d in shape)
+        if shape in self._compiled:
+            return self._compiled[shape]
+
+        import coremltools as ct
+        from coremltools.converters.mil import Builder as mb
+
+        weight, bias = self._arrays()
+        kwargs = {"weight": weight}
+        if bias is not None:
+            kwargs["bias"] = bias
+        pad = [self.padding[0], self.padding[0],
+               self.padding[1], self.padding[1]]
+
+        @mb.program(input_specs=[mb.TensorSpec(shape=shape)])
+        def program(x):
+            return mb.conv(x=x, strides=list(self.stride), pad_type="custom",
+                           pad=pad, dilations=list(self.dilation),
+                           groups=self.groups, **kwargs)
+
+        units = self._units()
+        model = ct.convert(
+            program,
+            convert_to="mlprogram",
+            minimum_deployment_target=ct.target.macOS13,
+            compute_precision=(ct.precision.FLOAT32
+                               if self.precision == "float32"
+                               else ct.precision.FLOAT16),
+            compute_units=units,
+        )
+        rows = compute_plan(model, compute_units=units)
+        self._report.setdefault("plans", []).append({
+            "leaf": "conv2d", "shape": list(shape),
+            "probe": bool(probe), "rows": rows,
+        })
+        self._compiled[shape] = model
+        if not probe:
+            _say_what_ran(self._report, self.precision, shape, rows)
+        return model
+
+    def forward(self, x):
+        import numpy as np
+
+        torch = _torch()
+        shape = tuple(int(d) for d in x.shape)
+        if len(shape) != 4:
+            raise CoreMLUnsupported(
+                f"torchnative coreml: this leaf emits a 2-D convolution, so "
+                f"its input must be 4-D (N, C, H, W); got {list(shape)}"
+            )
+        if shape[1] != self.in_channels:
+            raise CoreMLUnsupported(
+                f"torchnative coreml: input channel dimension {shape[1]} does "
+                f"not match in_channels={self.in_channels}."
+            )
+        model = self._compile_for(shape)
+        feed = np.asarray(x.detach().tolist(), dtype=np.float32).reshape(shape)
+        produced = list(model.predict(
+            {model.get_spec().description.input[0].name: feed}).values())[0]
+        result = torch.tensor(np.asarray(produced, dtype=np.float32).tolist())
+        return result.to(x.dtype)
+
+    def extra_repr(self) -> str:
+        return (
+            f"in_channels={self.in_channels}, "
+            f"out_channels={self.out_channels}, "
+            f"kernel_size={self.kernel_size}, stride={self.stride}, "
+            f"padding={self.padding}, dilation={self.dilation}, "
+            f"groups={self.groups}, bias={self.bias is not None}, "
+            f"precision={self.precision!r}"
+        )
+
+
+def _pair(value):
+    """`(a, b)` from an int or a 2-sequence, for stride/padding/dilation."""
+    if isinstance(value, (list, tuple)):
+        if len(value) != 2:
+            raise CoreMLUnsupported(
+                f"torchnative coreml: expected two spatial values, got "
+                f"{list(value)}"
+            )
+        return tuple(value)
+    return (value, value)
+
+
+#: `kind -> leaf class`. Adding a row here is adding a lowered leaf type, and
+#: the measurement that justifies one is in `_CoreMLConv2d`'s docstring.
+_LEAVES = {"linear": _CoreMLLinear, "conv2d": _CoreMLConv2d}
+
+#: Kinds whose program can be built from a shape this library may choose. A
+#: Linear's free dimension is the batch and 1 is a legitimate choice; a conv's
+#: free dimensions include the spatial size and there is no such thing as a
+#: default one.
+_PROBEABLE = frozenset({"linear"})
+
+
 def _compile_model(model, *, precision: str = "float16", compute_units=None,
                    predicate=None, eager: bool = True, progress=None):
     """Swap every `torch.nn.Linear` in `model` for a `_CoreMLLinear`. In place.
@@ -897,19 +1206,27 @@ def _compile_model(model, *, precision: str = "float16", compute_units=None,
     ways: as `model.torchnative_offload` and as a `UserWarning` when the
     offload is partial.
 
-    **Linear only, as on the Intel arm.** Conv2d has a MIL lowering here
-    (`supported_ops()` lists `aten.convolution.default`) and is still left on
-    the CPU, because a conv leaf's program cannot be built without its input's
-    spatial dimensions and those are not knowable at `to()` time. A Linear's
-    is: batch is the only free dimension, which is why `_NPULinear` can compile
-    at batch 1 too. Widening this to conv needs a shape source, not a bigger
-    table, and it is left named rather than half-done.
+    **Two leaf types, `Linear` and `Conv2d`, and the second was chosen by
+    measurement.** An earlier round left conv on the CPU because its program
+    cannot be built without the input's spatial dimensions. That obstacle is
+    real and is answered rather than removed: conv is compiled at the first
+    forward, keyed on the whole input shape, and until then it is listed in
+    `report["deferred"]` -- see `_CoreMLConv2d`.
+
+    What decided that it was worth answering is `MLComputePlan` at float16
+    (docs/graph/NPU2.md \u00a77): `conv` is *preferred* on the Neural Engine
+    from 128->256 at 32x32 upward, while `layer_norm`, `relu`, `gelu`,
+    `softmax` and `max_pool` list the unit as merely *supported* and are
+    preferred on the CPU or the GPU at every size tried, and `gather` does not
+    list it at all. Those are not lowered: a leaf swapped for one of them buys
+    a tensor round trip through CoreML and does not reach the unit, which is
+    the shape of the failure docs/graph/NPU2.md \u00a71 records.
 
     **Zero leaves lowered raises.** Returning an untouched model with a success
     message is the silent CPU fallback this path exists to prevent.
 
-    **`eager=True` compiles the batch-1 program for every leaf before
-    returning.** As on the Intel arm, that is a change of placement rather than
+    **`eager=True` compiles the batch-1 program for every *probeable* leaf
+    before returning.** As on the Intel arm, that is a change of placement rather than
     a speed-up: it makes "coremltools cannot build this" a failure of *this
     call* instead of a surprise several layers into a `generate()` loop. It is
     marked `probe: True` in the report and does not warn about which unit
@@ -925,14 +1242,16 @@ def _compile_model(model, *, precision: str = "float16", compute_units=None,
         "plans": [],
         "_said": [],
     }
-    swapped, left, skipped = [], {}, []
+    swapped, left, skipped, deferred = [], {}, [], []
+    kinds = {}
     moved_parameters = 0
 
     def walk(parent, prefix):
         nonlocal moved_parameters
         for name, child in list(parent.named_children()):
             path = f"{prefix}{name}"
-            if isinstance(child, torch.nn.Linear):
+            kind = _leaf_kind(torch, child)
+            if kind is not None:
                 if predicate is not None and not predicate(path, child):
                     skipped.append((path, "excluded by predicate"))
                     continue
@@ -940,20 +1259,21 @@ def _compile_model(model, *, precision: str = "float16", compute_units=None,
                     child.bias.numel() if child.bias is not None else 0
                 )
                 try:
-                    lowered = _CoreMLLinear.from_torch(
+                    lowered = _LEAVES[kind].from_torch(
                         child, precision=precision,
                         compute_units=compute_units, report=report)
                 except CoreMLUnsupported as exc:
                     skipped.append((
                         path,
-                        f"{type(child).__name__}"
-                        f"(out_features={child.out_features}, "
-                        f"in_features={child.in_features}) stays on the CPU: "
+                        f"{_describe(kind, child)} stays on the CPU: "
                         f"{str(exc).split(chr(10))[0]}",
                     ))
                     continue
                 parent.add_module(name, lowered)
                 swapped.append(path)
+                kinds[path] = kind
+                if kind not in _PROBEABLE:
+                    deferred.append(path)
                 moved_parameters += numel
                 continue
             grandchildren = list(child.named_children())
@@ -967,13 +1287,14 @@ def _compile_model(model, *, precision: str = "float16", compute_units=None,
         raise CoreMLUnsupported(
             f"torchnative coreml: nothing was lowered, so nothing runs on the "
             f"Neural Engine. Leaf module types found: "
-            f"{sorted(left) or ['<none>']}. {len(skipped)} Linear(s) were "
-            f"skipped: {skipped[:4]}. Returning the model unchanged with a "
-            f"success message would be the silent CPU fallback this path "
-            f"exists to prevent -- docs/graph/NPU2.md §1 is that exact failure, "
-            f"found only by reading MLComputePlan. torch.nn.Linear is the only "
-            f"leaf lowered at this stage; see `_compile_model` for why conv is "
-            f"named rather than half-done."
+            f"{sorted(left) or ['<none>']}. {len(skipped)} lowerable "
+            f"leaf/leaves were skipped: {skipped[:4]}. Returning the model "
+            f"unchanged with a success message would be the silent CPU "
+            f"fallback this path exists to prevent -- docs/graph/NPU2.md §1 is "
+            f"that exact failure, found only by reading MLComputePlan. "
+            f"torch.nn.Linear and torch.nn.Conv2d are the leaves lowered at "
+            f"this stage; see `_compile_model` for the MLComputePlan "
+            f"measurement that decided which types those are."
         )
 
     def leaf_at(path):
@@ -982,7 +1303,11 @@ def _compile_model(model, *, precision: str = "float16", compute_units=None,
             node = node[int(part)] if part.isdigit() else getattr(node, part)
         return node
 
-    leaves = [leaf_at(path) for path in swapped]
+    # Only the leaves whose shape this function may choose. A deferred leaf
+    # is not skipped quietly: it is on the report by name, and its plan
+    # appears at the first forward keyed by the shape that actually ran.
+    probeable = [path for path in swapped if kinds[path] in _PROBEABLE]
+    leaves = [leaf_at(path) for path in probeable]
 
     # The first eager compile is NOT caught by name, unlike every one after it.
     # It is different in kind: it is the assertion that coremltools on this host
@@ -990,11 +1315,11 @@ def _compile_model(model, *, precision: str = "float16", compute_units=None,
     # report would turn "CoreML is not usable here" into a model the caller
     # believes is offloaded.
     eager_failed = []
-    if eager:
+    if eager and leaves:
         leaves[0]._compile_for(1, probe=True)
         if progress is not None:
-            progress(1, len(leaves), swapped[0])
-        for index, (path, leaf) in enumerate(zip(swapped[1:], leaves[1:]), 2):
+            progress(1, len(leaves), probeable[0])
+        for index, (path, leaf) in enumerate(zip(probeable[1:], leaves[1:]), 2):
             try:
                 leaf._compile_for(1, probe=True)
             except Exception as exc:  # noqa: BLE001
@@ -1005,6 +1330,8 @@ def _compile_model(model, *, precision: str = "float16", compute_units=None,
     total = sum(p.numel() for p in model.parameters())
     report.update({
         "swapped": swapped,
+        "kinds": kinds,
+        "deferred": deferred,
         "skipped": skipped,
         "left_on_cpu": dict(sorted(left.items())),
         "eager_failed": eager_failed,
@@ -1023,17 +1350,13 @@ def _compile_model(model, *, precision: str = "float16", compute_units=None,
     probe_rows = [row for plan in report["plans"] for row in computes(plan["rows"])]
     if probe_rows and not any(
             "NeuralEngine" in row["supported"] for row in probe_rows):
+        report["_precision_warned"] = True
         warnings.warn(
-            f"torchnative coreml: lowered at precision={precision!r}, and at "
-            f"that precision the Neural Engine is NOT in CoreML's supported "
-            f"column for this program -- MLComputePlan offers "
-            f"{sorted({d for row in probe_rows for d in row['supported']})}, "
-            f"so no compute_units setting can reach the unit. This model runs "
-            f"through CoreML on the CPU or GPU. That is the trade this "
-            f"precision buys: it agrees with DecomposedTrace.replay at 2e-05, "
-            f"where float16 agrees at about 1e-03. Use "
-            f"`to(torchnative.device.npu)` (float16) to reach the unit, and "
-            f"see docs/graph/NPU2.md §1.1.",
+            _UNREACHABLE_PRECISION.format(
+                precision=precision,
+                offered=sorted(
+                    {d for row in probe_rows for d in row["supported"]}),
+            ),
             UserWarning,
             stacklevel=4,
         )
