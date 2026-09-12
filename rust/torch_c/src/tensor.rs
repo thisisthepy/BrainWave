@@ -1493,6 +1493,49 @@ pub fn shim_f16_bytes<'py>(
     Ok(PyBytes::new(py, &out))
 }
 
+/// **A tensor's view as little-endian bytes in its own dtype, without building
+/// a single Python object.**
+///
+/// `torch._C._shim_tensor_bytes(t)`. The general-dtype counterpart to
+/// `_shim_f16_bytes`: where that function converts to float16 and encodes,
+/// this one reads the tensor's *own* dtype and returns the bytes exactly as
+/// `to_le_bytes` produces them -- flattened, contiguous, row-major.
+///
+/// The motivation is `coreml._np`, which used `tolist()` to marshal a shim
+/// tensor into a numpy array. For a 1024x4096 weight that is four million
+/// `PyFloat` objects, which reproducibly **segfaults at interpreter shutdown**
+/// (docs/graph/NPU2.md §7.3). The `_shim_f16_bytes` fix for intelnpu does not
+/// generalise here: CoreML needs float32, float64, int32, int64 and bool, not
+/// float16. So this is the general route, and `_np` pairs it with
+/// `np.frombuffer(bytes, dtype=...)` on the Python side.
+///
+/// `to_le_bytes` already handles float32, float64, int32, int64, and u8
+/// (torch.bool). The only dtypes it refuses are the half-width floats (f16,
+/// bf16) -- and those are not in `_NUMPY_DTYPES` either, so `_np` never asks
+/// for them. Anything `to_le_bytes` refuses, this refuses, with the same
+/// message.
+#[pyfunction]
+#[pyo3(name = "_shim_tensor_bytes")]
+pub fn shim_tensor_bytes<'py>(
+    py: Python<'py>,
+    value: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyBytes>> {
+    const OP: &str = "torch._C._shim_tensor_bytes";
+    let Ok(base) = value.extract::<PyRef<'_, PyTensorBase>>() else {
+        return Err(not_implemented(format!(
+            "{OP} in torch._C shim: expected a tensor, got {}",
+            value
+                .get_type()
+                .name()
+                .map(|n| n.to_string())
+                .unwrap_or_default()
+        )));
+    };
+    let tensor = base.tensor()?;
+    let bytes = to_le_bytes(OP, tensor)?;
+    Ok(PyBytes::new(py, &bytes))
+}
+
 /// The contiguous (row-major) stride for a shape, in elements.
 fn contiguous_stride(size: &[usize]) -> Vec<i64> {
     let mut stride = vec![1i64; size.len()];
@@ -4420,6 +4463,7 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(set_size_class, m)?)?;
     m.add_function(wrap_pyfunction!(has_storage, m)?)?;
     m.add_function(wrap_pyfunction!(shim_f16_bytes, m)?)?;
+    m.add_function(wrap_pyfunction!(shim_tensor_bytes, m)?)?;
     m.add_function(wrap_pyfunction!(set_grad_enabled_flag, m)?)?;
     m.add_function(wrap_pyfunction!(set_throw_on_mutable_data_ptr, m)?)?;
     m.add_function(wrap_pyfunction!(throws_on_mutable_data_ptr, m)?)?;

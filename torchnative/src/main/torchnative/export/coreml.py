@@ -120,12 +120,21 @@ _NUMPY_DTYPES = {
 def _np(value):
     """A shim tensor as a numpy array.
 
-    Via `tolist()`, not `numpy()`: `TensorBase.numpy` is not implemented in
-    this shim and `np.asarray` goes through it, so the buffer route fails with
-    a message about a method nobody called. `tolist()` is exact for every dtype
-    here -- it goes through Python ints and floats, and float32 round-trips
-    through a Python float without loss -- so this is slow, not lossy, and the
-    numerical claims in `verify()` are unaffected by it.
+    Through `torch._C._shim_tensor_bytes`, not `tolist()`. The byte route
+    reads the candle storage directly -- flatten, contiguify, copy to a single
+    `bytes` object -- and `np.frombuffer` wraps it without building any Python
+    scalar objects. For a 1024x4096 float32 tensor that is 16 MB of bytes
+    instead of four million ``PyFloat`` objects (~128 MB of CPython heap), and
+    it removes the shutdown segfault docs/graph/NPU2.md §7.3 recorded.
+
+    The numerical result is bit-identical to the `tolist()` route for every
+    dtype in ``_NUMPY_DTYPES``: float32 and float64 are IEEE-754 in both
+    candle and numpy, int32 and int64 are two's-complement little-endian in
+    both, and bool is a single byte. ``verify()``'s claims are therefore
+    unaffected -- neither widened nor narrowed.
+
+    Falls back to `tolist()` only when `torch._C._shim_tensor_bytes` is
+    absent, which means upstream torch rather than this shim.
     """
     import numpy as np
     import torch
@@ -136,10 +145,31 @@ def _np(value):
             raise CoreMLRefused(
                 f"torchnative coreml: no numpy dtype mapped for {value.dtype}"
             )
+        reader = getattr(torch._C, "_shim_tensor_bytes", None)
+        if reader is not None:
+            raw = reader(value.detach())
+            return np.frombuffer(raw, dtype=dtype).reshape(tuple(value.shape))
         return np.array(value.detach().tolist(), dtype=dtype).reshape(
             tuple(value.shape)
         )
     return value
+
+
+def _tensor_from_np(torch, arr):
+    """A numpy array as a shim tensor, without ``tolist()``.
+
+    ``torch.frombuffer`` reads the buffer directly; ``torch.tensor`` of a
+    numpy array goes through ``__array__`` which the shim supports. Either
+    avoids the ``tolist()`` route that ``_np``'s byte path replaced.
+    """
+    import numpy as np
+
+    contiguous = np.ascontiguousarray(arr)
+    frombuffer = getattr(torch, "frombuffer", None)
+    if frombuffer is not None:
+        flat = frombuffer(bytearray(contiguous.data), dtype=torch.float32)
+        return flat.reshape(*arr.shape)
+    return torch.tensor(contiguous.tolist())
 
 
 def _conv(mb, x, args):
@@ -580,24 +610,29 @@ def compute_plan(model, *, compute_units=None) -> list[dict]:
             return "CPU"
         return type(device).__name__
 
+    import shutil
+
     directory = tempfile.mkdtemp(prefix="torchnative-coreml-")
-    package = os.path.join(directory, "m.mlpackage")
-    model.save(package)
-    plan = MLComputePlan.load_from_path(
-        ct_utils.compile_model(package), compute_units=compute_units)
-    function = plan.model_structure.program.functions["main"]
-    rows = []
-    for operation in function.block.operations:
-        usage = plan.get_compute_device_usage_for_mlprogram_operation(operation)
-        if usage is None:
-            continue
-        rows.append({
-            "op": operation.operator_name,
-            "preferred": name_of(usage.preferred_compute_device),
-            "supported": sorted(
-                name_of(d) for d in usage.supported_compute_devices),
-        })
-    return rows
+    try:
+        package = os.path.join(directory, "m.mlpackage")
+        model.save(package)
+        plan = MLComputePlan.load_from_path(
+            ct_utils.compile_model(package), compute_units=compute_units)
+        function = plan.model_structure.program.functions["main"]
+        rows = []
+        for operation in function.block.operations:
+            usage = plan.get_compute_device_usage_for_mlprogram_operation(operation)
+            if usage is None:
+                continue
+            rows.append({
+                "op": operation.operator_name,
+                "preferred": name_of(usage.preferred_compute_device),
+                "supported": sorted(
+                    name_of(d) for d in usage.supported_compute_devices),
+            })
+        return rows
+    finally:
+        shutil.rmtree(directory, ignore_errors=True)
 
 
 def computes(rows) -> list[dict]:
@@ -991,13 +1026,13 @@ class _CoreMLLinear:
         for dim in shape[:-1]:
             batch *= dim
         model = self._compile_for(batch)
-        feed = np.asarray(x.detach().tolist(), dtype=np.float32).reshape(
+        feed = _np(x.detach()).astype(np.float32).reshape(
             batch, self.in_features)
         produced = list(model.predict(
             {model.get_spec().description.input[0].name: feed}).values())[0]
-        result = torch.tensor(
-            np.asarray(produced, dtype=np.float32).reshape(
-                *shape[:-1], self.out_features).tolist())
+        out_np = np.asarray(produced, dtype=np.float32).reshape(
+            *shape[:-1], self.out_features)
+        result = _tensor_from_np(torch, out_np)
         return result.to(x.dtype)
 
     def extra_repr(self) -> str:
@@ -1157,10 +1192,11 @@ class _CoreMLConv2d:
                 f"not match in_channels={self.in_channels}."
             )
         model = self._compile_for(shape)
-        feed = np.asarray(x.detach().tolist(), dtype=np.float32).reshape(shape)
+        feed = _np(x.detach()).astype(np.float32).reshape(shape)
         produced = list(model.predict(
             {model.get_spec().description.input[0].name: feed}).values())[0]
-        result = torch.tensor(np.asarray(produced, dtype=np.float32).tolist())
+        out_np = np.asarray(produced, dtype=np.float32)
+        result = _tensor_from_np(torch, out_np)
         return result.to(x.dtype)
 
     def extra_repr(self) -> str:

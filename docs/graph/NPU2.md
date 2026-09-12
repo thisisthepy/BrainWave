@@ -505,17 +505,38 @@ one flag on the report keeps it from being said twice.
 Everything in that table is still **named** in `left_on_cpu` or `skipped`, a
 partial offload still warns, and zero leaves lowered is still a refusal.
 
-### 7.3 One thing that broke, recorded rather than worked around
+### 7.3 Two things that broke, now fixed
 
-The test fixture reproducibly **segfaulted at interpreter shutdown** — after
-its whole JSON was printed and every claim in it made — once it had marshalled
-a 1024x4096 tensor through `coreml._np`, which goes via `tolist()` and so
-builds four million Python floats. It is a shutdown crash in the fixture
-process, not in the lowering: the same work at 256x1024 exits 0, and the
-measurement does not depend on the size. The suite therefore asks the
-elementwise question at 256x1024 and this paragraph is why. `_np`'s `tolist()`
-route is the suspect; it is already documented there as "slow, not lossy", and
-this adds a second cost to it.
+**The segfault.** The test fixture reproducibly **segfaulted at interpreter
+shutdown** after marshalling a 1024x4096 tensor through `coreml._np`, which
+went via `tolist()` and built four million Python floats. The same defect
+family hit `intelnpu.py` as a `MemoryError` (docs/devices/INTELNPU.md), and the
+root cause is the same: `tolist()` in Rust builds `N` `PyFloat` objects via
+`pyo3::ffi::PyFloat_FromDouble`, then nests them in Python lists. At
+interpreter shutdown, pyo3's module finalization and CPython's GC teardown walk
+millions of these objects, and the ordering between pyo3's module state and
+CPython's type deallocation is not guaranteed — a `tp_dealloc` for a
+`pyo3`-managed type can fire after the module's state has been freed, which
+dereferences a dangling pointer.
+
+The fix is `torch._C._shim_tensor_bytes`: it reads the candle storage directly
+(flatten, contiguify, copy to a single `bytes` object), and `np.frombuffer`
+wraps the result without building any Python scalar objects. For a 1024x4096
+float32 tensor that is 16 MB of bytes instead of ~128 MB of `PyFloat` heap.
+The numerical result is bit-identical: float32 and float64 are IEEE-754 in both
+candle and numpy, int32 and int64 are two's-complement little-endian in both,
+and bool is a single byte. `verify()`'s claims are unaffected — neither
+widened nor narrowed.
+
+**The tempfile leak.** `compute_plan` called `tempfile.mkdtemp` and never
+cleaned up. 277 directories were left behind after the test round. Fixed with a
+`try/finally` wrapping `shutil.rmtree(directory, ignore_errors=True)`.
+
+Tests: 7 in `rust/torch_c/pytests/test_npmarshal.py`. Three nullifications, each
+red on the test it targets: (1) force `_np` back to `tolist()` and the heap test
+goes red (peak 731 KB vs limit 240 KB), (2) make `_shim_tensor_bytes` return
+empty bytes and the dtype test fails with a reshape error, (3) remove the
+`finally: rmtree` and the tempdir test finds a leaked directory.
 
 ### 7.4 Split the way CLAUDE.md §5.3 asks
 
