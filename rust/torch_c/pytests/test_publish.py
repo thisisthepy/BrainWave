@@ -149,12 +149,32 @@ def test_the_script_says_why_github_and_tools_ci_are_kept():
     assert "default branch" in text.lower()
 
 
-def test_all_three_workflows_are_still_workflow_dispatch():
+#: Every workflow, named. This was `len(wfs) == 3` and the number was the only
+#: thing holding the set together, so adding `publish-pypi.yml` failed with
+#: "expected three, found four" and said nothing about whether the new one met
+#: the requirement below. Named instead, for the reason build.py's
+#: EXPECTED_TARGET_KEYS is named: a count cannot say which one moved.
+EXPECTED_WORKFLOWS = (
+    "build-cuda-wheel.yml",
+    "publish-pypi.yml",
+    "qnn-lower.yml",
+    "verify-published-wheel.yml",
+)
+
+
+def test_every_workflow_is_still_workflow_dispatch():
     """The premise of the paragraph above. If a workflow stops being manually
     triggered, the reasoning for keeping `.github/` on main changes and should
-    be re-argued rather than inherited."""
+    be re-argued rather than inherited.
+
+    `publish-pypi.yml` is also triggered by a version tag, which is not a
+    counter-example: it is *additionally* `workflow_dispatch`, deliberately, so
+    that the first use of a release workflow is a dry run rather than a
+    release. docs/platform/PUBLISH_CI.md §6."""
     wfs = sorted((REPO / ".github/workflows").glob("*.yml"))
-    assert len(wfs) == 3, f"expected three workflows, found {[w.name for w in wfs]}"
+    names = tuple(w.name for w in wfs)
+    assert names == EXPECTED_WORKFLOWS, (
+        f"the workflow set is {list(names)}; expected {list(EXPECTED_WORKFLOWS)}")
     for wf in wfs:
         assert "workflow_dispatch" in wf.read_text(), (
             f"{wf.name} is no longer workflow_dispatch -- publish_main.sh keeps "
