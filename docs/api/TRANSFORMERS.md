@@ -130,7 +130,7 @@ would believe something untrue and have nothing to check.
 
 | argument | refusal |
 |---|---|
-| `export=` | Not implemented. It would mean "lower this checkpoint to an accelerator graph while loading it". The capture layer it needs exists (`torchnative.export.decompose` / `refold`); the step that turns a captured graph into a module leaf does not — the same wall `model.to(torchnative.device.npu)` reports ([`../devices/DEVICE_NS.md`](../devices/DEVICE_NS.md) §5.5). |
+| `export=` | Not implemented. It would mean "lower this checkpoint to an accelerator graph while loading it". The capture layer it needs exists (`torchnative.export.decompose` / `refold`); the step that turns a captured graph into a module leaf does not. **This row used to call that "the same wall `model.to(torchnative.device.npu)` reports", and that is no longer true**: on the `openvino` backend `to(npu)` lowers eligible `torch.nn.Linear` leaves in place and returns the same `nn.Module`. That is leaf replacement on an eager module rather than a captured graph, and it is what to reach for instead; `coreml` and `qnn` still refuse by name ([`../devices/DEVICE_NS.md`](../devices/DEVICE_NS.md) §5.5). |
 | `load_in_4bit=` | Not implemented. There is no 4-bit path: candle-core 0.11's `DType` has no `I8`, so the storage does not exist ([`../graph/QUANT.md`](../graph/QUANT.md) §2.1). The refusal names what *does* work — `torchnative.quant.quantize_(model, format="q8_0")`, or `torchnative.quant.TorchnativeConfig`. |
 
 `test_the_refusals_come_before_any_resolution` passes a model id that does not

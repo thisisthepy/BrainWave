@@ -117,8 +117,16 @@ def _refuse_unsupported(cls_name, kwargs):
             f"`export=True` would mean 'lower this checkpoint to an accelerator "
             f"graph while loading it'. The capture layer it needs exists "
             f"(torchnative.export.decompose / refold), and the step that turns a "
-            f"captured graph into a module leaf does not -- the same wall "
-            f"`model.to(torchnative.device.npu)` reports. See "
+            f"captured graph into a module leaf does not.\n"
+            f"\n"
+            f"What does exist, and is not this: "
+            f"`model.to(torchnative.device.npu)` on a host that resolves to the "
+            f"openvino backend lowers every eligible torch.nn.Linear leaf and "
+            f"hands back the same nn.Module. That is leaf replacement on an "
+            f"eager module, not a captured graph, and it happens after loading "
+            f"rather than during it -- so it is the thing to reach for here, "
+            f"not the thing `export=` would have done. The coreml and qnn "
+            f"backends still refuse by name. See "
             f"docs/api/TRANSFORMERS.md section 5."
         )
     if "load_in_4bit" in kwargs:
