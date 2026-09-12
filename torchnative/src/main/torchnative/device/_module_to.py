@@ -109,7 +109,12 @@ def _to_eager(original, self, device, position, args, kwargs):
 #: The compile step's own options, accepted by `to(device.npu, ...)` and
 #: passed through to `_compile_model`. Named rather than forwarded blindly:
 #: a typo'd kwarg must still be refused, not silently ignored.
-_COMPILE_OPTIONS = ("progress", "eager")
+#:
+#: `precision` is **CoreML's and only CoreML's**, which is why the openvino arm
+#: refuses it by name rather than ignoring it. On that backend the IR is f16
+#: and there is nothing for the word to select; accepting it there would be an
+#: argument taken and dropped, which is how a mode goes silent.
+_COMPILE_OPTIONS = ("progress", "eager", "precision")
 
 
 def _to_compiled(self, device, args, kwargs):
@@ -165,9 +170,33 @@ def _to_compiled(self, device, args, kwargs):
     to the model in that case either --- a report on a model that was never
     lowered is the same lie with a receipt.
 
-    **`coreml` and `qnn` still refuse.** They are not stubbed into a fake
-    success. Their refusal is the same `NotImplementedError`, after the same
-    real resolution, at the same quality of message it had before.
+    **`coreml` (Apple Neural Engine) is wired too, and it takes a
+    `precision`.** It goes to `torchnative.export.coreml._compile_model`, which
+    does the same `named_children()` walk and swaps each `torch.nn.Linear` for
+    a `_CoreMLLinear`. Same mechanism, same in-place contract, same report.
+
+    What is **not** the same is that CoreML's precision is a real choice with a
+    measured cost on each side, so this backend takes two spellings:
+
+        model.to(device.npu)                        # float16
+        model.to(device.npu, precision="float32")   # float32
+
+    float16 is what reaches the Neural Engine -- docs/graph/NPU2.md §1.1
+    measured that for a float32 program the unit is not in CoreML's *supported*
+    column at all, so no `compute_units` setting reaches it -- and it agrees
+    with `DecomposedTrace.replay` to about 1e-03. float32 agrees at 2e-05, the
+    bar the word *agrees* means here, and runs on the CPU or GPU. They are two
+    products and therefore two spellings; a single spelling that silently chose
+    would be the defect docs/graph/NPU2.md is about, one layer up.
+
+    Which unit **actually** ran is not inferred from either: `MLComputePlan` is
+    read at every compile and the per-operation rows are on the report. The
+    case that cannot reach the named unit warns at `to()`; the case that could
+    and did not warns at the forward that found out.
+
+    **`qnn` still refuses.** It is not stubbed into a fake success. Its refusal
+    is the same `NotImplementedError`, after the same real resolution, at the
+    same quality of message it had before.
     """
     # `progress` and `eager` are the compile step's own options, and they reach
     # it ONLY through here. `_compile_model` grew both, and nothing plumbed
@@ -180,7 +209,7 @@ def _to_compiled(self, device, args, kwargs):
     # not a conversion. What is accepted is exactly the compile step's own
     # arguments, named.
     options = {}
-    for name in ("progress", "eager"):
+    for name in _COMPILE_OPTIONS:
         if name in kwargs:
             options[name] = kwargs.pop(name)
 
@@ -196,7 +225,18 @@ def _to_compiled(self, device, args, kwargs):
     resolution = device.resolve()  # raises NpuUnresolved, by name, if it cannot
 
     if resolution.backend == "openvino":
+        if "precision" in options:
+            raise TypeError(
+                f"nn.Module.to(torchnative.device.{device.type}, precision=...): "
+                f"`precision` is the CoreML arm's argument and the openvino "
+                f"backend has no use for it -- its IR is f16 and there is "
+                f"nothing for the word to select. Refusing rather than "
+                f"accepting and dropping it."
+            )
         return _lower_for_openvino(self, device, resolution, **options)
+
+    if resolution.backend == "coreml":
+        return _lower_for_coreml(self, device, resolution, **options)
 
     raise NotImplementedError(
         f"nn.Module.to(torchnative.device.{device.type}): this host's "
@@ -252,6 +292,53 @@ def _lower_for_openvino(model, device, resolution, **options):
             f"parameters). Left on the CPU -- leaf module types: {left}."
             + (f" Skipped Linear(s): {skipped}." if skipped else "")
             + f" The full report is on the model as `.torchnative_offload`. "
+            f"This warning exists because docs/graph/NPU2.md is about a partial "
+            f"offload that went unnoticed while every answer it produced was "
+            f"right.",
+            UserWarning,
+            stacklevel=4,
+        )
+    return model
+
+
+def _lower_for_coreml(model, device, resolution, *, precision="float16",
+                      **options):
+    """Lower `model` for CoreML and hand back the same `nn.Module`.
+
+    The Intel arm's shape, with one addition it does not need: `precision`.
+    See `_to_compiled` for why that is a spelling and not a mode, and
+    `torchnative.export.coreml`'s lowering section for the measurement.
+
+    The partial-offload warning is the Intel arm's, word for word in intent: a
+    complete offload is silent, so the warning stays worth reading. The two
+    *unit* warnings -- "this precision cannot reach the Neural Engine" and "it
+    could and CoreML preferred something else" -- are raised inside
+    `export.coreml`, because only that layer has read the compute plan.
+    """
+    import warnings
+
+    from ..export import coreml
+
+    model, report = coreml._compile_model(model, precision=precision, **options)
+    # Attached only on success. `_compile_model` raises for zero leaves, so
+    # this line is unreachable for a model that was not actually lowered.
+    model.torchnative_offload = report
+
+    if not report["fully_offloaded"]:
+        left = ", ".join(
+            f"{name} x{count}" for name, count in report["left_on_cpu"].items()
+        ) or "none"
+        skipped = "; ".join(f"{name}: {why}" for name, why in report["skipped"][:4])
+        warnings.warn(
+            f"nn.Module.to(torchnative.device.{device.type}): a PARTIAL offload. "
+            f"{len(report['swapped'])} Linear(s) now go through CoreML at "
+            f"precision={report['precision']!r}, which is fraction_moved="
+            f"{report['fraction_moved']:.4f} "
+            f"({report['parameters_moved']} of {report['parameters_total']} "
+            f"parameters). Left on the CPU -- leaf module types: {left}."
+            + (f" Skipped Linear(s): {skipped}." if skipped else "")
+            + f" The full report, including the per-operation MLComputePlan "
+            f"rows, is on the model as `.torchnative_offload`. "
             f"This warning exists because docs/graph/NPU2.md is about a partial "
             f"offload that went unnoticed while every answer it produced was "
             f"right.",

@@ -269,18 +269,43 @@ propagates unchanged and no report is attached — returning an untouched model
 with a success message is the silent CPU fallback this path exists to prevent,
 and a report on a model that was never lowered is the same lie with a receipt.
 
-**`coreml` and `qnn` still refuse**, at the same quality of message and after
-the same real resolution: `NotImplementedError` naming the resolved unit, the
-backend, the probe, what exists (the capture layer; the per-vendor
-execution-device evidence: `intelnpu.probe`, `assert_execution_device`,
-`verdict_execution_devices`) and what is missing (the equivalent leaf). They
-are **not** stubbed into a fake success. Returning the model unchanged would be
-an argument accepted and dropped: the caller would hold a model they believe is
-on the Neural Engine and which is in fact on the CPU —
+**`coreml` is wired too, and it takes a `precision`.** It goes to
+`torchnative.export.coreml._compile_model`, the same `named_children()` walk
+swapping each `torch.nn.Linear` for a `_CoreMLLinear`. What is not the same is
+that CoreML's precision is a real choice with a measured cost on each side, so
+this backend has **two spellings**:
+
+```python
+model.to(torchnative.device.npu)                        # float16
+model.to(torchnative.device.npu, precision="float32")   # float32
+```
+
+float16 is what reaches the Neural Engine. [`../graph/NPU2.md`](../graph/NPU2.md)
+§1.1 measured that for a **float32** program the unit is not in CoreML's
+*supported* column at all, so no `compute_units` setting reaches it; §2.2 has
+the same reading for `linear`, at three sizes, plus the agreement each
+precision buys — 2.7e-06 at float32, 1.5e-03 at float16. Two products, two
+spellings, and never one spelling with a silent mode. `precision` is refused by
+name on the `openvino` backend, whose IR is f16 and has nothing for the word to
+select.
+
+Which unit **actually** ran is never inferred: `MLComputePlan` is read at every
+compile and the per-operation rows are on the report. The case that cannot
+reach the named unit warns at `to()`; the case that could and did not warns at
+the forward that found out.
+
+**`qnn` still refuses**, at the same quality of message and after the same real
+resolution: `NotImplementedError` naming the resolved unit, the backend, the
+probe, what exists (the capture layer; the per-vendor execution-device
+evidence: `intelnpu.probe`, `assert_execution_device`,
+`verdict_execution_devices`) and what is missing (the equivalent leaf). It is
+**not** stubbed into a fake success. Returning the model unchanged would be an
+argument accepted and dropped —
 [`../graph/NPU2.md`](../graph/NPU2.md) §1 exactly, and CLAUDE.md §6 on promised
 refusals that never happen.
-`test_to_the_compiled_target_refuses_and_names_what_it_resolved_to` fails if
-`self` comes back on this host (N7).
+`test_to_the_compiled_target_either_lowers_or_names_what_it_resolved_to` holds
+both halves: on a wired backend it fails if `to()` does not lower and attach a
+report, and on an unwired one it fails if `self` comes back (N7).
 
 **What the Intel branch is and is not evidence of.** No machine in this
 repository has an Intel NPU, and `library_candidates` refuses on darwin by

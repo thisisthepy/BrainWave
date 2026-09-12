@@ -408,34 +408,39 @@ def test_zero_leaves_lowered_is_a_refusal_and_not_a_success():
           "(dispatch evidence; the NPU is faked)")
 
 
-def test_coreml_and_qnn_still_refuse_at_the_quality_they_refused_before():
-    """Only the openvino branch was wired. The other two must not become fake successes.
+def test_coreml_lowers_and_qnn_still_refuses_at_the_quality_it_refused_before():
+    """`coreml` is wired now; `qnn` is not, and must not become a fake success.
 
-    Each is driven to its success-shaped resolution with the same probe-level
-    fake, so this is not merely observing that the probes fail here: the
-    resolution is real and names the real unit, and the refusal still happens
-    *after* it.
+    Both halves are driven to a success-shaped resolution with the same
+    probe-level fake, so this is not merely observing that the probes fail
+    here: the resolution is real and names the real unit, and what follows it
+    is asserted.
+
+    The CoreML half used to require a refusal. It requires a lowering now --
+    docs/graph/NPU2.md §2.2 -- and the guarantee is unchanged in substance:
+    the argument must never be accepted and silently dropped. A wired backend
+    honours that by lowering and attaching a report that says what happened; an
+    unwired one honours it by refusing and naming its resolution. Asserting the
+    lowering here rather than deleting the half is what keeps a regression to
+    the old `NotImplementedError` visible.
     """
     checked = []
 
-    # CoreML / Apple Neural Engine.
+    # CoreML / Apple Neural Engine -- wired, so it must LOWER.
     model = _fresh_block()
     with _on_host("darwin"):
         try:
             res = D.npu.resolve()
         except D.NpuUnresolved:
             res = None
-        if res is not None:
-            try:
-                model.to(D.npu)
-            except NotImplementedError as exc:
-                text = str(exc)
-                assert res.unit in text, text
-                assert "NOT implemented" in text, text
-                assert "npu" in text, text
-                checked.append(f"coreml -> {res.unit}")
-            else:
-                raise AssertionError("to(npu) on darwin must still refuse")
+        if res is not None and res.backend == "coreml":
+            returned = model.to(D.npu)
+            assert returned is model, "to() must return self, never a wrapper"
+            report = model.torchnative_offload
+            assert report["backend"] == "coreml", report
+            assert report["precision"] == "float16", report
+            assert report["swapped"], report
+            checked.append(f"coreml -> {res.unit} (lowered {len(report['swapped'])})")
 
     # QNN / Hexagon.
     from torchnative.export import qnn_device
@@ -461,8 +466,8 @@ def test_coreml_and_qnn_still_refuse_at_the_quality_they_refused_before():
         qnn_device.device_report = saved
 
     assert "qnn -> Qualcomm Hexagon NPU" in checked, checked
-    print(f"ok   npuwire: the unwired backends still refuse after resolving "
-          f"({', '.join(checked)})")
+    print(f"ok   npuwire: coreml lowers and qnn still refuses, both after a "
+          f"real resolution ({', '.join(checked)})")
 
 
 def test_the_openvino_branch_is_chosen_by_the_resolution_and_not_by_the_platform():

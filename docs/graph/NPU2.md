@@ -15,6 +15,14 @@
 <!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_npu2.py test_a_driver_that_does_not_claim_the_operations_refuses_by_name present -->
 <!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_npu2.py test_executing_on_a_device_widened_nothing present -->
 <!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_npu2.py test_the_device_module_refuses_to_guess_which_emulator_to_use present -->
+<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/coreml.py plan_lowering present -->
+<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/coreml.py compute_plan present -->
+<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/coreml.py _CoreMLLinear present -->
+<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/coreml.py _compile_model present -->
+<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/device/_module_to.py _lower_for_coreml present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_anepath.py test_the_neural_engine_is_supported_at_float16_and_absent_at_float32 present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_anepath.py test_a_lowered_leaf_records_which_unit_coreml_actually_preferred present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_anepath.py test_the_float32_spelling_agrees_and_the_float16_one_only_nearly_does present -->
 
 ## 1. The headline: the CoreML models docs/graph/NPU.md executed ran on the **CPU**
 
@@ -114,6 +122,92 @@ rather than arguing with it; the consequence for a reader is only that
 **No timing is reported here.** Four agents were running on this machine while
 these numbers were taken, and docs/devices/MPS.md and docs/devices/VULKAN3.md both record why a
 throughput number measured like that is worse than no number.
+
+### 2.2 And now `to(torchnative.device.npu)` lowers for it
+
+Everything above is a measurement of artefacts built by hand in a test. The
+device namespace could see the hardware and not use it: on this machine
+`device.npu.availability()` returned `available=True, kind=measured` and
+`resolve()` named the Apple Neural Engine through the `coreml` backend, and
+then `model.to(device.npu)` raised `NotImplementedError` — only the `openvino`
+arm had been wired. `torchnative.export.coreml` now has the equivalent of
+`intelnpu.plan_lowering` and `_compile_model`, and `device/_module_to.py` has
+the dispatch arm.
+
+**There is no float32 road to the unit, and that was checked rather than
+assumed.** coremltools' `compute_precision` accepts exactly three things
+(`converters/_converters_entry.py`): `precision.FLOAT32` (no transform),
+`precision.FLOAT16` (cast everything), and
+`transform.FP16ComputePrecision(op_selector=...)` — which is a *subset selector
+for the float16 cast*, not a third precision and not a float32 route. Nothing
+in the API asks for float32 on the Neural Engine, because the Neural Engine is
+float16 hardware. Measured here for `ios16.linear` at three sizes, one
+`MLComputePlan` read each:
+
+| program | precision | preferred | supported |
+|---|---|---|---|
+| `linear` (1, 1024→1024) | float32 | CPU | CPU, GPU |
+| `linear` (1, 4096→4096) | float32 | CPU | CPU, GPU |
+| `linear` (128, 1024→1024) | float32 | GPU | CPU, GPU |
+| `linear` (1, 1024→1024) | float16 | CPU | CPU, GPU, **NeuralEngine** |
+| `linear` (1, 4096→4096) | float16 | CPU | CPU, GPU, **NeuralEngine** |
+| `linear` (128, 1024→1024) | float16 | **NeuralEngine** | CPU, GPU, **NeuralEngine** |
+
+The float32 rows are the §1.1 finding again on a different operator: the unit is
+absent from the *supported* column at every size, so this is a property of the
+precision and not of the size. The float16 rows add §2.1's: the unit is
+supported at every size and *preferred* only once there is enough work, which
+is why batch 1 goes to the CPU and batch 128 does not.
+
+**So they are two products, and therefore two spellings.**
+
+```python
+model.to(torchnative.device.npu)                        # float16
+model.to(torchnative.device.npu, precision="float32")   # float32
+```
+
+With the grades stated rather than averaged. Both through `coreml.verify`,
+which runs the compiled model and compares against `DecomposedTrace.replay`,
+on one `Linear(1024, 1024)` at batch 128 with `ComputeUnit.CPU_AND_NE`:
+
+| spelling | max abs diff vs `replay` | grade | unit |
+|---|---|---|---|
+| `precision="float32"` | **2.7e-06** | **agrees** (≤ 2e-05) | CPU / GPU |
+| `precision="float16"` | **1.5e-03** | agrees *at float16* | **Neural Engine** |
+
+2e-05 is `verify`'s own default and is where docs/graph/NPU.md set it; it is the
+bar the word *agrees* means in this project, and the float16 path does not meet
+it. That is reported and not papered over by widening one tolerance to cover
+both — 1.5e-03 is larger than §2's 2.0e-04 because a `Linear(1024, 1024)`
+accumulates over 1024 terms where that CNN did not, and it is half precision
+behaving exactly as half precision does.
+
+**Nothing succeeds without saying what ran.** `MLComputePlan` is read at every
+compile, not optionally, and the per-operation rows land on
+`model.torchnative_offload["plans"]` keyed by the shape that produced them —
+because §2.1 means "which unit" is not answerable until there is a real shape.
+Two things warn, and only these two, so that silence stays informative:
+
+* at `to()`, when the chosen precision puts the unit out of the supported
+  column entirely (`precision="float32"`), since that is decided by the
+  precision and not the shape;
+* at the forward that compiles a new shape, when the unit *is* supported and
+  CoreML preferred something else anyway.
+
+The eager batch-1 compile does not warn. It is a probe this code chose the
+shape for, and warning that CoreML preferred the CPU for a shape nobody asked
+for is noise; its plan is still recorded, marked `probe: True`.
+
+**Linear only, and conv is named rather than half-done.** `supported_ops()` has
+a MIL lowering for `aten.convolution.default` and conv leaves are still left on
+the CPU and reported, because a conv leaf's program cannot be built without its
+input's spatial dimensions and those are not knowable at `to()` time. A
+Linear's can: batch is the only free dimension. Widening this needs a shape
+source, not a bigger table.
+
+Zero leaves lowered raises, as on the Intel arm. `rust/torch_c/pytests/test_anepath.py`
+holds all of it, and each guarantee was nullified individually and seen to go
+red.
 
 ## 3. NNAPI, executed — and by which driver
 

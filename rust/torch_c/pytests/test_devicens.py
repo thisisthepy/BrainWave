@@ -644,26 +644,57 @@ def test_to_an_unavailable_eager_device_refuses_by_name():
     print("ok   devicens: to(device.cuda) refuses by name with _cuda_probe's reason")
 
 
-def test_to_the_compiled_target_refuses_and_names_what_it_resolved_to():
-    """It must not return `self` unchanged: that is the dropped argument."""
+def test_to_the_compiled_target_either_lowers_or_names_what_it_resolved_to():
+    """Never an accepted and dropped argument -- in **both** directions.
+
+    This test used to require a refusal, because no backend was wired and
+    returning `self` unchanged would have meant a caller holding a model they
+    believed was on an NPU and which was on the CPU. Two backends are wired
+    now -- `openvino` and, since the CoreML arm landed, `coreml` -- so for
+    those the correct outcome is the opposite one: `to()` lowers, returns
+    `self` (upstream's contract, and `_module_to.py`'s "no wrapping, ever"),
+    and attaches a report that says what happened.
+
+    Both halves are asserted here rather than the test being deleted, because
+    the guarantee is the same guarantee: the argument must never be accepted
+    and silently dropped. An unwired backend proves that by refusing and naming
+    its resolution; a wired one proves it by lowering and being able to show,
+    from `MLComputePlan` or `EXECUTION_DEVICES`, what ran.
+    """
     _shim()
     m = _fresh()
+    try:
+        res = D.npu.resolve()
+    except D.NpuUnresolved as exc:
+        assert "npu" in str(exc)
+        print(f"ok   devicens: to(device.npu) refuses -- unresolved here: {str(exc)[:70]}")
+        return
+
+    if res.backend in ("openvino", "coreml"):
+        result = m.to(D.npu)
+        assert result is m, "to() must return self; wrapping is what this project is not"
+        assert isinstance(result, nn.Module), type(result)
+        report = m.torchnative_offload
+        assert report["fully_offloaded"] in (True, False), report
+        assert 0.0 < report["fraction_moved"] <= 1.0, report
+        print(
+            f"ok   devicens: to(device.npu) LOWERS on the {res.backend} backend "
+            f"({res.unit!r}), fraction_moved={report['fraction_moved']:.3f}, "
+            f"and returns self"
+        )
+        return
+
     try:
         result = m.to(D.npu)
     except NotImplementedError as exc:
         text = str(exc)
         assert "npu" in text
-        res = D.npu.resolve()
         assert res.unit in text, "the refusal must say which NPU this host has"
         assert "NOT implemented" in text
         print(
             f"ok   devicens: to(device.npu) refuses after resolving to {res.unit!r} "
             f"rather than returning the model unchanged"
         )
-        return
-    except D.NpuUnresolved as exc:
-        assert "npu" in str(exc)
-        print(f"ok   devicens: to(device.npu) refuses -- unresolved here: {str(exc)[:70]}")
         return
     raise AssertionError(
         f"to(npu) returned {result!r} instead of refusing -- an accepted and "
