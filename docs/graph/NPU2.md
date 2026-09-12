@@ -558,6 +558,12 @@ empty bytes and the dtype test fails with a reshape error, (3) remove the
 <!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_bf16ane.py test_a_real_smollm2_checkpoint_lowers_and_names_everything_it_did_not present -->
 <!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_bf16ane.py test_a_decode_step_reaches_the_neural_engine_on_none_of_its_linears present -->
 <!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_bf16ane.py test_the_whole_model_runs_through_coreml_and_picks_the_same_next_token present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_bf16ane.py test_the_path_a_user_types_survives_its_own_first_forward present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_bf16ane.py test_a_second_forward_at_another_shape_also_survives_and_is_not_stale present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_bf16ane.py _NAIVE_SCRIPT present -->
+<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/coreml.py _feed_buffer present -->
+<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/coreml.py _predict present -->
+<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/coreml.py _RETAINED_FEEDS present -->
 
 §7 landed two leaf types and measured the Neural Engine running them. Every
 module it was measured on was built here, in float32. The obvious next thing
@@ -649,11 +655,12 @@ float16 **1.2e-03** — exactly where §1.1 and §7.2 left them.
 the swap `parameters()` deduplicates `lm_head` against the embedding, and
 after it the lowered leaf holds its own copy, so the denominator grows.
 
-And it executes. All 211 leaves, the prompt "The capital of France is",
-compared against the same model's own eager forward: same next token (`" the"`,
-id 260), max absolute logit difference **0.6875** on logits whose own scale is
-tens. That is a 30-layer float16 accumulation and it is not offered as an
-`agrees`; it is offered as *the same answer*.
+And it executes, through the path a caller takes and no other (§8.3). All 211
+leaves, a five-token input, compared against the same model's own eager
+forward before the swap: **the same next token**, max absolute logit
+difference **0.75** on logits whose own scale is 27.4. That is a 30-layer
+float16 accumulation and it is not offered as an `agrees`; it is offered as
+*the same answer*.
 
 Then the part that matters more than either. `MLComputePlan`, read per distinct
 Linear shape in the model, at a decode-shaped batch and a prefill-shaped one:
@@ -682,28 +689,128 @@ mistaken for "the Neural Engine ran it". That is §1's failure, refused.
 **So the honest summary is: generation on this arm is a prefill story, not a
 decode story.** Nothing measured here reaches the unit one token at a time.
 
-### 8.3 Found, not fixed: `ct.convert` inside a forward segfaults
+### 8.3 The first forward ended the process — and the first diagnosis was wrong
 
-`_CoreMLLinear` compiles lazily, on first use, keyed by the shape that
-arrived — and a real forward is the first thing that supplies a real shape.
-Calling `coremltools.convert` from **inside** the model's forward pass
-**segfaults the interpreter**, reproducibly, at the seventh leaf, with about
-1 GB resident (so not memory) and with the faulthandler traceback inside
-`_converters_entry.convert`. The same seven leaves, same shapes, same dtypes,
-compiled and run *outside* a forward are fine, with or without the model
-resident and with or without `no_grad`.
+This section replaces one that was published here and is **superseded**. What
+it said:
 
-The `to()`-time eager probe does not cover it: it compiles at batch 1, and a
-transformer's forward is never batch 1. The fixture in
-`rust/torch_c/pytests/test_bf16ane.py` therefore compiles every leaf at the
-real shape before forwarding, and says where it does it and why. Deferring
-compilation out of `forward` properly is a design change and is left named
-rather than guessed at.
+> `ct.convert` called from **inside** a model's forward pass segfaults the
+> interpreter, reproducibly, at the seventh leaf. The eager probe does not
+> cover it because it probes batch 1. Deferring compilation out of `forward`
+> is a design change and is left named rather than guessed at.
 
-A second fixture-level symptom of the same fragility: the marshalling checks,
-a compiled leaf and two `verify` calls in one process, *followed by*
-`from_pretrained`, segfault inside `convert` — three stages that each pass
-alone. The real model therefore gets a clean interpreter.
+Every observation in that paragraph was real. **The cause was not.** It was
+correlation dressed as a mechanism, and it was published because the controls
+that would have refuted it were never run. The rule it broke is
+CLAUDE.md §5.5's: a verification that cannot fail is not a verification, and
+"it crashed inside `convert`, and `convert` was inside a forward" is a claim
+with no control attached. The negative control belonged *before* the sentence,
+not after the round.
+
+Worse, it was found late for the same reason. The tests for §8.1–8.2 compiled
+every leaf at the real shape before forwarding — an escape hatch **a caller
+does not have**, because these leaves compile lazily and the forward is the
+only thing that supplies a real shape. So the suite was green while the path a
+user types
+
+```python
+m = AutoModelForCausalLM.from_pretrained("HuggingFaceTB/SmolLM2-135M",
+                                         dtype="auto")
+m.to(torchnative.device.npu)     # LOWERED 0.826
+m(torch.tensor([[1, 2, 3, 4, 5]]))   # process ends. no traceback. no message.
+```
+
+**ended the process.** `to()` reported success, attached a report naming 211
+swapped Linears, and died on the first forward — a model that cannot be used,
+handed back with a success message.
+
+#### The controls, and the real cause
+
+| | |
+|---|---|
+| `gc.collect()` x300 **before** any forward | fine |
+| `gc.collect()` x300 **after** a model forward | **crash** |
+| `gc.collect()` x300 *inside* a trivial `nn.Module.forward` | fine |
+| one `_CoreMLLinear` forward, then `gc.collect()` — no transformers, no model | **crash** |
+| `MLModel.predict(plain numpy array)`, drop it, `gc.collect()` | **crash, 5 runs of 5** |
+| the same, array kept alive | **0 of 5** |
+
+Rows three and four are the ones that kill the old explanation: a forward with
+a collection inside it is fine, and a collection *outside* a forward is not.
+
+`predict` is not as synchronous as it looks. CoreML wraps each numpy input in
+an `MLFeatureValue` and binds it into an `MLE5InputPort`, and that binding
+outlives the call — the stream is **lingering**. Milliseconds later a
+libdispatch worker runs `-[MLE5ExecutionStream resetAfterLingering:]`, which
+tears the binder down, destroys the `MLFeatureValue`, and drops
+`libcoremlpython`'s reference to the Python array **on a thread that does not
+hold the GIL**. The macOS crash report is unambiguous — faulting thread,
+innermost frame first:
+
+```
+Python              _PyObject_Free                       <- no GIL held
+libcoremlpython.so  (pybind11 handle destructor)
+libobjc             object_cxxDestructFromClass / _objc_rootDealloc
+CoreML              -[MLFeatureValue dealloc]
+CoreML              -[MLE5InputPortBinder reset]
+CoreML              -[MLE5ExecutionStream _reset]
+CoreML              -[MLE5ExecutionStream resetAfterLingering:]_block_invoke
+libdispatch         _dispatch_workloop_worker_thread
+
+EXC_BAD_ACCESS (SIGSEGV), KERN_INVALID_ADDRESS at 0x10
+```
+
+Freeing a Python object from a thread without the GIL corrupts CPython's heap,
+and the next thing to walk it dies. **`gc.collect()` is what usually walks
+it** — and `coremltools.converters.convert` ends with a `gc.collect()` (line
+679 of coremltools 9.0). That is the whole of the coincidence: a convert
+shortly after a predict is simply the likeliest moment for the two to meet.
+This is a defect in CoreML's Python bindings, not in this repository; what is
+ours is not handing it a short-lived array.
+
+#### The fix, and what it costs
+
+`coreml._feed_buffer`: one float32 input buffer per compiled shape, allocated
+once, refilled in place, held by the leaf. A single `_predict` funnel carries
+both leaf types and `verify`. Two holders, each measured:
+
+| removed | result |
+|---|---|
+| nothing | the naive path passes, five consecutive suite runs |
+| the leaf's buffer reuse (fresh array per forward), retention kept | intermittent: 1 clean run in 3 |
+| both the reuse and `_RETAINED_FEEDS`, right after a forward | **5 crashes in 5** |
+| `leaf._feeds.clear()` only (the backstop still holds it) | 0 crashes in 5 |
+
+So reuse is what makes it deterministic and `_RETAINED_FEEDS` is a real
+backstop rather than decoration. Nothing is ever removed from it, which means
+**a caller cannot release these buffers, deliberately.** For all 211 leaves of
+SmolLM2-135M that is `batch x 150,336 x 4` bytes = **601,344 bytes per batch
+row**: 0.57 MiB at a decode batch of 1, 73 MiB at a prefill batch of 128.
+Measured on the model: 2.87 MiB after one batch-5 forward, 4.59 MiB (422
+buffers) after a second forward at a different shape.
+
+That is a minority of what compile-per-shape already costs beside it:
+`_compiled` holds one CoreML program per leaf per shape, each carrying that
+leaf's weights in float16, so a second distinct batch value adds ~269 MB
+(134,479,872 parameters x 2 bytes). Both grow with the number of *distinct*
+batch values a model is called at. That is the number to watch, and it is a
+property of compiling per shape rather than of this fix.
+
+#### And the tests now drive the path a caller takes
+
+`rust/torch_c/pytests/test_bf16ane.py` gained `_NAIVE_SCRIPT`:
+`from_pretrained` -> `to(device.npu)` -> `model(x)` in one process with
+**nothing in front of it**. The pre-compilation was deleted from the other
+fixture, and the executed claims of §8.2 now hang off the naive one, so an
+executed claim cannot again be made on a path nobody can take.
+
+A second fixture-level lesson landed with it: `_npu_fixture` parses the last
+line of stdout as JSON, and **CoreML's ANE compiler writes diagnostics
+straight to file descriptor 1** when it cannot produce a bundle — which
+`sys.stdout = io.StringIO()` does not intercept, because the write never goes
+through Python. That made the suite flaky, which is worse than broken: a flaky
+gate gets re-run rather than read. Fd 1 itself is now pointed at `/dev/null`
+for the body of each fixture and the JSON is written to a dup of the original.
 
 ### 8.4 Split the way CLAUDE.md §5.3 asks
 
@@ -711,7 +818,9 @@ alone. The real model therefore gets a clean interpreter.
 |---|---|
 | **feature added** | `_WIDENED_DTYPES` — `bfloat16` and `float16` checkpoints lower; `from_pretrained(dtype="auto").to(device.npu)` works |
 | **defect fixed** | `_np` refused every real Hugging Face checkpoint |
-| **defect found, not fixed** | `ct.convert` called from inside a forward segfaults (§8.3) |
+| **defect fixed** | the first forward after `to(device.npu)` ended the process; CoreML frees the input array off-thread without the GIL (§8.3) |
+| **claim withdrawn** | "`ct.convert` inside a forward segfaults" — correlation, published without its control (§8.3) |
 | **claim added** | a decode-shaped batch reaches the Neural Engine on **none** of SmolLM2's Linears; prefill reaches it on four of five shapes |
 | **claim unchanged** | both agreement grades — float32 0.0, float16 1.2e-03 — measured through `coreml.verify` and no second comparator |
-| **tests added** | 15, in `rust/torch_c/pytests/test_bf16ane.py`; five nullifications, each red on the tests it targets |
+| **test defect fixed** | the fixtures avoided the caller's path; `_NAIVE_SCRIPT` drives it with nothing in front of it |
+| **tests added** | 18, in `rust/torch_c/pytests/test_bf16ane.py`; eight nullifications, each red on the tests it targets |

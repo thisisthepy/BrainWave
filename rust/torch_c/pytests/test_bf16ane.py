@@ -40,15 +40,28 @@ prefill-shaped batch of 128; `lm_head` (576->49152) does not reach it at 128
 either. That is the finding, not a defect, and it is asserted here so that
 nobody reads "SmolLM2 lowered" as "SmolLM2 ran on the Neural Engine".
 
-**One defect was found and is not fixed here.** `_CoreMLLinear` compiles
-lazily, on first use, keyed by the shape that arrived; a real forward is the
-first thing that supplies a real shape. Calling `coremltools.convert` from
-*inside* the model's forward pass **segfaults the interpreter**, reproducibly,
-at the seventh leaf -- with about 1 GB resident, so not memory, and the same
-seven leaves compiled and run outside a forward are fine. The `to()`-time
-eager probe does not cover it: it compiles at batch 1 and a transformer's
-forward is never batch 1. The fixture below therefore compiles at the real
-shape before forwarding, and says so where it does it.
+**One defect was found, and this file is the reason it was found late.** The
+first version of these tests compiled every leaf at the real shape *before*
+forwarding -- something a caller cannot do, because `_CoreMLLinear` compiles
+lazily and the forward is the only thing that supplies a real shape. With that
+escape hatch the suite was green while the path a user types --
+`from_pretrained` -> `to(device.npu)` -> `model(x)` -- **ended the process**,
+with no traceback and no "Segmentation fault" line. The escape hatch is gone
+and `_NAIVE_SCRIPT` drives the caller's path with nothing in front of it.
+
+The mechanism turned out to have nothing to do with forwards. `predict` is not
+as synchronous as it looks: CoreML keeps the `MLFeatureValue` wrapping each
+numpy input bound into a *lingering* execution stream, and some milliseconds
+later a libdispatch worker runs `-[MLE5ExecutionStream resetAfterLingering:]`,
+which destroys it, which drops `libcoremlpython`'s reference to the array. If
+that is the last reference the object is freed **on a thread that does not
+hold the GIL** -- `_PyObject_Free` is the innermost frame of the crash report
+-- which corrupts CPython's heap, and the next thing to walk it dies.
+`gc.collect()` is what usually walks it, and `coremltools.convert` ends with
+one, which is why the first diagnosis was "convert inside a forward". Measured
+on one leaf with no torch forward anywhere: feed dropped, 5 crashes out of 5;
+feed retained, 0 out of 5. `coreml._predict` retains them, and the leaves reuse
+one input buffer per compiled shape so the retention stays bounded.
 
 Skips say by name what is missing, for docs/devices/VULKAN3.md §6.1's reason.
 """
@@ -67,12 +80,40 @@ from test_shim import _CKPT_VENDOR_SHIM, _npu_fixture
 _SMOL = "HuggingFaceTB/SmolLM2-135M"
 
 
+#: The preamble every script in this file runs before anything else, held in
+#: one place so that what the guard test exercises is literally what the
+#: fixtures run. See the comment inside it for what it is guarding against.
+_STDOUT_GUARD = r"""# `_npu_fixture` parses the **last line of stdout** as JSON, and this
+# fixture's stdout has two other writers. A `from_pretrained` progress bar
+# can land there (tqdm's carriage returns are line breaks to
+# `str.splitlines`), and CoreML's own ANE compiler writes diagnostics
+# straight to **file descriptor 1** when it cannot produce a bundle -- which
+# `sys.stdout = io.StringIO()` does not intercept, because the write never
+# goes through Python. Either one turns a passing fixture into
+# `JSONDecodeError: Expecting value: line 1 column 1`, intermittently, which
+# is worse than always: a flaky gate gets re-run rather than read.
+#
+# So fd 1 itself is pointed at /dev/null for the whole body, and the result
+# is written at the end to a dup of the original. Nothing but the JSON can
+# reach the parent's stdout, whoever writes it and from whatever language.
+_stdout = os.fdopen(os.dup(1), "w")
+_sink = os.open(os.devnull, os.O_WRONLY)
+os.dup2(_sink, 1)
+os.close(_sink)
+sys.stdout = io.StringIO()
+"""
+
+
 _BF16_SCRIPT = r"""
+import io
 import json
 import os
+import sys
 import warnings
 
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
+
+@STDOUT_GUARD@
 
 import torch
 
@@ -84,7 +125,7 @@ try:
 except Exception as error:
     out["coremltools"] = None
     out["import_error"] = f"{type(error).__name__}: {error}"
-    print(json.dumps(out))
+    print(json.dumps(out), file=_stdout, flush=True)
     raise SystemExit(0)
 
 import numpy as np
@@ -214,7 +255,7 @@ except Exception as error:  # noqa: BLE001
     import traceback
     out["bf16_error"] = traceback.format_exc()
 
-print(json.dumps(out))
+print(json.dumps(out), file=_stdout, flush=True)
 """
 
 
@@ -229,11 +270,15 @@ print(json.dumps(out))
 #: reports nothing about the thing it was actually measuring. So the model
 #: gets a clean interpreter.
 _SMOL_SCRIPT = r"""
+import io
 import json
 import os
+import sys
 import warnings
 
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
+
+@STDOUT_GUARD@
 
 import torch
 
@@ -245,7 +290,7 @@ try:
 except Exception as error:
     out["coremltools"] = None
     out["import_error"] = f"{type(error).__name__}: {error}"
-    print(json.dumps(out))
+    print(json.dumps(out), file=_stdout, flush=True)
     raise SystemExit(0)
 
 import numpy as np
@@ -266,28 +311,16 @@ out["resolution"] = {"backend": resolution.backend,
                      "unit": resolution.unit, "source": resolution.source}
 
 try:
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoModelForCausalLM
 
-    tokeniser = AutoTokenizer.from_pretrained("HuggingFaceTB/SmolLM2-135M")
     model = AutoModelForCausalLM.from_pretrained(
         "HuggingFaceTB/SmolLM2-135M", dtype="auto").eval()
     out["checkpoint_dtypes"] = sorted({str(p.dtype) for p in model.parameters()})
 
-    ids = tokeniser("The capital of France is", return_tensors="pt")["input_ids"]
-    with torch.no_grad():
-        reference = model(ids).logits
-    out["reference"] = {
-        "shape": list(reference.shape),
-        "argmax": int(reference[0, -1].argmax()),
-        "token": tokeniser.decode([int(reference[0, -1].argmax())]),
-        "scale": float(np.abs(C._np(reference.to(torch.float32))).max()),
-    }
-
     # `eager=False`: the probe compiles every lowered leaf at batch 1, and
-    # this model has 211 of them at a batch its forward will never use. The
-    # probe's own guarantee is measured on models where it is cheap
-    # (test_anepath, test_coremlops); what is measured here is the shape the
-    # forward below actually runs at.
+    # this model has 211 of them at a batch no forward here uses. What this
+    # fixture measures is the report and the compute plans; the *default*
+    # spelling, probe included, is driven end to end by `_NAIVE_SCRIPT`.
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         model.to(tn_device.npu, eager=False)
@@ -309,9 +342,6 @@ try:
                               if not list(m.children())}),
     }
 
-    leaves = [leaf for _, leaf in model.named_modules()
-              if type(leaf).__name__ == "_CoreMLLinear"]
-
     # -- MLComputePlan per distinct shape, decode batch against prefill ----
     seen = {}
     for name, leaf in model.named_modules():
@@ -329,41 +359,150 @@ try:
                 entry[str(batch)] = sorted({r["preferred"] for r in rows})
             out["smol_plans"][f"{in_f}->{out_f}"] = entry
 
-    # -- and then it runs, all 211 leaves, on the real prompt --------------
-    #
-    # Compiled here, **outside** the forward, and that is load-bearing rather
-    # than an optimisation: calling `ct.convert` from inside the model's
-    # forward pass segfaults this interpreter at the seventh leaf, reproducibly
-    # (see this file's docstring). `_CoreMLLinear` compiles lazily on first
-    # use, so a forward at a shape no leaf has seen does exactly that. Doing
-    # it in advance is the only way this fixture can report the executed
-    # result at all, and the defect is recorded rather than hidden.
-    batch = int(ids.shape[0]) * int(ids.shape[1])
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        for leaf in leaves:
-            leaf._compile_for(batch, probe=True)
-    with torch.no_grad():
-        produced = model(ids).logits
-    difference = float(np.abs(
-        C._np(produced.to(torch.float32)) - C._np(reference.to(torch.float32))
-    ).max())
-    out["executed"] = {
-        "batch": batch,
-        "n_leaves": len(leaves),
-        "shape": list(produced.shape),
-        "dtype": str(produced.dtype),
-        "argmax": int(produced[0, -1].argmax()),
-        "token": tokeniser.decode([int(produced[0, -1].argmax())]),
-        "max_abs_logit_diff": difference,
-        "finite": bool(np.isfinite(C._np(produced.to(torch.float32))).all()),
-    }
 except Exception as error:  # noqa: BLE001
     import traceback
     out["smol_error"] = traceback.format_exc()
 
-print(json.dumps(out))
+print(json.dumps(out), file=_stdout, flush=True)
 """
+
+
+#: The path a user actually types, driven end to end in **one process with no
+#: pre-compilation**: `from_pretrained` -> `to(device.npu)` -> `model(x)`.
+#:
+#: It gets its own script because the first version of this file did not drive
+#: it. The fixture compiled every leaf at the real shape before forwarding,
+#: which is something a *caller* cannot do -- `_CoreMLLinear` compiles lazily
+#: on first use, and the only thing that supplies a real shape is the forward
+#: itself. So the tests passed while `to(device.npu)` handed back a model
+#: whose first forward **ended the process**: no traceback, no "Segmentation
+#: fault" line, nothing. That is the exact shape of defect this project keeps
+#: finding, and this fixture exists so that it cannot come back.
+#:
+#: `eager=False` here is not the workaround it replaced. The eager probe
+#: compiles at batch 1 and this model's forward is batch 5, so the probe never
+#: covers the shape the forward uses -- skipping it changes only how long the
+#: fixture takes, not which compilations happen inside the forward. Every
+#: compile this test is about still happens where it happened before: in
+#: `forward`.
+_NAIVE_SCRIPT = r"""
+import io
+import json
+import os
+import sys
+import warnings
+
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
+
+@STDOUT_GUARD@
+
+import torch
+
+out = {"is_shim": hasattr(torch._C, "_aten_implemented")}
+
+try:
+    import coremltools as ct
+    out["coremltools"] = ct.__version__
+except Exception as error:
+    out["coremltools"] = None
+    out["import_error"] = f"{type(error).__name__}: {error}"
+    print(json.dumps(out), file=_stdout, flush=True)
+    raise SystemExit(0)
+
+import numpy as np
+
+import torchnative
+from torchnative import device as tn_device
+from torchnative.export import coreml as C
+
+resolution = tn_device.npu.resolve()
+out["resolution"] = {"backend": resolution.backend,
+                     "unit": resolution.unit, "source": resolution.source}
+
+try:
+    from transformers import AutoModelForCausalLM
+
+    model = AutoModelForCausalLM.from_pretrained(
+        "HuggingFaceTB/SmolLM2-135M", dtype="auto").eval()
+    ids = torch.tensor([[1, 2, 3, 4, 5]])
+    with torch.no_grad():
+        reference = model(ids).logits
+
+    with warnings.catch_warnings(record=True):
+        warnings.simplefilter("always")
+        model.to(tn_device.npu, eager=False)
+    report = model.torchnative_offload
+    out["lowered"] = report["fraction_moved"]
+    out["n_leaves"] = len(report["swapped"])
+
+    # Nothing between the lowering and the forward. No `_compile_for`, no
+    # probe, no warm-up: every one of the 211 leaves meets its shape for the
+    # first time inside this call.
+    with warnings.catch_warnings(record=True):
+        warnings.simplefilter("always")
+        with torch.no_grad():
+            produced = model(ids).logits
+
+    # And a second forward at a *different* shape, so the answer cannot be
+    # "it survived because nothing had to compile the second time". Any
+    # buffer this arm reuses has to give the right answer when the input
+    # changes underneath it.
+    other = torch.tensor([[7, 8, 9]])
+    with warnings.catch_warnings(record=True):
+        warnings.simplefilter("always")
+        with torch.no_grad():
+            produced_other = model(other).logits
+
+    # A third at the FIRST shape with DIFFERENT tokens. This is the one that
+    # makes the staleness check non-vacuous: a reused buffer that is never
+    # refilled reuses the *same* buffer object at the same shape, so it would
+    # hand back the first call's logits here and a test that only repeated
+    # the first input would not notice.
+    other_tokens = torch.tensor([[11, 12, 13, 14, 15]])
+    with warnings.catch_warnings(record=True):
+        warnings.simplefilter("always")
+        with torch.no_grad():
+            produced_diff = model(other_tokens).logits
+
+    # And a fourth, back at the first input: the buffer must have been
+    # refilled with *this* input and not left holding the third call's.
+    with warnings.catch_warnings(record=True):
+        warnings.simplefilter("always")
+        with torch.no_grad():
+            again = model(ids).logits
+
+    out["naive"] = {
+        "shape": list(produced.shape),
+        "argmax": int(produced[0, -1].argmax()),
+        "dtype": str(produced.dtype),
+        "reference_argmax": int(reference[0, -1].argmax()),
+        "finite": bool(np.isfinite(C._np(produced.to(torch.float32))).all()),
+        "other_shape": list(produced_other.shape),
+        "repeat_is_stable": float(np.abs(
+            C._np(again.to(torch.float32))
+            - C._np(produced.to(torch.float32))).max()),
+        "different_input_differs": float(np.abs(
+            C._np(produced_diff.to(torch.float32))
+            - C._np(produced.to(torch.float32))).max()),
+        "max_abs_logit_diff": float(np.abs(
+            C._np(produced.to(torch.float32))
+            - C._np(reference.to(torch.float32))).max()),
+        "scale": float(np.abs(C._np(reference.to(torch.float32))).max()),
+    }
+except Exception as error:  # noqa: BLE001
+    import traceback
+    out["naive_error"] = traceback.format_exc()
+
+print(json.dumps(out), file=_stdout, flush=True)
+"""
+
+
+#: Every script runs `_STDOUT_GUARD` first. Spliced rather than repeated so
+#: that `test_the_fixture_guard_stops_a_write_that_bypasses_sys_stdout` is
+#: exercising the same text the fixtures run.
+_BF16_SCRIPT = _BF16_SCRIPT.replace("@STDOUT_GUARD@", _STDOUT_GUARD)
+_SMOL_SCRIPT = _SMOL_SCRIPT.replace("@STDOUT_GUARD@", _STDOUT_GUARD)
+_NAIVE_SCRIPT = _NAIVE_SCRIPT.replace("@STDOUT_GUARD@", _STDOUT_GUARD)
 
 
 _CACHE = {}
@@ -419,6 +558,38 @@ def _smol_or_skip():
             "skip:\n" + result["smol_error"]
         )
     return result
+
+
+def _naive_or_skip():
+    """The naive-path fixture, or `None` by name.
+
+    A crash here arrives as `_npu_fixture` raising on a non-zero return code,
+    which is the point: the defect this covers produced **no** Python-level
+    error at all.
+    """
+    if not os.path.isfile(_CKPT_VENDOR_SHIM):
+        print("   (skipped: vendored tree has no _C.abi3.so)")
+        return None
+    if not _checkpoint_path():
+        print(f"   (skipped: {_SMOL} is not in the Hugging Face cache)")
+        return None
+    if "n" not in _CACHE:
+        _CACHE["n"] = _npu_fixture(_NAIVE_SCRIPT)
+    result = _CACHE["n"]
+    if result["coremltools"] is None:
+        print("   (skipped: coremltools not installed for this interpreter)")
+        return None
+    if result.get("resolution", {}).get("backend") != "coreml":
+        print("   (skipped: this host's npu does not resolve to the coreml "
+              "backend)")
+        return None
+    if "naive_error" in result:
+        raise AssertionError(
+            "the naive-path fixture raised; this is a failure and not a "
+            "skip:\n" + result["naive_error"]
+        )
+    return result
+
 
 
 def _checkpoint_path():
@@ -700,38 +871,20 @@ def test_the_whole_model_runs_through_coreml_and_picks_the_same_next_token():
     model's own eager forward before the swap. The token chosen must be the
     same token -- that is the property a user notices, and it is not implied
     by the max-abs number on logits this large.
+
+    Driven through the naive fixture and no other, because an executed claim
+    made on a path the caller cannot take is the defect this file's docstring
+    is about.
     """
-    r = _smol_or_skip()
+    r = _naive_or_skip()
     if r is None:
         return
-    ran, want = r["executed"], r["reference"]
-    assert ran["n_leaves"] == 211, ran
-    assert ran["shape"] == want["shape"] == [1, 5, 49152], (ran, want)
-    assert ran["finite"] is True, ran
-    assert ran["dtype"] == "torch.bfloat16", ran
-    assert ran["argmax"] == want["argmax"], (ran, want)
-    assert ran["token"] == want["token"] == " the", (ran, want)
-
-
-def test_the_executed_logits_agree_at_float16_and_are_not_asserted_at_float32():
-    """The honest grade for what just ran.
-
-    These logits are a 30-layer float16 accumulation, not a single op, and
-    they are not compared through `coreml.verify` because `verify` grades a
-    captured trace and this is a whole transformer. So the claim made is the
-    weak one and it is named weak: the difference is small *relative to the
-    logits' own scale*, and nothing here pretends it meets the 2e-05 that the
-    word "agrees" means elsewhere in this project.
-    """
-    r = _smol_or_skip()
-    if r is None:
-        return
-    ran, want = r["executed"], r["reference"]
-    assert want["scale"] > 1.0, want
-    relative = ran["max_abs_logit_diff"] / want["scale"]
-    assert relative < 0.05, (ran, want, relative)
-    # Not zero either: a zero here would mean the swap did not take effect.
-    assert ran["max_abs_logit_diff"] > 0.0, ran
+    naive = r["naive"]
+    assert r["n_leaves"] == 211, r
+    assert naive["shape"] == [1, 5, 49152], naive
+    assert naive["finite"] is True, naive
+    assert naive["dtype"] == "torch.bfloat16", naive
+    assert naive["argmax"] == naive["reference_argmax"], naive
 
 
 def test_the_shape_that_never_reaches_the_unit_is_the_output_projection():
@@ -759,6 +912,103 @@ def test_a_cpu_preferred_decode_shape_warns_instead_of_looking_offloaded():
     warns = r["bf16_forward"]["warnings"]
     assert any("is NOT what it preferred" in w for w in warns), warns
     assert any("MLComputePlan says ['CPU']" in w for w in warns), warns
+
+
+def test_the_path_a_user_types_survives_its_own_first_forward():
+    """`from_pretrained` -> `to(device.npu)` -> `model(x)`, one process, no
+    pre-compilation of any kind.
+
+    This is the test the first version of this file did not have. Its fixture
+    compiled every leaf at the real shape before forwarding -- an escape hatch
+    a caller does not have, because `_CoreMLLinear` compiles lazily and the
+    forward is the only thing that supplies a real shape. With that hatch, the
+    suite was green while `model(x)` **ended the process**: no traceback, no
+    "Segmentation fault" line, nothing a user could see.
+
+    A crash shows up here as `_npu_fixture` raising on the subprocess's return
+    code (-11), so this cannot pass by silence.
+    """
+    r = _naive_or_skip()
+    if r is None:
+        return
+    naive = r["naive"]
+    assert naive["shape"] == [1, 5, 49152], naive
+    assert naive["finite"] is True, naive
+    assert naive["argmax"] == naive["reference_argmax"], naive
+    assert r["lowered"] > 0.82, r
+
+
+def test_a_second_forward_at_another_shape_also_survives_and_is_not_stale():
+    """The forward is not a one-shot, and the retained input buffers are
+    refilled.
+
+    Holding on to the arrays handed to `MLModel.predict` is what makes the
+    first forward survive (see this file's docstring), and the cheapest way to
+    bound that retention is to reuse one buffer per shape. A reused buffer
+    that was not refilled would return the previous call's answer, so the
+    third forward here repeats the first input and must reproduce the first
+    answer **exactly**, with a different shape's forward in between.
+    """
+    r = _naive_or_skip()
+    if r is None:
+        return
+    naive = r["naive"]
+    assert naive["other_shape"] == [1, 3, 49152], naive
+    # Same shape, different tokens: the buffer was refilled.
+    assert naive["different_input_differs"] > 1.0, naive
+    # Same shape, same tokens, after two other calls: bit-for-bit the same.
+    assert naive["repeat_is_stable"] == 0.0, naive
+
+
+def test_the_executed_logits_agree_at_float16_and_are_not_asserted_at_float32():
+    """The honest grade for what just ran.
+
+    These logits are a 30-layer float16 accumulation, not a single op, and
+    they are not compared through `coreml.verify` because `verify` grades a
+    captured trace and this is a whole transformer. So the claim made is the
+    weak one and it is named weak: the difference is small *relative to the
+    logits' own scale*, and nothing here pretends it meets the 2e-05 that the
+    word "agrees" means elsewhere in this project. Stated so that "it stopped
+    crashing" cannot be bought with a wrong answer.
+    """
+    r = _naive_or_skip()
+    if r is None:
+        return
+    naive = r["naive"]
+    assert naive["scale"] > 1.0, naive
+    assert naive["max_abs_logit_diff"] / naive["scale"] < 0.05, naive
+    assert naive["max_abs_logit_diff"] > 0.0, naive
+
+
+def test_the_fixture_guard_stops_a_write_that_bypasses_sys_stdout():
+    """The fixtures' stdout carries the JSON and nothing else -- including
+    writes that never go through Python.
+
+    CoreML's ANE compiler writes `CreateBnnsGraphProgramFromMIL` diagnostics
+    straight to file descriptor 1 when it cannot produce a bundle, which
+    `sys.stdout = io.StringIO()` does not intercept. That made this suite
+    flaky, and a flaky gate gets re-run rather than read.
+
+    Driven on `_STDOUT_GUARD` itself, in a subprocess, with an `os.write(1,
+    ...)` standing in for the native one -- so this is the same text the three
+    fixtures run and not a paraphrase of it. Nullified by replacing the guard
+    with `sys.stdout = io.StringIO()`: two lines instead of one.
+    """
+    import subprocess
+    import sys
+
+    script = (
+        "import io, json, os, sys\n"
+        + _STDOUT_GUARD
+        + '\nos.write(1, b"CreateBnnsGraphProgramFromMIL: native noise\\n")\n'
+        + 'print("also via sys.stdout")\n'
+        + 'print(json.dumps({"ok": True}), file=_stdout, flush=True)\n'
+    )
+    proc = subprocess.run([sys.executable, "-c", script],
+                          capture_output=True, text=True, timeout=120)
+    assert proc.returncode == 0, proc.stderr
+    lines = proc.stdout.strip().splitlines()
+    assert lines == ['{"ok": true}'], lines
 
 
 def _main():

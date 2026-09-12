@@ -223,6 +223,109 @@ def _np(value):
     return value
 
 
+
+# ---------------------------------------------------------------------------
+# Handing an array to CoreML, and not letting CoreML free it
+# ---------------------------------------------------------------------------
+#
+# `MLModel.predict(feed)` looks synchronous and is not, all the way through.
+# CoreML wraps each numpy input in an `MLFeatureValue`, binds it into an
+# `MLE5InputPort`, and keeps that binding alive **after predict returns** --
+# the stream is "lingering". Some milliseconds later a libdispatch worker runs
+# `-[MLE5ExecutionStream resetAfterLingering:]`, which tears the binder down,
+# which destroys the `MLFeatureValue`, which drops `libcoremlpython`'s
+# reference to the Python array.
+#
+# If that is the *last* reference, the free happens **on a dispatch worker
+# thread without the GIL**. Read from the crash report, faulting thread,
+# innermost frames first:
+#
+#     Python              _PyObject_Free                       <- no GIL held
+#     libcoremlpython.so  (pybind11 handle destructor)
+#     libobjc             object_cxxDestructFromClass / _objc_rootDealloc
+#     CoreML              -[MLFeatureValue dealloc]
+#     CoreML              -[MLE5InputPortBinder reset]
+#     CoreML              -[MLE5ExecutionStream _reset]
+#     CoreML              -[MLE5ExecutionStream resetAfterLingering:]_block_invoke
+#     libdispatch         _dispatch_workloop_worker_thread
+#
+#     EXC_BAD_ACCESS (SIGSEGV), KERN_INVALID_ADDRESS at 0x10
+#
+# Racing CPython's allocator from a thread that does not hold the GIL
+# corrupts the heap, and the next thing to walk it dies. **`gc.collect()` is
+# what usually walks it**, which is why this surfaced as "a crash inside
+# `coremltools.convert`": `_converters_entry.convert` ends with a
+# `gc.collect()` (line 679 of coremltools 9.0), so a convert shortly after a
+# predict is the most likely moment for the two to meet. The forward it was
+# called from had nothing to do with it -- measured: the *same* leaf, feed
+# dropped, then `gc.collect()` in a loop, segfaults 5 runs out of 5 with no
+# torch forward and no transformers anywhere on the stack.
+#
+# There is one condition under our control: **the array handed to `predict`
+# must never reach refcount zero.** Two things hold it, and both were
+# measured rather than assumed:
+#
+# * **`_feed_buffer` reuse** -- one float32 buffer per compiled shape, held by
+#   the leaf, refilled in place. This is what makes it *deterministic*: a
+#   freshly allocated feed that is merely retained in a dict still corrupts
+#   the process intermittently (1 clean run in 3), while a reused buffer does
+#   not. It also bounds the retention, which a growing list would not.
+# * **`_RETAINED_FEEDS`** -- the module-level backstop, for callers with no
+#   leaf of their own (`verify`) and for anyone who empties a leaf's cache.
+#   Not dead code: `leaf._feeds.clear()` right after a forward, then
+#   `gc.collect()` in a loop, is **0 crashes in 5** because this dict still
+#   holds the buffer, and clearing *both* is **5 crashes in 5**.
+#
+# Nothing is ever removed from `_RETAINED_FEEDS`, so **a caller cannot
+# release these buffers, by design**. What that costs is small and worth
+# stating: the buffer for one leaf is `batch x in_features x 4` bytes, so for
+# all 211 leaves of SmolLM2-135M it is **601,344 bytes per batch row** --
+# 0.57 MiB at a decode batch of 1, 73 MiB at a prefill batch of 128. Measured
+# on that model: 211 buffers and 2.87 MiB after one batch-5 forward, 422 and
+# 4.59 MiB after a second forward at another shape.
+#
+# That is a minority of what compiling per shape already costs beside it.
+# `self._compiled` holds one CoreML program per leaf per shape, each carrying
+# that leaf's weights in float16, so a second distinct batch value adds
+# another ~269 MB of weights (134,479,872 parameters x 2 bytes) against the
+# feed buffers' 0.57 MiB per row. Both grow with the number of *distinct*
+# batch values a model is called at, which is a property of compile-per-shape
+# and not of this fix -- but it is the number to watch, not the buffers.
+_RETAINED_FEEDS = {}
+
+
+def _predict(model, feed: dict):
+    """`MLModel.predict(feed)`, holding on to every input array.
+
+    The single funnel for this module's predicts. See the comment above for
+    the crash report and for which half of this is measured to carry the fix:
+    the leaves' per-shape buffer reuse does, and this retention is the
+    backstop for callers that have no leaf.
+    """
+    for value in feed.values():
+        _RETAINED_FEEDS[id(value)] = value
+    return model.predict(feed)
+
+
+def _feed_buffer(cache, key, shape):
+    """A reusable, retained float32 input buffer for `shape`.
+
+    One per compiled shape, so what `_predict` retains stays bounded. The
+    caller fills it in place; CoreML has finished reading it by the time
+    `predict` returns (the lingering is the *binding*, not the compute), and
+    the tests drive a second forward at another shape and then a third back at
+    the first to prove a stale buffer would be caught.
+    """
+    import numpy as np
+
+    buffer = cache.get(key)
+    if buffer is None:
+        buffer = np.zeros(shape, dtype=np.float32)
+        cache[key] = buffer
+        _RETAINED_FEEDS[id(buffer)] = buffer
+    return buffer
+
+
 def _tensor_from_np(torch, arr):
     """A numpy array as a shim tensor, without ``tolist()``.
 
@@ -533,7 +636,7 @@ def verify(trace, inputs, *, tolerance: float = 2e-5, fold: bool = True,
         name: _np(value).astype(np.float32)
         for name, value in zip(names, inputs)
     }
-    produced = model.predict(feed)
+    produced = _predict(model, feed)
     reference = emitted.replay(inputs)
 
     ordered = list(produced.values())
@@ -1021,6 +1124,9 @@ class _CoreMLLinear:
         self._report = report if report is not None else {"plans": [], "_said": []}
         self._weight_np = None
         self._bias_np = None
+        #: One retained float32 input buffer per compiled shape. See
+        #: `_predict` for why an array handed to CoreML is never released.
+        self._feeds = {}
 
     @classmethod
     def from_torch(cls, layer, *, precision="float16", compute_units=None,
@@ -1094,9 +1200,10 @@ class _CoreMLLinear:
         for dim in shape[:-1]:
             batch *= dim
         model = self._compile_for(batch)
-        feed = _np(x.detach()).astype(np.float32).reshape(
-            batch, self.in_features)
-        produced = list(model.predict(
+        feed = _feed_buffer(self._feeds, batch, (batch, self.in_features))
+        feed[...] = _np(x.detach()).reshape(batch, self.in_features)
+        produced = list(_predict(
+            model,
             {model.get_spec().description.input[0].name: feed}).values())[0]
         out_np = np.asarray(produced, dtype=np.float32).reshape(
             *shape[:-1], self.out_features)
@@ -1177,6 +1284,9 @@ class _CoreMLConv2d:
             "plans": [], "_said": []}
         self._weight_np = None
         self._bias_np = None
+        #: One retained float32 input buffer per compiled shape. See
+        #: `_predict` for why an array handed to CoreML is never released.
+        self._feeds = {}
 
     @classmethod
     def from_torch(cls, layer, *, precision="float16", compute_units=None,
@@ -1260,8 +1370,10 @@ class _CoreMLConv2d:
                 f"not match in_channels={self.in_channels}."
             )
         model = self._compile_for(shape)
-        feed = _np(x.detach()).astype(np.float32).reshape(shape)
-        produced = list(model.predict(
+        feed = _feed_buffer(self._feeds, shape, shape)
+        feed[...] = _np(x.detach()).reshape(shape)
+        produced = list(_predict(
+            model,
             {model.get_spec().description.input[0].name: feed}).values())[0]
         out_np = np.asarray(produced, dtype=np.float32)
         result = _tensor_from_np(torch, out_np)
