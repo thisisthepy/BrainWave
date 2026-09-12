@@ -812,7 +812,116 @@ through Python. That made the suite flaky, which is worse than broken: a flaky
 gate gets re-run rather than read. Fd 1 itself is now pointed at `/dev/null`
 for the body of each fixture and the JSON is written to a dup of the original.
 
-### 8.4 Split the way CLAUDE.md §5.3 asks
+### 8.4 What compiling leaves on disk, and which half had an owner
+
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_bf16ane.py test_compiling_leaves_no_compiled_bundle_behind_in_the_system_temp present -->
+
+A full gate run was costing 2.7 GB of the internal disk and filling
+`$TMPDIR` until CoreML could not write at all (§8.3's investigation was
+blocked by it). A separate round had tried `atexit.register(shutil.rmtree, ...)`
+in six harnesses and the number did not move, because the growth was not the
+named harness directories: it was **`.mlmodelc` bundles**, on this arm.
+
+#### The anatomy, measured
+
+Each compile writes **two** compiled bundles, and they are not the same kind
+of thing:
+
+| bundle | written by | reachable from Python? | lifetime |
+|---|---|---|---|
+| `tmpXXXXXXXX.mlmodelc` | `MLModel` loading `ct.convert`'s package | yes — `MLModel.get_compiled_model_path()` | **removed when the `MLModel` is collected**, including at interpreter shutdown |
+| `m_<UUID>.mlmodelc` | **our** `compute_plan`, via `coremltools.models.utils.compile_model(package)` with no destination | no | **nothing ever removed it** |
+
+`MLModel.predict` writes neither. `ct.convert` writes only the first. So the
+one that accumulated was ours, and it was one per compile —
+**not content-addressed**: compiling the *same* program three times left
+three.
+
+Two more facts that explain why earlier attempts missed it:
+
+* **`NSTemporaryDirectory()` is not `$TMPDIR`.** CoreML's native side ignores
+  the environment variable, so pointing `TMPDIR` at another volume moves the
+  `.mlpackage` (Python `tempfile`) and not the `.mlmodelc`. Measured: with
+  `TMPDIR` on the external disk, zero `.mlmodelc` appeared there and they
+  still landed in `/var/folders/.../T`.
+* **coremltools' own cleanup is for the package, not the bundle.** `MLModel`
+  registers `atexit` cleanup for a temporary `.mlpackage` and holds no path to
+  the compiled output at all.
+
+#### The fix, and the numbers
+
+`compute_plan` already made a temporary directory and already removed it in a
+`finally`. It now names the compiled bundle **inside** that directory, so the
+existing cleanup reaches it — one argument, `compile_model(package, compiled)`.
+
+Measured on one run of `rust/torch_c/pytests/test_bf16ane.py`, the suite that
+compiles most:
+
+| | entries | `m_*.mlmodelc` | `tmp*.mlmodelc` | `*.mlpackage` |
+|---|---|---|---|---|
+| before | 9107 -> 9547 | 7998 -> 8436 (**+438**) | +0 | +0 |
+| after | 9547 -> 9549 | 8436 -> 8436 (**+0**) | +0 | +0 |
+
+And over a whole gate, which is the number that matters:
+
+| one `run.sh` | entries | `m_*.mlmodelc` | MB of them | `/` free |
+|---|---|---|---|---|
+| before | +501 | **+454** | **+650 MB** | **-2735 MB** |
+| after | +55 | **+6** | **+1 MB** | **+462 MB** |
+
+`tmp*.mlmodelc` and `*.mlpackage` were **+0 on both** — the two halves that
+clean themselves were already clean, so this was the whole of what this
+repository leaked per run. A gate now *returns* disk rather than consuming it,
+because the transient package and bundle of each compile are removed while the
+stale ones from earlier runs are not replaced.
+
+The residual **+6** is `rust/torch_c/pytests/test_npu2.py`'s own `plan_for`,
+measured by running that suite alone: it has the same undestined
+`compile_model` and no `finally` around its `mkdtemp`. It is 1 MB per gate and
+is left alone deliberately — its `directory` leaks either way, so naming a
+destination there would move bytes rather than free them, and the callers use
+the package it returns.
+
+#### It does not reintroduce §8.3's crash — checked before it was written
+
+§8.3 established that CoreML releases a bound input from a libdispatch worker
+without the GIL, and that *reusing* the feed buffer is what makes the forward
+deterministic. Dropping an `MLModel` tears down an execution stream, so eager
+cleanup is exactly the shape of change that could bring it back. Measured on
+the §8.3 harness, after a real `predict`:
+
+| | crashes |
+|---|---|
+| keep everything (shipped) | 0/5 |
+| drop the `MLModel`, retention kept | 0/5 |
+| drop the `MLModel` **and** clear both retentions | 0/5 |
+| clear both retentions, **keep** the `MLModel` — the known-bad control | **5/5** |
+
+The control still reproduces, so the comparison is real: dropping the model
+does not reintroduce the crash, it *removes* it — the teardown then happens on
+the main thread under the GIL instead of in the lingering worker. None of this
+changes what ships, because the compile cache is load-bearing and is kept; it
+is recorded so the next person does not have to re-derive it.
+
+#### What this does not recover, named
+
+* **The 311 `tmpXXXXXXXX.mlmodelc` (348 MB) already on this machine.** Those
+  are residue from the era §8.3 ended: a process that segfaults never runs
+  shutdown, so the half that normally dies with the `MLModel` survived. They
+  stopped accumulating when that crash was fixed — measured **+0** per gate
+  both before and after this change — and the existing ones are a
+  developer-hygiene matter, not a defect.
+* **`com.apple.e5rt.e5bundlecache`.** Apple's, not redirectable, and not
+  something library code should delete. It is the remainder of the 2.7 GB.
+* **Nothing for a caller to call.** There is no `release()` here, deliberately:
+  measured, dropping the compiled models recovers nothing at process exit
+  (`m_*` residue was +3 for three compiles whether they were dropped eagerly
+  or left to shutdown), and the cache a `generate()` loop depends on is worth
+  more than bounding peak disk. A long-lived process that wants that bound can
+  clear a leaf's `_compiled`; §8.3's table above is the evidence that doing so
+  is safe.
+
+### 8.5 Split the way CLAUDE.md §5.3 asks
 
 | | |
 |---|---|
@@ -823,4 +932,6 @@ for the body of each fixture and the JSON is written to a dup of the original.
 | **claim added** | a decode-shaped batch reaches the Neural Engine on **none** of SmolLM2's Linears; prefill reaches it on four of five shapes |
 | **claim unchanged** | both agreement grades — float32 0.0, float16 1.2e-03 — measured through `coreml.verify` and no second comparator |
 | **test defect fixed** | the fixtures avoided the caller's path; `_NAIVE_SCRIPT` drives it with nothing in front of it |
-| **tests added** | 18, in `rust/torch_c/pytests/test_bf16ane.py`; eight nullifications, each red on the tests it targets |
+| **defect fixed** | `compute_plan` orphaned one `.mlmodelc` per compile, forever — +454 directories and +650 MB per gate run (§8.4) |
+| **limitation named** | the `m_<UUID>` bundle had no owner at any level; `NSTemporaryDirectory()` ignores `$TMPDIR`; `e5bundlecache` is Apple's (§8.4) |
+| **tests added** | 19, in `rust/torch_c/pytests/test_bf16ane.py`; nine nullifications, each red on the tests it targets |

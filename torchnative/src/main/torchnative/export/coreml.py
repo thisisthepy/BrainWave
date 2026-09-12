@@ -759,6 +759,25 @@ def compute_plan(model, *, compute_units=None) -> list[dict]:
     The double compile is not tidiness. `MLComputePlan.load_from_path` wants a
     compiled `.mlmodelc`; handed the `.mlpackage` that `MLModel.save` writes it
     aborts the process with a C++ exception rather than raising.
+
+    **`compile_model` is given a destination, and that is not tidiness
+    either.** Left to choose, it writes `m_<UUID>.mlmodelc` into
+    `NSTemporaryDirectory()` -- which is *not* `$TMPDIR`, because CoreML's
+    native side ignores the variable -- and nothing ever removes it. Not
+    coremltools: the `atexit` cleanup it registers is for the temporary
+    `.mlpackage`, and the compiled bundle is not something it holds a path to.
+    Not the `MLModel` either: the bundle `ct.convert` produces
+    (`tmpXXXXXXXX.mlmodelc`) does belong to that object and is removed when it
+    is collected, but this is a second one with no owner at all.
+    Content-addressing does not save it: compiling the *same* program three
+    times leaves three.
+
+    Measured over a full gate before this argument was passed:
+    `tmpXXXXXXXX.mlmodelc` +0 and `*.mlpackage` +0 -- those two clean
+    themselves -- and `m_<UUID>.mlmodelc` **+454 directories, +650 MB**, which
+    was the whole of what this repository leaked per run. Naming a destination
+    inside `directory` puts it under the `finally` below, where the saved
+    `.mlpackage` already was.
     """
     import os
     import tempfile
@@ -787,8 +806,10 @@ def compute_plan(model, *, compute_units=None) -> list[dict]:
     try:
         package = os.path.join(directory, "m.mlpackage")
         model.save(package)
+        compiled = os.path.join(directory, "m.mlmodelc")
         plan = MLComputePlan.load_from_path(
-            ct_utils.compile_model(package), compute_units=compute_units)
+            ct_utils.compile_model(package, compiled),
+            compute_units=compute_units)
         function = plan.model_structure.program.functions["main"]
         rows = []
         for operation in function.block.operations:

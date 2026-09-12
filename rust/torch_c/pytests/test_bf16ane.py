@@ -235,6 +235,43 @@ try:
         "warnings": ours(caught),
     }
 
+    # -- 2b. what compiling leaves behind on disk --------------------------
+    #
+    # Counted in `NSTemporaryDirectory()` and not in `$TMPDIR`, because the
+    # two are not the same place: CoreML's native side ignores the
+    # environment variable, which is why pointing `TMPDIR` at another volume
+    # does not move these.
+    import subprocess as _sp
+    _native = _sp.run(["getconf", "DARWIN_USER_TEMP_DIR"],
+                      capture_output=True, text=True).stdout.strip()
+
+    def _bundles():
+        return {n for n in os.listdir(_native) if n.endswith(".mlmodelc")}
+
+    probe = C._CoreMLLinear(w, b, precision="float16",
+                            compute_units=ct.ComputeUnit.ALL)
+    before = _bundles()
+    with warnings.catch_warnings(record=True):
+        warnings.simplefilter("always")
+        for batch in (11, 13, 17):
+            probe._compile_for(batch, probe=True)
+    # While the models are alive, `ct.convert`'s own `tmpXXXXXXXX.mlmodelc`
+    # is legitimately on disk -- it belongs to the `MLModel`. What matters is
+    # what is left **after** they are released, so the probe is dropped first
+    # and the difference taken then.
+    during = sorted(_bundles() - before)
+    del probe
+    import gc as _gc
+    _gc.collect()
+    _gc.collect()
+    survived = sorted(_bundles() - before)
+    out["bundles"] = {
+        "compiles": 3,
+        "during": len(during),
+        "survived": len(survived),
+        "sample": survived[:3],
+    }
+
     # -- 3. the agreement grades, through coreml.verify and no other ------
     #
     # `verify` grades a *trace*, and `compile_model`'s input specs are
@@ -695,6 +732,40 @@ def test_a_bfloat16_tensor_reaches_numpy_as_an_exact_float32_array():
     assert "error" not in entry, entry
     assert entry["dtype"] == "float32", entry
     assert entry["values"] == [1.5, -2.25, 3.0, 0.125, -64.0], entry
+
+
+def test_compiling_leaves_no_compiled_bundle_behind_in_the_system_temp():
+    """`compute_plan` used to orphan one `.mlmodelc` per compile, forever.
+
+    Anatomy, measured: `ct.convert` writes a `tmpXXXXXXXX.mlmodelc` that
+    belongs to the `MLModel` and is removed when that object is collected --
+    including at interpreter shutdown -- and `MLModel.predict` writes none.
+    The one that stayed was **ours**: `compute_plan` calls
+    `coremltools.models.utils.compile_model(package)` with no destination, and
+    that writes `m_<UUID>.mlmodelc` somewhere the `finally: rmtree` around it
+    does not reach. One per compile, 0.64 MiB each, never content-addressed --
+    three compiles of the *same* program left three -- and no hook at any
+    level to reach them by.
+
+    Measured over a full gate before the fix: `tmp*.mlmodelc` +0 and
+    `*.mlpackage` +0 (those two clean themselves), `m_*.mlmodelc` **+454,
+    +650 MB**. So this was the whole of what this repository was leaking.
+
+    The count is of `NSTemporaryDirectory()`, which is **not** `$TMPDIR` --
+    CoreML's native side ignores the variable. A non-zero here means either
+    the fix regressed or another CoreML process was running concurrently;
+    `run.sh` runs suites serially, so the first is the one to look at.
+    """
+    r = _fixture_or_skip()
+    if r is None:
+        return
+    bundles = r["bundles"]
+    assert bundles["compiles"] == 3, bundles
+    # While the models are alive their own bundles are legitimately on disk;
+    # asserting that too would forbid CoreML from having a compiled model.
+    assert bundles["during"] >= 3, bundles
+    # Nothing survives the models.
+    assert bundles["survived"] == 0, bundles
 
 
 def test_float16_is_in_the_map_too_and_is_not_a_second_refusal():
