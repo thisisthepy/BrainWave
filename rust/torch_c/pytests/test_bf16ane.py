@@ -71,7 +71,7 @@ import json
 import os
 import struct
 
-from test_shim import _CKPT_VENDOR_SHIM, _npu_fixture
+from test_shim import _CKPT_VENDOR_SHIM, _STDOUT_GUARD, _npu_fixture
 
 
 #: The motivating checkpoint, read from the Hugging Face cache and never
@@ -80,28 +80,13 @@ from test_shim import _CKPT_VENDOR_SHIM, _npu_fixture
 _SMOL = "HuggingFaceTB/SmolLM2-135M"
 
 
-#: The preamble every script in this file runs before anything else, held in
-#: one place so that what the guard test exercises is literally what the
-#: fixtures run. See the comment inside it for what it is guarding against.
-_STDOUT_GUARD = r"""# `_npu_fixture` parses the **last line of stdout** as JSON, and this
-# fixture's stdout has two other writers. A `from_pretrained` progress bar
-# can land there (tqdm's carriage returns are line breaks to
-# `str.splitlines`), and CoreML's own ANE compiler writes diagnostics
-# straight to **file descriptor 1** when it cannot produce a bundle -- which
-# `sys.stdout = io.StringIO()` does not intercept, because the write never
-# goes through Python. Either one turns a passing fixture into
-# `JSONDecodeError: Expecting value: line 1 column 1`, intermittently, which
-# is worse than always: a flaky gate gets re-run rather than read.
-#
-# So fd 1 itself is pointed at /dev/null for the whole body, and the result
-# is written at the end to a dup of the original. Nothing but the JSON can
-# reach the parent's stdout, whoever writes it and from whatever language.
-_stdout = os.fdopen(os.dup(1), "w")
-_sink = os.open(os.devnull, os.O_WRONLY)
-os.dup2(_sink, 1)
-os.close(_sink)
-sys.stdout = io.StringIO()
-"""
+#: The preamble every script in this file runs before anything else.
+#:
+#: It lives in `test_shim` now rather than here, because it is not this
+#: file's problem: `test_coremlops.py` had the same two writers on stdout
+#: and no guard, and was intermittently red under the gate for it. One
+#: copy, so a fixture anywhere splices in the text this file's guard test
+#: drives. Re-bound to the local name so that test is unchanged.
 
 
 _BF16_SCRIPT = r"""

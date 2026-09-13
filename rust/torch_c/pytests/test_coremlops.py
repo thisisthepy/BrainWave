@@ -36,13 +36,17 @@ Skips say by name what is missing, for docs/devices/VULKAN3.md §6.1's reason.
 
 import os
 
-from test_shim import _CKPT_VENDOR_SHIM, _npu_fixture
+from test_shim import _CKPT_VENDOR_SHIM, _STDOUT_GUARD, _npu_fixture
 
 
 _COREMLOPS_SCRIPT = r"""
+import io
 import json
 import os
+import sys
 import warnings
+
+@STDOUT_GUARD@
 
 import torch
 
@@ -54,7 +58,7 @@ try:
 except Exception as error:
     out["coremltools"] = None
     out["import_error"] = f"{type(error).__name__}: {error}"
-    print(json.dumps(out))
+    print(json.dumps(out), file=_stdout, flush=True)
     raise SystemExit(0)
 
 import numpy as np
@@ -230,8 +234,11 @@ except Exception as error:  # noqa: BLE001
     import traceback
     out["coremlops_error"] = traceback.format_exc()
 
-print(json.dumps(out))
+print(json.dumps(out), file=_stdout, flush=True)
 """
+
+
+_COREMLOPS_SCRIPT = _COREMLOPS_SCRIPT.replace("@STDOUT_GUARD@", _STDOUT_GUARD)
 
 
 _CACHE = {}
@@ -437,6 +444,81 @@ def test_a_model_with_no_lowerable_leaf_is_still_a_refusal():
     assert refusal is not None, "to(device.npu) on a conv-free model succeeded"
     assert "nothing was lowered" in refusal, refusal
     assert "ReLU" in refusal and "LayerNorm" in refusal, refusal
+
+
+def test_the_fixtures_json_is_the_only_thing_that_reaches_stdout():
+    """Why this file was intermittently red, and the guard that ends it.
+
+    `_npu_fixture` reads the **last line of stdout** as JSON, and this
+    fixture's stdout had a second writer: CoreML's ANE compiler writes
+    diagnostics straight to **file descriptor 1**, which `sys.stdout =
+    io.StringIO()` cannot intercept because the write never goes through
+    Python. Python's own stdout is block-buffered into the parent's pipe, so
+    the JSON is flushed at interpreter exit while a native write lands the
+    moment it is made -- a chunk with no trailing newline, or one written
+    during shutdown after the flush, ends up on the JSON's own line and the
+    parent raises `JSONDecodeError: Expecting value: line 1 column 1 (char
+    0)`. Measured under the gate as fail / pass / fail, which is the worst
+    shape: a flaky gate gets re-run rather than read.
+
+    Driven on the guard **as this file splices it**, not on a paraphrase: the
+    subprocess below runs the same `_STDOUT_GUARD` text, and the three writes
+    are the three positions that can reach the JSON line -- before it, glued
+    to it with no newline, and after the flush. Nullified by replacing the
+    guard with `sys.stdout = io.StringIO()`: all three come back.
+    """
+    import subprocess
+    import sys
+
+    assert "@STDOUT_GUARD@" not in _COREMLOPS_SCRIPT, "guard never spliced"
+    assert _STDOUT_GUARD in _COREMLOPS_SCRIPT, "guard missing from the script"
+    assert "print(json.dumps(out))" not in _COREMLOPS_SCRIPT, (
+        "a print still goes to the sink instead of the saved fd 1")
+
+    script = (
+        "import io, json, os, sys\n"
+        + _STDOUT_GUARD
+        + '\nos.write(1, b"CreateBnnsGraphProgramFromMIL: noise\\n")\n'
+        + 'os.write(1, b"unterminated native chunk")\n'
+        + 'print("also via sys.stdout")\n'
+        + 'print(json.dumps({"ok": True}), file=_stdout, flush=True)\n'
+        + 'os.write(1, b"a write during shutdown\\n")\n'
+    )
+    proc = subprocess.run([sys.executable, "-c", script],
+                          capture_output=True, text=True, timeout=120)
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip().splitlines() == ['{"ok": true}'], proc.stdout
+
+
+def test_the_fixture_parent_reports_what_it_got_instead_of_discarding_it():
+    """A `JSONDecodeError` that throws the evidence away costs gate runs.
+
+    The parent used to be a bare `json.loads(last_line)`, so when a fixture's
+    stdout carried something other than its JSON the only thing said was
+    `Expecting value: line 1 column 1 (char 0)` -- with the text that names
+    the writer already discarded. Characterising one such failure took three
+    full gate runs for want of a string the parent was holding when it raised.
+
+    So both shapes are checked here through `_npu_fixture` itself: a stdout
+    whose last line is not JSON, and a stdout that is empty (which used to
+    raise `IndexError` from `splitlines()[-1]` and did not even look like a
+    parse problem). Nullified by restoring the bare `json.loads`: the first
+    loses the repr, the second is no longer an `AssertionError` at all.
+    """
+    try:
+        _npu_fixture('import os\nos.write(1, b"not json at all\\n")\n')
+    except AssertionError as error:
+        assert "not json at all" in str(error), str(error)
+        assert "_STDOUT_GUARD" in str(error), str(error)
+    else:
+        raise AssertionError("a non-JSON stdout was accepted")
+
+    try:
+        _npu_fixture("pass\n")
+    except AssertionError as error:
+        assert "wrote nothing to stdout" in str(error), str(error)
+    else:
+        raise AssertionError("an empty stdout was accepted")
 
 
 def _main():

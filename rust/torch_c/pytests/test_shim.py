@@ -26357,6 +26357,36 @@ print(json.dumps(out))
 """
 
 
+#: The preamble a fixture script runs before anything else, so that **only**
+#: its JSON reaches the parent's stdout.
+#:
+#: `_npu_fixture` parses the last line of stdout as JSON, and a fixture that
+#: reaches CoreML has other writers on that stream. CoreML's ANE compiler
+#: writes `CreateBnnsGraphProgramFromMIL` diagnostics straight to **file
+#: descriptor 1**, and a `from_pretrained` progress bar can land there too --
+#: neither goes through `sys.stdout`, so `sys.stdout = io.StringIO()` does not
+#: intercept either one. Python's own stdout is block-buffered into a pipe, so
+#: the JSON is flushed at interpreter exit while a native write reaches the
+#: pipe the moment it is made; a native chunk with no trailing newline, or one
+#: written during shutdown after the flush, lands on the JSON's own line and
+#: the parent gets `JSONDecodeError: Expecting value: line 1 column 1`. That
+#: is intermittent, which is worse than always: a flaky gate gets re-run
+#: rather than read.
+#:
+#: So fd 1 itself is pointed at /dev/null for the whole body, and the result
+#: is written at the end to a dup of the original. Nothing but the JSON can
+#: reach the parent's stdout, whoever writes it and from whatever language.
+#:
+#: A script that splices this in must `import io, os, sys` above it and print
+#: its JSON with `file=_stdout, flush=True`.
+_STDOUT_GUARD = r"""_stdout = os.fdopen(os.dup(1), "w")
+_sink = os.open(os.devnull, os.O_WRONLY)
+os.dup2(_sink, 1)
+os.close(_sink)
+sys.stdout = io.StringIO()
+"""
+
+
 def _npu_fixture(script):
     env = dict(os.environ)
     env["PYTHONPATH"] = _CKPT_VENDOR_DIR
@@ -26373,7 +26403,38 @@ def _npu_fixture(script):
             f"npu subprocess exited {proc.returncode}\n"
             f"--- stdout ---\n{proc.stdout}\n--- stderr ---\n{proc.stderr}"
         )
-    return json.loads(proc.stdout.strip().splitlines()[-1])
+    # Report what arrived, rather than discarding it.
+    #
+    # This used to be a bare `json.loads(...)`, and when a fixture's stdout
+    # carried something other than its JSON the parent said only
+    # `JSONDecodeError: Expecting value: line 1 column 1 (char 0)` -- with the
+    # text that would have named the writer already thrown away. Characterising
+    # one such failure cost three full gate runs for want of a string that the
+    # parent was holding at the moment it raised. An empty stdout was worse
+    # still: `splitlines()[-1]` on it raised `IndexError`, which does not even
+    # look like a parse problem.
+    lines = proc.stdout.strip().splitlines()
+    if not lines:
+        raise AssertionError(
+            "npu subprocess exited 0 but wrote nothing to stdout; the JSON "
+            "line is missing entirely.\n"
+            f"--- stderr (last 2000 chars) ---\n{proc.stderr[-2000:]}"
+        )
+    try:
+        return json.loads(lines[-1])
+    except json.JSONDecodeError as error:
+        raise AssertionError(
+            "npu subprocess exited 0 but its last stdout line is not JSON: "
+            f"{error}\n"
+            "Something other than the fixture's own `print` wrote to stdout. "
+            "CoreML's ANE compiler writes to fd 1 directly; see "
+            "`_STDOUT_GUARD`, which a fixture script splices in to stop "
+            "exactly this.\n"
+            f"--- last stdout line (repr) ---\n{lines[-1]!r}\n"
+            f"--- full stdout (repr, last 4000 chars) ---\n"
+            f"{proc.stdout[-4000:]!r}\n"
+            f"--- stderr (last 2000 chars) ---\n{proc.stderr[-2000:]}"
+        ) from error
 
 
 def _npu_serialiser_fixture():

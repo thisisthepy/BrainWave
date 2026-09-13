@@ -30,13 +30,17 @@ Skips say by name what is missing, for docs/devices/VULKAN3.md §6.1's reason.
 
 import os
 
-from test_shim import _CKPT_VENDOR_SHIM, _npu_fixture
+from test_shim import _CKPT_VENDOR_SHIM, _STDOUT_GUARD, _npu_fixture
 
 
 _ANEPATH_SCRIPT = r"""
+import io
 import json
 import os
+import sys
 import warnings
+
+@STDOUT_GUARD@
 
 import torch
 
@@ -48,7 +52,7 @@ try:
 except Exception as error:
     out["coremltools"] = None
     out["import_error"] = f"{type(error).__name__}: {error}"
-    print(json.dumps(out))
+    print(json.dumps(out), file=_stdout, flush=True)
     raise SystemExit(0)
 
 import numpy as np
@@ -192,8 +196,12 @@ except Exception as error:  # noqa: BLE001
     import traceback
     out["anepath_error"] = traceback.format_exc()
 
-print(json.dumps(out))
+print(json.dumps(out), file=_stdout, flush=True)
 """
+
+
+#: fd 1 carries the JSON and nothing else; see `_STDOUT_GUARD`.
+_ANEPATH_SCRIPT = _ANEPATH_SCRIPT.replace("@STDOUT_GUARD@", _STDOUT_GUARD)
 
 
 _CACHE = {}

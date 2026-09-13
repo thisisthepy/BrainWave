@@ -28,7 +28,7 @@ pass and is worse than a failure.
 
 import os
 
-from test_shim import _CKPT_VENDOR_SHIM, _npu_fixture
+from test_shim import _CKPT_VENDOR_SHIM, _STDOUT_GUARD, _npu_fixture
 
 
 # ---------------------------------------------------------------------------
@@ -40,9 +40,13 @@ from test_shim import _CKPT_VENDOR_SHIM, _npu_fixture
 # script would make each half's availability depend on the other's.
 
 _NPU2_COREML_SCRIPT = r"""
+import io
 import json
 import os
+import sys
 import tempfile
+
+@STDOUT_GUARD@
 
 import torch
 
@@ -58,7 +62,7 @@ try:
 except Exception as error:
     out["coremltools"] = None
     out["import_error"] = f"{type(error).__name__}: {error}"
-    print(json.dumps(out))
+    print(json.dumps(out), file=_stdout, flush=True)
     raise SystemExit(0)
 
 import numpy as np
@@ -214,12 +218,21 @@ except Exception as error:  # noqa: BLE001
     import traceback
     out["coreml_error"] = traceback.format_exc()
 
-print(json.dumps(out))
+print(json.dumps(out), file=_stdout, flush=True)
 """
 
 
+#: fd 1 carries the JSON and nothing else; see `_STDOUT_GUARD`.
+_NPU2_COREML_SCRIPT = _NPU2_COREML_SCRIPT.replace("@STDOUT_GUARD@", _STDOUT_GUARD)
+
+
 _NPU2_NNAPI_SCRIPT = r"""
+import io
 import json
+import os
+import sys
+
+@STDOUT_GUARD@
 
 import torch
 
@@ -234,7 +247,7 @@ out["serial"] = D.serial()
 out["adb"] = D.adb_available()
 out["ndk_clang"] = D.ndk_clang()
 if not out["adb"] or out["ndk_clang"] is None:
-    print(json.dumps(out))
+    print(json.dumps(out), file=_stdout, flush=True)
     raise SystemExit(0)
 
 
@@ -340,8 +353,12 @@ except Exception as error:  # noqa: BLE001
     import traceback
     out["nnapi_error"] = traceback.format_exc()
 
-print(json.dumps(out))
+print(json.dumps(out), file=_stdout, flush=True)
 """
+
+
+_NPU2_NNAPI_SCRIPT = _NPU2_NNAPI_SCRIPT.replace(
+    "@STDOUT_GUARD@", _STDOUT_GUARD)
 
 
 _CACHE = {}

@@ -1072,3 +1072,110 @@ is present as a named `unknown` row rather than as an absence.
 | **claim unchanged** | relu and gelu are supported on the unit and preferred elsewhere — re-measured at four shapes, not widened, not re-graded |
 | **test defect fixed** | the relu/gelu measurement rested on a single artefact and became `assert []` when that artefact went silent |
 | **tests added** | 8, in `rust/torch_c/pytests/test_emptyplan.py` |
+
+---
+
+## 10. Two failures in one file, and only one of them was the fixture's
+
+`test_coremlops.py` was intermittently red under the gate — fail, pass, fail
+across three consecutive full runs — with
+
+```
+FAIL test_a_conv_leaf_is_deferred_because_its_shape_is_not_known_at_to_time:
+     JSONDecodeError: Expecting value: line 1 column 1 (char 0)
+```
+
+and every other test in the file green on every run. Investigating it turned up
+a **second**, unrelated failure in the same file that is not a test bug at all.
+They are separated here because a fragile fixture and a non-deterministic
+product need opposite responses, and reporting them as one "flaky file" is how
+the first one survived three gate runs.
+
+### 10.1 The intermittent one is the fixture, and §9's own guard already existed
+
+`_npu_fixture` reads the **last line of the subprocess's stdout** as JSON.
+`test_coremlops.py`'s script had a second writer on that stream and no guard:
+CoreML's ANE compiler writes diagnostics straight to **file descriptor 1**,
+which `sys.stdout = io.StringIO()` does not intercept because the write never
+goes through Python. `test_bf16ane.py` had already met this and carried a
+`_STDOUT_GUARD` for it; the guard was a local in that file, so the next fixture
+to need it did not get it.
+
+Why it lands on the *last* line rather than harmlessly above it: Python's
+stdout is block-buffered into the parent's pipe, so the fixture's 5 KB of JSON
+is flushed at interpreter exit, while a native write reaches the pipe the
+moment it is made. A native chunk **with no trailing newline**, or one written
+during shutdown after the flush, therefore shares a line with the JSON. Driven
+directly, with the guard nullified back to `sys.stdout = io.StringIO()`, the
+parent's stdout is:
+
+```
+CreateBnnsGraphProgramFromMIL: noise
+unterminated native chunk{"ok": true}
+a write during shutdown
+```
+
+— whose last line parses to exactly `Expecting value: line 1 column 1
+(char 0)`. Why only one test failed: `_main` runs tests in `sorted()` order,
+`test_a_conv_leaf_is_deferred...` sorts first, and `_CACHE` is populated only
+on success — so the first test pays for the subprocess, and a test *after* a
+failed one silently re-runs it and passes.
+
+Fixed three ways:
+
+* `_STDOUT_GUARD` moved into `test_shim.py`, beside the parent that depends on
+  it, and spliced into every CoreML-reaching fixture script: `test_coremlops`,
+  `test_anepath`, and both of `test_npu2`'s. `test_bf16ane` re-binds the
+  imported name so its existing guard test drives the same text.
+* `_npu_fixture` **reports what it got**. The bare `json.loads` discarded the
+  one string that named the writer, which is why characterising this cost three
+  gate runs; an empty stdout raised `IndexError` and did not even look like a
+  parse problem. Both now raise with the offending line's `repr`, the tail of
+  stdout and stderr, and a pointer to the guard.
+
+### 10.2 The other one is CoreML, and the silent set is growing
+
+`test_the_rejected_types_are_rejected_by_a_number_and_not_by_omission` is red
+on this host — **deterministically**, on the pre-change file as well as the
+changed one, so it is neither this round's doing nor the flakiness above.
+
+§9.1 established that an artefact can come back from `MLComputePlan` with no
+device for any operation, that it is tied to the artefact's bytes, and that it
+is sticky. What is added here is that **an artefact can transition into that
+state**, and that the set of silent ones only grows. Same program, same shapes,
+same interpreter build, measured hours apart on one machine:
+
+| | `(256,1024)` | `(255,1024)` | `(128,1024)` | `(256,1023)` |
+|---|---|---|---|---|
+| relu, earlier (10 runs, identical) | unknown | CPU | CPU | CPU |
+| relu, later (3 runs, identical) | unknown | CPU | CPU | CPU |
+| gelu, earlier (10 runs, identical) | unknown | unknown | **CPU** | CPU |
+| gelu, later (3 runs, identical) | unknown | unknown | **unknown** | CPU |
+
+Nothing in this repository changed between the two blocks; what ran in between
+was `test_bf16ane`, `test_anepath` and `test_npu2`, i.e. more CoreML compiles.
+`gelu` is now down to **one** answering shape, and §9.4's deliberate "at least
+two shapes must answer or the claim is untested" is what fails. That threshold
+is doing exactly its job: the measurement behind "relu and gelu are supported
+on the unit and preferred elsewhere" is no longer obtainable here, and the test
+says so instead of passing on one shape.
+
+It is **not** weakened to fit. Lowering the threshold, or treating `unknown` as
+a pass, would convert a claim this host can no longer measure into a green
+line, which is §9's failure with a third entrance.
+
+Untested hypothesis, recorded as untested: the transition correlates with
+`~/Library/Caches/org.python.python/com.apple.e5rt.e5bundlecache` reaching
+**18 GB** against 13 GB free on `/`, and bundle-creation failure is also the
+condition under which the ANE compiler writes the fd-1 diagnostics of §10.1 —
+which would make one platform condition the root of both symptoms. Testing it
+means deleting Apple's 18 GB cache, which is outside this change and not
+library code's to delete.
+
+| | |
+|---|---|
+| **fixture defect fixed** | one stdout guard, now shared, spliced into four CoreML fixture scripts |
+| **legibility fixed** | `_npu_fixture` raises with the subprocess's own output instead of discarding it |
+| **product finding** | `MLComputePlan`'s per-op usage is not stable over time for a fixed program; artefacts enter the silent set and stay |
+| **left red, deliberately** | `test_the_rejected_types_are_rejected_by_a_number_and_not_by_omission` on this host — the measurement is unavailable, and saying so is the point |
+| **tests added** | 2, in `rust/torch_c/pytests/test_coremlops.py`; both nullified |
