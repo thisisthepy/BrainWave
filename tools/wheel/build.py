@@ -110,7 +110,9 @@ import re
 import shutil
 import struct
 import subprocess
+import time
 import sys
+import tempfile
 import zipfile
 from pathlib import Path
 
@@ -2271,7 +2273,15 @@ def upstream_dist_info(version: str) -> dict[str, bytes]:
     prefix = f"torchnative-{version}.data/purelib/{root.name}"
     out: dict[str, bytes] = {}
     for path in sorted(root.rglob("*")):
-        if not path.is_file() or path.name == "RECORD":
+        # `INSTALLER` and `REQUESTED` are not upstream's -- pip and uv write
+        # them into a dist-info when they INSTALL it, and vendor_torch.sh
+        # assembles this tree out of an installed venv, so they ride along.
+        # Every published torchnative wheel through 0.1.0b3 therefore carries
+        # `INSTALLER = b"uv"` inside a wheel pip is about to install, which is
+        # a statement about this machine's tooling and false for the reader.
+        # Nothing consumes them: pip rewrites INSTALLER for what it installs
+        # and REQUESTED marks a direct request, which a vendored tree is not.
+        if not path.is_file() or path.name in ("RECORD", "INSTALLER", "REQUESTED"):
             continue
         if any(part in SKIP_DIRS for part in path.parts):
             continue
@@ -2412,6 +2422,23 @@ def self_test() -> None:
         _fail(f"self-test needs source files under {CRATE / 'src'}; found {real}")
     hour = 3600 * 10**9
 
+    # The `stale` case needs a prerequisite NEWER than the backdated artefact,
+    # and it used `real[:2]` -- the alphabetically first two -- with a fixed
+    # 48-hour backdate. That is a claim about this checkout's file ages, not
+    # about the code: right after a cross-build round rebuilt every artefact,
+    # neither of those two had been touched inside 48 hours and the case
+    # silently became `fresh`, so the self-test failed with "the cases do not
+    # reach all three verdicts". The verdict logic was never wrong.
+    #
+    # So the backdate is computed from the newest real source instead of
+    # assumed. Real files are still used, because the containment rule (a
+    # prerequisite from another checkout) is one of the things under test and a
+    # synthetic path would not exercise it.
+    newest = max(real, key=lambda f: os.stat(f).st_mtime_ns)
+    newest_age_h = (time.time_ns() - os.stat(newest).st_mtime_ns) / hour
+    stale_age_h = newest_age_h + 1.0
+    stale_inputs = " ".join([newest] + [f for f in real if f != newest][:1])
+
     cases: list[tuple[str, str, str]] = []   # (label, expected, fragment)
     with tempfile.TemporaryDirectory() as tmp:
         tmpdir = Path(tmp)
@@ -2432,7 +2459,7 @@ def self_test() -> None:
             ("current artefact", FRESH, "recorded inputs",
              "@ART@: " + " ".join(real[:2]), 0.0),
             ("a prerequisite modified after the build", STALE,
-             "was modified", "@ART@: " + " ".join(real[:2]), 48.0),
+             "was modified", "@ART@: " + stale_inputs, stale_age_h),
             ("no dep-info at all", UNKNOWN, "does not exist", None, 0.0),
             ("dep-info with no rule in it", UNKNOWN, "no Makefile rule",
              "not a makefile\njust prose\n", 0.0),
@@ -3213,19 +3240,43 @@ def main() -> None:
               "(this interpreter's dynload table\n"
               "      has no .abi3.so in it)")
 
+    # Everything through `verify()` happens in a staging directory, not
+    # `args.outdir` (normally `dist/`). `run_pip_wheel` produces an
+    # intermediate that still carries the *host's* platform tag even for a
+    # cross build -- `_repack` only patches and retags it afterwards -- and if
+    # `_repack` or `verify` then fails, that intermediate is a publishable-
+    # looking artefact with the wrong tag sitting in `dist/`. Twice: a failed
+    # `linux-x86_64` and a failed `wasm32-emscripten` run each left a
+    # `...-macosx_11_0_universal2.whl` behind this way, and `dist/` also holds
+    # the released artefacts this script must not disturb.
+    #
+    # Staging beats cleanup-on-failure here because staging only has to get
+    # the *success* path right -- the intermediate lives in a
+    # `TemporaryDirectory` and is gone when this block exits, success or not,
+    # with no exit path to enumerate. Cleanup-on-failure has to catch every
+    # one of those paths (an exception, `_fail`'s `sys.exit`, a signal) to
+    # give the same guarantee, and missing one reproduces exactly the bug
+    # being fixed. The move into `args.outdir` below is the only step that can
+    # still put a wheel there, and it only runs after `verify()` has passed.
     args.outdir.mkdir(parents=True, exist_ok=True)
-    wheel = run_pip_wheel(args.python, args.outdir)
+    with tempfile.TemporaryDirectory(prefix="torchnative-wheel-build-") as staging_dir:
+        staging = Path(staging_dir)
+        wheel = run_pip_wheel(args.python, staging)
 
-    version = wheel.name.split("-")[1]
-    extra = {**upstream_dist_info(version), **global_deps_stub(target)}
-    wheel = _repack(wheel, extra, f"torchnative-{version}.dist-info",
-                    plat=plat, overrides=overrides, renames=renames)
+        version = wheel.name.split("-")[1]
+        extra = {**upstream_dist_info(version), **global_deps_stub(target)}
+        wheel = _repack(wheel, extra, f"torchnative-{version}.dist-info",
+                        plat=plat, overrides=overrides, renames=renames)
 
-    expected: set[str] = set()
-    for pkg in ("torch", *stamp.get("packages", "").split(","), "torchnative"):
-        if pkg and (SRC / pkg).is_dir():
-            expected |= tree_files(SRC / pkg)
-    verify(wheel, expected, target, extra, f"torchnative-{version}.dist-info")
+        expected: set[str] = set()
+        for pkg in ("torch", *stamp.get("packages", "").split(","), "torchnative"):
+            if pkg and (SRC / pkg).is_dir():
+                expected |= tree_files(SRC / pkg)
+        verify(wheel, expected, target, extra, f"torchnative-{version}.dist-info")
+
+        final_wheel = args.outdir / wheel.name
+        shutil.move(str(wheel), str(final_wheel))
+    wheel = final_wheel
 
     with zipfile.ZipFile(wheel) as zf:
         entries = zf.namelist()

@@ -743,5 +743,22 @@
   ],
   "logical_not": [
     "aten::logical_not(Tensor self) -> Tensor"
+  ],
+  "equal": [
+    "aten::equal(Tensor self, Tensor other) -> bool"
+  ],
+  "allclose": [
+    "aten::allclose(Tensor self, Tensor other, float rtol=1.0000000000000001e-05, float atol=1e-08, bool equal_nan=False) -> bool"
+  ],
+  "diff": [
+    "aten::diff(Tensor self, int n=1, int dim=-1, Tensor? prepend=None, Tensor? append=None) -> Tensor"
+  ],
+  "fmod": [
+    "aten::fmod.Tensor(Tensor self, Tensor other) -> Tensor",
+    "aten::fmod.Scalar(Tensor self, Scalar other) -> Tensor"
+  ],
+  "multiply": [
+    "aten::multiply.Tensor(Tensor self, Tensor other) -> Tensor",
+    "aten::multiply.Scalar(Tensor self, Scalar other) -> Tensor"
   ]
 }

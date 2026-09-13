@@ -261,8 +261,13 @@ else
     NEW=$(git commit-tree "$TREE" -m "Release $VERSION")
     echo "  parent     (none -- first release on $TARGET_REF)"
 fi
-git update-ref "$TARGET_REF" "$NEW"
-echo "  commit     $NEW -> $TARGET_REF"
+# The ref is NOT moved here. It used to be, and a publish whose build check
+# then failed left the branch already pointing at the unverified commit -- so
+# 0.1.0b1 ended up with two "Release 0.1.0b1" commits, the failed one and the
+# one that worked, collapsed by hand afterwards. Both checks below read `$NEW`,
+# the commit object, and neither needs the ref, so the ref moves only once they
+# have passed. A failed publish now leaves the branch exactly where it was.
+echo "  commit     $NEW (held back until both checks pass)"
 echo
 
 unset GIT_INDEX_FILE
@@ -303,6 +308,47 @@ EOF
     exit 0
 fi
 
+# Fail closed on PUBLISH_PYTHON before touching the scratch worktree.
+#
+# `tools/wheel/build.py` drives the build through `pip wheel --no-build-
+# isolation`, which means PUBLISH_PYTHON needs `pip` and the PEP 517 backend
+# (`setuptools`, per pyproject.toml's `build-backend = "setuptools.build_meta"`,
+# plus `wheel` since isolation is off and nothing will fetch it) already
+# importable -- isolation off is deliberate (see run_pip_wheel's docstring),
+# so nothing here will install them. This is the same trap as run.sh's:
+# a `PUBLISH_PYTHON` without `setuptools` has previously cost a run of this
+# exact script, and the failure landed deep inside the pip subprocess instead
+# of here, up front.
+_publish_py=${PUBLISH_PYTHON:-python3}
+_publish_py_missing=$("$_publish_py" - <<'PYEOF' 2>&1 || true
+import importlib
+missing = []
+for mod in ("pip", "setuptools", "wheel"):
+    try:
+        importlib.import_module(mod)
+    except ImportError as exc:
+        missing.append(mod + " (" + str(exc) + ")")
+if missing:
+    print("\n".join(missing))
+PYEOF
+)
+if [ -n "$_publish_py_missing" ]; then
+    cat >&2 <<EOF
+check_build: refusing to start -- $_publish_py cannot import what the build needs.
+
+Interpreter: $_publish_py
+Could not import:
+$_publish_py_missing
+
+pip wheel runs with --no-build-isolation (see run_pip_wheel's docstring), so
+nothing will install these for you. Nothing has been built yet.
+
+Fix: set PUBLISH_PYTHON to this repo's known-good interpreter and re-run:
+    PUBLISH_PYTHON=/Volumes/macMini/caches/spike-venv/bin/python $0
+EOF
+    exit 1
+fi
+
 echo "check_build: $TARGET_REF must still build a wheel"
 SCRATCH_WT=${PUBLISH_SCRATCH_WT:-/Volumes/macMini/worktrees/publish-buildcheck-$$}
 cleanup_all() {
@@ -340,4 +386,6 @@ if [ -z "$wheel" ]; then
 fi
 echo "  ok         $(basename "$wheel") ($(wc -c < "$wheel" | tr -d ' ') bytes)"
 echo
+# Both checks passed, so the branch may move now.
+git update-ref "$TARGET_REF" "$NEW"
 echo "published $TARGET_REF = $NEW"

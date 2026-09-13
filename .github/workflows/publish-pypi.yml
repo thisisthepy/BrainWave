@@ -1,0 +1,678 @@
+# Publish the nine torchnative wheels to PyPI from a version tag.
+#
+# Replaces the manual release: a person building nine wheels on one Mac and
+# running `twine upload`. That process was not merely tedious, it was
+# unreproducible -- its toolchain lived in that machine's scratch directories
+# (a `zig` shim in /tmp, an emsdk under /Volumes, a hand-written
+# PYO3_CONFIG_FILE for iOS) -- and on 2026-09-11 eight of its cross artefacts
+# were 44 hours stale against the Rust sources, caught only by build.py's own
+# freshness guard. A runner starts empty, so that failure mode stops existing.
+#
+# Read docs/platform/PUBLISH_CI.md before changing anything here. In particular:
+#
+#   * The name of this file is fixed. PyPI Trusted Publishing is registered
+#     against `publish-pypi.yml` + environment `pypi` for thisisthepy/torchnative.
+#     Renaming either breaks OIDC with a 403 that says nothing useful.
+#   * There is no PyPI token anywhere and none should be added. `id-token:
+#     write` plus pypa/gh-action-pypi-publish is the whole authentication story.
+#   * Three of the five non-downloadable target CPython distributions cannot be
+#     rebuilt (docs/platform/TARGET_PYTHON.md §5: the Android one was built from a
+#     `-dirty` tree whose modifications nothing records). They are fetched as a
+#     pinned bundle; see the `TARGET_PYTHON_BUNDLE_URL` repository variable and
+#     PUBLISH_CI.md §3, which is also where the bundle is published from.
+
+name: publish-pypi
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: >-
+          The tag to build, e.g. v0.1.0b4. Must equal `v` + pyproject.toml's
+          [project] version; the run stops before building otherwise.
+        required: true
+        type: string
+      dry_run:
+        description: >-
+          Build and verify everything, upload nothing. The first real use of
+          this workflow should not be its first execution.
+        required: true
+        type: boolean
+        default: true
+
+# Read-only by default. The one job that needs `id-token: write` asks for it
+# itself, so a step added to any other job cannot mint an OIDC token.
+permissions:
+  contents: read
+
+concurrency:
+  # One release at a time. Two tags pushed together would otherwise race to
+  # upload files of different versions into the same project, and PyPI's
+  # per-file uploads have no transaction to roll back.
+  group: publish-pypi
+  cancel-in-progress: false
+
+env:
+  # The vendoring source, pinned by exact wheel filename rather than by
+  # `pip install torch`. This is load-bearing and not obvious: vendor_torch.sh
+  # copies upstream's `torch-<v>.dist-info` verbatim into every one of our nine
+  # wheels, and that directory's WHEEL file says
+  # `Tag: cp313-cp313-macosx_14_0_arm64`. Vendor from a Linux torch wheel and
+  # all nine wheels change -- not only that line but METADATA, whose
+  # Requires-Dist differs between the CUDA and macOS builds. Measured: with
+  # this exact wheel, 2,666 of 2,666 vendored members come out byte-identical
+  # to the released 0.1.0b3 wheels. See PUBLISH_CI.md §2.
+  TORCH_WHEEL_VERSION: "2.13.0"
+  TORCH_WHEEL_PLATFORM: "macosx_14_0_arm64"
+  # python-build-standalone release the four downloadable target CPythons come
+  # from, checksummed in docs/platform/TARGET_PYTHON.md §3 and §4.
+  PBS_RELEASE: "20260825"
+  PBS_PYTHON: "3.13.15"
+  PYTHONUNBUFFERED: "1"
+
+jobs:
+
+  # ---------------------------------------------------------------- preflight
+  #
+  # Everything that can refuse before a single byte is compiled. A refusal here
+  # costs 40 seconds; the same refusal discovered in `collect` costs an hour of
+  # runner time across nine jobs, and discovered after upload costs a version
+  # number, because PyPI never allows a filename to be reused.
+  preflight:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+      tag: ${{ steps.check.outputs.tag }}
+      dry_run: ${{ steps.mode.outputs.dry_run }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - run: python -m pip install --upgrade packaging
+        name: packaging, for the normalised half of the version comparison
+
+      # THE tag/version check. `github.ref_name` on a tag push, the typed input
+      # on a dispatch. Nothing else in this repository compares these two, and
+      # without it `git tag v0.1.0b4` would have published 0.1.0b3 under that
+      # name -- nine internally consistent wheels, all the wrong version.
+      - id: check
+        name: the tag must be the version
+        run: |
+          python tools/ci/check_tag_version.py "${{ inputs.ref || github.ref }}"
+
+      - id: mode
+        name: decide whether this run may upload
+        run: |
+          # A tag push is a real release. A dispatch uploads only if the person
+          # who started it explicitly said so -- the input defaults to true for
+          # dry run, so the safe answer is also the default answer.
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "dry_run=${{ inputs.dry_run }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "dry_run=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Refused here rather than in the Android build job, which is 40 minutes
+      # in. docs/platform/TARGET_PYTHON.md §5: the aarch64-linux-android CPython was
+      # cross-built on a machine that is not this one, from a `heads/3.13-dirty`
+      # tree, and nothing records what the modifications were. It is the one
+      # distribution of the five that cannot be reconstructed from its own
+      # evidence, so CI cannot build it and must be handed it.
+      - name: the target-python bundle must be reachable
+        env:
+          BUNDLE_URL: ${{ vars.TARGET_PYTHON_BUNDLE_URL }}
+        run: |
+          if [ -z "$BUNDLE_URL" ]; then
+            echo "::error::repository variable TARGET_PYTHON_BUNDLE_URL is not set."
+            echo "Three of the five target CPython distributions cannot be obtained"
+            echo "on a fresh runner: the two iOS ones are rebuildable but not"
+            echo "downloadable, and the Android one is not reproducible at all"
+            echo "(docs/platform/TARGET_PYTHON.md §5 -- built from a -dirty tree)."
+            echo "docs/platform/PUBLISH_CI.md §3 has the one-time procedure that"
+            echo "publishes them as a checksummed bundle and sets this variable."
+            exit 1
+          fi
+          # HEAD only: the bundle is ~700 MB and the build jobs fetch it. This
+          # step exists to fail in 2 seconds rather than in 9 jobs at once.
+          curl -sSfIL "$BUNDLE_URL" -o /dev/null
+          echo "bundle reachable"
+
+  # ------------------------------------------------------------------- vendor
+  #
+  # Vendored once, consumed by all nine builds. Not for speed: it is what makes
+  # "the nine wheels carry the same tree" a fact rather than a consequence of
+  # having been built on one machine within one afternoon. `collect` below
+  # checks it again from the wheels themselves, and this job is why that check
+  # can pass.
+  vendor:
+    runs-on: ubuntu-24.04
+    needs: preflight
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - id: cache
+        uses: actions/cache@v4
+        with:
+          path: _upstream
+          key: torch-${{ env.TORCH_WHEEL_VERSION }}-${{ env.TORCH_WHEEL_PLATFORM }}
+
+      # `--platform`/`--python-version` make this a pure download: pip resolves
+      # a wheel for a platform it is not running on and never executes it. That
+      # is how a Linux runner vendors the macOS tree, and it is the only reason
+      # the vendoring does not need a Mac.
+      - name: fetch the pinned upstream torch wheel
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          python -m pip download "torch==${TORCH_WHEEL_VERSION}" \
+            --only-binary=:all: --no-deps \
+            --platform "${TORCH_WHEEL_PLATFORM}" --python-version 3.13 \
+            -d _download
+          mkdir -p _upstream
+          unzip -q "_download/torch-${TORCH_WHEEL_VERSION}-cp313-cp313-${TORCH_WHEEL_PLATFORM}.whl" -d _upstream
+
+      # Two files pip/uv write into site-packages that are NOT in the upstream
+      # wheel, and that the released 0.1.0b3 wheels nonetheless carry, because
+      # they were vendored out of an installed venv rather than out of a wheel.
+      # Reproduced rather than dropped: this round's job is to produce wheels
+      # that match the verified ones, and dropping them is a content change
+      # that belongs in its own round. PUBLISH_CI.md §2.2 argues they should go.
+      - name: restore the installer markers the released wheels carry
+        run: |
+          di="_upstream/torch-${TORCH_WHEEL_VERSION}.dist-info"
+          printf 'uv' > "$di/INSTALLER"
+          : > "$di/REQUESTED"
+
+      - name: vendor
+        run: |
+          TORCHNATIVE_TORCH_SRC="$PWD/_upstream" bash vendor/vendor_torch.sh
+          cat torchnative/src/main/.stamp
+
+      # `native_left=0` is vendor_torch.sh's own measurement that no upstream
+      # compiled artefact survived the copy. build.py refuses on a non-zero, but
+      # only after the cargo builds have run in whichever job got there first.
+      - name: the stamp must say the tree has exactly one hole
+        run: |
+          grep -qx 'native_left=0' torchnative/src/main/.stamp
+          grep -qx "version=${TORCH_WHEEL_VERSION}" torchnative/src/main/.stamp
+          grep -qx 'add_hooks=1' torchnative/src/main/.stamp
+
+      # tar rather than upload-artifact's own walk: the tree is ~2,400 files and
+      # upload-artifact does not preserve the empty `torch/bin/torch_shm_manager`
+      # marker's mode, nor symlinks.
+      - name: pack
+        run: tar -C torchnative/src/main -czf vendored-tree.tgz torch torchgen functorch .stamp "torch-${TORCH_WHEEL_VERSION}.dist-info"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vendored-tree
+          path: vendored-tree.tgz
+          retention-days: 7
+
+  # -------------------------------------------------------------------- gate
+  #
+  # The full pytests suite, run on this tag's tree.
+  #
+  # The alternative -- require that the tagged commit already has a green gate
+  # from a push run -- is faster and trusts two things this does not: that the
+  # gate ran on *this* tree (a tag can be moved, and `git tag` on an older
+  # commit is how a hotfix is usually cut), and that the status API's answer is
+  # about the same suite. A release is a handful per month; an hour of runner
+  # time to not have to trust that is the cheaper side of the trade.
+  #
+  # macos-14 rather than ubuntu deliberately: the 1438-ok baseline in CLAUDE.md
+  # was measured on macOS arm64, and no one has measured the suite on Linux. A
+  # gate whose number cannot be compared to the recorded one is a gate that
+  # cannot notice a regression.
+  gate:
+    runs-on: macos-14
+    needs: [preflight, vendor]
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: vendored-tree
+
+      - name: unpack the vendored tree and install the host shim
+        run: |
+          tar -C torchnative/src/main -xzf vendored-tree.tgz
+          bash vendor/install_shim.sh
+
+      - name: dependencies the suite imports
+        run: python -m pip install --upgrade packaging pyyaml
+
+      # run.sh refuses to start without PYTHON, and dies at 127 if cargo is not
+      # on PATH. Both are made explicit here so a failure names the cause.
+      - name: gate
+        run: PYTHON="$(which python)" bash rust/torch_c/pytests/run.sh
+
+  # ------------------------------------------------------------------- build
+  #
+  # Nine wheels, `fail-fast: false` so one broken target reports alongside the
+  # other eight instead of hiding them. Nothing downstream runs unless all nine
+  # arrive; see `collect`.
+  #
+  # Runner assignment, and why:
+  #
+  #   macos-14   host (macosx_11_0_arm64), ios-arm64, ios-arm64-sim
+  #              Not a preference. The macOS wheel's platform tag is read out of
+  #              the Mach-O the host cargo build produced (build.py
+  #              `honest_macos_plat`), and both iOS artefacts need `xcrun` and
+  #              an iOS SDK: the target CPython's own compiler shims in
+  #              `bin/arm64-apple-ios-simulator-clang` are two-line `xcrun`
+  #              wrappers (TARGET_PYTHON.md §1). There is no cross-from-Linux
+  #              route for either.
+  #
+  #   ubuntu     everything else. Each of the remaining six is already a cross
+  #              build today, done from a Mac through a toolchain that does not
+  #              care what host it runs on: `cargo zigbuild` (Linux),
+  #              `cargo xwin` (Windows), `cargo ndk` (Android), emscripten
+  #              (wasm). Running them on Linux removes the Rosetta/darwin-x86_64
+  #              prebuilt indirection the NDK needs on Apple Silicon, and a
+  #              Linux runner is a tenth the cost of a macOS one.
+  build:
+    needs: [preflight, vendor]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: host
+            runner: macos-14
+          - target: ios-arm64
+            runner: macos-14
+          - target: ios-arm64-sim
+            runner: macos-14
+          - target: linux-x86_64
+            runner: ubuntu-24.04
+          - target: linux-aarch64
+            runner: ubuntu-24.04
+          - target: windows-x86_64
+            runner: ubuntu-24.04
+          - target: windows-arm64
+            runner: ubuntu-24.04
+          - target: android-arm64-v8a
+            runner: ubuntu-24.04
+          - target: wasm32-emscripten
+            runner: ubuntu-24.04
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    env:
+      # Never the crate default, and never a shared path: build.py's freshness
+      # guard reads cargo's dep-info from under this directory, and the whole
+      # point of a runner is that it starts empty.
+      CARGO_TARGET_DIR: ${{ github.workspace }}/_cargo
+      TORCHNATIVE_TARGET_PYTHON: ${{ github.workspace }}/_target-python
+      TORCHNATIVE_PYODIDE: ${{ github.workspace }}/_pyodide/pyodide
+      # The emsdk cache. Redirected unconditionally, not only for the wasm job:
+      # docs/platform/WASM.md §9.6's rule is "never write to the shared emsdk cache",
+      # and a per-job scratch directory is how that rule stops depending on
+      # anyone remembering it.
+      EM_CACHE: ${{ github.workspace }}/_em-cache
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: vendored-tree
+
+      - name: unpack the vendored tree
+        run: tar -C torchnative/src/main -xzf vendored-tree.tgz
+
+      # build.py's `preflight` requires the host shim to exist even when the
+      # wheel being built is for another platform -- the tree cannot import
+      # without it, and a wheel built from a tree with the hole still open is
+      # the py3-none-any shell. So every job does a host cargo build first.
+      - name: host shim
+        run: bash vendor/install_shim.sh
+
+      - name: build dependencies
+        run: python -m pip install --upgrade setuptools wheel packaging build
+
+      # ---- the target CPython this target's tag is derived from -------------
+      #
+      # Every target in build.py reads its platform tag out of a target CPython
+      # rather than having it written down. Four of them are downloadable and
+      # checksummed; three are not, and arrive in the bundle.
+      - name: target CPython (downloadable, python-build-standalone)
+        if: startsWith(matrix.target, 'linux-') || startsWith(matrix.target, 'windows-')
+        run: |
+          set -eu
+          mkdir -p _target-python _dl
+          case "${{ matrix.target }}" in
+            linux-x86_64)    triple=x86_64-unknown-linux-gnu ;;
+            linux-aarch64)   triple=aarch64-unknown-linux-gnu ;;
+            windows-x86_64)  triple=x86_64-pc-windows-msvc ;;
+            windows-arm64)   triple=aarch64-pc-windows-msvc ;;
+          esac
+          url="https://github.com/astral-sh/python-build-standalone/releases/download/${PBS_RELEASE}/cpython-${PBS_PYTHON}+${PBS_RELEASE}-${triple}-install_only.tar.gz"
+          curl -sSfL "$url" -o "_dl/${triple}.tar.gz"
+          # The archive unpacks to a `python/` root; the directory name every
+          # consumer in tools/wheel/ expects is the triple. TARGET_PYTHON.md §3.
+          tar -C _dl -xzf "_dl/${triple}.tar.gz"
+          mv _dl/python "_target-python/${triple}"
+
+      - name: target CPython (bundled -- iOS and Android, see PUBLISH_CI.md §3)
+        if: startsWith(matrix.target, 'ios-') || startsWith(matrix.target, 'android-')
+        env:
+          BUNDLE_URL: ${{ vars.TARGET_PYTHON_BUNDLE_URL }}
+          BUNDLE_SHA256: ${{ vars.TARGET_PYTHON_BUNDLE_SHA256 }}
+        run: |
+          set -eu
+          mkdir -p _target-python _dl
+          curl -sSfL "$BUNDLE_URL" -o _dl/bundle.tar.gz
+          if [ -n "${BUNDLE_SHA256:-}" ]; then
+            echo "${BUNDLE_SHA256}  _dl/bundle.tar.gz" | shasum -a 256 -c -
+          else
+            echo "::error::TARGET_PYTHON_BUNDLE_SHA256 is unset. The bundle is"
+            echo "the input nothing else checks -- these three distributions"
+            echo "cannot be rebuilt and compared against anything."
+            exit 1
+          fi
+          tar -C _target-python -xzf _dl/bundle.tar.gz
+
+      - name: Pyodide distribution (the wasm tag's only source)
+        if: matrix.target == 'wasm32-emscripten'
+        run: |
+          set -eu
+          mkdir -p _pyodide
+          curl -sSfL "https://github.com/pyodide/pyodide/releases/download/0.29.0/pyodide-core-314.0.6.tar.bz2" -o _pyodide/core.tar.bz2
+          tar -C _pyodide -xjf _pyodide/core.tar.bz2
+          test -f _pyodide/pyodide/pyodide-lock.json
+
+      # ---- the cross toolchain ---------------------------------------------
+
+      - name: rust target
+        run: |
+          case "${{ matrix.target }}" in
+            host)              exit 0 ;;
+            ios-arm64)         rustup target add aarch64-apple-ios ;;
+            ios-arm64-sim)     rustup target add aarch64-apple-ios-sim ;;
+            linux-x86_64)      rustup target add x86_64-unknown-linux-gnu ;;
+            linux-aarch64)     rustup target add aarch64-unknown-linux-gnu ;;
+            windows-x86_64)    rustup target add x86_64-pc-windows-msvc ;;
+            windows-arm64)     rustup target add aarch64-pc-windows-msvc ;;
+            android-arm64-v8a) rustup target add aarch64-linux-android ;;
+            wasm32-emscripten) rustup target add wasm32-unknown-emscripten ;;
+          esac
+
+      - name: cargo-zigbuild and ziglang
+        if: startsWith(matrix.target, 'linux-')
+        run: |
+          python -m pip install ziglang
+          cargo install cargo-zigbuild --locked
+
+      - name: cargo-xwin
+        if: startsWith(matrix.target, 'windows-')
+        run: cargo install cargo-xwin --locked
+
+      - name: Android NDK
+        if: matrix.target == 'android-arm64-v8a'
+        run: cargo install cargo-ndk --locked
+
+      - uses: mymindstorm/setup-emsdk@v14
+        if: matrix.target == 'wasm32-emscripten'
+        with:
+          version: 4.0.13
+          actions-cache-folder: emsdk-cache
+
+      # ---- the cross artefact ----------------------------------------------
+      #
+      # build.py does NOT compile. It packages, and it refuses if the artefact
+      # under CARGO_TARGET_DIR/<triple>/release/ is older than the Rust sources
+      # it was built from -- that guard is what stopped eight 44-hour-stale
+      # artefacts shipping on 2026-09-11. Here it can only pass, because the
+      # directory did not exist five minutes ago; the guard is left alone.
+      - name: cross-build _C
+        working-directory: rust/torch_c
+        env:
+          PYO3_CROSS: "1"
+          PYO3_CROSS_PYTHON_VERSION: "3.13"
+          XWIN_ACCEPT_LICENSE: "1"
+          TP: ${{ github.workspace }}/_target-python
+        run: |
+          set -eux
+          case "${{ matrix.target }}" in
+            host)
+              : "already built by vendor/install_shim.sh" ;;
+
+            ios-arm64|ios-arm64-sim)
+              # PyO3 hardcodes iOS as a link-libpython target regardless of the
+              # extension-module feature, and the distribution has no
+              # libpython3.13.{a,dylib} -- only Python.framework/Python. The
+              # config file below turns PyO3's own `-lpython3.13` off; the
+              # framework is supplied separately for the device slice.
+              # docs/platform/RUST_CROSSBUILD.md §"iOS -- 여기만 특별합니다".
+              cat > "${RUNNER_TEMP}/pyo3-ios.cfg" <<'EOF'
+          implementation=CPython
+          version=3.13
+          shared=true
+          lib_name=Python
+          pointer_width=64
+          suppress_build_script_link_lines=true
+          EOF
+              export PYO3_CONFIG_FILE="${RUNNER_TEMP}/pyo3-ios.cfg"
+              if [ "${{ matrix.target }}" = "ios-arm64-sim" ]; then
+                PYO3_CROSS_LIB_DIR="$TP/arm64-iphonesimulator/lib" \
+                  cargo build --release --target aarch64-apple-ios-sim
+              else
+                PYO3_CROSS_LIB_DIR="$TP/arm64-iphoneos/lib" \
+                TORCHNATIVE_PYTHON_FRAMEWORK_DIR="$TP/arm64-iphoneos" \
+                  cargo build --release --target aarch64-apple-ios
+              fi ;;
+
+            linux-x86_64)
+              # The `.2.17` suffix is the glibc floor, and it must stay equal to
+              # LinuxTarget.GLIBC_TARGET -- build.py derives the manylinux tag
+              # from the artefact's own .gnu.version_r and refuses a mismatch.
+              PYO3_CROSS_LIB_DIR="$TP/x86_64-unknown-linux-gnu/lib" \
+                cargo zigbuild --release --target x86_64-unknown-linux-gnu.2.17 ;;
+            linux-aarch64)
+              PYO3_CROSS_LIB_DIR="$TP/aarch64-unknown-linux-gnu/lib" \
+                cargo zigbuild --release --target aarch64-unknown-linux-gnu.2.17 ;;
+
+            windows-x86_64)
+              PYO3_CROSS_LIB_DIR="$TP/x86_64-pc-windows-msvc/libs" \
+                cargo xwin build --release --target x86_64-pc-windows-msvc ;;
+            windows-arm64)
+              PYO3_CROSS_LIB_DIR="$TP/aarch64-pc-windows-msvc/libs" \
+                cargo xwin build --release --target aarch64-pc-windows-msvc ;;
+
+            android-arm64-v8a)
+              # Note the extra `prefix/` level: the Android distribution is the
+              # only one of the five whose root is a subdirectory, and every
+              # consumer hardcodes it. TARGET_PYTHON.md §5.
+              PYO3_CROSS_LIB_DIR="$TP/aarch64-linux-android/prefix/lib" \
+                cargo ndk -t arm64-v8a --platform 21 build --release ;;
+
+            wasm32-emscripten)
+              cargo build --release --target wasm32-unknown-emscripten ;;
+          esac
+
+      # ---- the wheel --------------------------------------------------------
+
+      - name: build the wheel
+        run: |
+          # build.py refuses while a setuptools build cache from a prior run
+          # exists, because build_py re-copies whatever is in there into every
+          # wheel afterwards -- that is how .DS_Store shipped in six wheels on
+          # 2026-08-30. A runner has none; removed anyway so the invocation here
+          # is the same one PUBLISH_CI.md tells a human to run locally.
+          rm -rf build
+          if [ "${{ matrix.target }}" = "host" ]; then
+            python tools/wheel/build.py
+          else
+            python tools/wheel/build.py --target "${{ matrix.target }}"
+          fi
+          ls -l dist/
+
+      # Deliberately NOT verified here. The artefact-level judgement
+      # (verify_cross.py) needs the macOS wheel as its `--reference` to answer
+      # its most useful question -- "does this wheel carry the same tree" -- and
+      # no build job has the other eight wheels. Run per-job it would have to be
+      # `--reference` -less, which is the CLAUDE.md §5.5 shape: a check that
+      # reports on whatever it was given. It runs once, in `collect`, with all
+      # nine present and a real reference.
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.target }}
+          path: dist/*.whl
+          if-no-files-found: error
+          retention-days: 7
+
+  # ------------------------------------------------------------------ collect
+  #
+  # "Nine wheels or no upload", made mechanical. This job is the only thing
+  # between a partial matrix and PyPI.
+  collect:
+    runs-on: ubuntu-24.04
+    needs: [preflight, gate, build]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheel-*
+          path: _wheels
+          merge-multiple: true
+
+      - run: python -m pip install --upgrade twine packaging
+
+      # The nine filenames are listed, not counted. A count passes when two jobs
+      # both produce a macosx wheel and the Windows one is missing; the list
+      # names which one did not arrive. Same reasoning as build.py's
+      # EXPECTED_TARGET_KEYS, which exists because a count did exactly that.
+      - name: exactly these nine wheels, by name
+        env:
+          VERSION: ${{ needs.preflight.outputs.version }}
+        run: |
+          python - <<'EOF'
+          import os, pathlib, sys
+          v = os.environ["VERSION"]
+          want = {f"torchnative-{v}-cp313-abi3-{p}.whl" for p in (
+              "macosx_11_0_arm64",
+              "android_21_arm64_v8a",
+              "ios_12_0_arm64_iphoneos",
+              "ios_14_0_arm64_iphonesimulator",
+              "manylinux_2_17_x86_64",
+              "manylinux_2_17_aarch64",
+              "win_amd64",
+              "win_arm64",
+              "pyemscripten_2026_0_wasm32",
+          )}
+          have = {p.name for p in pathlib.Path("_wheels").glob("*.whl")}
+          missing, extra = sorted(want - have), sorted(have - want)
+          for m in missing:
+              print(f"::error::missing wheel {m}")
+          for e in extra:
+              print(f"::error::unexpected wheel {e}")
+          if missing or extra:
+              sys.exit(1)
+          print(f"ok  all nine wheels present for {v}")
+          EOF
+
+      # twine's own metadata check, on every wheel. A wheel that twine refuses
+      # is refused here rather than half-way through the upload, where the
+      # earlier files are already live and cannot be replaced.
+      - name: twine check
+        run: python -m twine check --strict _wheels/*.whl
+
+      # Every cross wheel's file list against the macOS one's. This is the check
+      # that would catch a build job that quietly vendored a different tree --
+      # the failure mode the `vendor` job exists to remove, checked here from
+      # the wheels rather than trusted from the pipeline's shape.
+      - name: every wheel carries the same tree
+        env:
+          VERSION: ${{ needs.preflight.outputs.version }}
+        run: |
+          set -eu
+          ref="_wheels/torchnative-${VERSION}-cp313-abi3-macosx_11_0_arm64.whl"
+          rc=0
+          for w in _wheels/*.whl; do
+            case "$w" in *macosx*) continue ;; esac
+            python tools/wheel/verify_cross.py "$w" --reference "$ref" || rc=1
+          done
+          exit $rc
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-wheels
+          path: _wheels/*.whl
+          if-no-files-found: error
+
+  # ------------------------------------------------------------------ publish
+  #
+  # OIDC only. `environment: pypi` and the filename `publish-pypi.yml` are both
+  # part of what PyPI's Trusted Publisher for thisisthepy/torchnative was
+  # registered against; either one changing produces a 403 whose message does
+  # not say which.
+  #
+  # Residual exposure, stated because it cannot be removed: PyPI has no atomic
+  # multi-file upload. `gh-action-pypi-publish` hands twine the whole directory
+  # in one invocation, but each file is a separate HTTP request, so a network
+  # failure at file 4 leaves 3 live. `skip-existing: true` makes a re-run
+  # complete the set instead of dying on the three already there. What is left
+  # is a window -- seconds to minutes, until the re-run -- in which PyPI serves
+  # a partial platform set, and a `pip install torchnative` for a platform whose
+  # wheel has not landed resolves to the previous release or to nothing. There
+  # is no way to make that window zero from the client side.
+  publish:
+    runs-on: ubuntu-24.04
+    needs: [preflight, collect]
+    if: needs.preflight.outputs.dry_run != 'true'
+    environment:
+      name: pypi
+      url: https://pypi.org/project/torchnative/${{ needs.preflight.outputs.version }}
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-wheels
+          path: dist
+
+      - name: what is about to be uploaded
+        run: ls -l dist/
+
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
+          skip-existing: true
+          print-hash: true

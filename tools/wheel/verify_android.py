@@ -210,7 +210,14 @@ def stage_dependencies(into: Path, wheel: Path) -> list[str]:
     modules = {
         "filelock": ["filelock"],
         "typing-extensions": ["typing_extensions.py"],
-        "setuptools": ["setuptools", "pkg_resources"],
+        # setuptools shipped `pkg_resources` alongside `setuptools` until it was
+        # removed in setuptools 82; 84 is what the spike venv now has, so demanding
+        # `pkg_resources` unconditionally made this harness die before it reached
+        # the device -- a staging-source fact reported as a wheel fact. Staged when
+        # the source has it, since an older setuptools still installs it.
+        "setuptools": (["setuptools", "pkg_resources"]
+                       if (SPIKE_SITE / "pkg_resources").exists()
+                       else ["setuptools"]),
         "sympy": ["sympy", "mpmath"],
         "networkx": ["networkx"],
         "jinja2": ["jinja2", "markupsafe"],

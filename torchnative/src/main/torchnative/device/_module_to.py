@@ -45,6 +45,15 @@ upstream does. `optimum` returns an inference object and that is why it cannot
 backprop; this project ships its own `torch`, so it does not have to. If this
 file ever returns something that is not `self`, the thing that distinguishes
 this project from `optimum` is gone.
+
+That holds for the compiled targets too. `to(torchnative.device.npu)` on an
+Intel NPU lowers the model's `torch.nn.Linear` leaves **in place** --- the
+object that comes back is the object that went in, and `generate()`,
+`state_dict()` and `backward()` all still work because nothing was wrapped.
+The lowering's partial-offload report is carried out on
+`model.torchnative_offload`, and as a `UserWarning` when anything stayed on the
+CPU; `_to_compiled` explains why both. See section 5.5 of
+`docs/devices/DEVICE_NS.md`.
 """
 
 import functools
@@ -97,23 +106,138 @@ def _to_eager(original, self, device, position, args, kwargs):
     return original(self, *args, **kwargs)
 
 
-def _to_compiled(self, device, args, kwargs):
-    """A compiled target: resolve first, then say exactly what is missing.
+#: The compile step's own options, accepted by `to(device.npu, ...)` and
+#: passed through to `_compile_model`. Named rather than forwarded blindly:
+#: a typo'd kwarg must still be refused, not silently ignored.
+#:
+#: `precision` is **CoreML's and only CoreML's**, which is why the openvino arm
+#: refuses it by name rather than ignoring it. On that backend the IR is f16
+#: and there is nothing for the word to select; accepting it there would be an
+#: argument taken and dropped, which is how a mode goes silent.
+_COMPILE_OPTIONS = ("progress", "eager", "precision")
 
-    Resolution happens **before** the refusal on purpose. The caller learns
-    which NPU this host actually has --- which is the question
-    `docs/graph/NPU2.md` says a device must be able to answer --- rather than
-    a flat "not implemented" that tells them nothing about their machine.
+
+def _to_compiled(self, device, args, kwargs):
+    """A compiled target: resolve, then either lower for it or refuse by name.
+
+    Resolution happens **first, always**, whichever branch follows. The caller
+    learns which NPU this host actually has --- the question
+    `docs/graph/NPU2.md` says a device must be able to answer --- rather than a
+    flat verdict that tells them nothing about their machine. The dispatch key
+    below is `resolution.backend`, **not** `host()`: the host offers an ordered
+    list of candidate backends (`NPU_CANDIDATES`) and a probe picks one of them,
+    and the backend is what has or has not been wired --- so keying on the host
+    would be reading the wrong fact one step early, and now also the wrong
+    *number* of facts, since Windows offers two (docs/devices/NPUVENDOR.md).
+
+    **`openvino` (Intel NPU) is wired.** It goes to
+    `torchnative.export.intelnpu._compile_model`, which walks `named_children()`
+    and swaps each eligible `torch.nn.Linear` for a leaf whose forward runs on
+    the OpenVINO device. That call is **in place** and returns the same object,
+    so what comes back here is `self`: still an `nn.Module`, still with its
+    `parameters()`, `state_dict()` and `named_children()`, so `generate()`
+    keeps working and does not learn anything about the NPU. This module's
+    docstring says "no wrapping, ever", and lowering does not break that
+    promise --- it is the reason the mechanism was chosen over an inference
+    object in the first place.
+
+    No library path is passed. The OpenVINO runtime is discovered from the pip
+    package (`pip install torchnative[npu]`), and a path argument here would put
+    a filename back into the user's path for no gain.
+
+    **Where the partial-offload report goes, and why there.** `_compile_model`
+    returns `(model, report)`; the report names every leaf left behind, because
+    "the model is on the NPU" is false for any model with a `LayerNorm` in it.
+    That report must not stop here. It is delivered **twice**, deliberately:
+
+    * as `model.torchnative_offload`, a plain dict, for a caller who asks. An
+      attribute rather than a return value because the return value is fixed:
+      `to()` returns `self` and upstream's contract is not negotiable. An
+      attribute rather than a log line alone because a caller who wants to
+      assert on the offload needs a value --- `fraction_moved` is a number for
+      exactly that reason.
+    * as a `UserWarning` when `fully_offloaded` is False, for a caller who does
+      **not** ask. This is the load-bearing half. docs/graph/NPU2.md is a whole
+      document about a partial offload that went unnoticed *because the answers
+      were right*; an attribute nobody reads reproduces it exactly. Silence is
+      the defect, so the only silent case is the complete one --- which also
+      keeps the warning meaningful when it does fire.
+
+    **Zero leaves lowered is a refusal, not a success.** That refusal is
+    `_compile_model`'s own `IntelNPUUnsupported` and it is allowed to propagate
+    unchanged: returning an untouched model with a success message is the
+    silent CPU fallback this whole path exists to prevent. Nothing is attached
+    to the model in that case either --- a report on a model that was never
+    lowered is the same lie with a receipt.
+
+    **`coreml` (Apple Neural Engine) is wired too, and it takes a
+    `precision`.** It goes to `torchnative.export.coreml._compile_model`, which
+    does the same `named_children()` walk and swaps each `torch.nn.Linear` for
+    a `_CoreMLLinear`, and every `Conv2d` for a `_CoreMLConv2d`. Same
+    mechanism, same in-place contract, same report.
+
+    What is **not** the same is that CoreML's precision is a real choice with a
+    measured cost on each side, so this backend takes two spellings:
+
+        model.to(device.npu)                        # float16
+        model.to(device.npu, precision="float32")   # float32
+
+    float16 is what reaches the Neural Engine -- docs/graph/NPU2.md §1.1
+    measured that for a float32 program the unit is not in CoreML's *supported*
+    column at all, so no `compute_units` setting reaches it -- and it agrees
+    with `DecomposedTrace.replay` to about 1e-03. float32 agrees at 2e-05, the
+    bar the word *agrees* means here, and runs on the CPU or GPU. They are two
+    products and therefore two spellings; a single spelling that silently chose
+    would be the defect docs/graph/NPU2.md is about, one layer up.
+
+    Which unit **actually** ran is not inferred from either: `MLComputePlan` is
+    read at every compile and the per-operation rows are on the report. The
+    case that cannot reach the named unit warns at `to()`; the case that could
+    and did not warns at the forward that found out.
+
+    **`qnn` still refuses.** It is not stubbed into a fake success. Its refusal
+    is the same `NotImplementedError`, after the same real resolution, at the
+    same quality of message it had before.
     """
+    # `progress` and `eager` are the compile step's own options, and they reach
+    # it ONLY through here. `_compile_model` grew both, and nothing plumbed
+    # them, so `to(device.npu, progress=...)` raised TypeError while the
+    # feature sat there unreachable -- the gate stayed green because the tests
+    # called `_compile_model` directly. A public path that cannot reach a
+    # feature is the same as not having it.
+    #
+    # A dtype or memory format is still refused, because a compiled target is
+    # not a conversion. What is accepted is exactly the compile step's own
+    # arguments, named.
+    options = {}
+    for name in _COMPILE_OPTIONS:
+        if name in kwargs:
+            options[name] = kwargs.pop(name)
+
     extra = [a for a in args if a is not device]
     if extra or kwargs:
         raise TypeError(
             f"nn.Module.to(torchnative.device.{device.type}) takes no other "
             f"arguments: a compiled target is not a dtype or memory-format "
-            f"conversion. Got extra {extra!r} {kwargs!r}."
+            f"conversion. It does take the compile step's own options "
+            f"({', '.join(_COMPILE_OPTIONS)}). Got extra {extra!r} {kwargs!r}."
         )
 
     resolution = device.resolve()  # raises NpuUnresolved, by name, if it cannot
+
+    if resolution.backend == "openvino":
+        if "precision" in options:
+            raise TypeError(
+                f"nn.Module.to(torchnative.device.{device.type}, precision=...): "
+                f"`precision` is the CoreML arm's argument and the openvino "
+                f"backend has no use for it -- its IR is f16 and there is "
+                f"nothing for the word to select. Refusing rather than "
+                f"accepting and dropping it."
+            )
+        return _lower_for_openvino(self, device, resolution, **options)
+
+    if resolution.backend == "coreml":
+        return _lower_for_coreml(self, device, resolution, **options)
 
     raise NotImplementedError(
         f"nn.Module.to(torchnative.device.{device.type}): this host's "
@@ -127,13 +251,104 @@ def _to_compiled(self, device, args, kwargs):
         f"which is in fact running on the CPU -- docs/graph/NPU2.md section 1 "
         f"is that exact failure, found only by reading MLComputePlan.\n"
         f"\n"
-        f"What does exist today: the capture layer "
-        f"(torchnative.export.decompose / refold) and the per-vendor "
-        f"execution-device evidence (torchnative.export.intelnpu.probe, "
-        f"assert_execution_device, verdict_execution_devices). What is "
-        f"missing is the step that turns a captured graph into a leaf this "
-        f"module can carry. See docs/devices/DEVICE_NS.md section 5."
+        f"The Intel NPU path (the openvino backend) IS wired: it lowers "
+        f"torch.nn.Linear leaves through "
+        f"torchnative.export.intelnpu. What the {resolution.backend} backend "
+        f"still lacks is the equivalent leaf. What does exist for it today: "
+        f"the capture layer (torchnative.export.decompose / refold) and the "
+        f"per-vendor execution-device evidence (probe, "
+        f"assert_execution_device, verdict_execution_devices). See "
+        f"docs/devices/DEVICE_NS.md section 5."
     )
+
+
+def _lower_for_openvino(model, device, resolution, **options):
+    """Lower `model` for the Intel NPU and hand back the same `nn.Module`.
+
+    Separated from `_to_compiled` so that the dispatch --- which backend, and
+    what happens to everything that is not it --- reads as five lines, and so
+    that a test can point at the branch by name. See `_to_compiled` for why the
+    report is delivered both as an attribute and as a warning.
+    """
+    import warnings
+
+    from ..export import intelnpu
+
+    model, report = intelnpu._compile_model(model, device="NPU", **options)
+    # Attached only on success. `_compile_model` raises for zero leaves, so
+    # this line is unreachable for a model that was not actually lowered.
+    model.torchnative_offload = report
+
+    if not report["fully_offloaded"]:
+        left = ", ".join(
+            f"{name} x{count}" for name, count in report["left_on_cpu"].items()
+        ) or "none"
+        skipped = "; ".join(f"{name}: {why}" for name, why in report["skipped"][:4])
+        warnings.warn(
+            f"nn.Module.to(torchnative.device.{device.type}): a PARTIAL offload. "
+            f"{len(report['swapped'])} Linear(s) now run on the {resolution.unit}, "
+            f"which is fraction_moved="
+            f"{report['fraction_moved']:.4f} "
+            f"({report['parameters_moved']} of {report['parameters_total']} "
+            f"parameters). Left on the CPU -- leaf module types: {left}."
+            + (f" Skipped lowerable leaves: {skipped}." if skipped else "")
+            + f" The full report is on the model as `.torchnative_offload`. "
+            f"This warning exists because docs/graph/NPU2.md is about a partial "
+            f"offload that went unnoticed while every answer it produced was "
+            f"right.",
+            UserWarning,
+            stacklevel=4,
+        )
+    return model
+
+
+def _lower_for_coreml(model, device, resolution, *, precision="float16",
+                      **options):
+    """Lower `model` for CoreML and hand back the same `nn.Module`.
+
+    The Intel arm's shape, with one addition it does not need: `precision`.
+    See `_to_compiled` for why that is a spelling and not a mode, and
+    `torchnative.export.coreml`'s lowering section for the measurement.
+
+    The partial-offload warning is the Intel arm's, word for word in intent: a
+    complete offload is silent, so the warning stays worth reading. The two
+    *unit* warnings -- "this precision cannot reach the Neural Engine" and "it
+    could and CoreML preferred something else" -- are raised inside
+    `export.coreml`, because only that layer has read the compute plan.
+    """
+    import warnings
+
+    from ..export import coreml
+
+    model, report = coreml._compile_model(model, precision=precision, **options)
+    # Attached only on success. `_compile_model` raises for zero leaves, so
+    # this line is unreachable for a model that was not actually lowered.
+    model.torchnative_offload = report
+
+    if not report["fully_offloaded"]:
+        left = ", ".join(
+            f"{name} x{count}" for name, count in report["left_on_cpu"].items()
+        ) or "none"
+        skipped = "; ".join(f"{name}: {why}" for name, why in report["skipped"][:4])
+        warnings.warn(
+            f"nn.Module.to(torchnative.device.{device.type}): a PARTIAL offload. "
+            f"{len(report['swapped'])} leaf module(s) "
+            f"({', '.join(sorted(set(report['kinds'].values()))) or 'none'}) "
+            f"now go through CoreML at "
+            f"precision={report['precision']!r}, which is fraction_moved="
+            f"{report['fraction_moved']:.4f} "
+            f"({report['parameters_moved']} of {report['parameters_total']} "
+            f"parameters). Left on the CPU -- leaf module types: {left}."
+            + (f" Skipped Linear(s): {skipped}." if skipped else "")
+            + f" The full report, including the per-operation MLComputePlan "
+            f"rows, is on the model as `.torchnative_offload`. "
+            f"This warning exists because docs/graph/NPU2.md is about a partial "
+            f"offload that went unnoticed while every answer it produced was "
+            f"right.",
+            UserWarning,
+            stacklevel=4,
+        )
+    return model
 
 
 def make(original):

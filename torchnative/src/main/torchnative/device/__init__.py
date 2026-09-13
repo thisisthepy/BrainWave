@@ -33,19 +33,41 @@ or `"declared"`. Nothing here invents a probe: `_vulkan_probe`, `_cuda_probe`,
 `MLComputeDevice.get_all_compute_devices` are the existing ones and this module
 calls them.
 
-**The one place that disagrees with its own probe, on purpose.**
-`torch._C._mps_is_available()` is not a probe --- `bootstrap.py` installs it as
-`_constant_function(..., False)`, justified by a comment saying candle's
-`metal` feature is off in `Cargo.toml`. That comment is stale: `Cargo.toml`
+**The vendor is probed, not read off the operating system.** `npu` used to map
+one backend to each host, which said `platform.system()` names the silicon
+vendor. It does not: on Windows the NPU is Intel's, AMD's XDNA or a Snapdragon's
+Hexagon, and the one-entry table told all three they had an *Intel NPU* --- so a
+Ryzen AI owner was refused with the words "no Intel NPU" on a machine that has
+an NPU. A host now maps to an ordered list of candidates (`NPU_CANDIDATES`,
+ordered by `npu_candidates`), each ending in a real probe, and a refusal carries
+what `_pcivendor` found in the machine --- or says plainly that it could not
+look, which is a different sentence. `docs/devices/NPUVENDOR.md` is that round,
+including the source trace for why OpenVINO cannot reach an AMD NPU.
+
+**The place that used to disagree with its own probe, and no longer does.**
+`torch._C._mps_is_available()` was not a probe --- `bootstrap.py` installed it
+as `_constant_function(..., False)`, justified by a comment saying candle's
+`metal` feature was off in `Cargo.toml`. That comment was stale: `Cargo.toml`
 enables `metal` for Apple targets, and on this host `torch.empty(2, 2,
 device="mps")` succeeds and `a + a` on an `mps` tensor returns the right
-numbers. So the constant is a **false negative**, and reporting it as
-availability would say "no Metal" on a machine that is computing on Metal.
+numbers. So the constant was a **false negative**, and reporting it as
+availability would have said "no Metal" on a machine that was computing on
+Metal.
 
-`mps.availability()` therefore reports `kind="measured"` from an actual
-allocation, and carries the constant alongside as `detail["declared"]` with
-`detail["declared_disagrees"]`. The constant is reused, as required; it is just
-not allowed to be the answer. See `docs/devices/DEVICE_NS.md` section 3.
+That constant is gone (`docs/numerics/DTYPEDEV.md` section 2).
+`torch._C._mps_is_available()` now resolves an `mps` device and reports whether
+that succeeded, and `torch._C._has_mps` is `cfg!(target_vendor = "apple")` ---
+two names for two different questions, which is what upstream's own docstrings
+say they are.
+
+**`mps.availability()` is unchanged, and that is the point of it.** It still
+reports `kind="measured"` from an actual allocation and still carries the
+constant alongside as `detail["declared"]` with `detail["declared_disagrees"]`
+--- which is now `False` on this host, because the two agree. Nothing here was
+rewritten to depend on them agreeing: a probe that trusted the declared value
+would be a probe that could go stale again the same way, and the field exists
+precisely so that the next disagreement is visible rather than inferred. See
+`docs/devices/DEVICE_NS.md` section 3.
 """
 
 import os
@@ -60,6 +82,7 @@ __all__ = [
     "EagerDevice",
     "EagerUseRefused",
     "NpuResolution",
+    "npu_candidates",
     "cpu",
     "cuda",
     "members",
@@ -158,6 +181,21 @@ def host():
     }.get(system, system.lower() or "unknown")
 
 
+def machine():
+    """Which instruction set this is, as `platform.machine()` spells it.
+
+    Overridable through `TORCHNATIVE_DEVICE_MACHINE` for the same reason
+    `host()` is overridable: "windows" is not one machine. `win_amd64` and
+    `win_arm64` have NPUs from different vendors reached through different
+    runtimes, and a candidate order that could not be moved could not be shown
+    to depend on the ISA at all.
+    """
+    forced = os.environ.get("TORCHNATIVE_DEVICE_MACHINE")
+    if forced:
+        return forced
+    return platform.machine() or "unknown"
+
+
 class NpuResolution:
     """Which accelerator `npu` turned out to mean here, and who says so.
 
@@ -197,13 +235,63 @@ class NpuResolution:
 
 
 # The per-host table. Kept as data, and read by `NpuDevice.resolve`, so that a
-# host with no entry is a `KeyError` turned into a named refusal rather than a
-# silent fallthrough to something that happens to be there.
-NPU_BACKENDS = {
-    "darwin": ("coreml", "Apple Neural Engine"),
-    "windows": ("openvino", "Intel NPU"),
-    "android": ("qnn", "Qualcomm Hexagon NPU"),
+# host with no entry is a named refusal rather than a silent fallthrough to
+# something that happens to be there.
+#
+# **Each host maps to an ORDERED LIST of candidates, and a probe decides.** It
+# used to map to exactly one `(backend, unit)` pair, which said that the
+# operating system names the silicon vendor. It does not, and this project's own
+# wheel list is the counter-example: we ship both `win_amd64` and `win_arm64`,
+# and on Windows alone the NPU is Intel's (reached by OpenVINO), AMD's XDNA
+# (reached by nothing here), or Qualcomm's Hexagon (reached by QNN, never by
+# OpenVINO -- see below). The single-entry table told all three of them they had
+# an "Intel NPU", so a Ryzen AI owner was refused with the words "no Intel NPU",
+# on a machine that has an NPU. `docs/devices/NPUVENDOR.md` is that round.
+#
+# **OpenVINO cannot reach AMD's NPU, and that is checked, not assumed.**
+# `src/plugins/intel_npu/src/utils/src/zero/zero_init.cpp` selects its Level Zero
+# driver by `memcmp` against a compile-time constant --- `ze_intel_npu_driver_uuid`
+# from intel/level-zero-npu-extensions --- and throws "NPU driver wasn't found!"
+# when no driver matches. The shipped `openvino_intel_npu_plugin.dll` (openvino
+# 2026.3.1, win_amd64) contains those sixteen bytes exactly once and mentions
+# XDNA/Ryzen/Vitis nowhere. So `openvino` is not a candidate that *might* cover
+# AMD; NPUVENDOR.md §1 is the full trace.
+NPU_CANDIDATES = {
+    "darwin": (("coreml", "Apple Neural Engine"),),
+    "windows": (("openvino", "Intel NPU"), ("qnn", "Qualcomm Hexagon NPU")),
+    "android": (("qnn", "Qualcomm Hexagon NPU"),),
 }
+
+#: Machine strings on which a Windows box may have a Hexagon rather than an
+#: Intel NPU. `platform.machine()` spells win_arm64 `ARM64`.
+_ARM_MACHINE_PREFIXES = ("arm", "aarch")
+
+
+def npu_candidates(h=None, m=None):
+    """The backends to try on this host, in the order they will be tried.
+
+    **The order, and why.** Windows is the only host with more than one, and it
+    is ordered by instruction set, because the two candidates are mutually
+    exclusive by ISA: an Intel NPU exists only on x86-64 and a Snapdragon X's
+    Hexagon only on arm64. So on `win_arm64` Hexagon goes first and on
+    `win_amd64` Intel does --- the plausible one first, the other still probed
+    second rather than excluded.
+
+    Probing the second at all is the point. Excluding it would put the ISA-to-
+    vendor inference back in the table, one level down, and that inference is
+    what this round removed. `platform.machine()` is also not authoritative:
+    it reports the *interpreter's* architecture, so an x86-64 Python emulated
+    on an arm64 Windows box reports `AMD64` on a machine with a Hexagon. Trying
+    both means that host gets a probe rather than a guess.
+    """
+    h = host() if h is None else h
+    m = (machine() if m is None else m).lower()
+    candidates = NPU_CANDIDATES.get(h)
+    if not candidates:
+        return ()
+    if h == "windows" and m.startswith(_ARM_MACHINE_PREFIXES):
+        candidates = tuple(sorted(candidates, key=lambda c: 0 if c[0] == "qnn" else 1))
+    return tuple(candidates)
 
 
 # --------------------------------------------------------------------------
@@ -300,10 +388,16 @@ class CpuDevice(EagerDevice):
 
 
 class MpsDevice(EagerDevice):
-    """Metal. Measured by allocation, because the declared constant is wrong.
+    """Metal. Measured by allocation, and it stays that way now that the
+    declared value has stopped being wrong.
 
-    See this module's docstring: `torch._C._mps_is_available()` is a
-    build-time `False` whose justifying comment is stale.
+    See this module's docstring. `torch._C._mps_is_available()` was a
+    build-time `False` whose justifying comment was stale; it is a live probe
+    as of docs/numerics/DTYPEDEV.md section 2. This class was not rewritten to
+    read it, because "the declared value happens to be right today" is not a
+    reason to stop measuring -- it is how the stale constant survived in the
+    first place. `detail["declared_disagrees"]` is now `False` here, and that
+    is the field doing its job rather than the field being unnecessary.
     """
 
     __slots__ = ()
@@ -418,16 +512,56 @@ class NpuDevice(CompiledDevice):
         unspellable.
         """
         h = host()
-        if h not in NPU_BACKENDS:
+        m = machine()
+        candidates = npu_candidates(h, m)
+        if not candidates:
             raise NpuUnresolved(
                 f"torchnative.device.npu does not resolve on host {h!r}: this "
                 f"project knows an NPU path for "
-                f"{', '.join(sorted(NPU_BACKENDS))} and no other. It will not "
+                f"{', '.join(sorted(NPU_CANDIDATES))} and no other. It will not "
                 f"fall back to the CPU -- an npu that silently means cpu is "
                 f"docs/graph/NPU2.md's partial offload again."
             )
-        backend, unit = NPU_BACKENDS[h]
-        return getattr(self, f"_resolve_{backend}")(h, backend, unit)
+        refusals = []
+        for backend, unit in candidates:
+            try:
+                return getattr(self, f"_resolve_{backend}")(h, backend, unit)
+            except NpuUnresolved as exc:
+                refusals.append((backend, unit, str(exc)))
+        raise NpuUnresolved(self._compose_refusal(h, m, refusals))
+
+    def _compose_refusal(self, h, m, refusals):
+        """The sentence a machine with an NPU we cannot target has to read.
+
+        Three things have to be in it, and the reason each is here is a way the
+        old one-line refusal was wrong:
+
+        * **Every candidate that was tried, by name, with its own reason.** The
+          old message named one backend, so "no Intel NPU" was the whole answer
+          on a host where Intel was never the only possibility.
+        * **What the machine actually has**, from `_pcivendor`, which asks
+          Windows' PnP enumeration rather than inferring from the OS name. This
+          is the half that lets a refusal say `AMD ... Neural Processing Unit`
+          instead of implying there is nothing.
+        * **The difference between "looked and found nothing" and "could not
+          look".** `_pcivendor.describe` keeps those as separate sentences; a
+          message that compressed them would tell an owner of working hardware
+          that they have none, which is the defect.
+        """
+        from . import _pcivendor
+
+        scan = _pcivendor.npu_vendor_report()
+        tried = "; ".join(
+            f"{backend} ({unit}): {reason}" for backend, unit, reason in refusals
+        )
+        return (
+            f"torchnative.device.npu did not resolve on host {h!r} (machine "
+            f"{m!r}). {len(refusals)} candidate backend(s) were probed in order "
+            f"and each refused -- {tried}. "
+            f"What is in the machine: {_pcivendor.describe(scan)}. "
+            f"It will not fall back to the CPU -- an npu that silently means "
+            f"cpu is docs/graph/NPU2.md's partial offload again."
+        )
 
     # -- per-host resolvers, each ending in a real probe -------------------
 
@@ -485,6 +619,20 @@ class NpuDevice(CompiledDevice):
 
     def _resolve_qnn(self, h, backend, unit):
         source = "torchnative.export.qnn_device.device_report"
+        if h != "android":
+            raise NpuUnresolved(
+                f"torchnative.device.npu lists the {unit} as a candidate on "
+                f"{h}, and this project has no probe that can look for one "
+                f"there. Its only Hexagon probe is "
+                f"{source}, which talks to an *Android* device over adb and "
+                f"reads /sys/class/fastrpc on it -- neither exists on "
+                f"Windows-on-Snapdragon, where QNN is reached through the "
+                f"Windows QNN runtime DLLs instead. Naming this rather than "
+                f"running the adb probe anyway: an adb probe run on Windows "
+                f"would answer about whatever phone happens to be plugged in, "
+                f"which is docs/devices/QNN.md section 5's failure with the "
+                f"cable the other way round."
+            )
         try:
             from torchnative.export.qnn_device import device_report
         except Exception as exc:  # noqa: BLE001
@@ -505,6 +653,24 @@ class NpuDevice(CompiledDevice):
                 f"device is reachable but reports no HTP architecture, so there "
                 f"is no Hexagon NPU to target on it."
             )
+        # `htp_arch` alone is not enough, and this gate is here because for a
+        # while it was the only gate. It comes from `ro.soc.model` mapped
+        # through ExecuTorch's chipset table -- it is a *name*. Measured on a
+        # Galaxy Tab S9 Ultra: `ro.soc.model=SM8550` yields `htp_arch=73` and
+        # this function returned a confident "Qualcomm Hexagon NPU", on a device
+        # whose `/sys/class/fastrpc` registers no compute-DSP endpoint at all
+        # and on which not one QNN runtime library is present. That is the
+        # `_mps_is_available` shape inverted: a hardcoded yes instead of a
+        # hardcoded no, and it would have said the same thing about any device
+        # that merely *calls itself* an SM8550.
+        if not report.get("htp_reachable"):
+            raise NpuUnresolved(
+                f"torchnative.device.npu resolves to the {unit} on {h}, and the "
+                f"device names an SoC whose datasheet has a V{report['htp_arch']} "
+                f"HTP -- but that is the part number, not a probe. "
+                f"{report.get('htp_unreachable_reason')} Refusing by name rather "
+                f"than reporting a Hexagon NPU that nothing here has reached."
+            )
         return NpuResolution(h, backend, unit, source, report)
 
     # -- availability is resolution, caught ---------------------------------
@@ -514,14 +680,24 @@ class NpuDevice(CompiledDevice):
         try:
             res = self.resolve()
         except NpuUnresolved as exc:
-            backend = NPU_BACKENDS.get(h, (None, None))[0]
+            candidates = npu_candidates(h)
+            backends = [backend for backend, _unit in candidates]
             return Availability(
                 "npu",
                 False,
-                source=f"torchnative.device.npu.resolve ({backend or 'no backend for host'})",
+                source=(
+                    "torchnative.device.npu.resolve "
+                    f"({', '.join(backends) if backends else 'no backend for host'})"
+                ),
                 kind="measured",
                 reason="unresolved",
-                detail={"host": h, "error": str(exc), "backend": backend},
+                detail={
+                    "host": h,
+                    "machine": machine(),
+                    "error": str(exc),
+                    "backend": backends[0] if backends else None,
+                    "candidates": [list(c) for c in candidates],
+                },
             )
         return Availability(
             "npu",

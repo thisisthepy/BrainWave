@@ -61,11 +61,38 @@ to refuse is the *write*, not the aliasing -- and ``torch.save`` now works.
 What remains is a choice of format rather than a wall: safetensors is a flat,
 mmap-able, pickle-free container, and a delta on the wire is exactly the payload
 where not executing arbitrary pickle on arrival is worth something.
+
+**A delta covers parameters, not buffers -- and that is a decision.**
+DESIGN.md §3 ("델타는 버퍼를 덮지 않는다") records it with the reading it was
+made from. The short form: DESIGN.md §3's stage 0 recalibrates *running
+statistics*, which are buffers, and the question this file had to answer was
+whether to widen ``Delta.over`` from ``named_parameters()`` to
+``named_buffers()``. It does not, because the three operations above would each
+have to mean something different for a statistic than they mean for a
+parameter:
+
+* ``record`` stores ``w - base``, an **additive offset an optimiser produced**.
+  A running mean is not incremented; it is **re-estimated** from the batch by
+  an EMA, so the difference from base is a description of the data rather than
+  a quantity ``apply`` can put back on.
+* ``apply`` computes ``base + value``. Adding an offset to ``running_var`` can
+  make it negative, and nothing here or downstream would stop it.
+* ``persist`` and ``publish`` already refuse a non-floating table -- :meth:`Delta._bytes`
+  below and ``nn.federated.FedAvg.aggregate`` -- and ``num_batches_tracked`` is
+  ``int64``. Widening the key would make both refusals fire *after* a round had
+  been arranged, or force an exception list, and an exception list is the
+  evidence that two kinds of thing are wearing one name.
+
+What stage 0 actually needs is the **first** of the three lifetime questions in
+the table above and neither of the other two: snapshot the base, and restore it.
+:class:`BufferSnapshot` is that, and deliberately carries no ``record``,
+``apply``, ``persist`` or ``publish`` -- a name that exists and does nothing
+costs more than a name that is absent (DESIGN.md §6).
 """
 
 from __future__ import annotations
 
-__all__ = ["Delta"]
+__all__ = ["Delta", "BufferSnapshot"]
 
 
 class Delta:
@@ -427,4 +454,134 @@ class Delta:
         state = "zero" if self.value is None else "|d|=%.4g" % self.norm()
         return "<Delta over %d parameters, %s, base %d B, value %d B>" % (
             len(self.base), state, base, val,
+        )
+
+
+class BufferSnapshot:
+    """The values a set of named *buffers* held, and the road back to them.
+
+    The second kind of adaptation state, named as a second kind rather than
+    folded into :class:`Delta`. DESIGN.md §3 has the argument; the module
+    docstring above has the short form. In one line: a :class:`Delta` is an
+    additive offset an optimiser produced, and a running statistic is a
+    re-estimate, so ``base + value`` and a weighted mean of offsets -- the two
+    operations a delta exists for -- are not defined on it.
+
+        s = BufferSnapshot.over(model, names)   # copy exactly those buffers
+        ...                                     # a forward updates them
+        s.drift(model)                          # how far they moved
+        s.revert(model)                         # the base values are back
+
+    **What it deliberately does not have.** No ``record``: there is no offset
+    to hold, because the live buffer *is* the new estimate and the only other
+    quantity worth keeping is where it started. No ``apply``: putting an
+    offset back onto a variance can make it negative. No ``persist`` and no
+    ``publish``: ``num_batches_tracked`` is ``int64``, which both roads refuse
+    (``Delta._bytes``, ``nn.federated.FedAvg.aggregate``), and a statistic's
+    aggregation rule is per-buffer -- means average, counts sum -- so one
+    weighted mean over the table would be arithmetic on incomparable
+    quantities. Those four are absent rather than raising, for the reason
+    DESIGN.md §6 gives about names that exist and do nothing.
+
+    **Integer buffers are covered here and are why they are.** A snapshot is a
+    copy and a restore, and both are dtype-agnostic. It is *travel* that the
+    integer refuses, and this type does not travel.
+    """
+
+    def __init__(self, base):
+        self.base = dict(base)
+
+    @classmethod
+    def over(cls, model, names):
+        """Snapshot the named buffers of ``model``.
+
+        ``names`` is checked rather than trusted, for the same reason
+        :meth:`Delta.over` checks: a name that does not resolve would produce a
+        snapshot silently covering less than it claims, and the caller would
+        find out at ``revert`` -- which is the one moment at which finding out
+        is too late.
+
+        A buffer registered as ``None`` (``BatchNorm(track_running_stats=False)``
+        leaves ``running_mean`` that way) is not a buffer this can snapshot, and
+        is named as absent rather than stored as ``None`` and restored as one.
+        """
+        buffers = dict(model.named_buffers())
+        names = list(names)
+        missing = [n for n in names if buffers.get(n) is None]
+        if missing:
+            raise KeyError(
+                "torchnative.delta: %d of %d names are not buffers of this "
+                "model (or are registered as None), first is %r"
+                % (len(missing), len(names), missing[0])
+            )
+        if not names:
+            raise ValueError(
+                "torchnative.delta: a snapshot over no buffers. There would be "
+                "nothing to restore, and revert() would report success having "
+                "done nothing"
+            )
+        return cls({n: buffers[n].detach().clone() for n in names})
+
+    @property
+    def covers(self):
+        """The buffer names this snapshot is over, in the order it was taken."""
+        return tuple(self.base)
+
+    def __len__(self):
+        return len(self.base)
+
+    @property
+    def nbytes(self):
+        """What holding this snapshot costs, in bytes.
+
+        One number, not the pair :attr:`Delta.nbytes` returns: there is no
+        second table. Counted through ``element_size()`` rather than assumed
+        from the dtype, for the reason ``torchnative.quant.storage_bytes``
+        gives -- and here it is load-bearing rather than tidy, because the
+        table genuinely mixes ``float32`` statistics with an ``int64`` counter.
+        """
+        return sum(t.numel() * t.element_size() for t in self.base.values())
+
+    def drift(self, model):
+        """The L2 distance between the live buffers and the snapshot, as one number.
+
+        **Over the floating buffers only.** ``num_batches_tracked`` is a count
+        of forwards, and putting a count into a euclidean norm beside two
+        statistics would make the number grow with the length of the run rather
+        than with how far the statistics moved. It is excluded here and
+        restored by :meth:`revert` -- the two answer different questions.
+
+        Zero for a snapshot nothing has moved, which is the honest answer: the
+        model is still where the snapshot was taken.
+        """
+        buffers = dict(model.named_buffers())
+        total = 0.0
+        for name, base in self.base.items():
+            if not base.dtype.is_floating_point:
+                continue
+            d = buffers[name].detach() - base
+            total += float((d * d).sum().item())
+        return total ** 0.5
+
+    def revert(self, model):
+        """Put the snapshotted values back, byte for byte.
+
+        A copy, not a subtraction, for the reason the module docstring gives
+        about ``(w + d) - d`` -- and here there is no second option at all,
+        since no offset was ever kept.
+
+        **Every covered buffer, including the integer counter.** Restoring the
+        statistics and leaving ``num_batches_tracked`` at the run's value would
+        leave the next EMA weighting wrong (``momentum=None`` makes the running
+        estimate a cumulative average over that counter) on a model that
+        reported itself reverted.
+        """
+        buffers = dict(model.named_buffers())
+        for name, base in self.base.items():
+            buffers[name].copy_(base)
+        return self
+
+    def __repr__(self):
+        return "<BufferSnapshot over %d buffers, %d B>" % (
+            len(self.base), self.nbytes,
         )

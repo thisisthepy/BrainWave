@@ -64,6 +64,7 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.add_.Tensor",
     "aten.addmm.default",
     "aten.alias.default",
+    "aten.allclose.default",
     "aten.all.default",
     "aten.all.dim",
     "aten.all.dims",
@@ -118,6 +119,7 @@ pub const IMPLEMENTED: &[&str] = &[
     "aten.empty_strided.default",
     "aten.eq.Scalar",
     "aten.eq.Tensor",
+    "aten.equal.default",
     "aten.erf.default",
     "aten.erf_.default",
     "aten.erfinv.default",
@@ -1368,7 +1370,33 @@ pub fn aten_dispatch(
         // before the kernel runs.
         Some(Where::Dense(ref device)) if crate::device::is_metal(device) => {
             crate::device::mps_host_readback_gate(op)?;
-            aten_dispatch_inner(py, op, args, kwargs)?
+            // And the second `mps` door, which is a *translator* rather than a
+            // gate. candle has no Metal kernels for `I16`/`I32` -- not
+            // arithmetic, not reductions, not even a cast off the buffer -- and
+            // every one of those refusals arrived in candle's own words, naming
+            // an internal shader symbol (`badd_i16`) rather than the dtype, the
+            // device or a way out. `device::name_mps_int_refusal` rewords
+            // exactly those and nothing else; see the long comment above it in
+            // `device.rs` for why this is on the error path rather than in
+            // front of the kernel, and docs/numerics/DTYPEDEV.md §4.2 for why
+            // the obvious promotion to `int64` cannot be performed on-device.
+            //
+            // The argument scan is *inside* the `Err` arm, so a computation
+            // that succeeds pays nothing for it -- and paying nothing is what
+            // makes it safe to leave on for every op rather than a list.
+            match aten_dispatch_inner(py, op, args, kwargs) {
+                Ok(out) => out,
+                Err(err) => {
+                    let dtypes = mps_int_dtypes_among(args, kwargs);
+                    if dtypes.is_empty() {
+                        return Err(err);
+                    }
+                    let message = err.to_string();
+                    return Err(crate::device::name_mps_int_refusal(
+                        op, &dtypes, err, &message,
+                    ));
+                }
+            }
         }
         // The cuda half, and it is the mps half twice over: same table, same
         // gate, one shared body in `device.rs`. A cuda tensor is a
@@ -1565,6 +1593,64 @@ fn check_devices_agree(
         }
     }
     Ok(first)
+}
+
+/// The `I16`/`I32` candle dtypes among this call's tensor arguments.
+///
+/// Only ever called on the error path of the `mps` arm, so it is allowed to be
+/// the straightforward scan that `scan_for_device` above is careful not to be:
+/// nothing is about to compute, and a refusal that has to be worded can afford
+/// a second pass over half a dozen arguments.
+///
+/// It descends one level into lists and tuples for the reason
+/// `check_devices_agree` does -- `torch.cat([a, b])` arrives with its tensors
+/// one level down, and `cat` on a sealed `int16` buffer is exactly the sort of
+/// call whose refusal would otherwise keep candle's words.
+fn mps_int_dtypes_among(
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> Vec<candle_core::DType> {
+    let mut found: Vec<candle_core::DType> = Vec::new();
+    let mut visit = |value: &Bound<'_, PyAny>| {
+        let Ok(tensor) = value.cast::<PyTensorBase>() else {
+            return false;
+        };
+        let borrowed = tensor.borrow();
+        if let crate::tensor::Repr::Dense(inner) = borrowed.repr() {
+            let dtype = inner.dtype();
+            if crate::device::is_mps_unsupported_int(dtype) && !found.contains(&dtype) {
+                found.push(dtype);
+            }
+        }
+        true
+    };
+    let mut scan = |value: &Bound<'_, PyAny>| {
+        if visit(value) {
+            return;
+        }
+        if let Ok(sequence) = value.cast::<PyList>() {
+            for item in sequence.iter() {
+                if !visit(&item) {
+                    break;
+                }
+            }
+        } else if let Ok(sequence) = value.cast::<PyTuple>() {
+            for item in sequence.iter() {
+                if !visit(&item) {
+                    break;
+                }
+            }
+        }
+    };
+    for value in args.iter() {
+        scan(&value);
+    }
+    if let Some(kwargs) = kwargs {
+        for (_, value) in kwargs.iter() {
+            scan(&value);
+        }
+    }
+    found
 }
 
 /// One dispatched argument, and the sequences one level under it.
@@ -4018,6 +4104,9 @@ fn aten_dispatch_inner(
         "aten.lt.Scalar" => compare_scalar(py, args, kwargs, "aten.lt.Scalar", Cmp::Lt),
         "aten.le.Scalar" => compare_scalar(py, args, kwargs, "aten.le.Scalar", Cmp::Le),
         "aten.le.Tensor" => compare_tensor(py, args, kwargs, "aten.le.Tensor", Cmp::Le),
+
+        "aten.equal.default" => equal_default(py, args, kwargs),
+        "aten.allclose.default" => allclose_default(py, args, kwargs),
 
         "aten.bitwise_and.Tensor" => bitwise_binary(py, args, kwargs, "aten.bitwise_and.Tensor", Bitwise::And),
         "aten.bitwise_or.Tensor" => bitwise_binary(py, args, kwargs, "aten.bitwise_or.Tensor", Bitwise::Or),
@@ -9711,6 +9800,200 @@ fn compare_scalar(
     finish(py, apply_cmp(op, kind, &left, &right)?, TorchDType::Bool)
 }
 
+/// `aten::equal(Tensor self, Tensor other) -> bool`
+///
+/// `torch.equal` and `Tensor.equal` both dispatch this leaf directly --
+/// measured with a `TorchDispatchMode` logger on torch 2.13.0, which records
+/// exactly `aten.equal.default` and nothing decomposed under it. So this is a
+/// genuine `overloads.json` entry (`torch.equal(a, b)` resolves the single
+/// schema and calls straight through), not a `bootstrap.py` composite --
+/// unlike `allclose` below it, which shares the same measurement but a
+/// different C++ body.
+///
+/// **Reduces to a Python `bool`, not a `Tensor`.** That is why this belongs
+/// next to `_local_scalar_dense` in spirit (`item()`/`__bool__`'s own note)
+/// even though, unlike that op, it earns a table entry: the *arguments* still
+/// resolve through the normal one-schema table, only the *return* leaves the
+/// tensor world, and `_torch_level_function`'s `dispatch(key, **bound)` does
+/// not care which -- whatever `aten.rs` hands back is what `torch.equal(...)`
+/// returns.
+///
+/// Three things were measured against upstream rather than assumed, because
+/// "same size and elements" undersells what upstream actually checks:
+///
+///   * **dtype is not part of the check.** `torch.equal(int64([1,2,3]),
+///     int32([1,2,3]))` is `True`; `torch.equal(int64([1,2,3]),
+///     int32([1,2,4]))` is `False`. Upstream compares *values*, promoted the
+///     same way `eq.Tensor` promotes them -- so this reuses that exact
+///     machinery (`promote_operands` / `compare_common` / `apply_cmp`) rather
+///     than inventing a second promotion rule that could drift from the
+///     first.
+///   * **shape mismatch answers `False`, it does not raise** (unlike
+///     `allclose`, which broadcasts and can raise on a real mismatch).
+///     `torch.equal(zeros(2), zeros(3))` and `torch.equal(zeros(0,3),
+///     zeros(0,4))` are both `False`, measured -- there is no broadcast
+///     attempt here at all, which is also why an unequal-shape pair costs
+///     nothing but a `Vec` compare.
+///   * **`NaN` never equals itself.** No special case is needed: `eq.Tensor`'s
+///     own comparison already answers `False` for `NaN == NaN`, so
+///     `equal(nan_tensor, nan_tensor)` falls out of the reused machinery for
+///     free, matching upstream's measured `False`.
+///
+/// An empty (`numel() == 0`) pair of *matching* shapes is `True`, measured
+/// (`torch.equal(torch.tensor([]), torch.tensor([]))`), and is short-circuited
+/// before the comparison machinery runs rather than left to fall out of a
+/// reduction over zero elements, which is the same empty-input caution
+/// `any_or_all_default`'s note gives for `any`/`all`.
+fn equal_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.equal.default";
+    let lhs = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let rhs = tensor_arg(OP, args, kwargs, 1, "other")?;
+
+    if lhs.tensor()?.dims() != rhs.tensor()?.dims() {
+        return Ok(false.into_bound_py_any(py)?.unbind());
+    }
+    if lhs.tensor()?.elem_count() == 0 {
+        return Ok(true.into_bound_py_any(py)?.unbind());
+    }
+
+    let tag = promote_operands(OP, &lhs, &rhs)?;
+    let storage = PyDtype::new(tag).storage(OP)?;
+    let floating = tag.is_floating_point();
+    let left = compare_common(OP, &operand_in(OP, lhs.tensor()?, storage)?, floating, tag)?;
+    let right = compare_common(OP, &operand_in(OP, rhs.tensor()?, storage)?, floating, tag)?;
+    let mask = apply_cmp(OP, Cmp::Eq, &left, &right)?
+        .flatten_all()
+        .map_err(|e| candle_err(OP, e))?;
+    let all_equal = mask
+        .min(0)
+        .and_then(|t| t.flatten_all())
+        .map_err(|e| candle_err(OP, e))?
+        .to_vec1::<u8>()
+        .map_err(|e| candle_err(OP, e))?[0];
+    Ok((all_equal != 0).into_bound_py_any(py)?.unbind())
+}
+
+/// `aten::allclose(Tensor self, Tensor other, float rtol=1e-05, float
+/// atol=1e-08, bool equal_nan=False) -> bool`
+///
+/// Same leaf-op measurement as `equal.default` above (`TorchDispatchMode`
+/// records `aten.allclose.default` directly, nothing decomposed under it),
+/// but a different C++ body -- three divergences from `equal`, all measured
+/// against upstream torch 2.13.0 rather than assumed:
+///
+///   * **dtype mismatch raises**, it does not compare or answer `False`:
+///     `torch.allclose(float32(...), float64(...))` raises `RuntimeError:
+///     Float did not match Double`. The wording and the vocabulary (`Float`,
+///     `Double`, `Long`, ...) are both upstream's, transcribed with
+///     `TorchDType::cpp_name` -- the same table `aten::view.dtype`'s mismatch
+///     message already draws from, for the reason its own note gives: a
+///     message that keeps upstream's sentence but not its vocabulary would
+///     name the wrong dtype.
+///   * **shape mismatch broadcasts**, and only raises if the broadcast
+///     itself refuses: `torch.allclose(ones(3), tensor(1.0))` is `True`
+///     (broadcasts the 0-d operand), while `torch.allclose(zeros(2),
+///     zeros(3))` raises the ordinary broadcast error ("The size of tensor a
+///     (2) must match the size of tensor b (3) at non-singleton dimension
+///     0") -- the same `broadcast_shape` helper `arith_tensor`/`where`/
+///     `masked_fill` already share, not a bespoke check.
+///   * **the tolerance is asymmetric in `self`/`other`**, and it is easy to
+///     get backwards: the rule is `|self - other| <= atol + rtol *
+///     |other|`, so the magnitude that sets the tolerance is always the
+///     *second* argument. Measured: with `rtol=1.0, atol=0`,
+///     `allclose(tensor(1.0), tensor(100.0))` is `True` (`|1-100|=99 <=
+///     1.0*100`) while `allclose(tensor(100.0), tensor(1.0))` is `False`
+///     (`|100-1|=99 <= 1.0*1` is false) -- swapping the arguments changes the
+///     answer, which a formula that read `rtol * self.abs()` would not
+///     reproduce.
+///
+/// Infinities and `NaN` are handled per-element rather than folded into the
+/// `atol + rtol * |other|` arithmetic, because IEEE 754 does not let that
+/// arithmetic answer them correctly on its own (`inf - inf` is `NaN`, and
+/// `NaN <= anything` is `False`). Measured on 2.13.0:
+///
+///   * same-signed infinities compare close (`allclose(tensor(inf),
+///     tensor(inf))` is `True`) -- handled here as plain `x == y`, which
+///     IEEE 754 already answers `True` for two positive infinities and
+///     `False` for one positive and one negative, so no separate sign check
+///     is needed.
+///   * an infinity against a finite value is never close (`allclose(
+///     tensor(inf), tensor(1.0))` is `False`) -- `x == y` answers that too,
+///     for the same reason.
+///   * `NaN` is never close to anything, including another `NaN`, unless
+///     `equal_nan=True`, in which case two `NaN`s (and only two `NaN`s) are
+///     close. Measured: `allclose(nan, nan)` is `False` by default and
+///     `True` under `equal_nan=True`; a `NaN` against a non-`NaN` is `False`
+///     either way.
+///
+/// The elementwise loop reads both operands through `widen_f64` (the same
+/// single-widening-site `eq.Tensor`'s note above insists on) after
+/// broadcasting to the common shape, then applies the three-way rule
+/// per-element in plain Rust rather than composing candle kernels for it --
+/// the shape `bitwise_binary`'s own note already uses this crate for: no
+/// `isnan`/`isinf` primitive exists here, and inventing tensor-shaped ones
+/// only to fold them back into one Python `bool` would be a second door for
+/// nothing the einsum-sized ops in this file need.
+fn allclose_default(
+    py: Python<'_>,
+    args: &Bound<'_, PyTuple>,
+    kwargs: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    const OP: &str = "aten.allclose.default";
+    let lhs = tensor_arg(OP, args, kwargs, 0, "self")?;
+    let rhs = tensor_arg(OP, args, kwargs, 1, "other")?;
+    let rtol = float_arg(args, kwargs, 2, "rtol", 1.0e-05)?;
+    let atol = float_arg(args, kwargs, 3, "atol", 1.0e-08)?;
+    let equal_nan = bool_arg(args, kwargs, 4, "equal_nan")?.unwrap_or(false);
+
+    if lhs.tag() != rhs.tag() {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "{} did not match {}",
+            lhs.tag().cpp_name(),
+            rhs.tag().cpp_name()
+        )));
+    }
+
+    let shape = broadcast_shape(OP, lhs.tensor()?.dims(), rhs.tensor()?.dims())?;
+    let numel: usize = shape.iter().product();
+    if numel == 0 {
+        return Ok(true.into_bound_py_any(py)?.unbind());
+    }
+
+    let a = widen_f64(
+        &lhs.tensor()?
+            .broadcast_as(shape.clone())
+            .map_err(|e| candle_err(OP, e))?,
+    )
+    .and_then(|t| t.flatten_all())
+    .map_err(|e| candle_err(OP, e))?
+    .to_vec1::<f64>()
+    .map_err(|e| candle_err(OP, e))?;
+    let b = widen_f64(
+        &rhs.tensor()?
+            .broadcast_as(shape)
+            .map_err(|e| candle_err(OP, e))?,
+    )
+    .and_then(|t| t.flatten_all())
+    .map_err(|e| candle_err(OP, e))?
+    .to_vec1::<f64>()
+    .map_err(|e| candle_err(OP, e))?;
+
+    let all_close = a.iter().zip(b.iter()).all(|(&x, &y)| {
+        if x.is_nan() || y.is_nan() {
+            equal_nan && x.is_nan() && y.is_nan()
+        } else if x.is_infinite() || y.is_infinite() {
+            x == y
+        } else {
+            (x - y).abs() <= atol + rtol * y.abs()
+        }
+    });
+    Ok(all_close.into_bound_py_any(py)?.unbind())
+}
+
 #[derive(Clone, Copy)]
 enum Bitwise {
     And,
@@ -15161,6 +15444,13 @@ fn to_copy_default(
         return finish(py, out, tag);
     }
     let storage = PyDtype::new(tag).storage(OP)?;
+    // Before the conversion rather than after: `PyTensorBase::new` carries the
+    // same gate and is the one nothing can get round, but reaching it means
+    // going through candle first, and candle refuses `F32 -> F64` on Metal
+    // with `Metal contiguous to_dtype F32 F64 not implemented` -- a message
+    // about a missing kernel, for a dtype the API does not have. Asking here
+    // costs one comparison and answers with the fact instead.
+    crate::device::metal_dtype_gate(&device, storage)?;
     let (had_dtype, stayed_put) = {
         let t = input.tensor()?;
         (t.dtype(), t.device().same_device(&device))
