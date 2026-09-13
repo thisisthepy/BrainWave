@@ -29,6 +29,10 @@
 <!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_coremlops.py test_the_neural_engine_runs_the_conv_at_float16_and_cannot_at_float32 present -->
 <!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_coremlops.py test_a_conv_leaf_is_deferred_because_its_shape_is_not_known_at_to_time present -->
 <!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_coremlops.py test_the_rejected_types_are_rejected_by_a_number_and_not_by_omission present -->
+<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/coreml.py _say_unknown present -->
+<!-- DOCWATCH: symbol-in-file torchnative/src/main/torchnative/export/coreml.py _UNKNOWN_PLAN present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_emptyplan.py test_a_plan_with_no_rows_at_all_warns_that_what_ran_is_unknown present -->
+<!-- DOCWATCH: symbol-in-file rust/torch_c/pytests/test_emptyplan.py test_a_full_offload_is_still_silent present -->
 
 ## 1. The headline: the CoreML models docs/graph/NPU.md executed ran on the **CPU**
 
@@ -935,3 +939,136 @@ is recorded so the next person does not have to re-derive it.
 | **defect fixed** | `compute_plan` orphaned one `.mlmodelc` per compile, forever — +454 directories and +650 MB per gate run (§8.4) |
 | **limitation named** | the `m_<UUID>` bundle had no owner at any level; `NSTemporaryDirectory()` ignores `$TMPDIR`; `e5bundlecache` is Apple's (§8.4) |
 | **tests added** | 19, in `rust/torch_c/pytests/test_bf16ane.py`; nine nullifications, each red on the tests it targets |
+
+## 9. An empty compute plan is not silence — and the plan itself is not a property of the program
+
+`test_the_rejected_types_are_rejected_by_a_number_and_not_by_omission` was
+**red on develop**, in two consecutive full gate runs:
+
+```
+FAIL test_the_rejected_types_are_rejected_by_a_number_and_not_by_omission:
+     AssertionError: ('relu', {'relu': [], 'gelu': []})
+```
+
+A previous round saw this mid-work and reported it as having cleared on its
+own. It had not. That observation is withdrawn here — and it is withdrawn
+without a sentence to strike, because the claim never reached this document:
+searching §8.4 and the whole of `docs/graph/` for it finds nothing. It lived in
+a hand-off report. **A finding that only exists in a report is a finding the
+next person cannot check**, which is how it survived two red gates.
+
+### 9.1 Why the plan was empty — established
+
+`compute_plan` returned **zero** rows for a single-`relu` and a single-`gelu`
+float16 program at `(256, 1024)`, while returning full rows for a `linear` at
+the same precision in the same process.
+`get_compute_device_usage_for_mlprogram_operation` answered `None` for *every*
+operation of those two, including the `ios16.cast`s that do get a usage in a
+`linear` program.
+
+The cause is **the identity of the compiled artefact, not the program it
+encodes.** The decisive measurement, run in a fresh interpreter with no torch
+loaded, reading `.mlmodelc` directories straight off disk:
+
+| `.mlmodelc` | differs from the first by | per-op usage |
+|---|---|---|
+| as `compile_model` produced it (op named `relu_0`) | — | **none** |
+| the same bundle, `relu_0` → `relu_7` in `model.mil` + `coremldata.bin` | 2 bytes | **all** |
+| that one, `relu_7` → `relu_0` again | back to the original | **none** |
+| the same bundle, `relu_0` → `relu_8` | 2 bytes | **all** |
+
+A rename changes nothing the model computes. It changes the bytes, and with
+them whatever CoreML keys a cached plan on — and the answer follows the bytes.
+
+The three candidates worth eliminating rather than assuming, eliminated:
+
+* **not the program shape.** A single elementwise op is not what CoreML has no
+  per-op usage for: the same `relu` at `(255, 1024)`, `(128, 1024)`,
+  `(256, 1023)`, `(64, 4096)` and `(909, 1024)` all plan normally, as does
+  `gelu`. Only `(256, 1024)` — the one shape the fixture asked at — is silent.
+* **not a coremltools version behaviour.** coremltools 9.0 builds a
+  single-`relu` program at `(256, 1024)` through `mb.program` directly, at the
+  same precision and deployment target, and plans it fully. Same version, same
+  graph, same shape.
+* **not our call.** The same call, on a two-byte-renamed copy of the same
+  artefact, returns every row.
+
+### 9.2 The cold-cache hypothesis, tested and discarded
+
+A plausible reading was that `MLComputePlan`'s per-op usage depends on
+`~/Library/Caches/org.python.python/com.apple.e5rt.e5bundlecache` being warm
+for a given program, and that the 10 GB deletion between the green report and
+the red gates had cooled it. That would make an empty plan a *transient* state
+and every warning in `export/coreml.py` keyed on plan contents unreliable on a
+cold machine — a much larger finding. It is not what happens:
+
+| | first plan | after a real `predict` | recompiled |
+|---|---|---|---|
+| `(909, 1024)` — a shape nothing had ever compiled | **full** | — | full |
+| `(256, 1024)` — the known-silent one | none | **none** | **none** |
+
+A never-before-compiled program plans fully on its first, cold attempt, and the
+silent one stays silent after being run. So it is not warm-versus-cold; it is
+sticky, and tied to the artefact. What has **not** been established is which
+cache holds it and how an entry comes to be in that state. Deleting
+`e5bundlecache` would test it, and this round did not: it is Apple's, it is
+11 GB, and it is outside the change being made here.
+
+### 9.3 The half that mattered more: "nothing to say" was being said as nothing
+
+`_say_what_ran` began `if not compute: return`, and `_compile_model`'s
+`to()`-time guard began `if probe_rows and not any(...)`. Both drop the
+operations CoreML returned no usage for and then return early when nothing is
+left. So a model whose plan CoreML declines to produce got **no warning at
+all** — the same silence a FULL offload is deliberately given.
+
+That is §1's failure with a new entrance. "CoreML told us CPU" and "CoreML told
+us nothing" are different facts, and they were collapsing into one output.
+
+The rule now, and where `unknown` sits:
+
+| plan | said |
+|---|---|
+| every computing op known and preferred `NeuralEngine` | **nothing** — the silence is earned by positive evidence, and is what keeps a warning worth reading |
+| known, unit supported but not preferred | §2.1's sentence, per shape |
+| known, unit not in the supported column | `_UNREACHABLE_PRECISION`, once |
+| **any op unnamed, or no computing op at all** | **`_UNKNOWN_PLAN`, once** |
+
+`unknown` cannot borrow FULL's silence, because that silence is paid for with
+evidence and `unknown` has none; it is at least as loud as PARTIAL. It is also
+checked **first**, ahead of `_UNREACHABLE_PRECISION`, because that sentence
+reads an empty `supported` column as the precision's fault — and an empty
+column CoreML never filled in is not the same as one it filled in without the
+unit. Said as-is, it would have sent a caller to change a setting that cannot
+help.
+
+`compute_plan` no longer drops an unnamed operation. It drops `const` **by
+name** — that one has no compute device by construction — and emits every
+other operation as a row, with `preferred="unknown"` and an empty `supported`
+when CoreML would not say. Defaulting to *keep* is the point: the failure being
+guarded against is a silent drop.
+
+### 9.4 The fixture asks at four shapes now, and that is not belt-and-braces
+
+§9.1 is exactly the situation where a one-shape measurement can be taken away
+by one artefact. The relu/gelu claim — supported on the unit, preferred
+elsewhere, which is the number that decided not to lower them — is now taken at
+`(256, 1024)`, `(255, 1024)`, `(128, 1024)` and `(256, 1023)`. The test grades
+every shape CoreML answered and **requires at least two to answer**, so it
+cannot go quietly vacuous the way `assert rows` did; the shape CoreML declined
+is present as a named `unknown` row rather than as an absence.
+
+### 9.5 Split the way CLAUDE.md §5.3 asks
+
+| | |
+|---|---|
+| **defect fixed** | an empty or partly-unnamed `MLComputePlan` produced **no warning at all**, in both places that read one — the §1 silence, reached a different way |
+| **defect fixed** | `compute_plan` silently dropped every operation CoreML named no device for, so "no plan" and "no computing operations" were the same empty list |
+| **defect fixed** | an unknown plan was read as `_UNREACHABLE_PRECISION`, blaming the precision for a `supported` column CoreML never filled in |
+| **claim added** | the empty plan tracks the compiled artefact's **bytes**, not the program: a two-byte rename inside `.mlmodelc` restores it, and renaming back removes it again (§9.1) |
+| **claim withdrawn** | that the failure had "cleared on its own" — it is deterministic, and it reproduces at `af47641` as well |
+| **hypothesis discarded** | that per-op usage needs a warm `e5bundlecache`; a never-compiled shape plans fully cold, and the silent one stays silent after a real `predict` (§9.2) |
+| **limitation named** | which cache holds the bad entry, and how one gets into that state, is **not** established; `e5bundlecache` was not deleted to find out |
+| **claim unchanged** | relu and gelu are supported on the unit and preferred elsewhere — re-measured at four shapes, not widened, not re-graded |
+| **test defect fixed** | the relu/gelu measurement rested on a single artefact and became `assert []` when that artefact went silent |
+| **tests added** | 8, in `rust/torch_c/pytests/test_emptyplan.py` |

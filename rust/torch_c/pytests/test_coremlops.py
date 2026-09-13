@@ -186,12 +186,25 @@ try:
     # the size (the sweep measured CPU/GPU preferred at 1024x4096 and at
     # 1x256x64x64 as well), so the fixture asks it at a size it survives, and
     # the crash is recorded rather than hidden: see docs/graph/NPU2.md §7.3.
-    big = torch.randn(256, 1024)
+    #
+    # **Asked at more than one shape, and that is not belt-and-braces.**
+    # docs/graph/NPU2.md §9.1: at exactly (256, 1024) the compiled artefact
+    # for each of these two programs comes back from MLComputePlan with no
+    # device for any operation -- while (255, 1024), (128, 1024), (64, 4096)
+    # and (256, 1023) all answer normally for the same op at the same
+    # precision in the same process. So a fixture that asks once can have its
+    # measurement taken away by one artefact, and the claim "relu is supported
+    # and not preferred" would silently become untested. It is asked at every
+    # shape, each answer is kept as it came -- including `unknown`, which is
+    # now a row rather than an absence -- and the test grades them.
     for name, module in (("relu", torch.nn.ReLU()), ("gelu", torch.nn.GELU())):
-        model_, _names, _emitted = C.compile_model(
-            capture(module.eval(), big), float32=False)
-        out.setdefault("rejected_plans", {})[name] = C.computes(
-            C.compute_plan(model_, compute_units=ct.ComputeUnit.ALL))
+        by_shape = {}
+        for shape in ((256, 1024), (255, 1024), (128, 1024), (256, 1023)):
+            model_, _names, _emitted = C.compile_model(
+                capture(module.eval(), torch.randn(*shape)), float32=False)
+            by_shape[str(list(shape))] = C.computes(
+                C.compute_plan(model_, compute_units=ct.ComputeUnit.ALL))
+        out.setdefault("rejected_plans", {})[name] = by_shape
     out["layer_norm_has_no_lowering"] = sorted(
         op for op in C.supported_ops() if "layer_norm" in op)
 
@@ -350,16 +363,37 @@ def test_the_rejected_types_are_rejected_by_a_number_and_not_by_omission():
     `LayerNorm` is refused a step earlier: there is no MIL lowering here for
     `aten.native_layer_norm.default` at all, so it is absent from
     `supported_ops()` and a leaf for it would have to invent one.
+
+    **Graded per shape, and an unanswered shape is a named `unknown`, not a
+    missing row.** This test was red on develop for days because CoreML
+    returned no device for any operation of the (256, 1024) artefact and the
+    fixture's single `assert rows` had nothing left to stand on
+    (docs/graph/NPU2.md §9.1). The rule is not weakened to fit that: the
+    measurement is still required, at every shape CoreML answered, and at
+    least two shapes must answer or the claim is untested and this fails.
+    What changed is that the shape CoreML declined is *visible* -- it is a row
+    reading `preferred == "unknown"` -- instead of being an empty list that
+    reads exactly like "no measurement was taken".
     """
     r = _fixture_or_skip()
     if r is None:
         return
     for name in ("relu", "gelu"):
-        rows = r["rejected_plans"][name]
-        assert rows, (name, r["rejected_plans"])
-        for row in rows:
-            assert "NeuralEngine" in row["supported"], (name, row)
-            assert row["preferred"] != "NeuralEngine", (name, row)
+        by_shape = r["rejected_plans"][name]
+        assert len(by_shape) == 4, (name, sorted(by_shape))
+        answered = 0
+        for shape, rows in sorted(by_shape.items()):
+            # Never absent. One row per computing operation, whatever CoreML
+            # was willing to say about it.
+            assert len(rows) == 1, (name, shape, rows)
+            row = rows[0]
+            if row["preferred"] == "unknown":
+                assert row["supported"] == [], (name, shape, row)
+                continue
+            answered += 1
+            assert "NeuralEngine" in row["supported"], (name, shape, row)
+            assert row["preferred"] != "NeuralEngine", (name, shape, row)
+        assert answered >= 2, (name, by_shape)
     assert r["layer_norm_has_no_lowering"] == [], r["layer_norm_has_no_lowering"]
 
 

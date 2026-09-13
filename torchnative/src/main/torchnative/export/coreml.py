@@ -742,12 +742,37 @@ def _check_precision(precision: str) -> str:
     return precision
 
 
+#: What `preferred` holds when `MLComputePlan` loaded the model, listed the
+#: operation, and returned **no** device usage for it. Not "CPU", which is a
+#: fact CoreML stated; not dropped, which is what this module used to do and
+#: is how a CPU-bound model came to look like an offloaded one. See
+#: docs/graph/NPU2.md §9.1 for the measurement that it happens.
+UNKNOWN = "unknown"
+
+#: Operations that have no compute device *by construction*, so `None` from
+#: `get_compute_device_usage_for_mlprogram_operation` is the expected answer
+#: for them rather than a refusal to say. Held as a set and matched by name so
+#: that everything NOT in it is unknown-if-unnamed: the failure mode being
+#: guarded against is a silent drop, so the default has to be to keep.
+_NO_COMPUTE_OPS = frozenset({"const", "ios16.const"})
+
+
 def compute_plan(model, *, compute_units=None) -> list[dict]:
     """CoreML's own answer to which unit runs each operation of `model`.
 
     `model` is an `MLModel` as `compile_model` returns it. Returns one row per
-    *computing* operation -- `const` has no compute device and is dropped --
-    with `op`, `preferred` and the sorted `supported` set.
+    *computing* operation -- `const` has no compute device and is dropped by
+    name -- with `op`, `preferred` and the sorted `supported` set.
+
+    **An operation CoreML declines to name a device for is a row, not a
+    gap.** It comes back as `preferred=UNKNOWN` with an empty `supported`,
+    because "CoreML told us nothing" and "CoreML told us CPU" are different
+    facts and collapsing the first into an absent row collapses them into the
+    same silence. This function used to `continue` past a `None` usage, and
+    docs/graph/NPU2.md §9.1 is the measurement of a real float16 program --
+    a single `relu`, a single `gelu` -- for which *every* operation came back
+    `None`, so the whole plan vanished and every caller read the empty list as
+    "nothing to report".
 
     This is the evidence, not a decoration. docs/graph/NPU2.md §1 is the record
     of a model that was compiled by macOS, run, and agreed with replay at
@@ -813,8 +838,15 @@ def compute_plan(model, *, compute_units=None) -> list[dict]:
         function = plan.model_structure.program.functions["main"]
         rows = []
         for operation in function.block.operations:
+            if operation.operator_name in _NO_COMPUTE_OPS:
+                continue
             usage = plan.get_compute_device_usage_for_mlprogram_operation(operation)
             if usage is None:
+                rows.append({
+                    "op": operation.operator_name,
+                    "preferred": UNKNOWN,
+                    "supported": [],
+                })
                 continue
             rows.append({
                 "op": operation.operator_name,
@@ -1010,8 +1042,19 @@ def plan_lowering(model, predicate=None) -> dict:
 def _say_what_ran(report, precision, shape, rows) -> None:
     """Warn when CoreML did not put this shape on the Neural Engine.
 
-    Two different sentences, and which one is said is decided by
+    Three different sentences, and which one is said is decided by
     `MLComputePlan` rather than by the caller's argument:
+
+    * the plan is **unknown** -- CoreML named no device for some or all of the
+      computing operations, so there is no evidence about what ran. This one
+      is checked first and returns, because the other two are readings of
+      rows that in this case do not exist: `_UNREACHABLE_PRECISION` in
+      particular would blame the precision for an empty `supported` column
+      that CoreML never filled in, and send the caller to change a setting
+      that will not help. Where it sits relative to FULL and PARTIAL is the
+      point: FULL is silent because it has positive evidence that everything
+      reached the unit, and unknown has *no* evidence, so it cannot borrow
+      that silence -- it is at least as loud as PARTIAL;
 
     * the unit is **supported** for this program and was not **preferred** --
       CoreML weighs dispatch cost against work and below some amount of work
@@ -1030,7 +1073,9 @@ def _say_what_ran(report, precision, shape, rows) -> None:
     import warnings
 
     compute = computes(rows)
-    if not compute:
+    if not compute or any(row["preferred"] == UNKNOWN for row in compute):
+        _say_unknown(report, [row["op"] for row in compute if
+                              row["preferred"] == UNKNOWN], bool(rows))
         return
     if not any("NeuralEngine" in row["supported"] for row in compute):
         if report.get("_precision_warned"):
@@ -1067,6 +1112,61 @@ def _say_what_ran(report, precision, shape, rows) -> None:
         UserWarning,
         stacklevel=3,
     )
+
+
+def _say_unknown(report, unnamed, had_rows) -> None:
+    """Say that CoreML produced no usable compute plan. Once per model.
+
+    Called from both places that read a plan -- `_say_what_ran` at forward
+    time and `_compile_model` at `to()` time -- for the reason
+    `_UNREACHABLE_PRECISION` is one string: two copies of a sentence drift,
+    and this one is the sentence that stands between a CPU-bound model and a
+    caller who believes it was offloaded.
+
+    Not silent, and that is the whole change. The FULL-offload silence is
+    earned by evidence that every operation reached the unit; an unknown plan
+    has no evidence at all, so it gets the louder treatment. Said **once**, on
+    `report`, because a leaf compiles per shape and a warning repeated at
+    every batch is one a caller filters out -- the same bookkeeping
+    `_precision_warned` does for the precision sentence.
+    """
+    import warnings
+
+    if report.get("_unknown_warned"):
+        return
+    report["_unknown_warned"] = True
+    warnings.warn(
+        _UNKNOWN_PLAN.format(
+            detail=(
+                f"it named no compute device for {sorted(set(unnamed))}"
+                if unnamed else
+                ("the plan has no computing operation in it at all"
+                 if had_rows else "it produced no compute plan at all")
+            ),
+        ),
+        UserWarning,
+        stacklevel=4,
+    )
+
+
+#: The unknown sentence. Deliberately does NOT name a unit or a precision:
+#: every such word here would be a claim about evidence that does not exist,
+#: and docs/graph/NPU2.md §9.1 measured that the same program plans fine once
+#: its compiled artefact differs by a single operation name, so neither the
+#: program nor the precision is established as the cause.
+_UNKNOWN_PLAN = (
+    "torchnative coreml: MLComputePlan produced no usable compute plan for "
+    "this program -- {detail} -- so **what ran is unknown**. This is said "
+    "rather than left silent because silence here is what a FULL offload "
+    "gets, and an unknown plan is the opposite of that: there is no evidence "
+    "that anything reached the Neural Engine, and none that it did not. Do "
+    "not read it as CPU and do not read it as offloaded. `to(torchnative."
+    "device.npu)` still lowered and still runs; only the question \"which "
+    "unit\" is unanswered. See docs/graph/NPU2.md \u00a79.1, which records a "
+    "float16 program whose every operation came back without a device, and "
+    "the measurement that the compiled artefact's identity rather than the "
+    "program it encodes is what decided it."
+)
 
 
 #: Said once per model, by whoever gets there first. Held as one string
@@ -1584,7 +1684,37 @@ def _compile_model(model, *, precision: str = "float16", compute_units=None,
     # `compute_units` setting can reach it. A caller who wrote
     # `to(device.npu, precision="float32")` and got a model that silently runs
     # on the CPU is exactly docs/graph/NPU2.md §1.
+    _say_at_to_time(report, precision)
+    return model, report
+
+
+def _say_at_to_time(report, precision) -> None:
+    """What `to()` says about the plans its eager probes produced.
+
+    Module-level and taking only `report`, so the decision can be exercised
+    without a machine that can compile anything -- the same reason
+    `_say_what_ran` is module-level. The two say the same three things about
+    the same rows; they differ only in *when* they get to look, because a
+    probed leaf has a plan at `to()` time and a deferred one does not.
+
+    Order matters and is the fix this carries. The unknown case is checked
+    **first**, and over the plan entries rather than over `probe_rows`: a plan
+    CoreML returned nothing for contributes no rows at all, so a test written
+    against `probe_rows` alone cannot see it -- which is exactly how this went
+    silent (docs/graph/NPU2.md §9.3). And `_UNREACHABLE_PRECISION` below must
+    not be reached in that state: its `offered` list would be an empty
+    `supported` column CoreML never filled in, reported as though CoreML had
+    filled it in without the unit, which sends the caller to change a
+    precision that will not help.
+    """
+    import warnings
+
     probe_rows = [row for plan in report["plans"] for row in computes(plan["rows"])]
+    unnamed = [row["op"] for row in probe_rows if row["preferred"] == UNKNOWN]
+    if report["plans"] and (unnamed or not probe_rows):
+        _say_unknown(report, unnamed,
+                     any(plan["rows"] for plan in report["plans"]))
+        return
     if probe_rows and not any(
             "NeuralEngine" in row["supported"] for row in probe_rows):
         report["_precision_warned"] = True
@@ -1597,4 +1727,3 @@ def _compile_model(model, *, precision: str = "float16", compute_units=None,
             UserWarning,
             stacklevel=4,
         )
-    return model, report
