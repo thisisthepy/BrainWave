@@ -2273,7 +2273,15 @@ def upstream_dist_info(version: str) -> dict[str, bytes]:
     prefix = f"torchnative-{version}.data/purelib/{root.name}"
     out: dict[str, bytes] = {}
     for path in sorted(root.rglob("*")):
-        if not path.is_file() or path.name == "RECORD":
+        # `INSTALLER` and `REQUESTED` are not upstream's -- pip and uv write
+        # them into a dist-info when they INSTALL it, and vendor_torch.sh
+        # assembles this tree out of an installed venv, so they ride along.
+        # Every published torchnative wheel through 0.1.0b3 therefore carries
+        # `INSTALLER = b"uv"` inside a wheel pip is about to install, which is
+        # a statement about this machine's tooling and false for the reader.
+        # Nothing consumes them: pip rewrites INSTALLER for what it installs
+        # and REQUESTED marks a direct request, which a vendored tree is not.
+        if not path.is_file() or path.name in ("RECORD", "INSTALLER", "REQUESTED"):
             continue
         if any(part in SKIP_DIRS for part in path.parts):
             continue

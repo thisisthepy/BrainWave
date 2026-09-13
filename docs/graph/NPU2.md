@@ -1179,3 +1179,37 @@ library code's to delete.
 | **product finding** | `MLComputePlan`'s per-op usage is not stable over time for a fixed program; artefacts enter the silent set and stay |
 | **left red, deliberately** | `test_the_rejected_types_are_rejected_by_a_number_and_not_by_omission` on this host — the measurement is unavailable, and saying so is the point |
 | **tests added** | 2, in `rust/torch_c/pytests/test_coremlops.py`; both nullified |
+
+### 10.4 The host condition was the cause, and clearing Apple's cache proved it
+
+§10 left one failure open and deliberately red:
+`test_the_rejected_types_are_rejected_by_a_number_and_not_by_omission`,
+with `gelu` down to a single answering shape against §9.4's "at least two
+must answer". The round that found it recorded an **untested** hypothesis
+rather than acting on it: `~/Library/Caches/org.python.python/com.apple.e5rt.e5bundlecache`
+stood at **18 GB against 12 GB free**, and a failure to create a bundle is
+also the condition that produces the fd-1 diagnostics of §10.1 -- one
+platform condition possibly rooting both symptoms. Testing it meant
+deleting Apple's cache, which is outside what a round may do.
+
+**Tested, 2026-09-13: the hypothesis holds.** The cache was removed (19 GB
+recovered, `/` from 12 GB to 31 GB) and the next full gate run passed that
+test, with no change to the repository between the two runs.
+
+So the "sticky, artefact-tied" silence of §9.1 is real but has a
+precondition that is *not* the artefact: when the ANE bundle cache cannot
+grow, CoreML stops answering `MLComputePlan` for programs it has not
+already cached, and the answers it does give are the ones already there.
+That is why the silent set only ever grew, and why the same program
+answered earlier and not later.
+
+Two consequences worth carrying:
+
+* **A green `MLComputePlan` result depends on free disk.** Any conclusion
+  drawn from an empty plan on a machine short of space is a conclusion
+  about the machine. §9.3's `unknown` row is what keeps that from reading
+  as "the CPU ran it", and this is the case it was written for.
+* **The threshold was right not to move.** Lowering "at least two shapes
+  must answer" would have turned a disk-full machine into a green line,
+  permanently, on every host. The round that declined to weaken it and
+  asked instead is the reason this was diagnosable at all.
