@@ -261,8 +261,13 @@ else
     NEW=$(git commit-tree "$TREE" -m "Release $VERSION")
     echo "  parent     (none -- first release on $TARGET_REF)"
 fi
-git update-ref "$TARGET_REF" "$NEW"
-echo "  commit     $NEW -> $TARGET_REF"
+# The ref is NOT moved here. It used to be, and a publish whose build check
+# then failed left the branch already pointing at the unverified commit -- so
+# 0.1.0b1 ended up with two "Release 0.1.0b1" commits, the failed one and the
+# one that worked, collapsed by hand afterwards. Both checks below read `$NEW`,
+# the commit object, and neither needs the ref, so the ref moves only once they
+# have passed. A failed publish now leaves the branch exactly where it was.
+echo "  commit     $NEW (held back until both checks pass)"
 echo
 
 unset GIT_INDEX_FILE
@@ -381,4 +386,6 @@ if [ -z "$wheel" ]; then
 fi
 echo "  ok         $(basename "$wheel") ($(wc -c < "$wheel" | tr -d ' ') bytes)"
 echo
+# Both checks passed, so the branch may move now.
+git update-ref "$TARGET_REF" "$NEW"
 echo "published $TARGET_REF = $NEW"
